@@ -1,0 +1,33 @@
+# 换行符统一策略
+#
+# 背景：本机 core.autocrlf=true，仓库里没有 .gitattributes 时，
+# 任何文本文件检出到 Windows 工作副本都会被改写成 CRLF。
+# 对板端要运行的 shell 脚本来说这是致命的：/bin/sh 会把 CRLF 读成
+# 行尾的 ^M，报 "not found" 之类的怪错。
+#
+# 因此：源码与脚本一律 LF（跨主机 / 跨板端一致），二进制不做转换。
+
+* text=auto eol=lf
+
+*.c      text eol=lf
+*.h      text eol=lf
+*.sh     text eol=lf
+*.cmake  text eol=lf
+*.txt    text eol=lf
+*.md     text eol=lf
+*.json   text eol=lf
+
+CMakeLists.txt  text eol=lf
+.gitattributes  text eol=lf
+.gitignore      text eol=lf
+
+# Windows 侧批处理必须保留 CRLF，否则 cmd.exe 解析异常
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+
+# 二进制文件禁止任何换行符转换
+*.png    binary
+*.jpg    binary
+*.ipk    binary
+*.gz     binary
+*.exe    binary

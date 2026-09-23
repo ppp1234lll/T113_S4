@@ -35,6 +35,18 @@ if(IVSBOX_WERROR)
     add_compile_options(-Werror)
 endif()
 
+# ----------------------------------------------------------------------------
+# POSIX / GNU 特性宏
+#   CMAKE_C_EXTENSIONS OFF 会传 -std=c11，此时 __STRICT_ANSI__ 被定义，
+#   glibc 的 features.h 便不再暴露 clock_gettime / CLOCK_MONOTONIC 等 POSIX 声明
+#   （-Werror 下直接编译失败）。后续 S03 要用的 epoll / timerfd / signalfd /
+#   accept4 同属这一类，故板端与 Linux 主机统一开启 _GNU_SOURCE。
+#   Windows(MinGW) 主机走 std=c11 的 ISO 分支，不需要也不启用该宏。
+# ----------------------------------------------------------------------------
+if(UNIX)
+    add_compile_definitions(_GNU_SOURCE)
+endif()
+
 set(IVSBOX_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 # ----------------------------------------------------------------------------

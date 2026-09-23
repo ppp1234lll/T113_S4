@@ -236,3 +236,4 @@
 | 会话隔离配置 | `.stint.json` | 规则 8 的 git-stint 仓库级配置，**所有 AI 共用同一份策略** |
 | Claude Code 适配 | `.claude/` | 规则 8 在 Claude Code 侧的 hook 配置与适配说明（WorkBuddy 侧生效） |
 | 编译环境搭建 | `ivsbox-v5/docs/环境搭建/` | 编译机（天嵌 TQT113 虚拟机）的环境搭建步骤，如 `cmake安装步骤.md`；S01 前置，经用户确认保留（规则 7 第 2 条） |
+| 操作手册 | `ivsbox-v5/docs/操作手册/` | 分任务详细操作手册，如 `S02-core基础设施操作手册.md`；经用户主动要求新建（规则 7 第 2 条） |

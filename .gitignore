@@ -31,6 +31,7 @@ _*.txt
 
 # 工具生成的状态文件
 .merkle-snapshot.json
+.embeddedskills/
 
 # 临时截图
 ScreenShot_*.png

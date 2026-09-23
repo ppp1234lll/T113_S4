@@ -26,6 +26,9 @@ _*.txt
 .workbuddy/
 .trae/
 
+# git-stint 会话 worktree 目录（会话隔离用，不进仓库）
+.stint/
+
 # 工具生成的状态文件
 .merkle-snapshot.json
 

@@ -233,3 +233,5 @@
 | 代码说明 | `ivsbox-v5/docs/代码说明.md` | 规则 4 的权威记录文件 |
 | 开发规则 | `AGENTS.md` | 规则 7 的权威规则文件，**所有 AI 共用同一份** |
 | 编辑器格式化 | `ivsbox-v5/.clang-format` | 代码风格基线，所有 AI 共用 |
+| 会话隔离配置 | `.stint.json` | 规则 8 的 git-stint 仓库级配置，**所有 AI 共用同一份策略** |
+| Claude Code 适配 | `.claude/` | 规则 8 在 Claude Code 侧的 hook 配置与适配说明（WorkBuddy 侧生效） |

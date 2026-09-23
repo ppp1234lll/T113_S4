@@ -2,7 +2,7 @@
 
 > 适用目录：`f:\debug\T113_TCP`
 > 主工程：`ivsbox-v5/`
-> 建立日期：2026-09-22（2026-09-23 增补规则 4、规则 5、规则 6、规则 7）
+> 建立日期：2026-09-22（2026-09-23 增补规则 4、规则 5、规则 6、规则 7、规则 8）
 
 本文件是**强制规则**，所有对本项目的开发、修改、文档编写都必须遵守。
 
@@ -160,6 +160,47 @@
 
 ---
 
+## 规则 8：用 git-stint 会话隔离，禁止在 main 工作副本直接改文件
+
+> 规则 7 靠人工约定防冲突，没有工具级隔离。本规则用 `git-stint`（已全局安装，v0.6.1）
+> 给**每个 AI 会话**开独立分支 + 独立 worktree，从物理上保证两个 AI 不会写到同一份文件。
+
+**会话命名**（用前缀区分归属，便于对方识别）：
+
+- TRAE 用 `trae-<主题>`，例：`trae-netmgr`
+- WorkBuddy 用 `wb-<主题>`，例：`wb-proto`
+
+**开工**：
+
+1. `git fetch origin`；`git status -sb` 必须干净且与 `origin/main` 一致（有 ahead/behind 先按规则 7 第 7 条处理）。
+2. `git stint start <前缀>-<主题>`，然后 `cd .stint/<会话名>/`。**本次任务的所有改动只在这个 worktree 内进行**，主工作副本 `f:\debug\T113_TCP` 只用于拉取与合并。
+3. 改动文件用 `git stint track <文件...> --session <会话名>` 登记进待提交列表。**不 track，`conflicts` 就检测不到重叠。**
+4. `git stint conflicts --session <会话名>` 检查是否与另一会话改了同一文件；**发现有重叠就停下、告知用户**，由用户决定谁继续，不得自行抢改。
+
+**会话中**：规则 1 / 2 / 4 / 6 照常执行，改动（含共用文档）一律写在会话 worktree 内。
+
+**收尾（顺序固定）**：
+
+1. `git stint commit -m "<Conventional Commits 信息>"` → `git stint squash -m "<最终提交信息>"`，把会话内多次提交压成一个干净提交。
+2. `git fetch origin`，再合并回 main（工具的 `git stint merge`，或常规 git merge）。**若 `AGENTS.md`、`ivsbox-v5/docs/修改记录.md`、`ivsbox-v5/docs/代码说明.md` 这类共用文档冲突，处理原则是"双方记录都保留、按时间倒序排列"**，绝不丢弃对方的条目。
+3. `git stint end`（放弃则 `git stint abort --session <会话名>`）清理会话分支与 worktree；确认 `git stint list` 为 `No active sessions`、`.stint/` 下无残留（规则 6）。
+4. `git push` 推 main（规则 3），让另一方下次开工能直接拉到最新。
+
+**已知限制（本机实测）**：
+
+- 多会话并存时，即使已 `cd` 进 worktree，本工具在 Windows 上仍会报 `Multiple active sessions`，因此**所有 stint 子命令都显式带上 `--session <会话名>`**。
+- `git stint install-hooks` 只适配 Claude Code；**TRAE 没有对应 hook，必须自己手动执行 start / track / commit / squash / end**，不得跳过。
+
+**禁止**：
+
+- 禁止在 main 工作副本上直接编辑代码或文档（例外见下）。
+- 禁止两个 AI 同时操作同一个会话或同一个 `stint/*` 分支。
+- 禁止用 `git checkout --force`、`git reset --hard`、`git push -f` 去"解决"冲突。
+
+**例外**：`AGENTS.md` 规则本身的修改、以及紧急修复，允许在 main 工作副本直接进行，但必须在规则 2 的记录中写明原因。
+
+---
+
 ## 规则执行检查表
 
 每次完成任务后，逐项自查：
@@ -173,6 +214,7 @@
 - [ ] 涉及 T113 / 天嵌平台事实时，是否已先查天嵌官方语雀资料并标注出处（规则 5）
 - [ ] 临时文件、调试脚本、被否掉的代码是否已全部清理，工作区只剩最终文件（规则 6）
 - [ ] 写入共用文档前是否已读取其最新内容、是否新建了未经用户同意的文档（规则 7）
+- [ ] 是否用 `git stint start` 开了独立会话、收尾是否 `squash` + 合并 + `end` 清理（规则 8）
 
 ---
 

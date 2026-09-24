@@ -18,7 +18,7 @@ include mk/rules.mk
 # -----------------------------------------------------------------------------
 CORE_SRCS     := $(wildcard src/core/*.c)
 HAL_SRCS      := $(wildcard src/hardware/*.c)
-MODULES_SRCS  := $(wildcard src/modules/*/*.c)
+MODULES_SRCS  := $(wildcard src/modules/*.c src/modules/*/*.c)
 APP_SRCS      := $(wildcard src/app/*.c)
 
 MEDIA_SRCS    := $(wildcard media/src/*.c)
@@ -95,13 +95,13 @@ test:
 	done
 
 asan:
-	$(MAKE) TARGET=host SANITIZE=1 test
+	$(MAKE) TARGET=host SANITIZE=1 BUILD_DIR=build/asan test
 
 fuzz:
 	$(MAKE) TARGET=host $(FUZZ_BINS)
 
 analyze:
-	$(MAKE) TARGET=host ANALYZE=1 $(BINS)
+	$(MAKE) TARGET=host ANALYZE=1 BUILD_DIR=build/analyze $(BINS)
 
 package: arm
 	@mkdir -p packaging
@@ -173,9 +173,9 @@ $(PROVISION_BIN): $(PROVISION_OBJS)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(BUILD_DIR)/tests/unit/%: $(BUILD_DIR)/tests/unit/%.o $(LIBCORE)
+$(BUILD_DIR)/tests/unit/%: $(BUILD_DIR)/tests/unit/%.o $(LIBMODULES) $(LIBHAL) $(LIBCORE)
 	@mkdir -p $(dir $@)
-	$(CC) $(LDFLAGS) -o $@ $< -L$(BUILD_DIR) -livcore $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $< -L$(BUILD_DIR) -livmodules -livhal -livcore $(LDLIBS)
 
 $(BUILD_DIR)/tests/fuzz/%: $(BUILD_DIR)/tests/fuzz/%.o
 	@mkdir -p $(dir $@)

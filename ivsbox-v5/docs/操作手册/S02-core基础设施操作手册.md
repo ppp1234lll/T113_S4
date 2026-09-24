@@ -73,6 +73,20 @@ S01 解决的是"能编译、能上板"；S02 解决的是"地基材料"。它**
 | 平台事实（2026-09-24 实测） | 板端 `/usr/lib/libz.so.1.2.11` 在位；交叉 sysroot `usr/include/zlib.h` + `usr/lib/libz.so` 在位；VM 主机 `zlib1g-dev` 已安装 |
 | 连带影响 | 验收项"CRC 已知向量"改为 CRC-32 向量（`"123456789"` → `0xCBF43926`）；`ivcore` 在 UNIX 下链接 `ZLIB::ZLIB`（Windows 主机验证不编 iv_crc） |
 
+### 2.6 决策 D3：环形缓冲（步骤 2）—— 不引入第三方库，且先判定"是否需要"（2026-09-24）
+
+沿用决策 D2 的口径（"优先使用现有 Linux 开发库"）去查步骤 2，结论是**没有库可用，而且这一步本身要重新论证**。
+
+| 项 | 内容 |
+|---|---|
+| 开发列表原文 | "环形缓冲：自己写"；本手册步骤 2 原设计"SPSC 无锁 + 静态存储 + 容量 2 的幂" |
+| 平台事实（2026-09-24 实测） | **交叉 sysroot 与板端都没有任何无锁/环形缓冲库**：liburcu、concurrencykit(`ck_ring`)、liblfds、DPDK(`rte_ring`)、libkfifo 全无；libubox 只有 `avl/blob/kvlist/list/runqueue/uloop/usock`；glib `GQueue`/`GAsyncQueue` 与 GStreamer `GstAdapter` 虽是**有锁 + 堆分配**，违反本节"静态存储、不动态 malloc"纪律。清单见 `bsp-capability.md` §7 |
+| 公开候选体检 | `szanni/ringbuf`（单头文件、C11 原子、ISC 许可）形状最接近，但 `ringbuf_new()` **内部堆分配且无 caller 传缓冲 API**，且 2020 年后停更、自带并发测试自述偶发失败；Zephyr `spsc_lockfree.h` 是**编译期静态数组**、形状最对，但绑 Zephyr 原子原语（`z_spsc_in/out`），移植成本 ≥ 自研；`RomanHorshkov/SPSCring` 只存 `int` 且动态分配 → **三者均不采用**，见 `bsp-capability.md` §7.3 与 §7.5 |
+| **结论 A：要不要做** | **"接收数据"这件事本身不需要环形缓冲。** 串口按架构 §7.4 纳入主 Reactor，`O_NONBLOCK` + epoll 模型下每轮 `read()` 到 `EAGAIN`、直接喂流式帧解析器（解析器自己攒半包）即可；内核 tty 翻转缓冲已充当缓冲，多加一层环只是**多一次拷贝** |
+| **结论 B：何时才需要** | 仅三种情况：① **UART 的读不在 Reactor 线程**（独立线程 / 厂商 SDK 回调线程投递）→ 这时才需要跨线程通道、也才需要原子操作；② 主循环可能被长时间阻塞，需"快吸慢解"防内核 tty 缓冲溢出（架构已有"有界慢任务池"专门防这个，属保险）；③ 需要保留最近 N KB 原始字节做现场留痕（"黑盒"），与"接收"无关 |
+| **连带的护栏（比环更值钱）** | **环不能防丢，只把溢出点后移**。而板端 `/proc/tty/driver/uart`（sunxi 驱动）实测**只有 `tx:`/`rx:` 累计，没有 overrun / frame-error 计数** → 丢字节**无法从驱动层观测**。所以该先做的是应用层统计：`read()` 到的字节数、解析出帧数、半包等待数、CRC 错次数、重同步次数，并与 `/proc/tty/driver/uart` 的 `rx:` 累计比对以发现丢失 |
+| 本轮处置 | **步骤 2 暂缓**（不写 `iv_ring.c`）。改为前置任务：确认 UART 读究竟在哪个线程；确认后再定"不做"或"自研 60~80 行"。步骤 2 原设计保留存档，见 §4 步骤 2 |
+
 ---
 
 ## 3. 开工前准备
@@ -138,7 +152,15 @@ uint32_t ivs_crc32(uint32_t crc, const uint8_t *data, size_t len);
 - CMake：仅 `UNIX` 下 `find_package(ZLIB REQUIRED)` 并给 `ivcore` 挂 `ZLIB::ZLIB`（PUBLIC 传递给测试与上层）；Windows(MinGW) 主机验证脚本无 zlib，不编 `iv_crc.c`。
 - 单测向量（`tests/unit/test_crc.c`，CRC-32/ISO-HDLC 公开检验值）：`""` → `0x00000000`、`"A"` → `0xD3D99E8B`、`"123456789"` → `0xCBF43926`，另验证分段累计 == 一次性计算。
 
-### 步骤 2：SPSC 环形缓冲（`src/core/iv_ring.c` + `include/ivsbox/iv_ring.h`）
+### 步骤 2：SPSC 环形缓冲（`src/core/iv_ring.c` + `include/ivsbox/iv_ring.h`）—— **暂缓执行**
+
+> **状态（2026-09-24）：暂缓，本轮不写代码。** 决策与论证见 **§2.6 决策 D3**：
+> ① 实测交叉 sysroot 与板端**都没有可用的环形缓冲库**（urcu / ck / liblfds / rte_ring / kfifo 全无；
+> glib `GQueue`、GStreamer `GstAdapter` 是有锁 + 堆分配）；
+> ② 更关键的是，串口按架构 §7.4 纳入主 Reactor 后，**"接收数据"本身不需要环**
+> —— `read()` 到局部数组 → 直接喂流式帧解析器（解析器自己攒半包）即可，内核 tty 缓冲已是缓冲；
+> ③ 只有确认 UART 读**跨线程**（或需要最近 N KB 原始字节留痕）时才需要环，届时按"自研 60~80 行"处理。
+> 下面原设计**保留存档**，等线程模型确认后再启用或删除。
 
 **API 草图**
 
@@ -364,4 +386,5 @@ cat /opt/ivsbox/config/ivsbox.conf
 |---|---|---|---|
 | 本操作手册编制 | 已实现 | 2026-09-23 17:55 | 依据开发列表 §3-S02 与 bsp-capability 回填结论编制，含决策 D1（不引入 cJSON） |
 | S02 步骤 1：CRC 校验（zlib crc32 包装，决策 D2） | 已实现 | 2026-09-24 10:07 | 用户指示改用现有库：`ivs_crc32` 薄包装 zlib crc32；VM 主机 ctest 2/2 全绿（含 4 条 CRC-32 向量），ARM 交叉编译通过，板端链接 libz 运行 `RUN_EXIT=0`（ivsboxd 20828B）；CRC8/CRC16 待 S06 确认帧格式后再定 |
+| S02 步骤 2：环形缓冲选型体检（决策 D3） | 已实现（结论：暂缓实现） | 2026-09-24 11:05 | 实测交叉 sysroot 与板端均无可用环形缓冲库；公开候选 szanni/ringbuf、Zephyr spsc_lockfree、SPSCring 逐个体检后均不采用；进一步论证"主 Reactor 模型下接收数据不需要环"。步骤 2 暂缓，转为前置确认线程模型；平台清单见 `bsp-capability.md` §7，决策见 §2.6 |
 | S02 core 基础设施（整体） | 未实现 | — | 步骤 1 完成；步骤 2（环形缓冲）~6（main 接线）待执行 |

@@ -183,10 +183,66 @@ Windows 宿主机角色已调整为：串口控制台（COM4/CH340，115200）+ 
 
 ---
 
-## 7. 实现记录
+## 7. 第三方库可用性清单（2026-09-24 实测，交叉 sysroot 与板端 rootfs 对照）
+
+> 用途：选型前先查这张表，避免两类返工——**"板上有库但编译期没头文件"**、**"根本没这个库"**。
+> 口径：**交叉 sysroot** = VM 内 `/opt/EmbedSky/Tina/arm-buildroot-linux-gnueabi/sysroot`（编译期可见）；
+> **板端 rootfs** = 192.168.2.105 的 `/lib` + `/usr/lib`（运行期可见）。**两侧都在位，才能直接编 + 直接跑。**
+> 补充：v5 架构文档删掉了 v4 的"附录 A 依赖清单（含体积/可否省略）"（见缺口清单），本节即为该清单的实测替代。
+
+### 7.1 两侧都在位 —— 可直接链接（零成本）
+
+| 库 | 实测标识 | 典型用途 |
+|---|---|---|
+| zlib | `libz.so.1.2.11`（板端含 `libz.so` 开发符号链接） | CRC-32（已用于 S02 步骤 1，决策 D2）、OTA 包 |
+| OpenSSL | `libssl.so.1.1` / `libcrypto.so.1.1` + `libssl.pc` `libcrypto.pc` | 平台 TLS、SHA/HMAC、随机数 |
+| libcurl | `libcurl.so.4.5.0` + `libcurl.pc`（另含 `librtmp`） | S19 OTA 下载、平台 HTTP |
+| SQLite | `libsqlite3.so.0.8.6` + `sqlite3.pc` | 本地库（**文件名为 SONAME 口径，精确版本待查**） |
+| libnl-3 / libnl-route-3 / libnl-genl-3 / libnl-nf-3 / libmnl / libnetfilter_* | 全套 + 各自 `.pc` | S11 rtnetlink、S12 双 WAN 状态机 |
+| libpcap | `libpcap.so.1` + `libpcap.pc` | 抓包排障（非业务依赖） |
+| libxml2 | `libxml-2.0.pc` | S14 ONVIF/SOAP 解析 |
+| libdbus-1 / libglib-2.0 | 在位 | 系统集成；⚠️ glib 的 `GQueue`/`GAsyncQueue` 是**有锁 + 堆分配** |
+| GStreamer 1.0 | `gstreamer-*.pc` 20+ 个，全家在位 | S16 媒体（红线①已定 GStreamer 路线） |
+| libgpiod / libi2c / libsocketcan | 在位 | 硬件侧 |
+| libubox / libuci | 在位 | OpenWrt 基础库；内容仅 `avl blob blobmsg kvlist list runqueue safe_list uloop usock ustream utils vlist` —— **没有环形缓冲** |
+
+### 7.2 只有板端、编译期缺开发包 —— 要先补头文件/链接桩
+
+| 库 | 板端实测 | 编译期缺口 |
+|---|---|---|
+| Paho MQTT | `libpaho-mqtt3a.so.1.3.9` / `libpaho-mqtt3c.so.1.3.9`，含 `.so` 开发符号链接 | sysroot **无头文件、无 `.pc`** |
+| libmodbus | `libmodbus.so.5.1.0`，含 `libmodbus.so` 符号链接 + `libmodbus.la` + `libmodbus.pc` | sysroot 无头文件（板端无 `/usr/include` 目录） |
+| 全志/天嵌 SDK | `libsdk_*`、`libMemAdapter`、`libvdecoder`/`libvencoder`、`libcdx_*`、`libtplayer` 等 | 头文件在 SDK 内，位置待确认 |
+
+**结论：板上预装 ≠ 能编。** 要用 Paho / libmodbus，必须先把**对应版本**的头文件补进 VM sysroot（或源码交叉编译一份装进 sysroot），且 ABI 版本必须与板上 `.so` 对齐（Paho 1.3.9 / libmodbus `so.5`）。
+
+### 7.3 两侧都没有 —— 要自己交叉编译
+
+| 库 | 说明 |
+|---|---|
+| liburcu / concurrencykit（`ck_ring`）/ liblfds / DPDK（`rte_ring`）/ libkfifo | 无锁数据结构库，**全无** |
+| libevent / libuv / libev | 事件循环库，**全无**（且 S03 已定自研 Reactor） |
+| cJSON / mosquitto / nanomsg / nng / protobuf-c / libssh2 | 全无（cJSON 另被决策 D1 排除） |
+
+### 7.4 选型流程（本节的使用方法）
+
+1. 先查本节；两侧都在位 → 直接 `find_package` / `pkg-config` 链接。
+2. 只有板端有 → 先解决**编译期开发包**（版本必须对齐），否则会"编不过"或"跑起来符号不匹配"。
+3. 两侧都没有 → 评估"引入库 vs 自研"的体量比，结论记进决策记录。
+4. **平台事实以本节实测为准，禁止凭猜测写"应该能链接"**（规则 5）。
+
+### 7.5 来源
+
+- sysroot / 板端清单：2026-09-24 本机实测（VM 内 `find` / `ls`；板端 `ls /lib /usr/lib`，经 VM 中转）。
+- 通用 C 库的形态与许可：公开仓库与官方文档（`github.com/szanni/ringbuf`、`github.com/RomanHorshkov/SPSCring`、Zephyr 官方 API 文档）——**天嵌官方语雀资料不涉及通用 C 库选型**，故按规则 5 标注公开来源。
+
+---
+
+## 8. 实现记录
 
 | 功能 | 状态 | 完成时间 | 说明 |
 |---|---|---|---|
+| 第三方库可用性清点（sysroot vs 板端对照，§7） | 已实现 | 2026-09-24 11:05 | 两侧逐库实测；识别出 Paho/libmodbus"板上能跑但编译缺头文件"的关键缺口，并确认无任何可用的无锁环形缓冲库 |
 | 板端 BSP 盘点（bsp-survey.sh） | 已实现 | 2026-09-23 17:50 | 856 行输出，rootfs/串口/网络/看门狗/存储/中间件全覆盖 |
 | §2 盘点结论回填 | 已实现 | 2026-09-23 17:50 | 7 张表 + 2.8 补充事实表 |
 | §3 三条红线判定 + §3.1 架构差异记录 | 已实现 | 2026-09-23 17:50 | 5 项架构差异待回写架构文档 |

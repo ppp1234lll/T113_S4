@@ -1,24 +1,19 @@
-# S02 操作卡片
-
-> 本文件是给**干活的人**看的操作卡：只写步骤、命令、判读。背景论证一概不写，查证记录都在 `bsp-capability.md`，决策 D1~D4 都在 `修改记录.md`。
-> 编制：2026-09-24 11:45（自 240 行手册压缩而来）
+# S02 操作手册
 
 ## 待办
 
 | # | 任务 | 文件 |
 |---|---|---|
-| 3 | 配置读写 | `src/core/iv_config.c` `include/ivsbox/iv_config.h` `tests/unit/test_config.c` |
-| 4 | 日志接 syslogd | 改 `src/core/iv_log.c`，根 CMakeLists 加开关 |
-| 5 | 单实例锁 | `src/app/main.c` |
-| 6 | main 接线 | `src/app/main.c` |
+| 1 | 配置读写 | `src/core/iv_config.c` `include/ivsbox/iv_config.h` `tests/unit/test_config.c` |
+| 2 | 日志接 syslogd | 改 `src/core/iv_log.c`，根 CMakeLists 加开关 |
+| 3 | 单实例锁 | `src/app/main.c` |
+| 4 | main 接线 | `src/app/main.c` |
 
-（1 CRC 已完成；2 环形缓冲已删除）
-
-**纪律**：选库优先用现成 Linux 库（开发列表 §6.11）；无现成的→先自研→登记 `bsp-capability.md` §7.6→做镜像时替换。syscall 判返回值+errno；EINTR 重试；日志 ASCII；有界无 malloc；时长用 `ivs_clock_mono_ms()`。
+**纪律**：选库优先现成 Linux 库（开发列表 §6.11）；无 → 自研 + 登记 `bsp-capability.md` §7.6。syscall 判返回值 + errno；EINTR 重试；日志 ASCII；有界无 malloc；时长用 `ivs_clock_mono_ms()`。
 
 ---
 
-## 步骤 3：配置读写
+## 1. 配置读写
 
 **做**：
 
@@ -43,16 +38,11 @@ cmake --build ivsbox-v5/build/host -j && ctest --test-dir ivsbox-v5/build/host -
 
 `test_config.c`：①save→load 往返一致；②未知/超长/重复/空键拒绝；③坏文件→默认值。
 
-**上板**：
-
-```sh
-scp ivsbox-v5/build/host/ivsboxd root@192.168.2.105:/tmp/ivsboxd   # 应为 build/arm
-chmod +x /tmp/ivsboxd && /tmp/ivsboxd && cat /opt/ivsbox/config/ivsbox.conf
-```
+**上板**：跑 `ivsboxd` 后 `cat /opt/ivsbox/config/ivsbox.conf` 有内容。
 
 ---
 
-## 步骤 4：日志接 syslogd
+## 2. 日志接 syslogd
 
 **做**：
 
@@ -76,7 +66,7 @@ scp ivsbox-v5/build/arm/ivsboxd root@192.168.2.105:/tmp/ivsboxd
 
 ---
 
-## 步骤 5：单实例锁
+## 3. 单实例锁
 
 **做**（main 最前）：
 
@@ -92,7 +82,7 @@ if (fd < 0 || flock(fd, LOCK_EX|LOCK_NB) != 0) return 1;   /* 已有实例 */
 
 ---
 
-## 步骤 6：main 接线
+## 4. main 接线
 
 **做**（版本打印后）：
 
@@ -102,14 +92,14 @@ rc ? IVS_LOGW("cfg", "load failed, defaults: %s", ivs_strerror(rc))
    : IVS_LOGI("cfg", "loaded %u", n);
 ```
 
-**判读**：板端跑一次，logread 有 cfg 行、conf 文件生成。全过 → S02 完成，收尾见下。
+**判读**：板端跑一次，logread 有 cfg 行、conf 文件生成。全过 → S02 完成，按"收尾"回写三份记录并推送。
 
 ---
 
 ## 收尾
 
 - 开发列表 §10、`修改记录.md`、`代码说明.md` 各追加一条；`git status` 无多余文件。
-- worktree 会话：commit → main `merge --ff-only` → `worktree remove`（先 cd 出来，否则 Windows 句柄占用删不掉）→ `branch -d` → push。
+- worktree 会话：commit → main `merge --ff-only` → `worktree remove`（先 cd 出来再删，Windows 句柄占用会 Permission denied）→ `branch -d` → push。
 
 ## 板端命令速查
 

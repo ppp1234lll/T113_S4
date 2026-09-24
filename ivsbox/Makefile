@@ -10,7 +10,11 @@ ANALYZE ?=
 
 BUILD_DIR := build/$(TARGET)
 
-include mk/toolchain-$(TARGET).mk
+ifeq ($(TARGET),arm)
+include mk/toolchain-tina-arm.mk
+else
+include mk/toolchain-host.mk
+endif
 include mk/rules.mk
 
 # -----------------------------------------------------------------------------

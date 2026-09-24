@@ -38,12 +38,12 @@
 
 具体要求：
 
-1. **任何一次代码或文档修改**，都必须在该文件末尾追加一条记录。
+1. **任何一次代码或文档修改**，都必须在该文件新增一条记录。
 2. 每条记录至少包含三要素：
    - **修改的文件**：列出全部被改动的文件路径
    - **问题 / 目的**：这次修改解决什么问题、达成什么目的
-   - **时间**：YYYY-MM-DD HH:mm
-3. 采用倒序还是正序由该文件自身规定，**新增记录一律追加，不覆盖历史**。
+   - **时间**：YYYY-MM-DD HH:mm，**必须是本机当前时间**，不得填写预计时间、占位时间或晚于当前时刻的时间
+3. **新增记录的位置按该文件自身规定的顺序**（`修改记录.md` 规定为**倒序**，即插入文件最上方、紧接格式模板之后）；**一律追加，绝不覆盖或改写历史条目**。
 4. 一次修改涉及多个文件时，写为一条记录，不要拆成多条。
 5. 禁止修改或删除已存在的历史记录条目；若需更正，只能新增一条更正记录。
 6. 记录模板：
@@ -85,6 +85,13 @@
 5. 提交范围只包含本次修改涉及的文件，**不要用 `git add -A` 或 `git add .`**，避免误提交构建产物和临时文件。
 6. 若本次修改涉及密钥、口令、设备序列号等敏感内容，**禁止提交**，必须先过滤。
 7. 推送失败（无权限、冲突、网络异常）**必须明确告知用户失败原因和待处理项**，不得静默跳过、不得假装已推送。
+
+**本机推送环境（2026-09-24 实测，照做可省一轮排查）**：
+
+- **必须走本地代理**：git 已配 `http.proxy = http://127.0.0.1:7897`。代理未启动时 `push` 必失败；另一端口 `52667` 实测不通（HTTP 000），不要去试。
+- **单次 `git push` 约 50 秒**（走代理）。**不要用短超时判定失败**——曾因超时被 `SIGTERM` 掐掉、误判成"推送失败"。要么后台跑，要么超时放到 180s 以上，**只认退出码与 `To <url> main -> main` 输出行**。
+- **凭据**由 PortableGit 自带的 `git-credential-manager` 提供，非交互环境下失败是**静默的**（无错误文本）；脚本化时加 `GIT_TERMINAL_PROMPT=0` 防止卡住。
+- 推送后用 `git ls-remote origin main` 与本地 `HEAD` 比对，确认真的上去了，不要只看命令返回码。
 
 ---
 
@@ -173,9 +180,25 @@
 **开工**：
 
 1. `git fetch origin`；`git status -sb` 必须干净且与 `origin/main` 一致（有 ahead/behind 先按规则 7 第 7 条处理）。
-2. `git stint start <前缀>-<主题>`，然后 `cd .stint/<会话名>/`。**本次任务的所有改动只在这个 worktree 内进行**，主工作副本 `f:\debug\T113_TCP` 只用于拉取与合并。
+2. `git stint start <前缀>-<主题>`，然后 `cd .stint/<会话名>/`。**本次任务的所有改动只在这个 worktree 内进行**，主工作副本 `f:\debug\T113_TCP` 只用于拉取与合并。**若 `git stint` 报错，不要停在这里反复重试，直接走下面的降级路径。**
 3. 改动文件用 `git stint track <文件...> --session <会话名>` 登记进待提交列表。**不 track，`conflicts` 就检测不到重叠。**
 4. `git stint conflicts --session <会话名>` 检查是否与另一会话改了同一文件；**发现有重叠就停下、告知用户**，由用户决定谁继续，不得自行抢改。
+
+**降级路径（`git stint` 不可用时，等价的纯 git 做法）**：
+
+本机 `git-stint` 0.6.1 **高频失败**：`Error: git rev-parse failed: spawnSync git EBUSY`、`Error: Not inside a git repository`，以及 `refs/heads/stint/*` 声称创建成功却不落盘（加沙箱与绕过沙箱结果一致，**不是沙箱引起**）。下列等价做法**已实测可用**，隔离效果与 git-stint 相同：
+
+```sh
+git worktree add .stint/<会话名> -b stint/<会话名>   # 建独立 worktree + 分支
+cd .stint/<会话名>/                                   # 本任务所有改动都在这里
+# 收尾：会话内 git commit → 回 main 副本 git merge --ff-only stint/<会话名>
+git worktree remove .stint/<会话名>                   # 清理（先 cd 出该目录，否则 Windows 句柄占用报 Permission denied）
+git branch -d stint/<会话名>
+```
+
+- `.stint/` 已在 `.gitignore` 中忽略，隔离效果与 git-stint 等价。
+- 降级时**没有 `track` / `conflicts`**，防重叠改为人工自查：开工前 `git worktree list` 看是否存在对方会话；收尾合并前用 `git diff --name-only main...stint/<会话名>` 与对方分支比对文件是否重叠。
+- 走降级路径时，在规则 2 的记录里写明"本次使用降级路径"，便于对方识别。
 
 **会话中**：规则 1 / 2 / 4 / 6 照常执行，改动（含共用文档）一律写在会话 worktree 内。
 
@@ -183,13 +206,16 @@
 
 1. `git stint commit -m "<Conventional Commits 信息>"` → `git stint squash -m "<最终提交信息>"`，把会话内多次提交压成一个干净提交。
 2. `git fetch origin`，再合并回 main（工具的 `git stint merge`，或常规 git merge）。**若 `AGENTS.md`、`ivsbox-v5/docs/修改记录.md`、`ivsbox-v5/docs/代码说明.md` 这类共用文档冲突，处理原则是"双方记录都保留、按时间倒序排列"**，绝不丢弃对方的条目。
-3. `git stint end`（放弃则 `git stint abort --session <会话名>`）清理会话分支与 worktree；确认 `git stint list` 为 `No active sessions`、`.stint/` 下无残留（规则 6）。
+3. 清理会话分支与 worktree：
+   - git-stint 可用时：`git stint end`（放弃则 `git stint abort --session <会话名>`），确认 `git stint list` 为 `No active sessions`。
+   - **走降级路径时**：确认 `git worktree list` 已无本次会话，且 `.stint/` 下无残留目录（规则 6）。
 4. `git push` 推 main（规则 3），让另一方下次开工能直接拉到最新。
 
 **已知限制（本机实测）**：
 
 - 多会话并存时，即使已 `cd` 进 worktree，本工具在 Windows 上仍会报 `Multiple active sessions`，因此**所有 stint 子命令都显式带上 `--session <会话名>`**。
 - `git stint install-hooks` 只适配 Claude Code；**TRAE 没有对应 hook，必须自己手动执行 start / track / commit / squash / end**，不得跳过。
+- **收尾判据不要只依赖 `git stint list`**——工具失败时这条命令本身就跑不了；用 `git worktree list` + `ls .stint/` 作为兜底判据。
 
 **禁止**：
 
@@ -233,6 +259,7 @@
 | 代码说明 | `ivsbox-v5/docs/代码说明.md` | 规则 4 的权威记录文件 |
 | 开发规则 | `AGENTS.md` | 规则 7 的权威规则文件，**所有 AI 共用同一份** |
 | 编辑器格式化 | `ivsbox-v5/.clang-format` | 代码风格基线，所有 AI 共用 |
+| 换行与编码 | `.gitattributes` | 规则 7 第 3 条的仓库级配置，行尾/编码归一，所有 AI 共用 |
 | 会话隔离配置 | `.stint.json` | 规则 8 的 git-stint 仓库级配置，**所有 AI 共用同一份策略** |
 | Claude Code 适配 | `.claude/` | 规则 8 在 Claude Code 侧的 hook 配置与适配说明（WorkBuddy 侧生效） |
 | 编译环境搭建 | `ivsbox-v5/docs/环境搭建/` | 编译机（天嵌 TQT113 虚拟机）的环境搭建步骤，如 `cmake安装步骤.md`；S01 前置，经用户确认保留（规则 7 第 2 条） |

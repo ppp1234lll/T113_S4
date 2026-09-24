@@ -13,6 +13,14 @@ target_link_libraries(test_ipc_hdr PRIVATE ivcore)
 
 add_test(NAME ipc_hdr COMMAND test_ipc_hdr)
 
+# S02 步骤 1：CRC（zlib crc32 包装）；ZLIB 依赖经 ivcore PUBLIC 传递
+add_executable(test_crc
+    unit/test_crc.c
+)
+target_link_libraries(test_crc PRIVATE ivcore ivhal)
+
+add_test(NAME crc COMMAND test_crc)
+
 # TODO(M1): 配置事务、帧解析、探活统计、自愈规则的单元测试
 # TODO(M2): 集成测试（uart_simulator + platform_simulator）
 # TODO(M2): fuzz 目标（libFuzzer 或 afl，主机侧）

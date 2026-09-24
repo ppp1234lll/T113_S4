@@ -470,7 +470,8 @@ ivsboxd 启动
 |---|---|---|---|---|
 | — | 工程骨架（ivsboxd 可编译） | 已实现 | 2026-09-22 16:00 | `iv_err` / `iv_log` / `iv_clock` / `main.c` |
 | S01 | 交叉编译与上板跑通 | 已实现 | 2026-09-23 17:42 | 天嵌 VM（`arm-linux-gnueabi-` gcc 7.3.1）交叉编译，scp 上板运行，三行版本输出正常、`mono_clock_ready=yes`、退出码 0 |
-| S02 | core 基础设施 | 未实现 | — | 日志/错误码/时钟已有，缺 JSON/CRC/环形缓冲/配置 |
+| S02.1 | CRC 校验 | 已实现 | 2026-09-24 10:07 | 决策 D2（用户指示用现有库）：`ivs_crc32` 薄包装 zlib crc32；主机 ctest 2/2 全绿、ARM 编译通过、板端链接 libz 运行 `RUN_EXIT=0`；CRC8/CRC16 待 S06 确认帧格式后再定 |
+| S02 | core 基础设施 | 未实现 | — | 步骤 1 CRC 已完成；余：环形缓冲/配置原子写/syslog 接入/main 接线（JSON 按 D1 改 key=value，不引入 cJSON） |
 | S03 | 事件循环 Reactor | 未实现 | — | 项目心脏，优先实现 |
 | S04 | 串口 HAL | 未实现 | — | termios raw 非阻塞 |
 | S05 | 板间协议模拟器 | 未实现 | — | 先于 S06 |

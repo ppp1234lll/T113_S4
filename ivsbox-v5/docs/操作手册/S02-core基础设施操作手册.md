@@ -23,7 +23,7 @@ S01 解决的是"能编译、能上板"；S02 解决的是"地基材料"。它**
 | 2 | 错误码 | `src/core/iv_err.c` | 已有（0=成功/负数=失败） | 步骤 5：仅核对，无改动 |
 | 3 | 时钟 | `src/hal/iv_clock.c` | 已有（`ivs_clock_mono_ms`） | 步骤 5：仅核对 + 补单调性单测 |
 | 4 | JSON | — | 无 | **决策 D1：不引入 cJSON**，见 §2.3 |
-| 5 | CRC8 / CRC16 | `src/core/`（新建） | 无 | 步骤 1 |
+| 5 | CRC 校验 | `src/core/iv_crc.c`（新建） | **已实现（2026-09-24）**：zlib crc32 包装 | 步骤 1，**决策 D2**，见 §2.5 |
 | 6 | 环形缓冲 | `src/core/`（新建） | 无 | 步骤 2 |
 | 7 | 配置读写 | `src/core/`（新建） | 无 | 步骤 3 |
 
@@ -62,6 +62,16 @@ S01 解决的是"能编译、能上板"；S02 解决的是"地基材料"。它**
 ### 2.4 时钟纪律（缺口 G9）
 
 - 板载时钟上电为 1970（bsp-capability §2.8），墙钟不可信 → **所有时长/超时/窗口一律 `ivs_clock_mono_ms()`**，此纪律从 S02 起执行。
+
+### 2.5 决策 D2：CRC 用系统 zlib 库，不手写多项式位运算（2026-09-24 用户指示）
+
+| 项 | 内容 |
+|---|---|
+| 开发列表原文 | "CRC8 / CRC16：自己写，20 行" |
+| 用户决策 | **使用现有 Linux 开发库计算**（2026-09-24，执行步骤 1 时指示） |
+| 本手册执行口径 | CRC 统一走 **zlib `crc32()`**（Linux 用户态事实标准，glibc 无 CRC 函数）；CRC8/CRC16 属手写实现且现网帧实际 CRC 类型待 S06 确认，**确认前不预写**，S06 按需在本文件扩展 |
+| 平台事实（2026-09-24 实测） | 板端 `/usr/lib/libz.so.1.2.11` 在位；交叉 sysroot `usr/include/zlib.h` + `usr/lib/libz.so` 在位；VM 主机 `zlib1g-dev` 已安装 |
+| 连带影响 | 验收项"CRC 已知向量"改为 CRC-32 向量（`"123456789"` → `0xCBF43926`）；`ivcore` 在 UNIX 下链接 `ZLIB::ZLIB`（Windows 主机验证不编 iv_crc） |
 
 ---
 
@@ -109,24 +119,24 @@ git log --oneline -1    # 应与本机 main 一致
 > 约定：以下"新建文件"均相对 `ivsbox-v5/`；公共头一律放 `include/ivsbox/`（架构 §6 依赖规则：模块只经公共头互访）。
 > 编码纪律（开发列表 §6）：所有系统调用判断返回值 + `errno` 进日志；`EINTR` 重试不当错误；日志文本一律 ASCII。
 
-### 步骤 1：CRC8 / CRC16（`src/core/iv_crc.c` + `include/ivsbox/iv_crc.h`）
+### 步骤 1：CRC 校验（`src/core/iv_crc.c` + `include/ivsbox/iv_crc.h`）——已按决策 D2 执行
 
-**API 草图**
+**实现方式（2026-09-24 实际落地）**：薄包装 zlib `crc32()`，不自写多项式位运算。
+
+**API（已实现）**
 
 ```c
-/* CRC-8：poly=0x07，init=0x00，不反射（SMBus/ATM 风格） */
-uint8_t  ivs_crc8(const uint8_t *data, size_t len);
-/* CRC-16/Modbus：poly=0x8005 反射，init=0xFFFF，输出字节序待 S06 按现网帧确认 */
-uint16_t ivs_crc16_modbus(const uint8_t *data, size_t len);
+/* CRC-32（zlib 口径 = CRC-32/ISO-HDLC，与 zip/以太网 FCS 一致）。
+ * 支持分段累计：首次 crc 传 0，后续传回上次返回值（S06 半包场景）。 */
+uint32_t ivs_crc32(uint32_t crc, const uint8_t *data, size_t len);
 ```
 
-**实现要点**
+**要点**
 
-- 逐位算法即可（查表法是优化，20 行内先跑对；协议实际跑在 220MB RAM 的 A7 上，查表可后补）。
-- **现网帧用哪种 CRC、字节序如何，属 S06 对帧格式的确认项，本步骤不拍板**（标注"待确认"）；先把两个常用变体做对并向量验证，S06 需要变体时在此文件扩展。
-- 已知向量（单测硬编码）：`"123456789"`（9 字节 ASCII）→ CRC-8 = `0xF4`；CRC-16/Modbus = `0x4B37`。
-
-**坑**：CRC-16/Modbus 是反射算法，"左移实现 + 结果反转"与"右移实现"结果必须一致，用向量验证即可发现写错。
+- `iv_crc.c` 仅 1 个函数，直接转调 `zlib crc32(crc, data, (uInt)len)`；算法正确性由 zlib 保证。
+- CRC8/CRC16-Modbus **不预写**：现网帧实际 CRC 类型待 S06 对帧格式确认（开发列表 §3-S06 兼容纪律），确认后再按需扩展。
+- CMake：仅 `UNIX` 下 `find_package(ZLIB REQUIRED)` 并给 `ivcore` 挂 `ZLIB::ZLIB`（PUBLIC 传递给测试与上层）；Windows(MinGW) 主机验证脚本无 zlib，不编 `iv_crc.c`。
+- 单测向量（`tests/unit/test_crc.c`，CRC-32/ISO-HDLC 公开检验值）：`""` → `0x00000000`、`"A"` → `0xD3D99E8B`、`"123456789"` → `0xCBF43926`，另验证分段累计 == 一次性计算。
 
 ### 步骤 2：SPSC 环形缓冲（`src/core/iv_ring.c` + `include/ivsbox/iv_ring.h`）
 
@@ -242,7 +252,7 @@ endif()
 
 | 测试 | 文件 | 验收点 |
 |---|---|---|
-| ① CRC 已知向量 | `test_crc.c` | `"123456789"` → CRC-8=0xF4、CRC-16/Modbus=0x4B37；空串、单字节 |
+| ① CRC 已知向量 | `test_crc.c`（**已实现**） | CRC-32/ISO-HDLC 向量：`""`→0、`"A"`→0xD3D99E8B、`"123456789"`→0xCBF43926；分段累计==一次性（决策 D2：zlib crc32） |
 | ② 环形缓冲边界 | `test_ring.c` | 空 read=0、满 write 拒绝、恰好写满、写读交替回绕、cap 非 2 幂被拒 |
 | ③ 配置往返 | `test_config.c` | save→load 内容一致（含注释行、空白容错） |
 | ④ 非法配置拒绝 | （并入 `test_config.c`） | 未知键/超长键/重复键/空键 → `IVS_ERR_INVAL`；坏文件加载后调用方拿到默认值 |
@@ -323,7 +333,7 @@ cat /opt/ivsbox/config/ivsbox.conf
 
 ## 9. 验收清单（对照开发列表 §3-S02 + 本手册修正）
 
-- [ ] CRC8 / CRC16 已知向量测试通过（①）
+- [x] CRC 已知向量测试通过（①，zlib crc32 四条向量全过，决策 D2）
 - [ ] 环形缓冲空/满/回绕/非 2 幂拒绝测试通过（②）
 - [ ] 配置往返测试通过（③，替代原 JSON 往返，决策 D1）
 - [ ] 非法配置被拒绝、回退默认值测试通过（④）
@@ -353,4 +363,5 @@ cat /opt/ivsbox/config/ivsbox.conf
 | 功能 | 状态 | 完成时间 | 说明 |
 |---|---|---|---|
 | 本操作手册编制 | 已实现 | 2026-09-23 17:55 | 依据开发列表 §3-S02 与 bsp-capability 回填结论编制，含决策 D1（不引入 cJSON） |
-| S02 core 基础设施 | 未实现 | — | 按本手册步骤 1~6 执行 |
+| S02 步骤 1：CRC 校验（zlib crc32 包装，决策 D2） | 已实现 | 2026-09-24 10:07 | 用户指示改用现有库：`ivs_crc32` 薄包装 zlib crc32；VM 主机 ctest 2/2 全绿（含 4 条 CRC-32 向量），ARM 交叉编译通过，板端链接 libz 运行 `RUN_EXIT=0`（ivsboxd 20828B）；CRC8/CRC16 待 S06 确认帧格式后再定 |
+| S02 core 基础设施（整体） | 未实现 | — | 步骤 1 完成；步骤 2（环形缓冲）~6（main 接线）待执行 |

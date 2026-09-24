@@ -67,6 +67,15 @@ add_library(ivcore STATIC
 )
 target_include_directories(ivcore PUBLIC ${IVSBOX_INCLUDE_DIR})
 
+# CRC 走系统 zlib（用户决策 D2，见 include/ivsbox/iv_crc.h 头注）。
+# 仅 UNIX（VM 主机 + 板端）启用：两侧 zlib 1.2.11 已实测在位；
+# Windows(MinGW) 主机验证脚本无 zlib，不编 iv_crc 以免破坏主机验证。
+if(UNIX)
+    find_package(ZLIB REQUIRED)
+    target_sources(ivcore PRIVATE src/core/iv_crc.c)
+    target_link_libraries(ivcore PUBLIC ZLIB::ZLIB)
+endif()
+
 add_library(ivhal STATIC
     src/hal/iv_clock.c
 )

@@ -46,6 +46,9 @@ WEB_OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(WEB_SRCS))
 UPDATER_OBJS  := $(patsubst %.c,$(BUILD_DIR)/%.o,$(UPDATER_SRCS))
 PROVISION_OBJS:= $(patsubst %.c,$(BUILD_DIR)/%.o,$(PROVISION_SRCS))
 
+TEST_OBJS     := $(patsubst tests/unit/%.c,$(BUILD_DIR)/tests/unit/%.o,$(TEST_SRCS))
+FUZZ_OBJS     := $(patsubst tests/fuzz/%.c,$(BUILD_DIR)/tests/fuzz/%.o,$(FUZZ_SRCS))
+
 # -----------------------------------------------------------------------------
 # 目标产物
 # -----------------------------------------------------------------------------
@@ -141,6 +144,15 @@ help:
 # -----------------------------------------------------------------------------
 # 模式规则与显式规则（依赖方向在链接顺序中显式写死）
 # -----------------------------------------------------------------------------
+# 保护单测/模糊测试的 .o 不被当垃圾清掉：
+# 它们只由下面的通用模式规则生成，makefile 里没有显式规则提到它们，于是 make 把它们
+# 判成"隐式规则链的中间文件"，在链出可执行文件后即删除。现象：make clean 后第一次构建
+# 只有 11 个 .o，第二次才补齐 13 个，且每次 clean 后都要把单测白重编一遍。
+# .PRECIOUS 只禁止删除、不改变其他任何语义。
+# 注意：不要写成不带前置条件的 `.SECONDARY:` —— 那会让 make 认为所有目标都不需重编，
+# `make arm` 会直接报"对 build 无需做任何事"而什么都不产出（2026-09-24 实测踩过）。
+.PRECIOUS: $(TEST_OBJS) $(FUZZ_OBJS)
+
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<

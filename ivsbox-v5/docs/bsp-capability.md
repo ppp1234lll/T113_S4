@@ -97,7 +97,7 @@ scp root@<板子IP>:/tmp/bsp-survey.txt .
 | 检查项 | 命令/位置 | 实际结果 | 结论 | 影响任务 |
 |---|---|---|---|---|
 | SQLite | `ls /usr/lib/libsqlite3*` | `libsqlite3.so.0.8.6` + CLI `sqlite3 3.25.3` | **可用**（3.25.3，2018 年版，无窗口函数等新特性，S13 建表时避开） | S13、S14 ✅ |
-| JSON 库 | `ls /usr/lib/libcjson*` | 无 | 按原计划**自带 cJSON 源码**进仓库（S02 既定方案，不受影响） | S02、S10、S13 ✅ |
+| JSON 库 | `ls /usr/lib/libcjson*` | 无 | ~~按原计划自带 cJSON 源码进仓库~~ → **决策 D1（2026-09-23）改为不使用 JSON 库**：配置用 `key=value` 文本 + 逐行字符串解析。本行原结论作废，详见 `操作手册/S02-core基础设施操作手册.md` §2.3 | S02、S10、S13 ✅ |
 | TLS 库 | `ls /usr/lib/libssl* /usr/lib/libmbed*` | **OpenSSL 1.1**（`libssl.so.1.1`、`libcrypto.so.1.1`）；无 mbedTLS；`openssl` CLI 无 | TLS 走 **OpenSSL 1.1**（S19 验签、S10 平台 TLS） | S10、S19 |
 | cgroup | `ls /sys/fs/cgroup` | **空目录**；内核 `CONFIG_CGROUPS=y` 但所有子系统（cpu/pids/devices…）全部未启用 | **cgroup 不可用** → 红线③成立一半；媒体隔离用 `nice`/`setpriority` 弱隔离，并在文档明确"进程级卡死由看门狗兜底" | S16 资源隔离 |
 | netfilter | `which nft iptables` | 有 `iptables`/`ip6tables` + `libmnl`；无 nft；内核 XTABLES/MASQUERADE 可用，大量 match 模块被裁 | 策略路由/防火墙用 **iptables + `ip rule`**（内核 `IPV6_MULTIPLE_TABLES` 开，IPv4 多表需 S12 实测确认） | S12 |
@@ -126,6 +126,9 @@ scp root@<板子IP>:/tmp/bsp-survey.txt .
 | telnetd 在启动项（`S50telnet`） | 同上 | 同上，安全审查项 |
 | 板载时间从 1970 起（RTC 未电池备份或未同步） | `date` 输出 `Jan 1 10:19 1970`、`/proc/uptime` | 墙钟完全不可信；S02 单调时钟纪律 + NTP/平台对时必须尽早做 |
 | 内核由另一套工具链编译（Linaro GCC 5.3） | `/proc/version` | 正常现象；应用工具链（7.3.1 + glibc 2.25）与内核 ABI 兼容，实测已验证 |
+| 日志服务是 busybox `syslogd`（BusyBox v1.33.2），**且忽略 `/etc/syslog.conf`** | `syslogd --help` 自述 `this version of syslogd ignores /etc/syslog.conf`；`/etc/syslog.conf` 实测**不存在** | `LOG_LOCAL0` **不会分流到独立文件**，所有 facility 都写进同一个 `/var/log/messages`；应用侧只按 ident（`ivsboxd`）筛选，不依赖 facility 路由 |
+| 日志轮转由 syslogd 自己完成，且参数为全默认 | `--help`：`-s SIZE`（**单位 KB**，轮转阈值，默认 **200KB**，0=off）、`-b N`（保留份数，默认 **1**，最大 99）、`-O FILE`（默认 `/var/log/messages`）；`/etc/init.d/S01syslogd` 的 `SYSLOGD_ARGS=""` | **应用侧不要实现日志轮转**；注意默认只留 200KB × 2 个文件，现场故障日志容易被冲掉——长期留痕需改板端 `/etc/default/syslogd`（S13/固件层处理） |
+| 串口驱动的错误计数不可从 procfs 观测 | `/proc/tty/driver/uart` 仅报 `tx:` / `rx:` 累计，**无 overrun / frame-error 计数** | 丢字节不能靠驱动层发现 → 必须做应用层收包对账统计（`read` 字节数 / 出帧数 / 半包数 / CRC 错 / 重同步次数）；标准 ioctl `TIOCGICOUNT` 是否被该驱动填充**待 S04 实测** |
 
 ---
 

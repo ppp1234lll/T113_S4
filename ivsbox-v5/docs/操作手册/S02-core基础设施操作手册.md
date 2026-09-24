@@ -286,7 +286,9 @@ file ivsbox-v5/build/arm/ivsboxd        # 确认 ARM ELF
 scp ivsbox-v5/build/arm/ivsboxd root@192.168.2.105:/tmp/ivsboxd
 ```
 
-板端（Windows COM4，`serial_send.py --port COM4 --baudrate 115200 --crlf --wait-response`）：
+板端（Windows COM4，用 `serial-console-debug` skill 的 `serial_run.py`，实际调用为位置参数
+`serial_run.py COM4 115200 cmds.txt out.txt`（命令一行一条写进 `cmds.txt`）；
+完整用法见 `docs/操作手册/日常开发闭环流程.md` §7）：
 
 ```sh
 chmod +x /tmp/ivsboxd

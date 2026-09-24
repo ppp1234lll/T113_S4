@@ -1,0 +1,8 @@
+# IVSBox 工程局部忽略规则
+build/
+*.o
+*.a
+*.so
+*.exe
+compile_commands.json
+*.log

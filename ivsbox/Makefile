@@ -17,7 +17,7 @@ include mk/rules.mk
 # 源文件发现（非递归，按目录通配）
 # -----------------------------------------------------------------------------
 CORE_SRCS     := $(wildcard src/core/*.c)
-HAL_SRCS      := $(wildcard src/hal/*.c)
+HAL_SRCS      := $(wildcard src/hardware/*.c)
 MODULES_SRCS  := $(wildcard src/modules/*/*.c)
 APP_SRCS      := $(wildcard src/app/*.c)
 

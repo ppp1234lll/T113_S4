@@ -27,7 +27,7 @@ ivsbox/
 ├── src/                    ivsboxd 主控源码
 │   ├── app/                入口与装配：main、Reactor 启动、健康线程、命令路由
 │   ├── core/               平台无关基础件：错误码、日志、CRC、定时器、IPC 编解码、SQLite 封装
-│   ├── hal/                Linux 硬件抽象：串口(termios)、netlink、看门狗、时钟
+│   ├── hardware/           Linux 硬件抽象：串口(termios)、netlink、看门狗、时钟
 │   └── modules/            业务模块，一个子目录一个模块，禁止互改私有数据
 │       ├── link/           UART 板间链路（帧解析、可靠层、状态镜像）
 │       ├── proto/          云平台私有协议（表驱动路由、分级发送队列、持久上报队列）

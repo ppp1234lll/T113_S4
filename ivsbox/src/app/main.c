@@ -32,7 +32,8 @@ int main(int argc, char *argv[])
         fprintf(stderr, "ivsboxd init failed\n");
         return 1;
     }
-    printf("ivsboxd initialized\n");
+    printf("hello, ivsbox %d.%d.%d\n",
+           IVSBOX_VERSION_MAJOR, IVSBOX_VERSION_MINOR, IVSBOX_VERSION_PATCH);
     ivsbox_fini();
     return 0;
 }

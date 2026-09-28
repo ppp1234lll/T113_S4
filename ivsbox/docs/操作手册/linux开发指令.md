@@ -113,14 +113,13 @@ ls "$SYSROOT/lib/ld-linux"* 2>/dev/null || ls "$SYSROOT/lib/ld-"*
 # sqlite3（M1-S9 用，链接 -lsqlite3）
 ls "$SYSROOT/usr/include/sqlite3.h" "$SYSROOT/usr/lib/libsqlite3"* 2>/dev/null
 
-# zlib（M1-S3 CRC 用，链接 -lz）
-ls "$SYSROOT/usr/include/zlib.h" "$SYSROOT/usr/lib/libz"* 2>/dev/null
-
 # 主机侧同款库（Host 单测要能编过）
-ls /usr/include/sqlite3.h /usr/include/zlib.h 2>/dev/null
+ls /usr/include/sqlite3.h 2>/dev/null
 ```
 
 期望：头文件与 `lib*.so`/`lib*.a` 都在。`sqlite3.h` 缺失不会让当前构建失败（S1 尚未用到），但**要登记进"待安装库清单"**，别拖到 S9 才补。
+
+> **CRC（M1-S3）不需要任何外部库**：现网只用 CRC-8/SMBUS 与 CRC-16/MODBUS，已在 `src/core/iv_crc.c` 用逐位实现（零依赖、零表）。2026-09-28 之前本节列的 `zlib` 预检已删除——zlib 的 `crc32` 是 CRC-32，与现网两者都不相干。
 
 ---
 

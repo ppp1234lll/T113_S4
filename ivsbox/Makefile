@@ -18,6 +18,18 @@ endif
 include mk/rules.mk
 
 # -----------------------------------------------------------------------------
+# 版本注入（计划 M1-S2 第 4 件）
+# 把 Git 短哈希以 -DIV_GIT_VER="<sha>" 传给全部编译单元。
+# 脱离 .git 的离线构建（例如只把源码树拷到 VM 上编译）取不到哈希，退回 "unknown"，
+# iv_version 据此降级，不影响编译。
+# 注意引号写法：必须是 '"$(GIT_VER)"' —— 直接写 \"$(GIT_VER)\" 会被 shell 吃掉
+# 双引号，gcc 收到的是未加引号的 token，宏值就不是字符串字面量了。
+# -----------------------------------------------------------------------------
+GIT_VER := $(shell git rev-parse --short HEAD 2>/dev/null)
+GIT_VER := $(if $(strip $(GIT_VER)),$(strip $(GIT_VER)),unknown)
+CFLAGS  += -DIV_GIT_VER='"$(GIT_VER)"'
+
+# -----------------------------------------------------------------------------
 # 源文件发现（非递归，按目录通配）
 # -----------------------------------------------------------------------------
 CORE_SRCS     := $(wildcard src/core/*.c)
@@ -153,7 +165,18 @@ help:
 # `make arm` 会直接报"对 build 无需做任何事"而什么都不产出（2026-09-24 实测踩过）。
 .PRECIOUS: $(TEST_OBJS) $(FUZZ_OBJS)
 
-$(BUILD_DIR)/%.o: %.c
+# 版本戳：只在 Git 短哈希真的变化时刷新 mtime，从触发相关 .o 重编。
+# 少了这一步会出现"提交后哈希变了、二进制里仍是旧哈希"的静默不一致。
+VER_STAMP := $(BUILD_DIR)/.gitver
+
+$(VER_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@echo "$(GIT_VER)" | cmp -s - $@ || echo "$(GIT_VER)" > $@
+
+FORCE:
+.PHONY: FORCE
+
+$(BUILD_DIR)/%.o: %.c $(VER_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 

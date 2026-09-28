@@ -190,9 +190,36 @@ static int check_edges(void)
     return 0;
 }
 
+/* 编译期示例：常量字段越界会直接编不过（此处只放合法值） */
+IV_ERR_ASSERT_FIELDS(IV_ERR_TYPE_NET, 12u, 6u);
+
+/* 字段宽度自检：类别/序号/类型必须装得进各自位段，越界说明码值已进位到相邻字段 */
+static int check_field_range(void)
+{
+    size_t i;
+
+    IV_ERR_ASSERT_FIELDS(IV_ERR_TYPE_SENSOR, 7u, 0u); /* 块作用域同样可用 */
+
+    for (i = 0; i < GOLDEN_COUNT; i++) {
+        uint32_t code = k_golden[i].code;
+        uint32_t type = IV_ERR_TYPE_OF(code);
+        uint32_t cat = IV_ERR_CAT_OF(code);
+        uint32_t idx = IV_ERR_IDX_OF(code);
+
+        if (type > IV_ERR_TYPE_MAX || cat > IV_ERR_CAT_MAX || idx > IV_ERR_IDX_MAX) {
+            fprintf(stderr, "test_err: field overflow in %s (type %u / cat %u / idx %u)\n",
+                    k_golden[i].name, (unsigned)type, (unsigned)cat, (unsigned)idx);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 int main(void)
 {
-    if (check_values() != 0 || check_names() != 0 || check_layout() != 0 || check_edges() != 0) {
+    if (check_values() != 0 || check_names() != 0 || check_layout() != 0 || check_edges() != 0 ||
+        check_field_range() != 0) {
         return 1;
     }
 

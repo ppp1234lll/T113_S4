@@ -58,6 +58,9 @@ static void chk_has(int idx, const char *sub, const char *what)
 
 int main(void)
 {
+    /* 落盘出口显式关闭：本测试全程 sink 模式，不需要文件出口；
+     * 不关的话 iv_log_init() 会在宿主机上 mkdir 默认 /opt/log（12:02 条目遗留 1） */
+    iv_log_set_root(NULL);
     chk(iv_log_init("test_basic") == 0, "iv_log_init");
     iv_log_set_sink(sink, NULL);
 

@@ -345,6 +345,16 @@ void iv_taskpool_destroy(iv_taskpool_t *pool)
 
     pthread_mutex_lock(&pool->lock);
     pool->stopping = 1;
+
+    /* 让正在执行的任务也有机会收手：只置标志、不打断（协作式）。
+     * 计划 §S5 的「destroy 先置取消标志再 join」要的就是这一步 —— 否则关机
+     * 路径撞上一个 30s 的 SNMP 超时任务就得干等 30s，procd 的重启窗口未必
+     * 等得起。任务函数若不检查 iv_task_canceled()，仍会跑完，这是协作式的边界。 */
+    for (i = 0; i < pool->queue_size; i++) {
+        if (pool->slots[i].state == SLOT_RUNNING)
+            __atomic_store_n(&pool->slots[i].cancel, 1, __ATOMIC_RELAXED);
+    }
+
     pthread_cond_broadcast(&pool->cond);
     pthread_mutex_unlock(&pool->lock);
 
@@ -517,6 +527,22 @@ int iv_taskpool_process(iv_taskpool_t *pool, int max)
         pthread_mutex_unlock(&pool->lock);
 
         done++;
+    }
+
+    /* 因 max 提前收手时 eventfd 已经被读干，残留的 DONE 槽就没有唤醒源了 ——
+     * 若此后没有新任务完成，它们会一直占着槽位直到 destroy。补写一次，
+     * 让下一轮 reactor 必然再来取。max <= 0（不限）不会有残留，不必补。 */
+    if (max > 0) {
+        int remain;
+
+        pthread_mutex_lock(&pool->lock);
+        remain = (find_state(pool, SLOT_DONE) >= 0);
+        pthread_mutex_unlock(&pool->lock);
+
+        if (remain) {
+            uint64_t one = 1u;
+            (void)write(pool->efd, &one, sizeof(one));
+        }
     }
 
     return done;

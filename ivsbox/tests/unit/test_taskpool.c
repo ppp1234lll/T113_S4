@@ -12,8 +12,10 @@
  *   7) 截止时间：任务在队列里放到过期，取出时不再执行，rc 为 IV_ETIMEDOUT；
  *   8) 空闲不误判：无任务时进度号仍持续递增（S6 判活的前提）；
  *   9) process(max) 限流；
+ *   9b) process(max) 因限流提前返回时，残留 DONE 必须有唤醒源（补写 eventfd）；
  *  10) on_done 里再 submit（回调锁外执行，不得死锁）；
  *  11) destroy 无死锁（队列非空时直接销毁）；
+ *  11b) destroy 对正在执行的任务置取消标志 —— 计划 §S5「先置取消标志再 join」；
  *  12) fd 不泄漏：create/destroy 循环后 /proc/self/fd 数量不增长；
  *  13) 与 Reactor 联调：慢任务运行期间主循环进度号持续递增（Reactor 未被阻塞）。
  *
@@ -30,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ivsbox/iv_clock.h"
 #include "ivsbox/iv_log.h"
 #include "ivsbox/iv_reactor.h"
 #include "ivsbox/iv_ret.h"
@@ -686,6 +689,120 @@ static void test_destroy_no_deadlock(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * 11b) destroy 对正在执行的任务置取消标志（计划 §S5「先置取消标志再 join」）
+ * ------------------------------------------------------------------------- */
+
+static void test_destroy_cancels_running(void)
+{
+    iv_taskpool_t   *pool;
+    struct slow_arg  a;
+    iv_task_req_t    req;
+    uint64_t         id;
+    uint64_t         t0;
+    uint64_t         t1;
+    int              w;
+
+    pool = iv_taskpool_create(1, 4);
+    chk(pool != NULL, "create for destroy-cancel case");
+    if (pool == NULL)
+        return;
+
+    a.ms = 0;
+    a.ran = 0;
+    a.canceled = 0;
+
+    req.name = "long-cancelable";
+    req.fn = fn_sleep_cancelable; /* 自然时长上限 2s，且会周期检查取消标志 */
+    req.arg = &a;
+    req.timeout_ms = 0u;
+    req.on_done = NULL;
+    req.on_done_arg = NULL;
+    chk(iv_taskpool_submit(pool, &req, &id) == IV_OK, "submit long cancelable task");
+
+    /* 等它真正开工 —— 否则 destroy 走的是"丢弃未开工任务"那条路，验不到本路径 */
+    for (w = 0; w < 200 && a.ran == 0; w++)
+        sleep_ms(5);
+    chk(a.ran == 1, "long task started before destroy");
+
+    t0 = iv_clock_monotonic_ms();
+    iv_taskpool_destroy(pool);
+    t1 = iv_clock_monotonic_ms();
+
+    chk(a.canceled == 1, "destroy set the cancel flag on the running task");
+    chk((t1 - t0) < 1000u, "destroy returned promptly instead of waiting out the task");
+}
+
+/* ---------------------------------------------------------------------------
+ * 9b) process(max) 因限流提前返回时，残留 DONE 必须有唤醒源
+ * ------------------------------------------------------------------------- */
+
+static void test_process_residual_notify(void)
+{
+    enum { N = 3 };
+    iv_taskpool_t   *pool;
+    struct slow_arg  args[N];
+    struct cbstat    st;
+    iv_task_req_t    req;
+    uint64_t         id;
+    uint64_t         v;
+    int              efd;
+    int              i;
+    int              got;
+
+    pool = iv_taskpool_create(2, 8);
+    chk(pool != NULL, "create for residual-notify case");
+    if (pool == NULL)
+        return;
+
+    efd = iv_taskpool_eventfd(pool);
+    chk(efd >= 0, "eventfd available");
+
+    st.n = 0;
+    st.ok = 0;
+    st.bad_len = 0;
+    st.bad_val = 0;
+    st.last_rc = 0;
+    st.last_id = 0u;
+    st.expect_tokens = 0;
+
+    for (i = 0; i < N; i++) {
+        args[i].ms = 0;
+        args[i].ran = 0;
+        args[i].canceled = 0;
+        req.name = "quick";
+        req.fn = fn_mark;
+        req.arg = &args[i];
+        req.timeout_ms = 0u;
+        req.on_done = cb_count;
+        req.on_done_arg = &st;
+        chk(iv_taskpool_submit(pool, &req, &id) == IV_OK, "submit quick task");
+    }
+
+    sleep_ms(200); /* 3 个空任务 / 2 个 worker，足够全部跑完进 DONE */
+    chk(iv_taskpool_pending(pool) == N, "all N held in DONE");
+
+    /* 清干 eventfd：此后不该再有 worker 写入（任务都已跑完） */
+    while (read(efd, &v, sizeof(v)) == (ssize_t)sizeof(v))
+        ;
+
+    got = iv_taskpool_process(pool, 1);
+    chk(got == 1, "process(max=1) took exactly one");
+    chk(iv_taskpool_pending(pool) == N - 1, "residual DONE slots remain");
+
+    /* 关键判据：因为还有残留，process 补写了 eventfd，所以 fd 立即可读 */
+    v = 0u;
+    chk(read(efd, &v, sizeof(v)) == (ssize_t)sizeof(v),
+        "process refilled eventfd because DONE slots remained");
+
+    /* 再取一次，确认自唤醒确实能把剩余的带走 */
+    got = iv_taskpool_process(pool, 0);
+    chk(got == N - 1, "second process drained the residuals");
+    chk(iv_taskpool_pending(pool) == 0, "no slot left occupied");
+
+    iv_taskpool_destroy(pool);
+}
+
+/* ---------------------------------------------------------------------------
  * 12) fd 不泄漏
  * ------------------------------------------------------------------------- */
 
@@ -854,8 +971,10 @@ int main(void)
     test_deadline_expired();
     test_idle_progress();
     test_process_max();
+    test_process_residual_notify();
     test_resubmit_in_callback();
     test_destroy_no_deadlock();
+    test_destroy_cancels_running();
     test_fd_leak();
     test_reactor_integration();
 
@@ -863,6 +982,7 @@ int main(void)
         fprintf(stderr, "test_taskpool failed (%d check(s))\n", g_fail);
         return 1;
     }
-    printf("test_taskpool passed (queue full, cancel, deadline, idle progress, reactor)\n");
+    printf("test_taskpool passed (queue full, cancel, deadline, idle progress, "
+           "destroy-cancel, reactor)\n");
     return 0;
 }

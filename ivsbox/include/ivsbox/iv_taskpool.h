@@ -116,8 +116,13 @@ typedef struct iv_task_req {
  * 副作用：阻塞 SIGTERM/SIGINT/SIGPIPE 且不恢复（理由见文件头）。失败返回 NULL。 */
 iv_taskpool_t *iv_taskpool_create(int nworkers, int queue_size);
 
-/* 销毁：置停止标志 + 唤醒全部 worker + join；**队列中尚未开工的任务被丢弃，
- * 其完成回调不会执行**；DONE 槽位里尚未被 process 取走的结果同样丢弃。
+/* 销毁：置停止标志 + **对正在执行的任务置取消标志**（协作式，不打断）+
+ * 唤醒全部 worker + join。
+ *   - 正在执行的任务收到取消请求后应尽快返回（任务函数里查 iv_task_canceled）；
+ *     完全不检查标志的任务仍会跑完 —— 这是协作式的固有边界。少了这一步，
+ *     关机路径会被一个 30s 的 SNMP 超时任务干等（计划 §S5 原口径）。
+ *   - 队列中尚未开工的任务被丢弃，其完成回调不会执行；
+ *   - DONE 槽位里尚未被 process 取走的结果同样丢弃。
  * 必须保证此后没有线程再调本池任何接口。 */
 void iv_taskpool_destroy(iv_taskpool_t *pool);
 
@@ -148,7 +153,11 @@ int iv_taskpool_eventfd(const iv_taskpool_t *pool);
 
 /* 取走已完成任务并逐个调用其 on_done。
  * 本函数会先把 eventfd 读干（电平触发必须读干，否则反复上报），再处理 DONE 槽位。
- * max <= 0 表示不限。返回本次回调的任务数；pool 为 NULL 返回 IV_EINVAL。
+ * max <= 0 表示不限；max > 0 时限流 —— **但若处理完 max 条后仍有 DONE 残留，
+ * 本函数会补写一次 eventfd 自唤醒**，保证下一轮还会被调用。因此调用方不需要
+ * 自己循环取到返回 0，残留槽位也不会滞留（不补这一下，残留槽位要等到下一个
+ * 任务完成才有唤醒源，之后没新任务就永远占着，直到 destroy）。
+ * 返回本次回调的任务数；pool 为 NULL 返回 IV_EINVAL。
  * **只允许在 reactor 线程内调用**；on_done 里再调 submit 是安全的（回调期间不持锁）。 */
 int iv_taskpool_process(iv_taskpool_t *pool, int max);
 

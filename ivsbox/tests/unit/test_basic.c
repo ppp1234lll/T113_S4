@@ -1,13 +1,15 @@
 /*
  * S2 基础件综合单测：iv_log 日志门面（运行期级别 / 单行格式 / 风暴抑制）
  * - 错误码 44 码黄金表在 tests/unit/test_err.c（更严格），此处仅对 iv_strerror 冒烟；
- * - iv_clock / iv_version 待 S2 后续补齐，届时并入本文件。
+ * - iv_clock 单调性 / 走时在此验证；iv_version 待 S2 后续补齐，届时并入本文件。
  */
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
-#include "ivsbox/iv_log.h"
+#include "ivsbox/iv_clock.h"
 #include "ivsbox/iv_err.h"
+#include "ivsbox/iv_log.h"
 
 #define MAX_LINES 256
 
@@ -119,6 +121,23 @@ int main(void)
         "iv_strerror(OK)");
     chk(iv_strerror(0x7FFFFFFFu) != NULL && strcmp(iv_strerror(0x7FFFFFFFu), "UNKNOWN") == 0,
         "iv_strerror(UNKNOWN)");
+
+    /* 10) iv_clock：时钟活跃（非全 0 桩）+ 单调不减 + 睡 10ms 后必有推进 */
+    {
+        struct timespec req = {0, 10 * 1000 * 1000};
+        uint64_t ms1 = iv_clock_monotonic_ms();
+        uint64_t us1 = iv_clock_monotonic_us();
+        uint64_t ms2, us2;
+
+        chk(ms1 > 0 || us1 > 0, "clock is live (not the zero stub)");
+        nanosleep(&req, NULL);
+        ms2 = iv_clock_monotonic_ms();
+        us2 = iv_clock_monotonic_us();
+        chk(ms2 >= ms1, "monotonic ms non-decreasing");
+        chk(us2 >= us1, "monotonic us non-decreasing");
+        chk(ms2 - ms1 >= 5, "ms advances across 10ms sleep");
+        chk(us2 - us1 >= 5000, "us advances across 10ms sleep");
+    }
 
     if (g_fail) {
         fprintf(stderr, "test_basic failed (%d check(s))\n", g_fail);

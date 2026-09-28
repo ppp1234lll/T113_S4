@@ -11,7 +11,9 @@ AR := $(CROSS)ar
 CFLAGS_COMMON  := -std=c11 -Wall -Wextra -Werror -ffunction-sections -fdata-sections
 LDFLAGS_COMMON := -Wl,--gc-sections -Wl,--no-undefined
 
-CFLAGS  := $(CFLAGS_COMMON) -Iinclude
+# 板端同样启用 _GNU_SOURCE：严格 -std=c11 下 localtime_r / clock_gettime 等 POSIX
+# 接口不暴露（计划 §0 通用规则），核心层需要它们
+CFLAGS  := $(CFLAGS_COMMON) -D_GNU_SOURCE -Iinclude
 LDFLAGS := $(LDFLAGS_COMMON)
 LDLIBS  :=
 

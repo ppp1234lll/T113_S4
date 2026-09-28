@@ -3,8 +3,8 @@
  */
 #include <stdio.h>
 #include "ivsbox/ivsbox.h"
+#include "ivsbox/iv_log.h"
 
-extern int iv_log_init(const char *ident);
 extern int iv_hal_init(void);
 extern int iv_modules_init(void);
 
@@ -16,6 +16,8 @@ int ivsbox_init(void)
         return -1;
     if (iv_modules_init() != 0)
         return -1;
+    IV_LOG_I("app", "ivsboxd started, version %d.%d.%d",
+             IVSBOX_VERSION_MAJOR, IVSBOX_VERSION_MINOR, IVSBOX_VERSION_PATCH);
     return 0;
 }
 

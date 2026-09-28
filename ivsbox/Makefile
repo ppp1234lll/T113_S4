@@ -94,7 +94,7 @@ FUZZ_BINS     := $(patsubst tests/fuzz/%.c,$(BUILD_DIR)/tests/fuzz/%,$(FUZZ_SRCS
 # -----------------------------------------------------------------------------
 # 公共伪目标
 # -----------------------------------------------------------------------------
-.PHONY: all host arm test asan fuzz analyze package clean help
+.PHONY: all host arm test asan tsan fuzz analyze package clean help
 
 all: host
 
@@ -115,6 +115,11 @@ test:
 
 asan:
 	$(MAKE) TARGET=host SANITIZE=1 BUILD_DIR=build/asan test
+
+# TSan 只跑宿主机：armv7 交叉目标上 ThreadSanitizer 通常不可用。
+# 与 asan 互斥（不能同时开），故用独立的 BUILD_DIR，避免复用旧 .o。
+tsan:
+	$(MAKE) TARGET=host SANITIZE=thread BUILD_DIR=build/tsan test
 
 fuzz:
 	$(MAKE) TARGET=host $(FUZZ_BINS)
@@ -141,6 +146,7 @@ help:
 	@echo "  arm      - ARM cross build"
 	@echo "  test     - build and run unit tests"
 	@echo "  asan     - build and run tests with ASan/UBSan"
+	@echo "  tsan     - build and run tests with TSan (host only, exclusive with asan)"
 	@echo "  fuzz     - build fuzz targets"
 	@echo "  analyze  - build with GCC -fanalyzer"
 	@echo "  package  - copy ARM binaries to packaging/"
@@ -151,7 +157,7 @@ help:
 	@echo "  CROSS    - cross toolchain prefix (arm default: arm-linux-gnueabi-)"
 	@echo "  SYSROOT  - cross compile sysroot"
 	@echo "  DEBUG    - 1=enable -g -O0, 0=disable"
-	@echo "  SANITIZE - 1=enable ASan/UBSan"
+	@echo "  SANITIZE - 1=ASan/UBSan, thread=TSan (host only, mutually exclusive)"
 
 # -----------------------------------------------------------------------------
 # 模式规则与显式规则（依赖方向在链接顺序中显式写死）

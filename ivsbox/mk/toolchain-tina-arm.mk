@@ -15,7 +15,11 @@ LDFLAGS_COMMON := -Wl,--gc-sections -Wl,--no-undefined
 # 接口不暴露（计划 §0 通用规则），核心层需要它们
 CFLAGS  := $(CFLAGS_COMMON) -D_GNU_SOURCE -Iinclude
 LDFLAGS := $(LDFLAGS_COMMON)
-LDLIBS  :=
+# -lpthread：libivmodules 里的 iv_taskpool（M1-S5）需要 pthread。
+# **板端不能省**：glibc 2.25 的 pthread 符号在独立 libpthread 里，漏加直接链接失败；
+# 而宿主机的新 glibc（>=2.34）已把 pthread 并入 libc，不加也能过
+# —— 典型的"VM 绿、板端挂"。
+LDLIBS  := -lpthread
 
 ifdef SYSROOT
 CFLAGS  += --sysroot=$(SYSROOT)

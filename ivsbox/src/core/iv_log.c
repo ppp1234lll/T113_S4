@@ -1,18 +1,29 @@
 /*
  * IVSBox 统一日志门面（架构 §12.1，计划 M1-S2 第 2 条）
- * 板端：syslog(3) -> logd（logread 查看）；Host 单测 / 调试：stderr 或注入口。
+ * 板端：自建 <root>/YYYY-MM-DD/HH.log（root 默认 /opt/log，保留 3 个日历日）；
+ * Host 单测 / 调试：注入口或 stderr。不再走 syslog(3)（本板无 logread）。
  */
 #include "ivsbox/iv_log.h"
 #include "ivsbox/iv_err.h"
 
+#include <dirent.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 
 #define IV_LOG_MSG_MAX 256u                       /* 单条消息正文上限 */
 #define IV_LOG_BODY_MAX (IV_LOG_MSG_MAX + 64u)    /* 正文 + 码名前缀 */
 #define IV_LOG_SUP_MAX 32u                        /* 抑制表上限（有界，架构 §1.3） */
+
+#define IV_LOG_ROOT_MAX 192u                      /* 根目录字符串上限 */
+#define IV_LOG_PATH_MAX 256u                      /* <root>/YYYY-MM-DD/HH.log 上限 */
+#define IV_LOG_DATE_LEN 10u                       /* "YYYY-MM-DD" 字符数 */
+#define IV_LOG_PURGE_SEC 86400u                   /* 过期清理节流间隔（秒） */
 
 typedef struct {
     uint32_t key;   /* (module, code) 的 32 位指纹 */
@@ -29,6 +40,14 @@ static iv_log_sink_t    s_sink;
 static void            *s_sink_user;
 static iv_sup_ent_t     s_sup[IV_LOG_SUP_MAX];
 
+/* ---- 落盘状态 ---- */
+static char     s_root[IV_LOG_ROOT_MAX] = IV_LOG_ROOT_DEFAULT;
+static unsigned s_keep_days             = IV_LOG_KEEP_DAYS_DEFAULT;
+static FILE    *s_fp;                         /* 当前小时文件句柄，跨小时才重开 */
+static char     s_fp_path[IV_LOG_PATH_MAX];   /* 与 s_fp 对应的路径 */
+static time_t   s_last_purge;                 /* 上次过期清理时刻，0 = 从未 */
+static int      s_file_warned;                /* 落盘失败只提醒一次，避免刷屏 */
+
 /* ---------------------------------------------------------------------------
  * 内部工具
  * ------------------------------------------------------------------------- */
@@ -44,7 +63,7 @@ static const char *lvl_str(int level)
     }
 }
 
-/* 控制字符折叠为空格，保证每条日志严格单行（板端串行控制台 / logd 均按行取） */
+/* 控制字符折叠为空格，保证每条日志严格单行（板端按行读取） */
 static void sanitize(char *s)
 {
     for (; *s; s++) {
@@ -70,23 +89,249 @@ static void fmt_body(char *buf, size_t cap, const char *fmt, va_list ap)
     sanitize(buf);
 }
 
+/* "YYYY-MM-DD HH:MM:SS"；失败时置空串 */
+static void now_stamp(char *out, size_t cap)
+{
+    time_t    now = time(NULL);
+    struct tm tmv;
+
+    out[0] = '\0';
+    if (!localtime_r(&now, &tmv))
+        return;
+    (void)strftime(out, cap, "%Y-%m-%d %H:%M:%S", &tmv);
+}
+
+/*
+ * dst = a + "/" + b。手工拼接而非 snprintf：路径长度由调用方保证，
+ * 这样 GCC 的 -Wformat-truncation 不会对未知长度参数误报（-Werror 下会直接断编译）。
+ */
+static int join2(char *dst, size_t cap, const char *a, const char *b)
+{
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+
+    if (la + 1u + lb + 1u > cap)
+        return -1;
+
+    memcpy(dst, a, la);
+    dst[la] = '/';
+    memcpy(dst + la + 1u, b, lb + 1u);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * 落盘：<root>/YYYY-MM-DD/HH.log
+ * ------------------------------------------------------------------------- */
+
+static void file_reset(void)
+{
+    if (s_fp) {
+        fclose(s_fp);
+        s_fp = NULL;
+    }
+    s_fp_path[0] = '\0';
+}
+
+/* 创建 root 及其下子目录 sub（单层）。返回 0 成功 */
+static int ensure_dir(const char *root, const char *sub)
+{
+    char path[IV_LOG_PATH_MAX];
+
+    if (mkdir(root, 0755) != 0 && errno != EEXIST)
+        return -1;
+    if (join2(path, sizeof(path), root, sub) != 0)
+        return -1;
+    if (mkdir(path, 0755) != 0 && errno != EEXIST)
+        return -1;
+
+    return 0;
+}
+
+/* "HH.log"：tm_hour 已限定 0~23，两位数字手工生成 */
+static int hour_name(char *out, size_t cap, int hour)
+{
+    if (cap < 7u || hour < 0 || hour > 23)
+        return -1;
+
+    out[0] = (char)('0' + (hour / 10) % 10);
+    out[1] = (char)('0' + hour % 10);
+    out[2] = '.';
+    out[3] = 'l';
+    out[4] = 'o';
+    out[5] = 'g';
+    out[6] = '\0';
+    return 0;
+}
+
+/*
+ * 取当前应写入的文件句柄。路径与已打开的一致则直接复用（正常路径下每条日志只做
+ * 一次 strcmp）；跨小时/跨天或首次打开才建目录、开文件。
+ * 失败返回 NULL，并只在首次失败时往 stderr 打一行（避免日志系统自身刷屏）。
+ */
+static FILE *file_current(void)
+{
+    char      day[IV_LOG_DATE_LEN + 1];
+    char      name[8];
+    char      dir[IV_LOG_PATH_MAX];
+    char      path[IV_LOG_PATH_MAX];
+    struct tm tmv;
+    time_t    now;
+    FILE     *fp;
+
+    if (!s_root[0])
+        return NULL;
+
+    now = time(NULL);
+    if (!localtime_r(&now, &tmv))
+        return NULL;
+    if (strftime(day, sizeof(day), "%Y-%m-%d", &tmv) == 0)
+        return NULL;
+    if (hour_name(name, sizeof(name), tmv.tm_hour) != 0)
+        return NULL;
+
+    if (join2(dir, sizeof(dir), s_root, day) != 0)
+        return NULL;
+    if (join2(path, sizeof(path), dir, name) != 0)
+        return NULL;
+
+    if (s_fp && strcmp(path, s_fp_path) == 0)
+        return s_fp;
+
+    if (ensure_dir(s_root, day) != 0) {
+        if (!s_file_warned) {
+            s_file_warned = 1;
+            fprintf(stderr, "iv_log: cannot create %s, file output off\n", dir);
+        }
+        return NULL;
+    }
+
+    fp = fopen(path, "a");
+    if (!fp) {
+        if (!s_file_warned) {
+            s_file_warned = 1;
+            fprintf(stderr, "iv_log: cannot open %s, file output off\n", path);
+        }
+        return NULL;
+    }
+
+    setvbuf(fp, NULL, _IOLBF, 0); /* 行缓冲：逐行落盘，进程异常退出不丢行 */
+
+    file_reset();
+    s_fp = fp;
+    memcpy(s_fp_path, path, sizeof(s_fp_path)); /* 两侧同宽，末尾 NUL 一并复制 */
+    return s_fp;
+}
+
+/* 目录名须严格为 10 位 "YYYY-MM-DD"（ISO 格式，字典序即时间序） */
+static int is_date_name(const char *s)
+{
+    size_t i;
+
+    if (strlen(s) != IV_LOG_DATE_LEN)
+        return 0;
+    for (i = 0; i < IV_LOG_DATE_LEN; i++) {
+        if (i == 4u || i == 7u) {
+            if (s[i] != '-')
+                return 0;
+        } else if (s[i] < '0' || s[i] > '9') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * 保留期下界（含）的日期串：今天 -(keep-1) 天。
+ * 用 mktime 归一化 tm_mday 的越界（跨月/跨年）比手算日历可靠。
+ */
+static int cutoff_day(unsigned keep, char *out, size_t cap)
+{
+    time_t    now = time(NULL);
+    struct tm tmv;
+
+    if (!localtime_r(&now, &tmv))
+        return -1;
+    tmv.tm_hour  = 0;
+    tmv.tm_min   = 0;
+    tmv.tm_sec   = 0;
+    tmv.tm_isdst = -1;
+    tmv.tm_mday -= (int)(keep - 1u);
+
+    now = mktime(&tmv);
+    if (now == (time_t)-1)
+        return -1;
+    if (!localtime_r(&now, &tmv))
+        return -1;
+    if (strftime(out, cap, "%Y-%m-%d", &tmv) == 0)
+        return -1;
+
+    return 0;
+}
+
+/* 清空日期目录内的普通文件并删掉该目录。不递归（子目录一律跳过，防误删） */
+static int drop_day_dir(const char *dir)
+{
+    DIR           *d = opendir(dir);
+    struct dirent *e;
+
+    if (!d)
+        return -1;
+
+    while ((e = readdir(d)) != NULL) {
+        char        path[IV_LOG_PATH_MAX];
+        struct stat st;
+
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        if (join2(path, sizeof(path), dir, e->d_name) != 0)
+            continue;
+        if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+        (void)unlink(path);
+    }
+    closedir(d);
+
+    return (rmdir(dir) == 0) ? 0 : -1;
+}
+
+/* 写入路径上的节流清理：距上次满 24h（或时钟回拨）才真正扫盘 */
+static void purge_if_due(void)
+{
+    time_t now = time(NULL);
+
+    if (s_last_purge == 0 || now < s_last_purge
+        || (unsigned long)(now - s_last_purge) >= IV_LOG_PURGE_SEC)
+        (void)iv_log_purge();
+}
+
+/* ---------------------------------------------------------------------------
+ * 出口
+ * ------------------------------------------------------------------------- */
+
 static void emit(int level, const char *module, const char *body)
 {
+    char ts[24];
+
     if (s_sink) {
         s_sink(level, module, body, s_sink_user);
-        return;
+        return; /* 注入口独占：单测不落盘、不打屏 */
     }
-    if (s_stderr) {
-        time_t    now = time(NULL);
-        struct tm tmv;
-        char      ts[24];
 
-        localtime_r(&now, &tmv);
-        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
-        fprintf(stderr, "%s %s [%s] %s\n", ts, lvl_str(level), module, body);
-        return;
+    ts[0] = '\0';
+    if (s_root[0] || s_stderr)
+        now_stamp(ts, sizeof(ts));
+
+    if (s_root[0]) {
+        FILE *fp;
+
+        purge_if_due();
+        fp = file_current();
+        if (fp && fprintf(fp, "%s %s [%s] %s\n", ts, lvl_str(level), module, body) < 0)
+            file_reset(); /* 磁盘满 / 卡被拔：关掉，下次写入重开 */
     }
-    syslog(level, "[%s] %s", module, body);
+
+    if (s_stderr)
+        fprintf(stderr, "%s %s [%s] %s\n", ts, lvl_str(level), module, body);
 }
 
 /* ---------------------------------------------------------------------------
@@ -144,7 +389,13 @@ int iv_log_init(const char *ident)
 {
     if (ident && *ident)
         s_ident = ident;
-    openlog(s_ident, LOG_PID | LOG_NDELAY, LOG_DAEMON);
+
+    /* 落盘是懒创建的：这里只保证根目录存在并先清一次过期，失败不阻断启动
+     * （/opt/log 不可写时由首次写入打一行 stderr 提示） */
+    if (s_root[0])
+        (void)mkdir(s_root, 0755);
+    (void)iv_log_purge();
+
     return 0;
 }
 
@@ -156,6 +407,79 @@ void iv_log_set_level(int level)
 int iv_log_get_level(void)
 {
     return s_level;
+}
+
+int iv_log_set_root(const char *root)
+{
+    file_reset();
+    s_file_warned = 0;
+
+    if (!root || !*root) {
+        s_root[0]    = '\0';
+        s_last_purge = 0;
+        return 0;
+    }
+    if (strlen(root) >= sizeof(s_root))
+        return -1;
+
+    memcpy(s_root, root, strlen(root) + 1u);
+    s_last_purge = 0;
+    return 0;
+}
+
+const char *iv_log_get_root(void)
+{
+    return s_root;
+}
+
+void iv_log_set_keep_days(unsigned days)
+{
+    s_keep_days  = days;
+    s_last_purge = 0;
+}
+
+unsigned iv_log_get_keep_days(void)
+{
+    return s_keep_days;
+}
+
+int iv_log_purge(void)
+{
+    char           cutoff[IV_LOG_DATE_LEN + 1];
+    DIR           *d;
+    struct dirent *e;
+    int            removed = 0;
+
+    s_last_purge = time(NULL);
+
+    if (!s_root[0] || s_keep_days == 0u)
+        return 0;
+    if (cutoff_day(s_keep_days, cutoff, sizeof(cutoff)) != 0)
+        return -1;
+
+    d = opendir(s_root);
+    if (!d)
+        return -1; /* 目录还没建：等价于无过期内容 */
+
+    while ((e = readdir(d)) != NULL) {
+        char        path[IV_LOG_PATH_MAX];
+        struct stat st;
+
+        if (!is_date_name(e->d_name))
+            continue;
+        if (strcmp(e->d_name, cutoff) >= 0)
+            continue; /* 保留期内（含 cutoff 当天） */
+        if (join2(path, sizeof(path), s_root, e->d_name) != 0)
+            continue;
+        if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode))
+            continue;
+
+        if (drop_day_dir(path) == 0)
+            removed++;
+    }
+    closedir(d);
+
+    return removed;
 }
 
 void iv_log_set_stderr(int enable)

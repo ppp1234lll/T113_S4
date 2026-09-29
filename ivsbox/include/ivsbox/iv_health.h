@@ -88,7 +88,11 @@ typedef struct iv_health iv_health_t;
  *                     从而在测试里观察每一次喂狗与停喂。
  *   stuck_ms       —— 传 0 取 IV_HEALTH_STUCK_MS_DEFAULT。
  *   interval_ms    —— 传 0 取 IV_HEALTH_INTERVAL_MS_DEFAULT。
- * 失败（内存或 pthread_create）返回 NULL。 */
+ *                     **自定义值受运行期不变量约束**：watchdog_fd >= 0（真喂狗）时，
+ *                     stuck_ms + interval_ms 必须严格小于看门狗超时（对齐文件顶部
+ *                     编译期 #error 的口径），违反则**启动即失败**返回 NULL ——
+ *                     宁可拒绝启动，不让"判据还没判死、狗就先咬了"静默发生。
+ * 失败（内存、pthread_create、或上述不变量不满足）返回 NULL。 */
 iv_health_t *iv_health_start(const iv_reactor_t *reactor,
                              const iv_taskpool_t *pool,
                              int watchdog_fd,

@@ -166,7 +166,7 @@ static void case_healthy_worker_idle(void)
     chk(iv_health_snapshot(h, &s) == IV_OK, "case2: snapshot");
     chk(s.fault_code == IV_HEALTH_OK, "case2: idle workers must not raise a fault");
     chk(s.worker_count == 2, "case2: observed both workers");
-    chk(s.tick_count >= 20u, "case2: ticked ~50x/s over 3.2s");
+    chk(s.tick_count >= 20u, "case2: ticked ~20x/s over 3.2s");
 
     iv_health_destroy(h);
     iv_taskpool_destroy(pool);

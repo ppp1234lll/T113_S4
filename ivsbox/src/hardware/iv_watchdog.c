@@ -113,7 +113,10 @@ int iv_watchdog_disable(int fd)
      * 再 close：关掉 fd 本身也是 release 路径被触发的前提。
      * fd 无论成败都必须关掉 —— 停机失败还搭一个 fd 泄漏是最差的结果。*/
     n = write(fd, &k_magic_close_byte, 1u);
-    werr = (n == 1) ? 0 : errno;
+    /* n == -1 时 errno 一定有效；n == 0（1 字节写在实践中不会出现）时 errno
+     * 不会被内核触碰，可能是进函数前的陈旧值 —— 兜成 EIO，绝不让"没写进 'V'"
+     * 被误报成成功。*/
+    werr = (n == 1) ? 0 : (errno != 0 ? errno : EIO);
 
     if (close(fd) != 0)
         return -1;

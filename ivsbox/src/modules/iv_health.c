@@ -247,6 +247,16 @@ iv_health_t *iv_health_start(const iv_reactor_t *reactor,
     h->interval_ms = (interval_ms != 0u) ? interval_ms : IV_HEALTH_INTERVAL_MS_DEFAULT;
     h->snap.watchdog_fd = watchdog_fd;
 
+    /* 运行期不变量（与文件顶部的编译期 #error 同一口径，这里兜住**自定义值**）：
+     * 真喂狗时，判据最坏结论时延（stuck + interval）必须严格小于看门狗超时，
+     * 否则"判据还没判死、狗就先咬了"，门控被静默绕过。fd < 0（不真喂狗的
+     * 纯逻辑单测）不受此约束。*/
+    if (h->wd_fd >= 0 && (uint64_t)h->stuck_ms + h->interval_ms >=
+                             IV_WATCHDOG_DEFAULT_TIMEOUT_SEC * 1000u) {
+        free(h);
+        return NULL;
+    }
+
     if (pthread_mutex_init(&h->lock, NULL) != 0) {
         free(h);
         return NULL;

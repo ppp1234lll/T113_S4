@@ -12,7 +12,11 @@ CFLAGS  := $(CFLAGS_COMMON) -D_GNU_SOURCE -Iinclude
 LDFLAGS := $(LDFLAGS_COMMON)
 # -lpthread：libivmodules 里的 iv_taskpool（M1-S5）需要 pthread。
 # 位置在链接行末尾（... -livcore $(LDLIBS)），对系统库是正确位置。
-LDLIBS  := -lpthread
+# -ljson-c：M1-S8 配置模块（src/modules/config/，进 libivmodules）需要。
+# 本变量被全部 13 处链接行共用（主程序 + 全部单测 + fuzz），落这一处即全生效。
+# 宿主头文件来自 libjson-c-dev 0.15（libjson-c.so -> .so.5）；板端 sysroot 是
+# json-c 0.13.1（libjson-c.so -> .so.4）⇒ 代码只准用 0.13 的 API 子集。
+LDLIBS  := -lpthread -ljson-c
 
 # 默认 host 带调试信息
 ifeq ($(DEBUG),)

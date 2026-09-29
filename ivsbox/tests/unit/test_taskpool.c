@@ -17,7 +17,8 @@
  *  11) destroy 无死锁（队列非空时直接销毁）；
  *  11b) destroy 对正在执行的任务置取消标志 —— 计划 §S5「先置取消标志再 join」；
  *  12) fd 不泄漏：create/destroy 循环后 /proc/self/fd 数量不增长；
- *  13) 与 Reactor 联调：慢任务运行期间主循环进度号持续递增（Reactor 未被阻塞）。
+ *  13) 与 Reactor 联调：慢任务运行期间主循环进度号持续递增（Reactor 未被阻塞）；
+ *  14) 任务心跳：长任务执行期间 iv_task_heartbeat 推进 worker 进度号（S56-01）。
  *
  * 说明：
  *   - 本测试不调用 iv_log_init，并显式关闭落盘出口，避免在宿主机 mkdir 默认
@@ -29,6 +30,7 @@
  */
 #include <dirent.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -955,6 +957,103 @@ static void test_reactor_integration(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * 14) 任务心跳：长任务执行期间心跳推进 worker 进度号（S56-01）
+ * ------------------------------------------------------------------------- */
+
+struct beat_arg {
+    int         ms;   /* 任务总时长 */
+    int         step; /* 心跳周期 */
+    _Atomic int ran;
+};
+
+static int fn_heartbeat(iv_task_ctx_t *ctx)
+{
+    struct beat_arg *a = (struct beat_arg *)ctx->arg;
+    int elapsed = 0;
+
+    a->ran = 1;
+    while (elapsed < a->ms) {
+        sleep_ms(a->step);
+        elapsed += a->step;
+        iv_task_heartbeat(ctx); /* 周期心跳：等价"任务还活着"信号 */
+    }
+    return IV_OK;
+}
+
+static void test_heartbeat(void)
+{
+    iv_taskpool_t   *pool;
+    struct beat_arg  a;
+    struct cbstat    st;
+    iv_task_req_t    req;
+    uint64_t         id;
+    uint32_t         before;
+    uint32_t         after;
+    int              w;
+
+    /* ctx 未挂接 / NULL 必须是空操作，不得崩 */
+    {
+        iv_task_ctx_t dummy;
+
+        memset(&dummy, 0, sizeof(dummy));
+        iv_task_heartbeat(NULL);
+        iv_task_heartbeat(&dummy);
+    }
+
+    pool = iv_taskpool_create(1, 4);
+    chk(pool != NULL, "create for heartbeat case");
+    if (pool == NULL)
+        return;
+
+    /* 先跨过一次空闲超时轮，让"下一个空闲 deadline"落在一个已知远点：
+     * 之后的进度号增量就只可能来自心跳与任务完成，不掺空闲轮的 +1。 */
+    sleep_ms(1200);
+
+    before = iv_taskpool_worker_progress(pool, 0);
+
+    a.ms = 300; /* 跑 ~300ms，每 50ms 心跳一次（约 6 次） */
+    a.step = 50;
+    a.ran = 0;
+
+    st.n = 0;
+    st.ok = 0;
+    st.bad_len = 0;
+    st.bad_val = 0;
+    st.last_rc = 0;
+    st.last_id = 0u;
+    st.expect_tokens = 0;
+
+    req.name        = "beating";
+    req.fn          = fn_heartbeat;
+    req.arg         = &a;
+    req.timeout_ms  = 3000u;
+    req.on_done     = cb_count;
+    req.on_done_arg = &st;
+    chk(iv_taskpool_submit(pool, &req, &id) == IV_OK, "submit heartbeat task");
+
+    /* 等任务真正开工再继续（差值窗口从开工后起算） */
+    for (w = 0; w < 200 && a.ran == 0; w++)
+        sleep_ms(5);
+    chk(a.ran == 1, "heartbeat task started");
+    chk(iv_taskpool_worker_deadline(pool, 0) > iv_clock_monotonic_ms(),
+        "running bounded task exposes a future health deadline");
+
+    chk(drain_until(pool, &st.n, 1, 3000) == 0, "heartbeat task completed");
+    chk(st.last_rc == IV_OK, "heartbeat task rc == IV_OK");
+
+    after = iv_taskpool_worker_progress(pool, 0);
+
+    /* 关键判据：进度号增量必须 > 完成任务数（1）。只有完成 +1 而心跳无效时
+     * 增量恰为 1；心跳有效则 6 次心跳把它推到 ~7。取差值语义防 32 位回绕。 */
+    chk((uint32_t)(after - before) > (uint32_t)st.n,
+        "task heartbeats advanced the worker progress beyond completion count");
+    chk(iv_taskpool_worker_deadline(pool, 0) == 0u,
+        "completed worker clears its health deadline");
+
+    iv_taskpool_destroy(pool);
+}
+
+/* ---------------------------------------------------------------------------
  * main
  * ------------------------------------------------------------------------- */
 
@@ -977,12 +1076,13 @@ int main(void)
     test_destroy_cancels_running();
     test_fd_leak();
     test_reactor_integration();
+    test_heartbeat();
 
     if (g_fail) {
         fprintf(stderr, "test_taskpool failed (%d check(s))\n", g_fail);
         return 1;
     }
     printf("test_taskpool passed (queue full, cancel, deadline, idle progress, "
-           "destroy-cancel, reactor)\n");
+           "destroy-cancel, reactor, heartbeat)\n");
     return 0;
 }

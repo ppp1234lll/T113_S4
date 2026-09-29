@@ -1,6 +1,6 @@
 /*
  * IVSBox 统一日志门面（架构 §12.1，计划 M1-S2 第 2 条）
- * 板端：自建 <root>/YYYY-MM-DD/HH.log（root 默认 /opt/log，保留 3 个日历日）；
+ * 板端：自建 <root>/YYYY-MM-DD/HH.log（root 默认 /mnt/UDISK/log，保留 3 个日历日）；
  * Host 单测 / 调试：注入口或 stderr。不再走 syslog(3)（本板无 logread）。
  */
 #include "ivsbox/iv_log.h"
@@ -8,7 +8,9 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -26,13 +28,13 @@
 #define IV_LOG_PURGE_SEC 86400u                   /* 过期清理节流间隔（秒） */
 
 typedef struct {
-    uint32_t key;   /* (module, code) 的 32 位指纹 */
-    time_t   first; /* 窗口起点 */
-    uint32_t count; /* 窗口内总次数（含首次） */
+    uint32_t key;      /* (module, code) 的 32 位指纹 */
+    uint64_t first_ms; /* 窗口起点（CLOCK_MONOTONIC 毫秒，不受墙钟回拨影响） */
+    uint32_t count;    /* 窗口内总次数（含首次） */
     int      used;
 } iv_sup_ent_t;
 
-static const char      *s_ident      = "ivsbox";
+static char             s_ident[IV_LOG_IDENT_MAX] = "ivsbox";
 static int              s_stderr     = 0;
 static int              s_level      = LOG_DEBUG;
 static uint32_t         s_window     = 60;
@@ -43,10 +45,30 @@ static iv_sup_ent_t     s_sup[IV_LOG_SUP_MAX];
 /* ---- 落盘状态 ---- */
 static char     s_root[IV_LOG_ROOT_MAX] = IV_LOG_ROOT_DEFAULT;
 static unsigned s_keep_days             = IV_LOG_KEEP_DAYS_DEFAULT;
+static size_t   s_file_max              = 1024u * 1024u; /* 单小时文件字节上限，0 = 不限制 */
 static FILE    *s_fp;                         /* 当前小时文件句柄，跨小时才重开 */
 static char     s_fp_path[IV_LOG_PATH_MAX];   /* 与 s_fp 对应的路径 */
 static time_t   s_last_purge;                 /* 上次过期清理时刻，0 = 从未 */
 static int      s_file_warned;                /* 落盘失败只提醒一次，避免刷屏 */
+static int      s_cap_marked;                 /* 当前小时文件已写过触顶标记 */
+
+/* ---- 并发控制 ----
+ * 全模块唯一的一把 C11 atomic_flag 自旋锁：串行化上述全部状态（抑制表、文件句柄、
+ * 各设置项），格式化在锁外完成。锁内不回调任何用户代码，唯一例外是 sink 回调
+ * （见 emit），其"回调中禁止再入本模块"的契约写在 iv_log.h。
+ */
+static atomic_flag s_log_lock = ATOMIC_FLAG_INIT;
+
+static void log_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_log_lock, memory_order_acquire))
+        ;
+}
+
+static void log_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_log_lock, memory_order_release);
+}
 
 /* ---------------------------------------------------------------------------
  * 内部工具
@@ -70,6 +92,17 @@ static void sanitize(char *s)
         if ((unsigned char)*s < 0x20u)
             *s = ' ';
     }
+}
+
+/* 单调毫秒（CLOCK_MONOTONIC）。抑制窗口用它计时，不吃墙钟回拨的亏；
+ * 与 iv_reactor.c 同口径：core 层不依赖 libivhal 的 iv_clock。 */
+static uint64_t now_mono_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0u;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000L);
 }
 
 static void fmt_body(char *buf, size_t cap, const char *fmt, va_list ap)
@@ -218,6 +251,7 @@ static FILE *file_current(void)
 
     file_reset();
     s_fp = fp;
+    s_cap_marked = 0; /* 新小时文件：触顶标记重新计，恢复写入 */
     memcpy(s_fp_path, path, sizeof(s_fp_path)); /* 两侧同宽，末尾 NUL 一并复制 */
     return s_fp;
 }
@@ -268,40 +302,105 @@ static int cutoff_day(unsigned keep, char *out, size_t cap)
     return 0;
 }
 
-/* 清空日期目录内的普通文件并删掉该目录。不递归（子目录一律跳过，防误删） */
-static int drop_day_dir(const char *dir)
+/*
+ * 清空日期目录内的普通文件并删掉该目录（root_fd 锚定父目录）。
+ * 全程 openat/unlinkat 家族且不跟随符号链接：日期项若是 symlink 或普通文件，
+ * openat 带 O_NOFOLLOW|O_DIRECTORY 必然失败，直接跳过不删，杜绝被链接诱导
+ * 删到别处。不递归（子目录一律跳过，防误删）。仅在锁内被调。
+ */
+static int drop_day_dir_at(int root_fd, const char *name)
 {
-    DIR           *d = opendir(dir);
+    int            day_fd;
+    DIR           *d;
     struct dirent *e;
 
-    if (!d)
+    day_fd = openat(root_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (day_fd < 0)
+        return -1; /* symlink / 普通文件 / 已消失：一律跳过 */
+
+    d = fdopendir(day_fd);
+    if (!d) {
+        close(day_fd);
         return -1;
+    }
 
     while ((e = readdir(d)) != NULL) {
-        char        path[IV_LOG_PATH_MAX];
         struct stat st;
 
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
             continue;
-        if (join2(path, sizeof(path), dir, e->d_name) != 0)
+        if (fstatat(day_fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
             continue;
-        if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode))
-            continue;
-        (void)unlink(path);
+        if (!S_ISREG(st.st_mode))
+            continue; /* 子目录 / 链接等一律不动 */
+        (void)unlinkat(day_fd, e->d_name, 0);
     }
-    closedir(d);
+    closedir(d); /* 连同 day_fd 一并关闭 */
 
-    return (rmdir(dir) == 0) ? 0 : -1;
+    /* AT_REMOVEDIR 只删空目录，对非目录 / symlink 天然失败，安全 */
+    return (unlinkat(root_fd, name, AT_REMOVEDIR) == 0) ? 0 : -1;
 }
 
-/* 写入路径上的节流清理：距上次满 24h（或时钟回拨）才真正扫盘 */
+/*
+ * 过期清理主体。调用方必须已持有 s_log_lock（emit → purge_if_due 在锁内走到这里，
+ * 公有 iv_log_purge 也由锁内转发，绝不能在这里再上锁，否则自旋死锁）。
+ * root 经 open(O_NOFOLLOW) 锚定后全部走 openat 家族，不跟随符号链接。
+ * 返回删除的日期目录数；root 打不开（还没建 / 是链接 / 无权限）返回 -1。
+ */
+static long purge_locked(void)
+{
+    char           cutoff[IV_LOG_DATE_LEN + 1];
+    int            root_fd;
+    DIR           *d;
+    struct dirent *e;
+    long           removed = 0;
+
+    s_last_purge = time(NULL);
+
+    if (!s_root[0] || s_keep_days == 0u)
+        return 0;
+    if (cutoff_day(s_keep_days, cutoff, sizeof(cutoff)) != 0)
+        return -1;
+
+    root_fd = open(s_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (root_fd < 0)
+        return -1;
+
+    d = fdopendir(root_fd);
+    if (!d) {
+        close(root_fd);
+        return -1;
+    }
+
+    while ((e = readdir(d)) != NULL) {
+        struct stat st;
+
+        if (!is_date_name(e->d_name))
+            continue;
+        if (strcmp(e->d_name, cutoff) >= 0)
+            continue; /* 保留期内（含 cutoff 当天） */
+        /* 日期项本身也不跟随链接：AT_SYMLINK_NOFOLLOW 下 symlink 不算目录 */
+        if (fstatat(root_fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0
+            || !S_ISDIR(st.st_mode))
+            continue;
+
+        if (drop_day_dir_at(root_fd, e->d_name) == 0)
+            removed++;
+    }
+    closedir(d); /* 连同 root_fd 一并关闭 */
+
+    return removed;
+}
+
+/* 写入路径上的节流清理：距上次满 24h（或时钟回拨）才真正扫盘。
+ * 只在锁内被调，因此直接走 purge_locked()。 */
 static void purge_if_due(void)
 {
     time_t now = time(NULL);
 
     if (s_last_purge == 0 || now < s_last_purge
         || (unsigned long)(now - s_last_purge) >= IV_LOG_PURGE_SEC)
-        (void)iv_log_purge();
+        (void)purge_locked();
 }
 
 /* ---------------------------------------------------------------------------
@@ -326,8 +425,25 @@ static void emit(int level, const char *module, const char *body)
 
         purge_if_due();
         fp = file_current();
-        if (fp && fprintf(fp, "%s %s [%s] %s\n", ts, lvl_str(level), module, body) < 0)
-            file_reset(); /* 磁盘满 / 卡被拔：关掉，下次写入重开 */
+        if (fp) {
+            if (s_file_max > 0u) {
+                struct stat st;
+
+                /* 触顶：丢弃本条。首次触顶先写一行标记（标记行允许超限一次），
+                 * 换新小时文件后由 file_current 重置标记、恢复写入。仅在锁内执行。 */
+                if (fstat(fileno(fp), &st) == 0 && (size_t)st.st_size >= s_file_max) {
+                    if (!s_cap_marked) {
+                        s_cap_marked = 1;
+                        (void)fprintf(fp, "[log] file size cap reached (%lu bytes), "
+                                          "messages dropped until next hour\n",
+                                      (unsigned long)s_file_max);
+                    }
+                    return;
+                }
+            }
+            if (fprintf(fp, "%s %s [%s] %s\n", ts, lvl_str(level), module, body) < 0)
+                file_reset(); /* 磁盘满 / 卡被拔：关掉，下次写入重开 */
+        }
     }
 
     if (s_stderr)
@@ -375,7 +491,7 @@ static iv_sup_ent_t *sup_slot(void)
     for (i = 0; i < IV_LOG_SUP_MAX; i++) {
         if (!s_sup[i].used)
             return &s_sup[i];
-        if (!oldest || s_sup[i].first < oldest->first)
+        if (!oldest || s_sup[i].first_ms < oldest->first_ms)
             oldest = &s_sup[i];
     }
     return oldest;
@@ -387,147 +503,191 @@ static iv_sup_ent_t *sup_slot(void)
 
 int iv_log_init(const char *ident)
 {
-    if (ident && *ident)
-        s_ident = ident;
+    log_lock();
+    if (ident && *ident) {
+        strncpy(s_ident, ident, sizeof(s_ident) - 1u);
+        s_ident[sizeof(s_ident) - 1u] = '\0';
+    }
 
     /* 落盘是懒创建的：这里只保证根目录存在并先清一次过期，失败不阻断启动
-     * （/opt/log 不可写时由首次写入打一行 stderr 提示） */
+     * （/mnt/UDISK/log 不可写时由首次写入打一行 stderr 提示）。已在锁内，走 purge_locked */
     if (s_root[0])
         (void)mkdir(s_root, 0755);
-    (void)iv_log_purge();
+    (void)purge_locked();
+    log_unlock();
 
     return 0;
 }
 
 void iv_log_set_level(int level)
 {
+    log_lock();
     s_level = level;
+    log_unlock();
 }
 
 int iv_log_get_level(void)
 {
-    return s_level;
+    int level;
+
+    log_lock();
+    level = s_level;
+    log_unlock();
+    return level;
 }
 
 int iv_log_set_root(const char *root)
 {
+    int ret = 0;
+
+    log_lock();
     file_reset();
     s_file_warned = 0;
 
     if (!root || !*root) {
         s_root[0]    = '\0';
         s_last_purge = 0;
-        return 0;
+    } else if (strlen(root) >= sizeof(s_root)) {
+        ret = -1;
+    } else {
+        memcpy(s_root, root, strlen(root) + 1u);
+        s_last_purge = 0;
     }
-    if (strlen(root) >= sizeof(s_root))
-        return -1;
+    log_unlock();
 
-    memcpy(s_root, root, strlen(root) + 1u);
-    s_last_purge = 0;
-    return 0;
+    return ret;
 }
 
-const char *iv_log_get_root(void)
+int iv_log_get_root(char *out, size_t cap)
 {
-    return s_root;
+    size_t len;
+    int    ret = 0;
+
+    if (out == NULL || cap == 0u)
+        return -1;
+
+    log_lock();
+    len = strlen(s_root) + 1u;
+    if (len > cap)
+        ret = -1;
+    else
+        memcpy(out, s_root, len);
+    log_unlock();
+    return ret;
 }
 
 void iv_log_set_keep_days(unsigned days)
 {
+    log_lock();
     s_keep_days  = days;
     s_last_purge = 0;
+    log_unlock();
 }
 
 unsigned iv_log_get_keep_days(void)
 {
-    return s_keep_days;
+    unsigned days;
+
+    log_lock();
+    days = s_keep_days;
+    log_unlock();
+    return days;
+}
+
+/* 单个小时文件的字节上限。0 = 不限制（默认 1 MiB，见 iv_log.h） */
+void iv_log_set_file_max(size_t max_bytes)
+{
+    log_lock();
+    s_file_max = max_bytes;
+    log_unlock();
 }
 
 int iv_log_purge(void)
 {
-    char           cutoff[IV_LOG_DATE_LEN + 1];
-    DIR           *d;
-    struct dirent *e;
-    int            removed = 0;
+    long removed;
 
-    s_last_purge = time(NULL);
+    log_lock();
+    removed = purge_locked();
+    log_unlock();
 
-    if (!s_root[0] || s_keep_days == 0u)
-        return 0;
-    if (cutoff_day(s_keep_days, cutoff, sizeof(cutoff)) != 0)
-        return -1;
-
-    d = opendir(s_root);
-    if (!d)
-        return -1; /* 目录还没建：等价于无过期内容 */
-
-    while ((e = readdir(d)) != NULL) {
-        char        path[IV_LOG_PATH_MAX];
-        struct stat st;
-
-        if (!is_date_name(e->d_name))
-            continue;
-        if (strcmp(e->d_name, cutoff) >= 0)
-            continue; /* 保留期内（含 cutoff 当天） */
-        if (join2(path, sizeof(path), s_root, e->d_name) != 0)
-            continue;
-        if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode))
-            continue;
-
-        if (drop_day_dir(path) == 0)
-            removed++;
-    }
-    closedir(d);
-
-    return removed;
+    return (int)removed;
 }
 
 void iv_log_set_stderr(int enable)
 {
+    log_lock();
     s_stderr = enable;
+    log_unlock();
 }
 
 void iv_log_set_window(uint32_t seconds)
 {
+    log_lock();
     s_window = seconds;
+    log_unlock();
 }
 
 void iv_log_set_sink(iv_log_sink_t sink, void *user)
 {
+    log_lock();
     s_sink      = sink;
     s_sink_user = user;
+    log_unlock();
 }
 
 void iv_log_write(int level, const char *module, const char *fmt, ...)
 {
-    char    body[IV_LOG_MSG_MAX];
-    va_list ap;
+    char        body[IV_LOG_MSG_MAX];
+    char        module_buf[IV_LOG_IDENT_MAX];
+    const char *emit_module = module;
+    int         enabled;
+    va_list     ap;
 
-    if (level > s_level)
+    /* 级别和默认 ident 都是可并发修改的全局状态：必须在锁内读取。
+     * ident 复制到栈上后再解锁，避免格式化期间引用可变全局缓冲。 */
+    log_lock();
+    enabled = (level <= s_level);
+    if (enabled && emit_module == NULL) {
+        memcpy(module_buf, s_ident, sizeof(module_buf));
+        emit_module = module_buf;
+    }
+    log_unlock();
+    if (!enabled)
         return;
-    if (!module)
-        module = s_ident;
 
     va_start(ap, fmt);
     fmt_body(body, sizeof(body), fmt, ap);
     va_end(ap);
 
-    emit(level, module, body);
+    log_lock();
+    /* 格式化期间运行级别可能被收紧；最终出口前再判一次，保证设置生效后不漏出
+     * 一条旧级别消息。 */
+    if (level <= s_level)
+        emit(level, emit_module, body);
+    log_unlock();
 }
 
 void iv_log_code(int level, const char *module, uint32_t code, const char *fmt, ...)
 {
-    char    body[IV_LOG_BODY_MAX];
-    char    prev[IV_LOG_BODY_MAX];
-    uint32_t key;
-    time_t   now;
+    char         body[IV_LOG_BODY_MAX];
+    char         prev[IV_LOG_BODY_MAX];
+    char         module_buf[IV_LOG_IDENT_MAX];
+    const char  *emit_module = module;
+    uint32_t     key;
+    uint64_t     now;
     iv_sup_ent_t *e;
-    va_list ap;
+    int          enabled;
+    va_list      ap;
 
-    if (level > s_level)
+    log_lock();
+    enabled = (level <= s_level);
+    if (enabled && emit_module == NULL) {
+        memcpy(module_buf, s_ident, sizeof(module_buf));
+        emit_module = module_buf;
+    }
+    log_unlock();
+    if (!enabled)
         return;
-    if (!module)
-        module = s_ident;
 
     va_start(ap, fmt);
     {
@@ -539,64 +699,79 @@ void iv_log_code(int level, const char *module, uint32_t code, const char *fmt, 
     }
     va_end(ap);
 
-    if (s_window == 0u) {
-        /* 抑制关闭：逐条输出 */
-        emit(level, module, body);
+    log_lock();
+
+    if (level > s_level) {
+        log_unlock();
         return;
     }
 
-    key = sup_key(module, code);
-    now = time(NULL);
+    if (s_window == 0u) {
+        /* 抑制关闭：逐条输出 */
+        emit(level, emit_module, body);
+        log_unlock();
+        return;
+    }
+
+    key = sup_key(emit_module, code);
+    now = now_mono_ms();
     e   = sup_find(key);
     if (!e) {
         /* 首次 */
-        e        = sup_slot();
-        e->used  = 1;
-        e->key   = key;
-        e->first = now;
-        e->count = 1;
-        emit(level, module, body);
+        e           = sup_slot();
+        e->used     = 1;
+        e->key      = key;
+        e->first_ms = now;
+        e->count    = 1;
+        emit(level, emit_module, body);
+        log_unlock();
         return;
     }
 
-    if (now - e->first < (time_t)s_window) {
-        /* 窗口内：静默计数 */
+    if (now - e->first_ms < (uint64_t)s_window * 1000u) {
+        /* 窗口内：静默计数（单调差，墙钟回拨不影响窗口） */
         e->count++;
+        log_unlock();
         return;
     }
 
     /* 窗口过期：先补计数行，再按新窗口打本次首次行 */
     snprintf(prev, sizeof(prev), "%s(0x%08X): x%u in %lds",
              iv_strerror(code), (unsigned)code, (unsigned)e->count,
-             (long)(now - e->first));
-    emit(level, module, prev);
-    e->first = now;
+             (long)((now - e->first_ms) / 1000u));
+    emit(level, emit_module, prev);
+    e->first_ms = now;
     e->count = 1;
-    emit(level, module, body);
+    emit(level, emit_module, body);
+    log_unlock();
 }
 
 void iv_log_recover(const char *module, uint32_t code)
 {
-    char    body[IV_LOG_BODY_MAX];
-    uint32_t key;
+    char         body[IV_LOG_BODY_MAX];
+    uint32_t     key;
     iv_sup_ent_t *e;
 
+    log_lock();
     if (!module)
-        module = s_ident;
+        module = s_ident; /* 只在持锁区间内引用内部缓冲 */
 
     key = sup_key(module, code);
-    e   = sup_find(key);
-    if (!e)
+    e = sup_find(key);
+    if (!e) {
+        log_unlock();
         return; /* 无记录：静默 */
+    }
 
     if (e->count > 1u) {
-        /* 窗口内有静默计数：补恢复行 */
-        time_t now = time(NULL);
+        /* 窗口内有静默计数：补恢复行（已静默时长用单调差） */
+        uint64_t now = now_mono_ms();
 
         snprintf(body, sizeof(body), "%s(0x%08X): recovered, x%u in %lds",
                  iv_strerror(code), (unsigned)code, (unsigned)e->count,
-                 (long)(now - e->first));
+                 (long)((now - e->first_ms) / 1000u));
         emit(LOG_INFO, module, body);
     }
     e->used = 0;
+    log_unlock();
 }

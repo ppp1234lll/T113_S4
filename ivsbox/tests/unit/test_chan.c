@@ -11,8 +11,9 @@
  *     剩余预算继续等、不会把已花掉的时间丢掉重来**。
  *   - 接听点：真实 listen/connect/accept，覆盖 0660 权限落实、非 socket 路径拒绝
  *     （且**不删除该文件**）、残留 socket 重建、父目录缺失、路径过长，
- *     **backlog 满时 connect 返回可重试的 IV_EBUSY**，以及
- *     **listen_close(fd, NULL) 只关 fd 不删路径**。
+ *     **backlog 满时 connect 返回可重试的 IV_EBUSY**，
+ *     **listen_close(fd, NULL) 只关 fd 不删路径**，以及**关闭时的身份校验**（S7-01）：
+ *     路径对象被替换或 fd 无效时绝不按路径 unlink。
  *   - 鉴权：白名单规则用纯函数测（脱离 socket），再用真实 accept 测一次"规则命中
  *     但 uid 不在名单 → IV_EAUTH，且**对端看到的是 EOF、收不到任何解释性回应**"。
  *
@@ -641,6 +642,119 @@ static void test_listen_paths_and_auth(void)
 
 /* --------------------------------------------------------------------------- */
 
+/* listen_close 的身份校验（S7-01）：只 unlink"仍是本 fd 对应的同一文件"
+ * （dev+ino，lstat 不跟随符号链接）的 socket；路径对象被替换或 fd 无效时，
+ * 绝不按路径删东西。 */
+static void test_listen_close_identity(void)
+{
+    char       dir[] = "/tmp/ivchanidXXXXXX";
+    char       path[160];
+    struct stat st;
+    int        lfd;
+    int        lfd2;
+
+    if (mkdtemp(dir) == NULL) {
+        fprintf(stderr, "FAIL: mkdtemp() for identity test: %s\n", strerror(errno));
+        g_fail++;
+        return;
+    }
+    (void)snprintf(path, sizeof path, "%s/ctl", dir);
+
+    /* ① 常规关闭：身份一致 → socket 文件被清理
+     *    （test_listen_paths_and_auth 里已有同断言，这里独立复测一遍基准行为） */
+    lfd = iv_chan_listen(path, 0u, 0u);
+    chk(lfd >= 0, "identity: listen succeeds");
+    if (lfd >= 0) {
+        chk(iv_chan_listen_close(lfd, path) == IV_OK, "identity: normal close returns OK");
+        chk(stat(path, &st) != 0, "identity: socket file removed when identity matches");
+    }
+
+    /* ② 外来 fd + 正确 path：只能关闭外来 fd，不能消费登记或删除监听点。 */
+    lfd = iv_chan_listen(path, 0u, 0u);
+    chk(lfd >= 0, "identity: listen for foreign-fd case");
+    if (lfd >= 0) {
+        int pfd[2];
+        int prc = pipe(pfd);
+
+        chk(prc == 0, "identity: create foreign fd");
+        if (prc == 0) {
+            chk(iv_chan_listen_close(pfd[0], path) == IV_OK,
+                "identity: foreign fd close returns OK");
+            (void)close(pfd[1]);
+            chk(stat(path, &st) == 0 && S_ISSOCK(st.st_mode),
+                "identity: foreign fd cannot remove the live listener path");
+        }
+        chk(iv_chan_listen_close(lfd, path) == IV_OK,
+            "identity: owning fd still removes its registered path");
+    }
+
+    /* ③ 负 fd + 正确 path：不得消费登记或删除监听点。 */
+    lfd = iv_chan_listen(path, 0u, 0u);
+    chk(lfd >= 0, "identity: listen for negative-fd case");
+    if (lfd >= 0) {
+        chk(iv_chan_listen_close(-1, path) == IV_OK,
+            "identity: negative fd close returns OK");
+        chk(stat(path, &st) == 0 && S_ISSOCK(st.st_mode),
+            "identity: negative fd leaves the live listener path intact");
+        chk(iv_chan_listen_close(lfd, path) == IV_OK,
+            "identity: registration survives the negative-fd attempt");
+    }
+
+    /* ④ 同进程旧监听点被新监听点替换：旧 fd 关闭不能删除新 fd 的路径。 */
+    lfd = iv_chan_listen(path, 0u, 0u);
+    chk(lfd >= 0, "identity: first listen for same-process replacement");
+    lfd2 = iv_chan_listen(path, 0u, 0u);
+    chk(lfd2 >= 0, "identity: second listen replaces the path");
+    if (lfd >= 0) {
+        chk(iv_chan_listen_close(lfd, path) == IV_OK,
+            "identity: closing old fd does not claim the new registration");
+        chk(stat(path, &st) == 0 && S_ISSOCK(st.st_mode),
+            "identity: new listener path survives old-fd close");
+    }
+    if (lfd2 >= 0)
+        chk(iv_chan_listen_close(lfd2, path) == IV_OK,
+            "identity: new fd removes its own path");
+
+    /* ⑤ 服务生存期内路径被替换：先取 listen fd，再把它 bind 的 socket 换成
+     *    同路径上的普通文件 → 身份不符 → close 不删新对象、静默返回 */
+    lfd = iv_chan_listen(path, 0u, 0u);
+    chk(lfd >= 0, "identity: listen again for replacement case");
+    if (lfd >= 0) {
+        FILE *f;
+
+        (void)unlink(path); /* 模拟"路径对象被人重建/替换" */
+        f = fopen(path, "w");
+        chk(f != NULL, "identity: place a plain file on the same path");
+        if (f != NULL) {
+            (void)fputs("x", f);
+            (void)fclose(f);
+        }
+
+        chk(iv_chan_listen_close(lfd, path) == IV_OK,
+            "identity: close is silent on a replaced path object");
+        chk(stat(path, &st) == 0 && S_ISREG(st.st_mode),
+            "identity: the replacement plain file survives listen_close");
+    }
+
+    /* ⑥ 无登记的坏 fd + 普通文件：一律不删 */
+    {
+        FILE *f = fopen(path, "w");
+        chk(f != NULL, "identity: place a plain file for the bad-fd case");
+        if (f != NULL) {
+            (void)fputs("y", f);
+            (void)fclose(f);
+        }
+    }
+    chk(iv_chan_listen_close(-1, path) == IV_OK, "identity: bad-fd close returns OK");
+    chk(stat(path, &st) == 0, "identity: bad-fd close does not touch the path object");
+
+    /* 清理（规则 6：不留临时文件） */
+    (void)unlink(path);
+    (void)rmdir(dir);
+}
+
+/* --------------------------------------------------------------------------- */
+
 int main(void)
 {
     test_header_layout();
@@ -652,12 +766,13 @@ int main(void)
     test_recv_timeout();
     test_recv_timeout_absorbs_eintr();
     test_listen_paths_and_auth();
+    test_listen_close_identity();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_chan failed (%d check(s))\n", g_fail);
         return 1;
     }
     printf("test_chan passed (header layout, codec, acl, seqpacket io, full payload, "
-           "backlog, timeout, EINTR, listen paths)\n");
+           "backlog, timeout, EINTR, listen paths, listen_close identity)\n");
     return 0;
 }

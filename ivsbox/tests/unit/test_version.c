@@ -76,7 +76,7 @@ int main(void)
             "invalid flag => suffix degraded to 'unknown'");
     }
 
-    /* 3) 幂等 + 长度约束（内部缓冲 64 字节，且必须是单行） */
+    /* 3) 幂等 + 长度约束（编译期常量串，长度有界且必须是单行） */
     v2 = iv_version_string();
     chk(strcmp(v, v2) == 0, "repeated calls return identical content");
     n = strlen(v);

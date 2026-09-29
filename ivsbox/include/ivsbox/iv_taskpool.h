@@ -33,9 +33,8 @@
  *     - 任务的 cancel 标志（reactor 写 / worker 读）。
  *   它们之间没有锁提供 happens-before，裸读写会被 ThreadSanitizer 判成数据竞争。
  *   说"良性"没用——`make tsan` 会照样报，噪声一多就没人看真问题了。
- *   S4 的 iv_reactor_progress 用 volatile 表达"别人会改"，本模块要过 TSan，
- *   因此升级成真正的原子访问。armv5/armv7 上 4 字节 relaxed 访问是单条 ldr，
- *   不会把 libatomic 引进来。
+ *   S4 的 iv_reactor_progress 与本模块统一使用真正的原子访问。armv5/armv7 上
+ *   4 字节 relaxed 访问是单条 ldr/str，不会把 libatomic 引进来。
  *
  * 一个必须知道的调用契约：worker 完成后**不**直接释放槽位，而是把槽位置为 DONE
  * 并写 eventfd；调用方必须在 reactor 里挂 eventfd 读事件并调 `iv_taskpool_process()`
@@ -70,12 +69,20 @@ typedef struct iv_task_ctx {
                                * iv_task_canceled(ctx) —— 那是原子读，裸读会在
                                * TSan 下报竞争。池子不会强行打断已开工的任务，
                                * 长任务必须在循环里周期检查，短任务可忽略。 */
+    volatile uint32_t *heartbeat; /* 内部用：指向所属 worker 的进度号计数器（该
+                               * 计数器本身是 volatile 限定的，见 worker 定义）；
+                               * 未挂接时 NULL。任务函数**不要直接碰它**，喂心跳
+                               * 请调下面的 iv_task_heartbeat(ctx)。 */
     void         *result;     /* 结果缓冲，池内提供，容量 IV_TASKPOOL_RESULT_MAX */
     size_t        result_cap; /* == IV_TASKPOOL_RESULT_MAX */
     size_t        result_len; /* 任务函数填写实际写入长度；未用则保持 0 */
 } iv_task_ctx_t;
 
-/* 任务函数：worker 线程内执行。返回 IV_OK 表示成功，其他值原样回传给完成回调。 */
+/* 任务函数：worker 线程内执行。返回 IV_OK 表示成功，其他值原样回传给完成回调。
+ * **长任务契约**：能够循环推进的长计算应周期性调用 iv_task_heartbeat(ctx)；
+ * 单次 DNS/SNMP/ONVIF 等阻塞调用无法主动心跳，必须给 req.timeout_ms 设置覆盖其
+ * 最坏耗时的端到端截止时间。任务运行且尚未越过该截止时间时，health 将其视为
+ * 有效租约，不会仅因 worker 进度号未变而误判；越过截止时间后恢复正常判死。 */
 typedef int (*iv_task_fn)(iv_task_ctx_t *ctx);
 
 /* 检查取消请求（relaxed 原子读，跨线程安全）。
@@ -89,6 +96,14 @@ static inline int iv_task_canceled(const iv_task_ctx_t *ctx)
 #endif
 }
 
+/* 任务心跳（relaxed 原子 +1，跨线程安全）：向所属 worker 的进度号 +1，让健康线程
+ * （iv_health）把"正在干长活"与"worker 卡死"区分开。
+ *   - 能够拆成循环的长计算建议周期 <= health stuck_ms/3；无法插入心跳的单次
+ *     阻塞调用改用 req.timeout_ms 的运行期健康租约，不能把无限阻塞伪装成健康。
+ *   - 只在 worker 线程内的任务函数里调用（ctx 由 fn 的入参给出）。
+ *   - ctx 为 NULL 或 heartbeat 未挂接（例如调用方自建的 ctx）时是空操作。 */
+void iv_task_heartbeat(iv_task_ctx_t *ctx);
+
 /* 完成回调：**reactor 线程内**执行（在 iv_taskpool_process 里逐个调用）。
  * result 只在本次回调期间有效，需要留存请自行拷贝。 */
 typedef void (*iv_task_done_fn)(uint64_t id, int rc, const void *result,
@@ -101,9 +116,10 @@ typedef struct iv_task_req {
                                   * 临时字符串也安全，无需保证长寿。 */
     iv_task_fn       fn;         /* 必填，为 NULL 则 submit 失败 */
     void            *arg;        /* 传给 fn 的上下文，可为 NULL */
-    uint32_t         timeout_ms; /* 从提交时刻起的截止时间；**0 = 不限**。
-                                  * 语义是「开工准入」：worker 取出时若已过期就
-                                  * 不执行、直接以 IV_ETIMEDOUT 完成。 */
+    uint32_t         timeout_ms; /* 从提交时刻起的端到端截止时间；**0 = 不限**。
+                                  * worker 取出时若已过期就不执行、直接以
+                                  * IV_ETIMEDOUT 完成；已开工时该绝对截止时间同时
+                                  * 是 health 的阻塞任务租约（不会强制中断任务）。 */
     iv_task_done_fn  on_done;    /* 完成回调，可为 NULL */
     void            *on_done_arg;
 } iv_task_req_t;
@@ -165,11 +181,17 @@ int iv_taskpool_process(iv_taskpool_t *pool, int max);
  * 只读诊断（可跨线程，内部自有同步）
  * ------------------------------------------------------------------------- */
 
-/* worker 进度号：每完成一个任务、或每次空闲超时轮询都 +1。
+/* worker 进度号：每完成一个任务、或每次空闲超时轮询都 +1；任务执行期间，任务
+ * 函数每调一次 iv_task_heartbeat() 也 +1（长任务靠这个避免被健康线程误判）。
  * 读侧判断"是否前进"必须用差值语义：if ((uint32_t)(now - last) != 0) {...}
  * 理由同 iv_reactor_progress（armv7 上 32 位对齐读天然原子；空闲也推进是为了
  * 让 S6 能区分"空闲"与"死锁"）。idx 越界返回 0。 */
 uint32_t iv_taskpool_worker_progress(const iv_taskpool_t *pool, int idx);
+
+/* worker 当前任务的端到端绝对截止时刻（CLOCK_MONOTONIC 毫秒）。运行的是有界
+ * 任务时返回非 0；空闲、任务 timeout_ms=0 或 idx 越界返回 0。内部加锁快照，
+ * 允许 health 线程跨线程调用。 */
+uint64_t iv_taskpool_worker_deadline(const iv_taskpool_t *pool, int idx);
 
 int iv_taskpool_worker_count(const iv_taskpool_t *pool);
 

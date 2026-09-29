@@ -7,9 +7,13 @@
  *      （延迟释放路径，真正的验证靠 `make asan` —— 立即 free 会在这里报 use-after-free）；
  *   3) 定时器：同刻多个到期全部触发、取消后不触发、回调里取消自己、
  *      回调里重挂自己、上限（IV_REACTOR_TIMER_MAX）拒绝、全部回收；
- *   4) 进度号：空闲轮（无任何 fd 事件）同样递增 —— S6 健康线程判活的前提；
- *   5) SIGTERM：从回调内投递，run 以 IV_OK 正常返回、后续定时器不再执行；
- *   6) EINTR：SIGALRM 打断 epoll_wait 后主循环继续（不得当成致命错误退出）。
+ *   4) 取消远期定时器：到期批次的压缩回收已取消节点，句柄随即失效，
+ *      不再触碰后干净退出（ASan 下无 UAF / 泄漏）；
+ *   5) 句柄归属：跨 reactor 实例的 mod / del / cancel 一律 IV_EINVAL，
+ *      归属实例的操作照常；
+ *   6) 进度号：空闲轮（无任何 fd 事件）同样递增 —— S6 健康线程判活的前提；
+ *   7) SIGTERM：从回调内投递，run 以 IV_OK 正常返回、后续定时器不再执行；
+ *   8) EINTR：SIGALRM 打断 epoll_wait 后主循环继续（不得当成致命错误退出）。
  *
  * 说明：
  *   - 本测试不调用 iv_log_init，并显式关闭落盘出口，避免在宿主机 mkdir 默认
@@ -381,7 +385,9 @@ static void test_timers(void)
     chk(iv_timer_add(c.r, 20u, cb_t_same, &c) != NULL, "same-instant timer 2");
     chk(iv_timer_add(c.r, 20u, cb_t_same, &c) != NULL, "same-instant timer 3");
 
-    /* 取消：不得再触发；重复取消报 IV_ENOENT（句柄因惰性回收仍然有效） */
+    /* 取消：不得再触发；紧邻的重复取消在"节点尚未被回收"的窗口内
+     * 返回 IV_ENOENT（尽力而为的防御，契约见 iv_reactor.h：cancel 成功后
+     * 句柄即视为失效，之后任何再使用都是 UB） */
     ct = iv_timer_add(c.r, 30u, cb_t_canceled, &c);
     chk(ct != NULL, "cancelable timer added");
     chk(iv_timer_cancel(c.r, ct) == IV_OK, "cancel ok");
@@ -406,7 +412,97 @@ static void test_timers(void)
 }
 
 /* ---------------------------------------------------------------------------
- * 6) 进度号：空闲轮同样递增
+ * 6) 取消远期定时器：到期批次的压缩(compaction)回收已取消节点，
+ *    此后句柄失效——回归用例验证"不再触碰失效句柄"路径干净退出
+ *    （真正的验证靠 `make asan`：若 compaction 后仍有代码引用该节点，
+ *    会当场报 use-after-free）
+ * ------------------------------------------------------------------------- */
+
+static void cb_should_not_run(void *arg); /* 定义在文件后部（L548 附近），此处前置声明 */
+
+static void test_cancel_far_timer(void)
+{
+    iv_reactor_t   *r = iv_reactor_create(4);
+    struct stopctx  stop;
+    struct stopctx  far_t;
+    iv_timer_t     *t_near;
+    iv_timer_t     *t_far;
+    int             rc;
+
+    chk(r != NULL, "create for cancel-far-timer case");
+    if (r == NULL)
+        return;
+
+    memset(&stop, 0, sizeof(stop));
+    memset(&far_t, 0, sizeof(far_t));
+    stop.r  = r;
+    far_t.r = r;
+
+    /* 近定时器负责让 run 走完一个到期批次；远定时器 cancel 后留在堆里，
+     * 会被该批次末尾的 compact_canceled 释放 */
+    t_near = iv_timer_add(r, 60u, cb_stop, &stop);
+    t_far  = iv_timer_add(r, 10000u, cb_should_not_run, &far_t);
+    chk(t_near != NULL && t_far != NULL, "near/far timers added");
+
+    chk(iv_timer_cancel(r, t_far) == IV_OK, "cancel far timer ok");
+
+    /* 此刻起 t_far 已失效（契约），刻意不再触碰：无重复 cancel、无比较、
+     * 无任何解引用——ASan 下无 UAF、无泄漏即通过 */
+    rc = iv_reactor_run(r);
+    chk(rc == IV_OK, "run returns IV_OK after far cancel");
+    chk(stop.fired == 1, "near stop timer fired exactly once");
+    chk(far_t.fired == 0, "canceled far timer never fired");
+    chk(iv_reactor_timer_count(r) == 0, "far node reclaimed by compaction");
+
+    iv_reactor_destroy(r);
+}
+
+/* ---------------------------------------------------------------------------
+ * 7) 句柄归属：跨 reactor 实例使用 mod / del / cancel 必须被拒绝
+ * ------------------------------------------------------------------------- */
+
+static void test_cross_reactor(void)
+{
+    iv_reactor_t *r1 = iv_reactor_create(4);
+    iv_reactor_t *r2 = iv_reactor_create(4);
+    iv_event_t   *ev;
+    iv_timer_t   *tm;
+    int           fd = efd_new();
+
+    chk(r1 != NULL && r2 != NULL, "create two reactors for cross case");
+    chk(fd >= 0, "eventfd created for cross case");
+    if (r1 == NULL || r2 == NULL || fd < 0) {
+        if (r1 != NULL)
+            iv_reactor_destroy(r1);
+        if (r2 != NULL)
+            iv_reactor_destroy(r2);
+        if (fd >= 0)
+            (void)close(fd);
+        return;
+    }
+
+    ev = iv_reactor_add(r1, fd, IV_EV_READ, cb_noop_event, NULL);
+    tm = iv_timer_add(r1, 10000u, cb_noop_timer, NULL);
+    chk(ev != NULL && tm != NULL, "register event + timer on r1");
+
+    /* 跨实例操作：全部拒绝（IV_EINVAL），r2 的内部状态不得被触碰 */
+    chk(iv_reactor_mod(r2, ev, IV_EV_READ) == IV_EINVAL, "mod event via wrong reactor");
+    chk(iv_reactor_del(r2, ev) == IV_EINVAL, "del event via wrong reactor");
+    chk(iv_timer_cancel(r2, tm) == IV_EINVAL, "cancel timer via wrong reactor");
+
+    /* 归属 reactor 的自身操作照常 */
+    chk(iv_reactor_mod(r1, ev, IV_EV_READ | IV_EV_WRITE) == IV_OK,
+        "mod via owning reactor ok");
+    chk(iv_timer_cancel(r1, tm) == IV_OK, "cancel via owning reactor ok");
+    chk(iv_reactor_del(r1, ev) == IV_OK, "del via owning reactor ok");
+
+    iv_reactor_destroy(r1);
+    iv_reactor_destroy(r2);
+    (void)close(fd);
+}
+
+/* ---------------------------------------------------------------------------
+ * 8) 进度号：空闲轮同样递增
  * ------------------------------------------------------------------------- */
 
 static void test_idle_progress(void)
@@ -440,7 +536,7 @@ static void test_idle_progress(void)
 }
 
 /* ---------------------------------------------------------------------------
- * 7) SIGTERM 优雅退出
+ * 9) SIGTERM 优雅退出
  * ------------------------------------------------------------------------- */
 
 static void cb_terminate(void *arg)
@@ -484,7 +580,7 @@ static void test_sigterm(void)
 }
 
 /* ---------------------------------------------------------------------------
- * 8) EINTR：信号打断 epoll_wait 不算致命错误
+ * 10) EINTR：信号打断 epoll_wait 不算致命错误
  * ------------------------------------------------------------------------- */
 
 static void on_sigalrm(int sig)
@@ -540,6 +636,8 @@ int main(void)
     test_fd_event();
     test_batch_del();
     test_timers();
+    test_cancel_far_timer();
+    test_cross_reactor();
     test_idle_progress();
     test_sigterm();
     test_eintr();

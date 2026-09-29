@@ -13,7 +13,9 @@
  *      也不用改"的预防性令牌，见 iv_chan_send 的说明。）
  *   3. **不依赖 errno 做返回码**。对外返回 iv_ret.h 的负数码，errno 保留原值
  *      供调用方诊断（两者互不覆盖）。理由：调用方不该被迫 include <errno.h>
- *      才能区分"超时"和"被拒"。
+ *      才能区分"超时"和"被拒"。**所有失败路径均保证 errno 为原始系统调用的
+ *      值** —— 凡失败路径上还要调 close()/unlink() 这类可能改写 errno 的清理
+ *      调用，都必须先存后还（S7-03）。
  */
 #include <errno.h>
 #include <poll.h>
@@ -25,8 +27,117 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <stdatomic.h>
+
 #include "ivsbox/iv_chan.h"
 #include "ivsbox/iv_ret.h"
+
+/* ---------------------------------------------------------------------------
+ * 接听点身份登记（S7-01）
+ * ------------------------------------------------------------------------- */
+
+/*
+ * listen 成功后记录"本次 bind 在 path 上创建的 socket 文件"的 dev+ino；
+ * listen_close 只有在路径上**仍是同一个文件**时才 unlink。
+ *
+ * 为什么不能在 close 时拿 fd 与路径比对：AF_UNIX 套接字 fd 的 fstat() 返回的
+ * 是 sockfs 伪文件系统的 inode，与 bind() 在路径上创建的那个文件 inode 无关，
+ * 两者永不相等——身份必须在 bind 时刻从路径上取。
+ *
+ * 表满 / lstat 失败时不登记，close 侧宁可不动文件系统（宁漏删、不误删）。
+ * 登记只在进程内有效；进程被 kill -9 时登记随进程消失，路径残留本来就是
+ * listen() 里"上一个 socket 文件"分支处理的场景。
+ */
+#define IV_CHAN_SOCKID_MAX 8
+
+typedef struct {
+    int    used;
+    int    fd;
+    dev_t  dev;
+    ino_t  ino;
+    char   path[108]; /* == sizeof(((struct sockaddr_un *)0)->sun_path) */
+} sockid_ent_t;
+
+static sockid_ent_t s_sockid[IV_CHAN_SOCKID_MAX];
+static atomic_flag  s_sockid_lock = ATOMIC_FLAG_INIT;
+
+static void sockid_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_sockid_lock, memory_order_acquire))
+        ;
+}
+
+static void sockid_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_sockid_lock, memory_order_release);
+}
+
+/* listen 尾部登记本次接听点身份。fd 若被调用方绕过本模块直接关闭并复用，
+ * 新登记会先清掉该 fd 的旧记录；同一路径的其他活动 fd 记录必须保留，
+ * 这样“旧 fd 关闭时不能删除新 fd 重建的路径”才能成立。 */
+static void sockid_record(int fd, const char *path)
+{
+    struct stat st;
+    int         i;
+
+    if (lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode))
+        return; /* 取不到身份就不登记：close 侧会宁可不删 */
+
+    sockid_lock();
+    for (i = 0; i < IV_CHAN_SOCKID_MAX; i++) {
+        if (s_sockid[i].used && s_sockid[i].fd == fd)
+            s_sockid[i].used = 0; /* 同一个数字 fd 的陈旧记录 */
+    }
+    for (i = 0; i < IV_CHAN_SOCKID_MAX; i++) {
+        if (!s_sockid[i].used) {
+            s_sockid[i].used = 1;
+            s_sockid[i].fd   = fd;
+            s_sockid[i].dev  = st.st_dev;
+            s_sockid[i].ino  = st.st_ino;
+            memcpy(s_sockid[i].path, path, strlen(path) + 1u);
+            break;
+        }
+    }
+    sockid_unlock();
+}
+
+/*
+ * listen_close 侧按 fd 核销登记并判定身份：只有 fd 与 path 都匹配、且路径上
+ * 仍是登记过的那个 socket 文件时 *same 才置 1。外来 fd、负 fd、路径不符、
+ * 路径消失均不能消费别的监听器记录，更不能触发 unlink。
+ */
+static void sockid_take(int fd, const char *path, int *same)
+{
+    dev_t       dev = 0;
+    ino_t       ino = 0;
+    char        recorded_path[sizeof(s_sockid[0].path)];
+    struct stat st;
+    int         found = 0;
+    int         i;
+
+    *same = 0;
+    if (fd < 0)
+        return;
+
+    sockid_lock();
+    for (i = 0; i < IV_CHAN_SOCKID_MAX; i++) {
+        if (s_sockid[i].used && s_sockid[i].fd == fd) {
+            dev = s_sockid[i].dev;
+            ino = s_sockid[i].ino;
+            memcpy(recorded_path, s_sockid[i].path, sizeof(recorded_path));
+            s_sockid[i].used = 0;
+            found = 1;
+            break;
+        }
+    }
+    sockid_unlock();
+
+    if (!found || path == NULL || strcmp(recorded_path, path) != 0)
+        return;
+    if (lstat(path, &st) == 0 && S_ISSOCK(st.st_mode) &&
+        st.st_dev == dev && st.st_ino == ino)
+        *same = 1;
+}
 
 /* ---------------------------------------------------------------------------
  * 消息头工具
@@ -171,8 +282,10 @@ int iv_chan_listen(const char *path, unsigned mode, int backlog)
     memcpy(addr.sun_path, path, plen); /* 尾部靠上面的 memset 保证 NUL 结尾 */
 
     if (bind(fd, (struct sockaddr *)&addr, (socklen_t)sizeof(addr)) != 0) {
-        rc = (errno == ENOENT) ? IV_ENOENT : IV_EIO;
+        int saved = errno; /* close 会冲掉 errno，头文件承诺保留原值（S7-03） */
+        rc = (saved == ENOENT) ? IV_ENOENT : IV_EIO;
         (void)close(fd);
+        errno = saved;
         return rc;
     }
 
@@ -196,20 +309,40 @@ int iv_chan_listen(const char *path, unsigned mode, int backlog)
         return IV_EIO;
     }
 
+    /* 登记本次接听点身份（dev+ino，S7-01）：listen_close 据此只在"路径上仍是
+     * 我 bind 的那个文件"时才 unlink。 */
+    sockid_record(fd, path);
+
     return fd;
 }
 
 int iv_chan_listen_close(int listen_fd, const char *path)
 {
+    int same = 0;
     int rc = IV_OK;
+    int saved = 0;
 
-    if (listen_fd >= 0 && close(listen_fd) != 0)
-        rc = IV_EIO;
+    /* 身份判定（S7-01）：以 listen() 时刻登记的 dev+ino 为准，核销登记并检查
+     * 路径上是否仍是那个 socket 文件。替换成普通文件/别人的接听点 → same=0
+     * → 只关 fd、不动文件系统。外来 fd（非本模块 listen 创建）无登记，同样
+     * 不做文件清理。listen_fd < 0 时不核销任何登记，也不删路径。 */
+    sockid_take(listen_fd, path, &same);
 
-    /* path 为 NULL 时**只关 fd、不动文件系统**：避免"只想关连接却顺手删了
-     * 别人路径"这种意外。要清理接听点文件就必须显式把路径给出来。*/
-    if (path != NULL && unlink(path) != 0 && errno != ENOENT)
+    if (listen_fd >= 0 && close(listen_fd) != 0) {
+        saved = errno;
         rc = IV_EIO;
+        same = 0; /* fd 关闭失败时绝不顺带删除路径 */
+    }
+
+    /* 仅当路径对象仍是本 fd 的接听点文件才 unlink。path 为 NULL 时只关 fd、
+     * 不动文件系统。*/
+    if (same && unlink(path) != 0 && errno != ENOENT) {
+        saved = errno;
+        rc = IV_EIO;
+    }
+
+    if (rc != IV_OK)
+        errno = saved; /* 后续清理不得覆盖最先决定返回值的系统错误 */
 
     return rc;
 }
@@ -240,7 +373,9 @@ int iv_chan_accept(int listen_fd, const iv_chan_acl_t *acl, iv_chan_peer_t *peer
      * 鉴权依据而不是"参考信息"的原因。*/
     memset(&cred, 0, sizeof(cred));
     if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) != 0) {
+        int saved = errno; /* close 会冲掉 errno，保留原值供诊断（S7-03） */
         (void)close(fd);
+        errno = saved;
         return IV_EFAIL;
     }
 
@@ -298,15 +433,17 @@ int iv_chan_connect(const char *path)
     memcpy(addr.sun_path, path, plen);
 
     if (connect(fd, (struct sockaddr *)&addr, (socklen_t)sizeof(addr)) != 0) {
-        if (errno == ENOENT)
+        int saved = errno; /* close 会冲掉 errno，头文件承诺保留原值（S7-03） */
+        if (saved == ENOENT)
             rc = IV_ENOENT; /* 接听点不存在 = 服务没起 */
-        else if (errno == EACCES || errno == EPERM)
+        else if (saved == EACCES || saved == EPERM)
             rc = IV_EAUTH; /* 被文件权限这道门槛挡下 */
-        else if (errno == EAGAIN || errno == EWOULDBLOCK)
+        else if (saved == EAGAIN || saved == EWOULDBLOCK)
             rc = IV_EBUSY; /* backlog 满，稍后重试 */
         else
             rc = IV_ECONN;
         (void)close(fd);
+        errno = saved;
         return rc;
     }
 

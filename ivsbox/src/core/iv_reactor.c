@@ -14,6 +14,8 @@
  * 3) 取消定时器采用**惰性标记**：只置 canceled，不立即释放。
  *    因为节点还在堆里，提前释放会留下悬空指针；随后由"到期弹出"或
  *    "批次末尾压缩"两条路径回收，两条路径都保证没有定时器正在回调中。
+ *    代价是"取消成功返回后句柄立即失效"——节点随时可能被上述两条路径
+ *    回收，此后再使用该句柄（含重复 cancel）是 UB，契约见 iv_reactor.h。
  *
  * 4) fd 事件的注销采用**延迟释放**（zombie 链）：一次 epoll_wait 会返回一批
  *    事件，若某个回调里 del 掉了同一批中的另一个事件，立即 free 会让分发
@@ -55,6 +57,7 @@ struct iv_event {
     iv_event_fn  cb;
     void        *arg;
     int          active;  /* 1 = 句柄有效且已注册；0 = 已注销，等待回收 */
+    iv_reactor_t *owner;  /* 句柄归属：mod/del 校验 owner == r，防跨实例误用 */
     iv_event_t  *prev;    /* reactor 活性事件双向链表 */
     iv_event_t  *next;
     iv_event_t  *znext;   /* 待回收单向链表 */
@@ -66,6 +69,7 @@ struct iv_timer {
     void        *arg;
     int          canceled;    /* 惰性取消标记 */
     int          dispatched;  /* 1 = 正在回调中，禁止被回收 */
+    iv_reactor_t *owner;      /* 句柄归属：cancel 校验 owner == r，防跨实例误用 */
 };
 
 struct iv_reactor {
@@ -75,7 +79,7 @@ struct iv_reactor {
     struct epoll_event *epev;
     int          max_events;
     int          running;
-    volatile uint32_t progress;
+    uint32_t     progress;      /* 进度号：跨线程读取，仅经 __atomic_* 访问（见头文件） */
     int          dispatching;   /* >0：处于事件分发批次内 */
     iv_event_t  *ev_head;       /* 活性事件链表 */
     iv_event_t  *zombies;       /* 待回收事件链表 */
@@ -254,7 +258,7 @@ static void compact_canceled(iv_reactor_t *r)
 
 /* 按堆顶装定 timerfd；堆空则 disarm（it_value 全 0）。
  * 注意 it_value == 0 是"解除定时"的语义，因此"已到期"必须给一个非零最小值。 */
-static void arm_timer(iv_reactor_t *r)
+static int arm_timer(iv_reactor_t *r)
 {
     struct itimerspec its;
     uint64_t now;
@@ -269,7 +273,11 @@ static void arm_timer(iv_reactor_t *r)
         if (delta == 0u)
             its.it_value.tv_nsec = 1L;
     }
-    (void)timerfd_settime(r->tfd, 0, &its, NULL);
+    if (timerfd_settime(r->tfd, 0, &its, NULL) != 0) {
+        IV_LOG_E(REACTOR_MOD, "timerfd_settime failed, errno=%d", errno);
+        return IV_EFAIL;
+    }
+    return IV_OK;
 }
 
 /* 下次 epoll_wait 的等待毫秒：min(空闲兜底, 最近定时器剩余) */
@@ -510,6 +518,7 @@ iv_event_t *iv_reactor_add(iv_reactor_t *r, int fd, uint32_t events,
     ev->events = events;
     ev->cb = cb;
     ev->arg = arg;
+    ev->owner = r; /* 归属登记：mod/del 据此拒绝别的 reactor 拿句柄越权操作 */
 
     memset(&ee, 0, sizeof(ee));
     ee.events = to_epoll(events);
@@ -532,8 +541,8 @@ int iv_reactor_mod(iv_reactor_t *r, iv_event_t *ev, uint32_t events)
 
     if (r == NULL || ev == NULL)
         return IV_EINVAL;
-    if (ev->active == 0)
-        return IV_ENOENT;
+    if (ev->active == 0 || ev->owner != r)
+        return IV_EINVAL; /* 句柄已注销或不属于本 reactor */
     if ((events & (IV_EV_READ | IV_EV_WRITE)) == 0u)
         return IV_EINVAL;
 
@@ -552,8 +561,8 @@ int iv_reactor_del(iv_reactor_t *r, iv_event_t *ev)
 {
     if (r == NULL || ev == NULL)
         return IV_EINVAL;
-    if (ev->active == 0)
-        return IV_ENOENT;
+    if (ev->active == 0 || ev->owner != r)
+        return IV_EINVAL; /* 句柄已注销或不属于本 reactor */
 
     if (epoll_ctl(r->epfd, EPOLL_CTL_DEL, ev->fd, NULL) != 0) {
         /* fd 已被调用方自己关闭时会拿到 EBADF/ENOENT：不阻断注销与回收 */
@@ -600,6 +609,7 @@ iv_timer_t *iv_timer_add(iv_reactor_t *r, uint32_t timeout_ms,
     t->deadline_ms = now_ms() + (uint64_t)timeout_ms;
     t->cb = cb;
     t->arg = arg;
+    t->owner = r; /* 归属登记：cancel 据此拒绝别的 reactor 拿句柄越权操作 */
 
     r->heap[r->heap_n] = t;
     r->heap_n++;
@@ -611,8 +621,10 @@ int iv_timer_cancel(iv_reactor_t *r, iv_timer_t *t)
 {
     if (r == NULL || t == NULL)
         return IV_EINVAL;
+    if (t->owner != r)
+        return IV_EINVAL; /* 句柄不属于本 reactor（先于 canceled 检查） */
     if (t->canceled != 0)
-        return IV_ENOENT;
+        return IV_ENOENT; /* 窗口内的重复取消：尽力而为的防御，不构成承诺 */
 
     /*
      * 只标记不释放：节点还在堆里，提前 free 会留下悬空指针。
@@ -654,14 +666,17 @@ int iv_reactor_run(iv_reactor_t *r)
         int timeout = next_timeout_ms(r);
         int n;
 
-        arm_timer(r);
+        if (arm_timer(r) != IV_OK)
+            return IV_EFAIL; /* 内部唤醒源失效，不能静默退化成 1s 轮询 */
         n = epoll_wait(r->epfd, r->epev, r->max_events, timeout);
 
         /*
          * 每轮（含超时返回的空轮）递增进度号，S6 健康线程据此判断主循环是否
          * 真实前进。刻意放在错误分支之前：被信号打断（EINTR）同样说明主循环在跑。
+         * 跨线程读取侧走 __atomic_load_n（见 iv_reactor_progress），写侧同样
+         * 用 __atomic 内建：裸读写会被 TSan 判成数据竞争。
          */
-        r->progress++;
+        (void)__atomic_add_fetch(&r->progress, 1u, __ATOMIC_RELAXED);
 
         if (n < 0) {
             if (errno == EINTR)
@@ -683,7 +698,9 @@ void iv_reactor_stop(iv_reactor_t *r)
 
 uint32_t iv_reactor_progress(const iv_reactor_t *r)
 {
-    return (r != NULL) ? r->progress : 0u;
+    if (r == NULL)
+        return 0u;
+    return (uint32_t)__atomic_load_n(&r->progress, __ATOMIC_RELAXED);
 }
 
 int iv_reactor_timer_count(const iv_reactor_t *r)

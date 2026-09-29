@@ -22,6 +22,11 @@
  *   首次观察只播种、不判死，否则启动瞬间必报故障。
  *   为什么"进度号不动"确实等价于"卡死"：Reactor 的 epoll_wait 与 worker 的
  *   cond_timedwait 都用有限超时，空闲期也会推进进度号 —— 这是 S4/S5 刻意埋的。
+ *   例外是正在执行、且尚未越过 req.timeout_ms 端到端截止时间的 worker：该绝对
+ *   deadline 是健康租约，允许 DNS/SNMP/ONVIF 这类单次阻塞调用在声明预算内不发
+ *   主动心跳。租约到期后恢复 stuck_ms 判定；timeout_ms 必须按真实最坏耗时加合理
+ *   余量填写，过大会等比例推迟卡死检出，不能用大值掩盖故障；timeout_ms=0 的长
+ *   任务仍须周期调用 iv_task_heartbeat()，不能用无限租约掩盖永久阻塞。
  *
  * 线程与信号：
  *   本模块**不注册任何信号处理**。装配顺序（S10）为
@@ -64,14 +69,21 @@ extern "C" {
 #define IV_HEALTH_INTERVAL_MS_DEFAULT  1000u  /* 每秒检查一次 */
 #define IV_HEALTH_WORKERS_MAX          8      /* == IV_TASKPOOL_WORKERS_MAX */
 
+/* 连续喂狗失败达到该次数 → fail-stop：关闭 watchdog fd、此后不再尝试喂狗（S6-01）。
+ * 喂狗失败（含被信号打断的 EINTR，同样按失败计数）只打日志不 fail-stop 的话，
+ * "fd 一直在但一次都写不进去"会静默耗完看门狗窗口，快照却还显示一切正常。*/
+#define IV_HEALTH_WD_FAIL_MAX 3u
+
 /* 故障快照。由 iv_health_snapshot() 加锁拷出，读侧拿到的是副本。 */
 typedef struct iv_health_snapshot {
     uint32_t reactor_progress;                   /* 最近一次检查时的进度号（未观察则为 0） */
     uint32_t worker_progress[IV_HEALTH_WORKERS_MAX];
     int      worker_count;                       /* 实际观察的 worker 数 */
-    int      fault_code;                         /* 上列故障码 */
+    int      fault_code;                         /* 上列故障码（只反映进度判定，不含 wd） */
     uint32_t tick_count;                         /* 已完成的检查轮数 */
-    int      watchdog_fd;                        /* < 0 表示未喂 / 已停喂 */
+    int      watchdog_fd;                        /* < 0 表示未喂 / 已停喂 / 已 fail-stop */
+    uint32_t wd_fail_streak;                     /* 连续喂狗失败次数（S6-01）；成功一次即清零 */
+    int      wd_io_fault;                        /* 1 = 喂狗 I/O 已失败过且未恢复；从未失败为 0 */
 } iv_health_snapshot_t;
 
 typedef struct iv_health iv_health_t;
@@ -120,8 +132,9 @@ int iv_health_snapshot(iv_health_t *h, iv_health_snapshot_t *out);
  *   调用方在此窗口内 close 了该 fd，而 fd 号已被别的 open 复用，就等于每秒向无关
  *   对象注入 0x00 字节。要关就在本函数**返回之后**关。
  *
- * fd **不**由本函数关闭（所有权始终在调用方）。但若已判死，线程自己已 close 过
- *   并把内部记录置为 -1；所以"还要不要我再 close"的安全判据是快照里的
+ * fd **不**由本函数关闭（所有权始终在调用方）。但若已判死，或喂狗连续失败达到
+ *   IV_HEALTH_WD_FAIL_MAX 触发 fail-stop（S6-01），线程自己已 close 过并把内部
+ *   记录置为 -1；所以"还要不要我再 close"的安全判据是快照里的
  *   `watchdog_fd < 0`（见 iv_health_snapshot_t）—— 已经是负数就别再 close，
  *   否则 double-close 可能误关一个被复用的 fd。
  *

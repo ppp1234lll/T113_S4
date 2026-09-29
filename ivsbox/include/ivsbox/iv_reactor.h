@@ -88,9 +88,12 @@ void iv_reactor_stop(iv_reactor_t *r);
 /* 进度号：每轮循环（含超时返回的空轮）递增 1。
  * **唯一允许跨线程调用的接口**。读侧判断"是否前进"必须用差值语义：
  *     if ((uint32_t)(now - last) != 0) { ... }   // 不能写 now > last
- * 类型刻意用 uint32_t：armv7 上对齐的 32 位读写天然原子，64 位会被拆成两条
- * 指令产生撕裂值，`_Atomic uint64_t` 又会引入 -latomic。回绕周期约 49 天
- * （按每秒 1 轮计），差值语义在回绕点依然正确。 */
+ * 实现走 __atomic 内建（relaxed 序）：语言级原子操作，与 S5 taskpool 的跨线程
+ * 纪律一致（volatile 裸读写会被 TSan 判成数据竞争）；armv7 上对齐的 32 位
+ * relaxed 访问是单指令，不引入 -latomic 依赖。类型仍用 uint32_t：64 位会被
+ * 拆成两条指令产生撕裂值，`_Atomic uint64_t` 同样可能引入 -latomic。回绕周期
+ * 约 49 天（按每秒 1 轮计），差值语义在回绕点依然正确。消费方只看"变化量"，
+ * 该量不作任何同步用途。 */
 uint32_t iv_reactor_progress(const iv_reactor_t *r);
 
 /* 诊断用只读计数：当前堆内定时器数量（含已取消待回收的） */
@@ -107,11 +110,15 @@ int iv_reactor_timer_count(const iv_reactor_t *r);
 iv_event_t *iv_reactor_add(iv_reactor_t *r, int fd, uint32_t events,
                            iv_event_fn cb, void *arg);
 
-/* 修改关注事件；对 oneshot 事件同时用于"重新激活"。事件不存在返回 IV_ENOENT。 */
+/* 修改关注事件；对 oneshot 事件同时用于"重新激活"。
+ * 在句柄仍有效期间，若它不属于该 reactor 或 events 无读写位，返回 IV_EINVAL。
+ * del 成功后的句柄已经失效，不得再传给本函数探测状态。 */
 int iv_reactor_mod(iv_reactor_t *r, iv_event_t *ev, uint32_t events);
 
 /* 注销并释放事件句柄。回调内注销自己或注销同一批里的其他事件都是安全的：
- * 句柄的释放会延迟到本批分发结束之后，分发循环不再回调已注销的事件。 */
+ * 句柄的释放会延迟到本批分发结束之后，分发循环不再回调已注销的事件。
+ * 在句柄仍有效期间，若它不属于该 reactor 则返回 IV_EINVAL。
+ * 成功返回后句柄立即失效，此后不得再使用（包括再次 del）。 */
 int iv_reactor_del(iv_reactor_t *r, iv_event_t *ev);
 
 /* ---------------------------------------------------------------------------
@@ -124,9 +131,13 @@ int iv_reactor_del(iv_reactor_t *r, iv_event_t *ev);
 iv_timer_t *iv_timer_add(iv_reactor_t *r, uint32_t timeout_ms,
                          iv_timer_fn cb, void *arg);
 
-/* 取消：惰性标记，保证回调不再触发；内存由 reactor 在到期弹出或销毁时回收。
+/* 取消：惰性标记，保证回调不再触发。
+ * **iv_timer_cancel 成功返回后句柄立即失效**：该节点会在之后任意一个到期批次
+ * 的整理（compaction）中被回收，此后再使用该句柄（包括再次 cancel）是未定义
+ * 行为。在节点尚未被回收的窗口内重复 cancel 尽力而为地返回 IV_ENOENT——
+ * 这只是防御，不构成可依赖的承诺。
  * 在定时器自己的回调里取消自己也是安全的（本次回调跑完才释放）。
- * 重复取消返回 IV_ENOENT。 */
+ * 句柄不属于该 reactor 返回 IV_EINVAL。 */
 int iv_timer_cancel(iv_reactor_t *r, iv_timer_t *t);
 
 #ifdef __cplusplus

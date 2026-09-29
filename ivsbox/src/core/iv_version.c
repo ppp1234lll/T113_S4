@@ -16,10 +16,25 @@
 #endif
 
 #define IV_VERSION_UNKNOWN  "unknown"
-#define IV_VERSION_BUF_MAX  64u
 
-static char s_version[IV_VERSION_BUF_MAX];
-static int  s_version_ready;
+/* 把版本数字宏展开成字符串字面量（两级宏：先展开参数再字符串化） */
+#define IVV_STR_(x) #x
+#define IVV_STR(x)  IVV_STR_(x)
+
+/*
+ * 两个编译期常量串：版本号与哈希全部在预处理期拼好，运行期零状态、零写入，
+ * 天然线程安全（彻底移除旧的静态缓冲 + ready 标志——那个组合在多线程下
+ * 既非原子也无可见性保证）。
+ */
+static const char s_version_git[] = IVV_STR(IVSBOX_VERSION_MAJOR) "."
+                                    IVV_STR(IVSBOX_VERSION_MINOR) "."
+                                    IVV_STR(IVSBOX_VERSION_PATCH) "+g"
+                                    IV_GIT_VER;
+
+static const char s_version_unknown[] = IVV_STR(IVSBOX_VERSION_MAJOR) "."
+                                        IVV_STR(IVSBOX_VERSION_MINOR) "."
+                                        IVV_STR(IVSBOX_VERSION_PATCH) "+g"
+                                        IV_VERSION_UNKNOWN;
 
 /*
  * 短哈希合法性：非空、非占位值、且全部为十六进制字符。
@@ -50,16 +65,5 @@ int iv_version_git_valid(void)
 
 const char *iv_version_string(void)
 {
-    if (s_version_ready == 0) {
-        /*
-         * 三个版本宏与 IV_GIT_VER 都是编译期字符串常量，最长输出远小于缓冲，
-         * 不会触发 -Wformat-truncation（-Werror 下会直接断编译）。
-         */
-        (void)snprintf(s_version, sizeof(s_version), "%d.%d.%d+g%s",
-                       IVSBOX_VERSION_MAJOR, IVSBOX_VERSION_MINOR,
-                       IVSBOX_VERSION_PATCH,
-                       (iv_version_git_valid() != 0) ? IV_GIT_VER : IV_VERSION_UNKNOWN);
-        s_version_ready = 1;
-    }
-    return s_version;
+    return git_ver_usable(IV_GIT_VER) ? s_version_git : s_version_unknown;
 }

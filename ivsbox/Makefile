@@ -94,7 +94,7 @@ FUZZ_BINS     := $(patsubst tests/fuzz/%.c,$(BUILD_DIR)/tests/fuzz/%,$(FUZZ_SRCS
 # -----------------------------------------------------------------------------
 # 公共伪目标
 # -----------------------------------------------------------------------------
-.PHONY: all host arm test asan tsan fuzz analyze package clean help
+.PHONY: all host arm test asan tsan fuzz analyze analyze-build package package-copy clean help
 
 all: host
 
@@ -125,12 +125,29 @@ fuzz:
 	$(MAKE) TARGET=host $(FUZZ_BINS)
 
 analyze:
-	$(MAKE) TARGET=host ANALYZE=1 BUILD_DIR=build/analyze $(BINS)
+	$(MAKE) TARGET=host ANALYZE=1 BUILD_DIR=build/analyze analyze-build
 
+# 必须在带 BUILD_DIR=build/analyze 的子 make 内展开 $(BINS)。若在外层
+# analyze 配方中直接写 $(BINS)，make 会提前将它展开成 build/host/*，
+# 子 make 随后只有 build/analyze/* 的规则，导致“没有规则可创建目标”。
+analyze-build: $(BINS)
+
+# S1-01：package 原先在外层 make 里直接 cp $(BINS)，而外层 TARGET 默认 host，
+# 复制的是 x86 产物（arm 子 make 只影响它自己那次调用里的变量）。改为把复制
+# 也丢进一次 TARGET=arm 的子 make（package-copy），并加 readelf 断言防再犯：
+# 不是 ARM ELF 就打包失败，而不是悄悄发出一个跑不起来的包。
 package: arm
+	$(MAKE) TARGET=arm package-copy
+
+package-copy:
 	@mkdir -p packaging
 	@cp $(BINS) packaging/
-	@echo "Packaged ARM binaries to packaging/"
+	@for bin in $(BINS); do \
+		LC_ALL=C $(CROSS)readelf -h "$$bin" | grep -q "Machine:.*ARM" || { \
+			echo "package: ERROR, not ARM ELF: $$bin"; exit 1; \
+		}; \
+	done
+	@echo "Packaged ARM binaries -> packaging/"
 
 clean:
 	rm -rf build/ packaging/

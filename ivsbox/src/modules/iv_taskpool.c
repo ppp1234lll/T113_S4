@@ -90,6 +90,7 @@ struct iv_worker {
     pthread_t         tid;
     iv_taskpool_t    *pool;
     int               idx;
+    int               running_slot;           /* 锁内：当前 RUNNING 槽，空闲为 -1 */
     volatile uint32_t progress;                /* 每完成一个任务或每次空闲超时轮 +1；
                                                 * 仅通过 __atomic_* 访问 */
 };
@@ -187,6 +188,9 @@ static void *worker_main(void *arg)
 
         s = &pool->slots[idx];
         s->state = SLOT_RUNNING;
+        w->running_slot = idx;
+        /* 任务开工本身也是一次真实前进；先发布进度，再把锁释放给健康快照。 */
+        (void)__atomic_add_fetch(&w->progress, 1u, __ATOMIC_RELAXED);
 
         /* 快照执行所需字段，执行期间不持锁 */
         fn       = s->fn;
@@ -207,6 +211,7 @@ static void *worker_main(void *arg)
 
             ctx.arg        = targ;
             ctx.cancel     = &s->cancel;
+            ctx.heartbeat  = &w->progress; /* 任务心跳直达本 worker 的进度号（S56-01） */
             ctx.result     = s->result;
             ctx.result_cap = IV_TASKPOOL_RESULT_MAX;
             ctx.result_len = 0;
@@ -218,20 +223,35 @@ static void *worker_main(void *arg)
                 out_len = IV_TASKPOOL_RESULT_MAX;
         }
 
+        /* 先发布完成进度，再在锁内撤销运行租约。health 若看到“已不在运行”，
+         * 随后读取进度号时必能看到这次 +1，避免完成边界的误判窗口。 */
+        (void)__atomic_add_fetch(&w->progress, 1u, __ATOMIC_RELAXED);
         pthread_mutex_lock(&pool->lock);
         s->rc         = rc;
         s->result_len = out_len;
         s->state      = SLOT_DONE;
+        w->running_slot = -1;
         pthread_mutex_unlock(&pool->lock);
 
         /* 先改状态、后通知：保证 reactor 被唤醒时结果已经就绪 */
         if (write(pool->efd, &one, sizeof one) != (ssize_t)sizeof one)
             IV_LOG_W(TASKPOOL_MOD, "completion notify failed on eventfd");
 
-        (void)__atomic_add_fetch(&w->progress, 1u, __ATOMIC_RELAXED);
     }
 
     return NULL;
+}
+
+/* ---------------------------------------------------------------------------
+ * 任务心跳
+ * ------------------------------------------------------------------------- */
+
+void iv_task_heartbeat(iv_task_ctx_t *ctx)
+{
+    /* 进度号与 cancel 同一条原子纪律（relaxed）：写者其实在 worker 线程内
+     * （任务函数就跑在 worker 上），读者（健康线程）跨线程。 */
+    if (ctx != NULL && ctx->heartbeat != NULL)
+        __atomic_add_fetch(ctx->heartbeat, 1u, __ATOMIC_RELAXED);
 }
 
 /* ---------------------------------------------------------------------------
@@ -280,12 +300,46 @@ iv_taskpool_t *iv_taskpool_create(int nworkers, int queue_size)
         return NULL;
     }
 
-    pthread_mutex_init(&pool->lock, NULL);
+    /* 五个初始化调用的返回值**全部检查**（S5-01）：任一被静默吞掉的失败都比
+     * 直接拒绝启动更糟 —— 典型如 setclock 失败会得到 REALTIME 条件变量配
+     * MONOTONIC 绝对 deadline，timedwait 立即超时 → worker 忙循环。
+     * 互斥锁/条件变量先于 eventfd 初始化，各自失败沿已初始化层级逆序释放后
+     * 直接返回；eventfd 及之后的失败才走统一 fail 标号（那里假定锁已就绪）。*/
+    if (pthread_mutex_init(&pool->lock, NULL) != 0) {
+        IV_LOG_E(TASKPOOL_MOD, "pthread_mutex_init failed");
+        free(pool->workers);
+        free(pool->slots);
+        free(pool);
+        return NULL;
+    }
 
     /* 绑 CLOCK_MONOTONIC：默认的 CLOCK_REALTIME 会被 GPS 对时跳变打乱空闲轮询 */
-    pthread_condattr_init(&cattr);
-    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
-    pthread_cond_init(&pool->cond, &cattr);
+    if (pthread_condattr_init(&cattr) != 0) {
+        IV_LOG_E(TASKPOOL_MOD, "pthread_condattr_init failed");
+        pthread_mutex_destroy(&pool->lock);
+        free(pool->workers);
+        free(pool->slots);
+        free(pool);
+        return NULL;
+    }
+    if (pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC) != 0) {
+        IV_LOG_E(TASKPOOL_MOD, "pthread_condattr_setclock failed");
+        pthread_condattr_destroy(&cattr);
+        pthread_mutex_destroy(&pool->lock);
+        free(pool->workers);
+        free(pool->slots);
+        free(pool);
+        return NULL;
+    }
+    if (pthread_cond_init(&pool->cond, &cattr) != 0) {
+        IV_LOG_E(TASKPOOL_MOD, "pthread_cond_init failed");
+        pthread_condattr_destroy(&cattr);
+        pthread_mutex_destroy(&pool->lock);
+        free(pool->workers);
+        free(pool->slots);
+        free(pool);
+        return NULL;
+    }
     pthread_condattr_destroy(&cattr);
 
     pool->efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -300,12 +354,21 @@ iv_taskpool_t *iv_taskpool_create(int nworkers, int queue_size)
     sigaddset(&set, SIGTERM);
     sigaddset(&set, SIGINT);
     sigaddset(&set, SIGPIPE);
-    pthread_sigmask(SIG_BLOCK, &set, NULL);
+    {
+        int prc = pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+        if (prc != 0) {
+            /* pthread 接口直接返回错误码，不承诺写 errno。 */
+            IV_LOG_E(TASKPOOL_MOD, "pthread_sigmask failed: %s", strerror(prc));
+            goto fail; /* 发生在任何 worker 线程创建之前，fail 路径可安全回收 */
+        }
+    }
 
     for (i = 0; i < nworkers; i++) {
-        pool->workers[i].pool     = pool;
-        pool->workers[i].idx      = i;
-        pool->workers[i].progress = 0u;
+        pool->workers[i].pool         = pool;
+        pool->workers[i].idx          = i;
+        pool->workers[i].running_slot = -1;
+        pool->workers[i].progress     = 0u;
         if (pthread_create(&pool->workers[i].tid, NULL, worker_main,
                            &pool->workers[i]) != 0) {
             IV_LOG_E(TASKPOOL_MOD, "pthread_create failed at worker %d", i);
@@ -559,6 +622,27 @@ uint32_t iv_taskpool_worker_progress(const iv_taskpool_t *pool, int idx)
     if (pool == NULL || idx < 0 || idx >= pool->nworkers)
         return 0u;
     return __atomic_load_n(&pool->workers[idx].progress, __ATOMIC_RELAXED);
+}
+
+uint64_t iv_taskpool_worker_deadline(const iv_taskpool_t *pool, int idx)
+{
+    iv_taskpool_t *mutable_pool;
+    uint64_t       deadline = 0u;
+    int            slot;
+
+    if (pool == NULL || idx < 0 || idx >= pool->nworkers)
+        return 0u;
+
+    /* 逻辑只读，但 pthread_mutex_lock 需要非 const 地址；对象内容仍只在锁内读取。 */
+    mutable_pool = (iv_taskpool_t *)pool;
+    pthread_mutex_lock(&mutable_pool->lock);
+    slot = mutable_pool->workers[idx].running_slot;
+    if (slot >= 0 && slot < mutable_pool->queue_size &&
+        mutable_pool->slots[slot].state == SLOT_RUNNING)
+        deadline = mutable_pool->slots[slot].deadline_ms;
+    pthread_mutex_unlock(&mutable_pool->lock);
+
+    return deadline;
 }
 
 int iv_taskpool_worker_count(const iv_taskpool_t *pool)

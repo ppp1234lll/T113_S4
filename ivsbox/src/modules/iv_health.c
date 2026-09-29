@@ -8,6 +8,9 @@
  *   - 跨线程量 stopping 一律走 __atomic_* + relaxed（与 S5 iv_taskpool 同一纪律，
  *     裸读写会被 ThreadSanitizer 判成数据竞争）；快照走内部互斥锁。
  *   - 故障时"关 fd 即停喂"，不做补救：卡死由整机复位兜底，这是设计不是遗漏。
+ *   - 喂狗失败不静默（S6-01）：连续 IV_HEALTH_WD_FAIL_MAX 次失败（EINTR 也按失败
+ *     计数）即 fail-stop 关 fd、此后不再尝试；失败状态走快照的 wd_fail_streak /
+ *     wd_io_fault，fault_code 语义不变（只反映进度判定）。
  */
 #include <errno.h>
 #include <pthread.h>
@@ -112,7 +115,20 @@ static int health_check(struct iv_health *h, uint64_t now_ms,
 
     n = worker_span(h);
     for (i = 0; i < n; i++) {
-        uint32_t cur = iv_taskpool_worker_progress(h->pool, i);
+        uint64_t deadline = iv_taskpool_worker_deadline(h->pool, i);
+        uint32_t cur      = iv_taskpool_worker_progress(h->pool, i);
+
+        /* 有界阻塞任务在自己的端到端截止时间内拥有健康租约：DNS/SNMP/ONVIF
+         * 这类单次阻塞调用无法主动 heartbeat，但“仍在调用方声明的预算内”不等于
+         * worker 死锁。租约每轮刷新探针；越过 deadline 后恢复 stuck_ms 判据。
+         * deadline 先读、progress 后读，与 taskpool 的“先 +1、后撤运行槽”顺序配对，
+         * 避免任务恰好完成时看到“无租约 + 旧进度”的误判窗口。 */
+        if (deadline != 0u && now_ms <= deadline) {
+            worker_probes[i].primed = 1;
+            worker_probes[i].last = cur;
+            worker_probes[i].changed_ms = now_ms;
+            continue;
+        }
 
         if (probe_check(&worker_probes[i], cur, now_ms, h->stuck_ms))
             fault |= IV_HEALTH_WORKER_DEAD;
@@ -143,7 +159,8 @@ static void report_fault(struct iv_health *h, int fault)
     fprintf(stderr, "]\n");
 }
 
-static void fill_snapshot(struct iv_health *h, int fault)
+static void fill_snapshot(struct iv_health *h, int fault,
+                          uint32_t wd_streak, int wd_io_fault)
 {
     int i;
     int n;
@@ -160,6 +177,8 @@ static void fill_snapshot(struct iv_health *h, int fault)
     h->snap.fault_code = fault;
     h->snap.watchdog_fd = h->wd_fd;
     h->snap.tick_count++;
+    h->snap.wd_fail_streak = wd_streak;   /* 喂狗失败状态与 fault_code 分开走（S6-01） */
+    h->snap.wd_io_fault = wd_io_fault;
 
     pthread_mutex_unlock(&h->lock);
 }
@@ -171,14 +190,19 @@ static void *health_main(void *arg)
     iv_probe_t        reactor_probe;
     iv_probe_t        worker_probes[IV_HEALTH_WORKERS_MAX];
     int               last_fault = IV_HEALTH_OK;
+    uint32_t          wd_streak = 0u;    /* 连续喂狗失败次数，仅本线程访问（S6-01） */
+    int               wd_io_fault = 0;
 
     memset(&reactor_probe, 0, sizeof(reactor_probe));
     memset(worker_probes, 0, sizeof(worker_probes));
 
     /* 启动即喂一次：进程刚起来时主循环可能还没推进过一轮进度号，不能让它在
      * 首个判据窗口内就撞上看门狗超时。*/
-    if (h->wd_fd >= 0 && iv_watchdog_keepalive(h->wd_fd) != 0)
+    if (h->wd_fd >= 0 && iv_watchdog_keepalive(h->wd_fd) != 0) {
+        wd_streak = 1u; /* 启动首喂失败同样计入连续失败计数 */
+        wd_io_fault = 1;
         fprintf(stderr, HEALTH_TAG " initial keepalive failed: %s\n", strerror(errno));
+    }
 
     while (__atomic_load_n(&h->stopping, __ATOMIC_RELAXED) == 0) {
         uint64_t now_ms;
@@ -192,8 +216,30 @@ static void *health_main(void *arg)
         fault = health_check(h, now_ms, &reactor_probe, worker_probes);
 
         if (fault == IV_HEALTH_OK) {
-            if (h->wd_fd >= 0 && iv_watchdog_keepalive(h->wd_fd) != 0)
-                fprintf(stderr, HEALTH_TAG " keepalive failed: %s\n", strerror(errno));
+            if (h->wd_fd >= 0) {
+                /* 喂狗失败（含 EINTR，最坏多花一个 tick 才进入 fail-stop）按失败
+                 * 计数（S6-01）：只打日志不改状态的话，"fd 一直在但写不进去"
+                 * 会静默耗完看门狗窗口，快照却还显示一切正常。*/
+                if (iv_watchdog_keepalive(h->wd_fd) == 0) {
+                    wd_streak = 0u;
+                    wd_io_fault = 0;
+                } else {
+                    wd_streak++;
+                    wd_io_fault = 1;
+                    fprintf(stderr, HEALTH_TAG " keepalive failed (%u consecutive): %s\n",
+                            (unsigned)wd_streak, strerror(errno));
+
+                    if (wd_streak >= IV_HEALTH_WD_FAIL_MAX) {
+                        /* fail-stop：关 fd 即停喂。此后 fd < 0，上面的守卫自然
+                         * 跳过、不再尝试；wd_io_fault 在快照里保持 1。 */
+                        fprintf(stderr, HEALTH_TAG
+                                " watchdog keepalive failed %u times, closing watchdog fd\n",
+                                (unsigned)wd_streak);
+                        (void)iv_watchdog_close(h->wd_fd);
+                        h->wd_fd = -1;
+                    }
+                }
+            }
         } else {
             if (fault != last_fault)
                 report_fault(h, fault);
@@ -211,7 +257,7 @@ static void *health_main(void *arg)
         }
 
         last_fault = fault;
-        fill_snapshot(h, fault);
+        fill_snapshot(h, fault, wd_streak, wd_io_fault);
     }
 
     return NULL;

@@ -9,6 +9,8 @@
  *      发送用 sendmsg 两段 iovec 直接发出，全文件没有一处 malloc。
  *      嵌入式下"内存从哪来"必须一眼看得见。
  *   2. **不产生 SIGPIPE**。发送一律带 MSG_NOSIGNAL，对端先关闭时只返回 IV_ECONN。
+ *      （实测补充：本传输 SEQPACKET 上内核本就不送 SIGPIPE，该标志是"换流式传输
+ *      也不用改"的预防性令牌，见 iv_chan_send 的说明。）
  *   3. **不依赖 errno 做返回码**。对外返回 iv_ret.h 的负数码，errno 保留原值
  *      供调用方诊断（两者互不覆盖）。理由：调用方不该被迫 include <errno.h>
  *      才能区分"超时"和"被拒"。
@@ -16,6 +18,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <string.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -174,16 +177,22 @@ int iv_chan_listen(const char *path, unsigned mode, int backlog)
     }
 
     /* 权限在 bind 之后**显式 chmod**：socket 文件的模式会被进程 umask 削减，
-     * 而 umask 是环境决定的东西，安全边界不能依赖它恰好是什么。*/
+     * 而 umask 是环境决定的东西，安全边界不能依赖它恰好是什么。
+     * 下面两条失败路径都要先 close/unlink 再返回，而那两个调用都可能改写 errno；
+     * 头文件承诺"errno 保留原值供诊断"，故就地存下再复原。*/
     if (chmod(path, (mode_t)mode) != 0) {
+        int saved = errno;
         (void)close(fd);
         (void)unlink(path); /* 不留一个权限不对的接听点 */
+        errno = saved;
         return IV_EIO;
     }
 
     if (listen(fd, backlog) != 0) {
+        int saved = errno;
         (void)close(fd);
         (void)unlink(path);
+        errno = saved;
         return IV_EIO;
     }
 
@@ -239,6 +248,10 @@ int iv_chan_accept(int listen_fd, const iv_chan_acl_t *acl, iv_chan_peer_t *peer
         iv_chan_acl_default(&def);
         acl = &def;
     }
+    /* 取接听点属主用于 allow_owner 规则。**取不到时 owner 保持 -1（未知）**，
+     * 而 iv_chan_acl_permits() 明确"未知不算命中" ⇒ 该规则静默不生效。
+     * 方向是 fail-closed（少放行、不会误放行），且此处 listen_fd 刚被 accept4
+     * 用过、fstat 实际不可达，故不为此加返回值。*/
     if (acl->allow_owner && fstat(listen_fd, &st) == 0)
         owner = st.st_uid;
 
@@ -358,27 +371,68 @@ int iv_chan_recv(int fd, void *buf, size_t cap, ivs_chan_hdr_t *hdr, size_t *pay
     return IV_OK;
 }
 
+/* 距离 t0 已过去的毫秒数；clock_gettime 失败返回 -1。
+ * 只用 CLOCK_MONOTONIC：墙钟会被 NTP / 手动改时拨动，而超时预算必须单调。*/
+static int64_t elapsed_ms_from(const struct timespec *t0)
+{
+    struct timespec now;
+    int64_t         ms;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return (int64_t)-1;
+
+    ms = ((int64_t)now.tv_sec - (int64_t)t0->tv_sec) * 1000;
+    ms += ((int64_t)now.tv_nsec - (int64_t)t0->tv_nsec) / 1000000;
+    return ms;
+}
+
 int iv_chan_recv_timeout(int fd, void *buf, size_t cap, ivs_chan_hdr_t *hdr,
                          size_t *payload_len, int timeout_ms)
 {
-    struct pollfd pfd;
-    int           rc;
+    struct pollfd   pfd;
+    struct timespec t0;
+    int64_t         used;
+    int             wait_ms;
+    int             rc;
 
     if (fd < 0 || timeout_ms < 0)
         return IV_EINVAL;
 
-    pfd.fd      = fd;
-    pfd.events  = POLLIN;
-    pfd.revents = 0;
-
-    rc = poll(&pfd, 1, timeout_ms);
-    if (rc < 0) {
-        if (errno == EINTR)
-            return IV_EAGAIN; /* 被信号打断不算错误，调用方重新等待即可 */
+    /* 先取基准时刻，再进循环：预算从**进入本函数**开始算，而不是从第一次
+     * poll 开始算，这样"取时刻本身"的耗时也计入预算。*/
+    if (clock_gettime(CLOCK_MONOTONIC, &t0) != 0)
         return IV_EFAIL;
+
+    pfd.fd     = fd;
+    pfd.events = POLLIN;
+
+    for (;;) {
+        used = elapsed_ms_from(&t0);
+        if (used < 0)
+            return IV_EFAIL;
+
+        /* 剩多少预算就等多少。clamp 到 0 而不是直接判超时：poll(0) 只做状态
+         * 检查，能让"刚好在到点那一刻数据到了"不被误判成超时；而预算真耗尽时
+         * poll(0) 必然返回 0 → IV_ETIMEDOUT，不会在这里空转。*/
+        wait_ms = (int)((int64_t)timeout_ms - used);
+        if (wait_ms < 0)
+            wait_ms = 0;
+
+        pfd.revents = 0;
+        rc          = poll(&pfd, 1, wait_ms);
+        if (rc > 0)
+            break;
+        if (rc == 0)
+            return IV_ETIMEDOUT;
+
+        /* rc < 0：只有 EINTR 值得重试，其余是硬错误。
+         * **绝不把已经花掉的时间丢掉重来** —— 下一轮用的是剩余预算而不是完整的
+         * timeout_ms。否则持续的信号流（SIGCHLD 之类，poll 在 Linux 上不因
+         * SA_RESTART 而重启）会让"超时"永远不到期，与架构 §5.1「请求必须设置
+         * 超时」的纪律相悖。*/
+        if (errno != EINTR)
+            return IV_EFAIL;
     }
-    if (rc == 0)
-        return IV_ETIMEDOUT;
 
     /* 可读以外的事件（POLLHUP / POLLERR / POLLNVAL）都表示这条连接完了。
      * 特别地 POLLHUP 之后仍可能有数据，但由下一次 recv 处理更清楚。*/
@@ -423,7 +477,9 @@ int iv_chan_send(int fd, const ivs_chan_hdr_t *hdr, const void *payload, size_t 
     msg.msg_iovlen = (payload_len > 0u) ? 2 : 1;
 
     /* MSG_NOSIGNAL：对端先关闭时只返回 EPIPE，不会给本进程送 SIGPIPE。
-     * 架构 §4.1 要求主控屏蔽 SIGPIPE，本模块从源头就不产生它。*/
+     * **但它在本传输上是预防性的**：实测 `AF_UNIX/SOCK_SEQPACKET` 上对端关闭后
+     * sendmsg 只给 EPIPE、内核不送 SIGPIPE（带不带该标志结果逐字相同），
+     * SIGPIPE 只在 SOCK_STREAM 上出现。详见头文件 iv_chan_send 的说明。*/
     n = sendmsg(fd, &msg, MSG_NOSIGNAL);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK)

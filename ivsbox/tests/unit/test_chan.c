@@ -4,12 +4,17 @@
  * 覆盖范围与刻意的取舍：
  *   - 消息头：布局锁定（sizeof / offsetof / 魔数内存字节序）、编解码、各条校验失败路径。
  *   - 收发：用 socketpair 造一对已连接的 SEQPACKET fd，覆盖正常往返、空载荷、
- *     超长被拒、短包被拒、**头里撒谎**（声明长度与实际包长不符）被拒、对端关闭。
- *   - 超时：recv_timeout 的到期与命中两条路径。
+ *     超长被拒、短包被拒、**头里撒谎**（声明长度与实际包长不符）被拒、对端关闭，
+ *     **64 KiB 满载往返**（单包上限那一刻的行为），以及**对端关闭后 send 不产生
+ *     SIGPIPE**（架构 §4.1 的硬要求，靠"进程没被信号杀死"来证明）。
+ *   - 超时：recv_timeout 的到期与命中两条路径，外加**被信号打断（EINTR）时用
+ *     剩余预算继续等、不会把已花掉的时间丢掉重来**。
  *   - 接听点：真实 listen/connect/accept，覆盖 0660 权限落实、非 socket 路径拒绝
- *     （且**不删除该文件**）、残留 socket 重建、父目录缺失、路径过长。
+ *     （且**不删除该文件**）、残留 socket 重建、父目录缺失、路径过长，
+ *     **backlog 满时 connect 返回可重试的 IV_EBUSY**，以及
+ *     **listen_close(fd, NULL) 只关 fd 不删路径**。
  *   - 鉴权：白名单规则用纯函数测（脱离 socket），再用真实 accept 测一次"规则命中
- *     但 uid 不在名单 → IV_EAUTH 且连接被关闭"。
+ *     但 uid 不在名单 → IV_EAUTH，且**对端看到的是 EOF、收不到任何解释性回应**"。
  *
  * 为什么用 socketpair 而不是每次都 fork：SEQPACKET 的收发行为与"经由 listen/accept
  * 建立的连接"完全一致（内核走同一条 unix_dgram 收发路径），而 fork 会让单测在
@@ -19,14 +24,17 @@
  * 临时文件全部落在 mkdtemp 造的目录里，退出前清理干净（AGENTS.md 规则 6）。
  */
 #include <errno.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ivsbox/iv_chan.h"
@@ -264,11 +272,24 @@ static void test_exchange(void)
     chk(iv_chan_send(sv[0], &h, g_tx, (size_t)IV_CHAN_MAX_PAYLOAD + 1u) == IV_ERANGE,
         "send rejects a payload over the limit");
 
-    /* 7) 对端关闭 → IV_ECONN */
+    /* 7) 对端关闭后两个方向都要有确定行为：
+     *    - recv 侧返回 IV_ECONN；
+     *    - **send 侧也返回 IV_ECONN**。
+     *    ⚠️ **不要**把"进程没被 SIGPIPE 杀死"当成 MSG_NOSIGNAL 生效的证据 ——
+     *    2026-09-29 双端实测（VM 内核 6.8.0 / 板端 5.4.61-rt37）：`AF_UNIX`
+     *    `SOCK_SEQPACKET` 上对端关闭后 sendmsg 只返回 `EPIPE`，**内核根本不送
+     *    SIGPIPE**，带不带 MSG_NOSIGNAL 结果逐字相同；SIGPIPE 只出现在
+     *    `SOCK_STREAM` 上（同探针实测进程被信号杀死、rc=141）。
+     *    因此 MSG_NOSIGNAL 在本传输上是"将来换流式传输也不用改"的预防性令牌，
+     *    本用例的证明目标只是上面那条**返回码契约**（该分支此前零覆盖）。*/
     close(sv[0]);
     rlen = 0u;
     chk(iv_chan_recv(sv[1], g_rx, sizeof g_rx, &rh, &rlen) == IV_ECONN,
         "recv reports ECONN once the peer has closed");
+
+    chk(iv_chan_hdr_init(&h, IV_CHAN_TYPE_REQ, 9u, 0u, 3u) == IV_OK, "build header for post-close send");
+    chk(iv_chan_send(sv[1], &h, "abc", 3u) == IV_ECONN,
+        "send to a closed peer returns ECONN and does NOT raise SIGPIPE");
     close(sv[1]);
 }
 
@@ -309,6 +330,172 @@ static void test_recv_timeout(void)
 
 /* --------------------------------------------------------------------------- */
 
+/* 64 KiB 满载往返：单包上限是被架构 §5.1 冻结的那个"固定"值，而此前所有用例
+ * 的载荷都在 200 字节以内 —— 上限本身从未被真正用到过。这条补的是"上限那一刻
+ * 的行为"：头 + 65536 字节能否原样过去、recv 缓冲够不够、MSG_TRUNC 路径不会
+ * 把满载包误判成超长。*/
+static void test_full_payload(void)
+{
+    ivs_chan_hdr_t h;
+    ivs_chan_hdr_t rh;
+    size_t         rlen = 0u;
+    int            sv[2];
+
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) != 0) {
+        fprintf(stderr, "FAIL: socketpair() for full-payload test: %s\n", strerror(errno));
+        g_fail++;
+        return;
+    }
+
+    memset(g_tx, 0x5A, sizeof g_tx);
+    g_tx[0]                    = 0x00u;
+    g_tx[IV_CHAN_MAX_PAYLOAD - 1u] = 0xFFu; /* 首尾放可辨识字节，防"整体偏移"漏检 */
+
+    chk(iv_chan_hdr_init(&h, IV_CHAN_TYPE_RSP, 42u, 0u, IV_CHAN_MAX_PAYLOAD) == IV_OK,
+        "build a header declaring the full 64 KiB payload");
+    chk(iv_chan_send(sv[0], &h, g_tx, (size_t)IV_CHAN_MAX_PAYLOAD) == IV_OK,
+        "send a payload of exactly IV_CHAN_MAX_PAYLOAD");
+    rlen = 0u;
+    chk(iv_chan_recv(sv[1], g_rx, sizeof g_rx, &rh, &rlen) == IV_OK,
+        "recv a full-length payload with a large enough buffer");
+    chk(rlen == (size_t)IV_CHAN_MAX_PAYLOAD, "full payload length survives the round trip");
+    chk(memcmp(g_rx + IV_CHAN_HDR_SIZE, g_tx, (size_t)IV_CHAN_MAX_PAYLOAD) == 0,
+        "all 65536 payload bytes survive the round trip");
+
+    (void)close(sv[0]);
+    (void)close(sv[1]);
+}
+
+/* backlog 满时 connect 必须给出**可行动**的 IV_EBUSY，而不是模糊的 IV_ECONN。
+ * 这条错误码此前零覆盖，而它正是 S10 客户端"重试还是放弃"的判据。*/
+static void test_connect_backlog_full(void)
+{
+    enum { kProbeMax = 32 }; /* 上限只是防死循环，不是断言阈值，见下 */
+    char  dir[] = "/tmp/ivchanbkXXXXXX";
+    char  path[160];
+    int   held[kProbeMax];
+    int   held_n = 0;
+    int   lfd;
+    int   rc;
+    int   i;
+    int   saw_busy = 0;
+
+    if (mkdtemp(dir) == NULL) {
+        fprintf(stderr, "FAIL: mkdtemp() for backlog test: %s\n", strerror(errno));
+        g_fail++;
+        return;
+    }
+    (void)snprintf(path, sizeof path, "%s/ctl", dir);
+
+    /* backlog = 1，且**始终不 accept**，让待处理队列堆满。*/
+    lfd = iv_chan_listen(path, 0u, 1);
+    chk(lfd >= 0, "listen with backlog=1 succeeds");
+    if (lfd < 0) {
+        (void)rmdir(dir);
+        return;
+    }
+
+    /* 内核判满的条件是"队列长度 > backlog"，具体第几次连失败由内核语义决定，
+     * 故这里**连到出现 IV_EBUSY 为止**，不写死"第几次必失败"（写死就会变成
+     * 一条绑死内核版本的脆弱断言）。*/
+    for (i = 0; i < kProbeMax; i++) {
+        rc = iv_chan_connect(path);
+        if (rc == IV_EBUSY) {
+            saw_busy = 1;
+            break;
+        }
+        if (rc < 0) {
+            fprintf(stderr, "FAIL: unexpected connect rc=%d while filling backlog\n", rc);
+            g_fail++;
+            break;
+        }
+        held[held_n++] = rc;
+    }
+    chk(saw_busy == 1, "connect reports IV_EBUSY once the backlog is full (not IV_ECONN)");
+
+    /* 腾出一个位置（accept 一条）后必须又能连上 —— 这条才证明 IV_EBUSY 的
+     * "稍后重试即可"是真的，而不是"队列坏了"。*/
+    if (saw_busy == 1) {
+        int afd = iv_chan_accept(lfd, NULL, NULL);
+        chk(afd >= 0, "accept drains one slot after the backlog was full");
+        if (afd >= 0)
+            (void)close(afd);
+        chk(iv_chan_connect(path) >= 0, "connect succeeds again after a slot is freed");
+    }
+
+    /* 清场：先放掉积压的连接，再关接听点并删文件。*/
+    for (i = 0; i < held_n; i++)
+        (void)close(held[i]);
+    (void)close(lfd);
+    (void)unlink(path);
+    (void)rmdir(dir);
+}
+
+/* --------------------------------------------------------------------------- */
+
+/* recv_timeout 遇 EINTR 时必须在**同一个调用内**用剩余预算继续等。
+ * 造法：50ms 一次的 ITIMER_REAL，poll 会被信号打断；老实现（EINTR→IV_EAGAIN）
+ * 会在第一次被打断时就返回，新实现必须撑到自己的 400ms 预算用完才 ETIMEDOUT。*/
+static volatile sig_atomic_t g_alarms;
+
+static void on_sigalrm(int sig)
+{
+    (void)sig;
+    g_alarms++;
+}
+
+static void test_recv_timeout_absorbs_eintr(void)
+{
+    struct sigaction sa;
+    struct itimerval it;
+    struct timespec  t0;
+    struct timespec  t1;
+    ivs_chan_hdr_t   rh;
+    size_t           rlen = 0u;
+    int64_t          spent_ms;
+    int              sv[2];
+    int              rc;
+
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) != 0) {
+        fprintf(stderr, "FAIL: socketpair() for EINTR test: %s\n", strerror(errno));
+        g_fail++;
+        return;
+    }
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_sigalrm;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; /* 明确不要 SA_RESTART（poll 在 Linux 上本来也不重启）*/
+    (void)sigaction(SIGALRM, &sa, NULL);
+
+    g_alarms = 0;
+    memset(&it, 0, sizeof it);
+    it.it_interval.tv_usec = 50000;
+    it.it_value.tv_usec    = 50000;
+    (void)setitimer(ITIMER_REAL, &it, NULL);
+
+    (void)clock_gettime(CLOCK_MONOTONIC, &t0);
+    rc = iv_chan_recv_timeout(sv[0], g_rx, sizeof g_rx, &rh, &rlen, 400);
+    (void)clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    /* 先停表再断言：否则失败时定时器还会往后续用例里灌信号。*/
+    memset(&it, 0, sizeof it);
+    (void)setitimer(ITIMER_REAL, &it, NULL);
+
+    spent_ms = ((int64_t)t1.tv_sec - (int64_t)t0.tv_sec) * 1000;
+    spent_ms += ((int64_t)t1.tv_nsec - (int64_t)t0.tv_nsec) / 1000000;
+
+    chk(g_alarms >= 2, "the interrupting signal really fired (otherwise this test proves nothing)");
+    chk(rc == IV_ETIMEDOUT, "recv_timeout still reaches its own deadline across EINTR");
+    chk(spent_ms >= 350, "it waited out the whole budget instead of bailing out on the first EINTR");
+    chk(spent_ms < 3000, "it did not overshoot the budget");
+
+    (void)close(sv[0]);
+    (void)close(sv[1]);
+}
+
+/* --------------------------------------------------------------------------- */
+
 static void test_listen_paths_and_auth(void)
 {
     static const uid_t k_never[1] = {(uid_t)54321u};
@@ -319,8 +506,11 @@ static void test_listen_paths_and_auth(void)
     struct stat        st;
     iv_chan_acl_t      strict;
     iv_chan_peer_t     peer;
+    ivs_chan_hdr_t     rh;
+    size_t             rlen = 0u;
     int                lfd;
     int                lfd2;
+    int                lfd3;
     int                cfd;
     int                afd;
     FILE              *f;
@@ -376,6 +566,12 @@ static void test_listen_paths_and_auth(void)
     if (cfd >= 0) {
         chk(iv_chan_accept(lfd, &strict, NULL) == IV_EAUTH,
             "accept rejects a uid outside the acl");
+        /* 不能只断返回码：契约的另一半是"被拒的对端应当直接看到连接已关闭
+         * （EOF），且收不到任何解释性回应"（不给扫描脚本当路标）。
+         * 对端 recv 返回 0，在本模块映射为 IV_ECONN。*/
+        rlen = 0u;
+        chk(iv_chan_recv(cfd, g_rx, sizeof g_rx, &rh, &rlen) == IV_ECONN,
+            "a rejected peer observes EOF, with no explanatory reply");
         (void)close(cfd);
     }
 
@@ -420,6 +616,19 @@ static void test_listen_paths_and_auth(void)
     }
     chk(iv_chan_listen_close(-1, NULL) == IV_OK, "listen_close on a bad fd with NULL path is a no-op");
 
+    /* 10) path == NULL → **只关 fd、不碰文件系统**。若实现顺手 unlink，"只想关
+     *     接听点"的调用方就会连带把路径删掉。这条同时证明关掉之后文件仍在、
+     *     但已连不上（不再是活的接听点）。*/
+    lfd3 = iv_chan_listen(path, 0u, 0u);
+    chk(lfd3 >= 0, "listen again for the NULL-path close case");
+    if (lfd3 >= 0) {
+        chk(iv_chan_listen_close(lfd3, NULL) == IV_OK, "listen_close with NULL path returns OK");
+        chk(stat(path, &st) == 0 && S_ISSOCK(st.st_mode),
+            "listen_close with NULL path leaves the socket file on disk");
+        chk(iv_chan_connect(path) == IV_ECONN,
+            "the left-behind socket file no longer accepts connections");
+    }
+
     /* 清理（规则 6：不留临时文件） */
     (void)unlink(plain);
     for (i = 0u; i <= 1u; i++) {
@@ -438,13 +647,17 @@ int main(void)
     test_header_codec();
     test_acl_rules();
     test_exchange();
+    test_full_payload();
+    test_connect_backlog_full();
     test_recv_timeout();
+    test_recv_timeout_absorbs_eintr();
     test_listen_paths_and_auth();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_chan failed (%d check(s))\n", g_fail);
         return 1;
     }
-    printf("test_chan passed (header layout, codec, acl, seqpacket io, timeout, listen paths)\n");
+    printf("test_chan passed (header layout, codec, acl, seqpacket io, full payload, "
+           "backlog, timeout, EINTR, listen paths)\n");
     return 0;
 }

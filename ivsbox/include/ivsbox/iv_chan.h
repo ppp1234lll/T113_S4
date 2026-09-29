@@ -229,8 +229,14 @@ int iv_chan_acl_permits(const iv_chan_acl_t *acl, uid_t uid, uid_t owner);
  * 后重建 —— 这是必要的，否则服务重启永远起不来。但**绝不 unlink 非 socket**：
  * 那等于把"路径写错"变成"删掉别人的文件"。
  *
+ * 上面"lstat 判是 socket → unlink → bind"这段**不是原子的**，其间存在一个
+ * TOCTOU 窗口。但后果是安全的：窗口里若有人抢先在该路径放了东西，`bind` 会以
+ * EADDRINUSE 失败并返回 IV_EIO（失败路径**不再 unlink**），结果是"启动失败"，
+ * 而不是"删掉别人的文件"。接听点父目录由 root 预建、威胁模型下能在这个窗口里
+ * 动手的只有 root，故不做原子化处理，仅备案。
+ *
  * 调用方负责把返回的 fd 注册进自己的事件循环，并在退出时调
- * iv_chan_listen_close() 清理路径。*/
+ * iv_chan_listen_close() 清理路径。**单实例假设见 iv_chan_listen_close()。*/
 int iv_chan_listen(const char *path, unsigned mode, int backlog);
 
 /* 接受一个连接并完成鉴权。
@@ -244,20 +250,43 @@ int iv_chan_listen(const char *path, unsigned mode, int backlog);
  *   IV_ECONN   其他 accept 失败
  *
  * 注意第一道门槛在内核：不属于接听点属主/同组的进程在 connect 阶段就会被
- * 文件权限挡掉（EACCES），根本走不到这里。本函数是第二道。*/
+ * 文件权限挡掉（EACCES），根本走不到这里。本函数是第二道。
+ *
+ * `allow_owner` 规则依赖 `fstat()` 取接听点属主：**取不到时属主按"未知"处理，
+ * 该规则静默不生效**（"未知"不算命中）。方向上是 fail-closed，不会因此放行
+ * 陌生人；实际不可达（listen_fd 刚被 accept4 用过）。*/
 int iv_chan_accept(int listen_fd, const iv_chan_acl_t *acl, iv_chan_peer_t *peer);
 
-/* 关闭接听点：关掉 fd 并 unlink 路径（避免留下下次启动要清理的残留）。幂等。
- * path 为 NULL 时只关 fd、不 unlink。返回 IV_OK / IV_* 错误码。*/
+/* 关闭接听点：关掉 fd 并 unlink 路径（避免留下下次启动要清理的残留）。
+ * path 为 NULL 时**只关 fd、不 unlink** —— 把"关闭连接"与"清理路径"显式分开，
+ * 免得"只想关 fd"的调用顺手删掉别人的路径。返回 IV_OK / IV_* 错误码。
+ *
+ * **不是全幂等的，两类情况要分清**：
+ *   - unlink 侧幂等：路径本就不存在（ENOENT）视为成功，重复调不报错。
+ *   - fd 侧**不**幂等：拿**已关闭的 fd** 再调一次会命中 `close()` 的 EBADF →
+ *     返回 IV_EIO。这是刻意的（容忍 EBADF 会把"重复关闭"这种真实 bug 藏起来），
+ *     调用方须保证每个 listen fd 只 close 一次。
+ *
+ * **单实例假设（重要）**：本函数按**路径** unlink，不校验该路径上的 socket 是否
+ * 就是自己 bind 的那一个。因此同一路径上若跑起第二个实例：第二个实例
+ * iv_chan_listen() 会把第一个实例（仍在运行）的接听点 unlink 重建，而第一个实例
+ * 退出时本函数又反向删掉第二个实例的接听点 —— **双活部署下双方互相破坏**。
+ * 本模块不提供单实例保护，该防线落在 S10（启动时加单实例锁）。*/
 int iv_chan_listen_close(int listen_fd, const char *path);
 
 /* ============================ 连接端 ============================ */
 
-/* 连接到接听点。返回 >= 0 的已连接 fd，或 < 0 的 IV_* 错误码：
+/* 连接到接听点。返回 >= 0 的已连接 fd（**已设 CLOEXEC + NONBLOCK**），
+ * 或 < 0 的 IV_* 错误码：
  *   IV_ENOENT  接听点不存在（服务没起）
  *   IV_EAUTH   文件权限不允许（内核 EACCES/EPERM），即被第一道门槛挡下
  *   IV_ERANGE  路径为空或过长
- *   IV_ECONN   其他连接失败
+ *   IV_EBUSY   对端 **backlog 已满**（内核 EAGAIN）—— 服务是活的、只是暂时排不上，
+ *              **稍后重试即可**。S10 装配客户端时必须按"可重试"处理，
+ *              不要与 IV_ENOENT（服务没起）混为一谈
+ *   IV_EFAIL   本机资源不足（`socket()` 失败），**不是对端的问题**
+ *   IV_ECONN   其他连接失败（含 ECONNREFUSED / EPROTOTYPE）
+ * 返回值是**非阻塞** fd，因此后续 iv_chan_recv() 可能直接返回 IV_EAGAIN。
  * UDS 的 connect 是本地操作、不会阻塞等待网络，故不设超时参数；
  * "请求超时"由 iv_chan_recv_timeout() 覆盖。*/
 int iv_chan_connect(const char *path);
@@ -265,9 +294,12 @@ int iv_chan_connect(const char *path);
 /* ============================ 一条连接上的收发 ============================ */
 
 /* 收一条完整消息。
- *   buf / cap : 调用方提供的接收缓冲，**cap 必须 >= IV_CHAN_RECV_CAP_MIN**，
- *               否则合法消息会被误判为超长。容量决定权交给调用方，
- *               是为了让本模块**不做任何隐藏的内存分配**（嵌入式下这一点比省事重要）。
+ *   buf / cap : 调用方提供的接收缓冲。容量决定权交给调用方，是为了让本模块
+ *               **不做任何隐藏的内存分配**（嵌入式下这一点比省事重要）。
+ *               cap 只需 >= IV_CHAN_HDR_SIZE（32）；但**若需接收任意合法消息，
+ *               cap 应 >= IV_CHAN_RECV_CAP_MIN** —— 小于该值时合法的大消息会被
+ *               整包丢弃并返回 IV_ERANGE。反过来说，"只收小事件消息、刻意用小
+ *               缓冲"是**合法用法**，本模块不会因为 cap 小而拒绝调用。
  *   返回值：
  *     IV_OK       成功。*hdr 填好；载荷位于 (uint8_t *)buf + IV_CHAN_HDR_SIZE，
  *                 长度为 *payload_len
@@ -279,6 +311,12 @@ int iv_chan_connect(const char *path);
  *     IV_EAGAIN   非阻塞 fd 上当前无数据
  *     IV_EINVAL   参数非法
  *
+ * **出错返回时 *hdr 与 *payload_len 的内容不可信**，调用方只能走错误分支、
+ * 不得复用它们。具体地：IV_EPROTO 路径里 *hdr 已被写入**未经校验的原始头**；
+ * IV_ERANGE / IV_EAGAIN / IV_ECONN / IV_EINVAL 路径完全不碰 *hdr；
+ * *payload_len 只在 IV_OK 时写入（即成功时它一定是最新的，出错时是旧值或未定义）。
+ * 成功时 *hdr 是**已通过 iv_chan_hdr_check() 且与实际包长自洽**的头。
+ *
  * 实现说明：用 `recv(..., MSG_TRUNC)` 一次拿到**整包长度**——返回值大于 cap
  * 即说明真实包更大，此时内核已按 SEQPACKET 语义把整包丢弃，正好是我们想要的
  * "拒绝超长"而不是"读半截留下残渣"。因为只调一次 recv，不存在两次系统调用
@@ -289,8 +327,15 @@ int iv_chan_recv(int fd, void *buf, size_t cap, ivs_chan_hdr_t *hdr, size_t *pay
  * timeout_ms < 0 时返回 IV_EINVAL（**不支持"无限等待"** —— 架构 §5.1 明确
  * "请求必须设置超时"，给一个能睡死的接口等于给调用方留陷阱）。
  * 其余返回码与 iv_chan_recv 相同。
- * 注意：poll 报告可读之后 iv_chan_recv 仍可能返回 IV_EAGAIN（极罕见），
- * 调用方应把它与"真的没数据"同等对待，重新进入等待。*/
+ *
+ * **超时预算是全程有效的硬上限**：被信号打断（poll 返回 EINTR）时本函数
+ * **在同一个调用内**用**剩余**预算继续等，绝不把已经花掉的时间丢掉重来 ——
+ * 否则持续的信号流（SIGCHLD 之类）会把实际等待无限拉长，与上面"必须设置超时"
+ * 的纪律相悖。因此返回值里**不会**出现"因 EINTR 而提前返回的 IV_EAGAIN"。
+ *
+ * 注意：poll 报告可读之后 iv_chan_recv 仍可能返回 IV_EAGAIN（极罕见）。
+ * 那意味着调用方要**再调一次**本函数，而新的一次会以**全新的 timeout_ms** 重新
+ * 计时 —— 本函数管不了跨调用的时间，调用方若在外层循环重试，须自行累计总预算。*/
 int iv_chan_recv_timeout(int fd, void *buf, size_t cap, ivs_chan_hdr_t *hdr,
                          size_t *payload_len, int timeout_ms);
 
@@ -302,9 +347,14 @@ int iv_chan_recv_timeout(int fd, void *buf, size_t cap, ivs_chan_hdr_t *hdr,
  * IV_EAGAIN 非阻塞且发送缓冲满（**该消息一条都没发出去**，可安全重试）；
  * IV_ECONN 对端已关闭或发送出错。
  *
- * 实现用 `sendmsg` 把"头 + 载荷"作为两段 iovec 一次发出，**不拼临时缓冲**；
- * 带 MSG_NOSIGNAL，因此对端先关闭时只会返回 IV_ECONN，不会给本进程送 SIGPIPE
- * （架构 §4.1 要求 SIGPIPE 被屏蔽，本模块从源头不产生它）。*/
+ * 实现用 `sendmsg` 把"头 + 载荷"作为两段 iovec 一次发出，**不拼临时缓冲**。
+ *
+ * 关于 SIGPIPE：调用带 `MSG_NOSIGNAL`，但**别把它当成本模块抗 SIGPIPE 的依据** ——
+ * 2026-09-29 双端实测（VM 内核 6.8.0 / 板端 5.4.61-rt37）：`AF_UNIX`
+ * `SOCK_SEQPACKET` 上对端关闭后 `sendmsg` 只返回 `EPIPE`，**内核不送 SIGPIPE**，
+ * 带不带该标志结果逐字相同；SIGPIPE 只在 `SOCK_STREAM` 上出现（同探针实测
+ * rc=141）。保留该标志是预防性的：万一将来把传输换成 STREAM，本模块不用改就已免疫。
+ * 架构 §4.1 要求的"主控屏蔽 SIGPIPE"仍由 S10 装配负责，本模块不代劳。*/
 int iv_chan_send(int fd, const ivs_chan_hdr_t *hdr, const void *payload, size_t payload_len);
 
 #ifdef __cplusplus

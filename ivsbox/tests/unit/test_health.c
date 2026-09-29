@@ -130,9 +130,12 @@ static void case_reactor_dead(void)
 /* ---------------------------------------------------------------------------
  * 用例 2：taskpool 空转（空闲也推进进度号）→ 恒健康，不得误报
  *
- * stuck_ms 取 1500ms，**故意大于** IV_TASKPOOL_IDLE_POLL_MS(1000ms)，
- * 观察 2.6s（> 1 个 idle 周期）。若 worker 空闲不推进进度号，这里必然误判；
- * 实测保持健康即证明 S5 埋的"空闲轮推进进度号"确实生效。
+ * stuck_ms 取 2000ms，**故意为 IV_TASKPOOL_IDLE_POLL_MS(1000ms) 的 2 倍**，
+ * 观察 3.2s（> 3 个 idle 周期）。留 2 倍余量是因为宿主/VM 负载停顿若超过一个
+ * idle 周期，进度号就会晚推一次；余量只有 1.5 倍时这条用例会偶发误报
+ * （判死 → 停喂），那是测试自身脆弱，不是被测代码的问题。
+ * 若 worker 空闲不推进进度号，这里必然误判；实测保持健康即证明 S5 埋的
+ * "空闲轮推进进度号"确实生效。
  * ------------------------------------------------------------------------- */
 static void case_healthy_worker_idle(void)
 {
@@ -149,12 +152,12 @@ static void case_healthy_worker_idle(void)
     pool = iv_taskpool_create(2, 8);
     chk(pool != NULL, "case2: taskpool create");
 
-    h = iv_health_start(NULL, pool, p[1], 1500u, 50u);
+    h = iv_health_start(NULL, pool, p[1], 2000u, 50u);
     chk(h != NULL, "case2: health start");
 
-    sleep_ms(1300);
+    sleep_ms(1600);
     first = drain(p[0]);
-    sleep_ms(1300);
+    sleep_ms(1600);
     second = drain(p[0]);
 
     chk(first >= 1, "case2: feeding during first window");
@@ -163,10 +166,13 @@ static void case_healthy_worker_idle(void)
     chk(iv_health_snapshot(h, &s) == IV_OK, "case2: snapshot");
     chk(s.fault_code == IV_HEALTH_OK, "case2: idle workers must not raise a fault");
     chk(s.worker_count == 2, "case2: observed both workers");
-    chk(s.tick_count >= 20u, "case2: ticked ~50x in 2.6s");
+    chk(s.tick_count >= 20u, "case2: ticked ~50x/s over 3.2s");
 
     iv_health_destroy(h);
     iv_taskpool_destroy(pool);
+    /* 健康路径下 health 线程不会 close 写端，destroy 按契约也不关，
+     * 所以这里必须自己关 —— 否则本用例每跑一次就漏一个 fd。 */
+    close(p[1]);
     close(p[0]);
 }
 

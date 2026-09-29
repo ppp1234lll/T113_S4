@@ -21,6 +21,17 @@
 #include "ivsbox/iv_ret.h"
 #include "ivsbox/iv_watchdog.h"
 
+/* 编译期不变量：健康判据的最坏结论时延（stuck_ms + interval_ms）必须严格小于看门狗
+ * 超时窗口，否则"判据还没得出故障结论、看门狗就已经咬了"，门控形同虚设。
+ * 这里比的是**请求值**：板端 sunxi-wdt 的 max_timeout 恰为 16s，而内核只对越界值
+ * 返回 -EINVAL（不 clamp），所以"请求 16s 就被原样接受" ⇒ 请求值 = 实际值。
+ * 换板子/换驱动时：先实测该驱动的 max_timeout，再改 IV_WATCHDOG_DEFAULT_TIMEOUT_SEC
+ * 或这两个默认值 —— 顺序反了会被下面这个 #error 当场拦下。 */
+#if (IV_HEALTH_STUCK_MS_DEFAULT + IV_HEALTH_INTERVAL_MS_DEFAULT) >= \
+    (IV_WATCHDOG_DEFAULT_TIMEOUT_SEC * 1000u)
+#error "health: stuck_ms + interval_ms must stay strictly below the watchdog timeout"
+#endif
+
 #define HEALTH_TAG "[health]"
 
 /* 一个被观察对象的活跃度探针 */
@@ -187,7 +198,12 @@ static void *health_main(void *arg)
             if (fault != last_fault)
                 report_fault(h, fault);
 
-            /* 停喂：关掉 fd（nowayout=0 时内核随之停狗），此后不再写。 */
+            /* 停喂：**故意**只 close，不写 'V'。本工程 keepalive 写的是 '\0'，
+             * 而 sunxi-wdt 声明了 WDIOF_MAGICCLOSE —— 内核 release 路径只在
+             * "写过 magic 'V'"或"驱动未声明 MAGICCLOSE"时才停狗，所以这里 close
+             * 之后狗会继续倒计时、约 timeout 秒后整机复位，正是门控要的结果。
+             * **判死路径绝不写 'V'**：写 'V' 是"正常停机"的动作，
+             * 见 iv_watchdog_disable() 的纪律说明。 */
             if (h->wd_fd >= 0) {
                 (void)iv_watchdog_close(h->wd_fd);
                 h->wd_fd = -1;

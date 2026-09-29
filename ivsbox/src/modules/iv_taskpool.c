@@ -27,9 +27,11 @@
  *    hal 会当场链接失败，S4 的 iv_reactor 就只能自己调 libc clock_gettime。
  *
  * 6) 信号掩码在**建线程之前**由本模块自己阻塞（pthread_sigmask），且不恢复。
- *    架构 §4.2 的装配顺序是 taskpool 先、Reactor 后，而 iv_reactor_create()
+ *    按计划 §S10 的装配顺序，taskpool 先建、Reactor 后建，而 iv_reactor_create()
  *    也要求"必须在建任何线程之前"阻塞信号 —— 两个要求直接冲突。由本模块
  *    自己负责，无论先后顺序，worker 继承的掩码都是正确的。
+ *    （此前这里写的是"架构 §4.2 的装配顺序"，属**错误归属**：§4.2 只画并发模型的
+ *    数据流，没有规定任何创建次序。2026-09-29 更正为归到计划 §S10。）
  *
  * 7) 链接期需要 -lpthread：板端 glibc 2.25 的 pthread 符号在独立 libpthread
  *    里，漏加板上直接链接失败；而新 glibc（>=2.34）已把 pthread 并入 libc，

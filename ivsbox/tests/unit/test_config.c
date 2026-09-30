@@ -4,7 +4,7 @@
  * 覆盖计划 §S8 的七个功能 F1~F7，以及 §S8.1 的五项新增/变更能力：
  *   ① 单文件口径（`<dir>/ivsbox.json`）与八个一级分类；
  *   ② 单句柄约束（第二次 open 同名必须返回 NULL）；
- *   ③ JSON 数组（camera.ch，元素＝条目，下标越界/空洞判非法）；
+ *   ③ JSON 数组（camera.ch，真实保存 0/1/6 路，下标越界/空洞判非法）；
  *   ④ double（elec.* / sensor.* 物理量阈值，类型严格不隐式转换）；
  *   ⑤ 中文注释渲染 + **渲染→再解析** 往返等值；
  *   ⑥ 热更新事务粒度＝**按一级分类子树**（坏分类单独回退，其余分类照常采用）。
@@ -17,6 +17,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,16 +127,18 @@ static int contains(const char *hay, const char *needle)
 
 /* F7 订阅者计数 */
 struct notify_ctx {
-    int  count;
-    char last[IV_CFG_NAME_MAX];
+    int      count;
+    char     last[IV_CFG_NAME_MAX];
+    uint32_t last_mask;
 };
 
-static void on_notify(iv_config_t *c, const char *name, void *user)
+static void on_notify(iv_config_t *c, const char *name, uint32_t changed_mask, void *user)
 {
     struct notify_ctx *n = (struct notify_ctx *)user;
 
     (void)c;
     n->count++;
+    n->last_mask = changed_mask;
     if (name != NULL) {
         size_t l = strlen(name);
 
@@ -171,7 +174,8 @@ static iv_config_t *reopen_cfg(void)
 
 /* ===========================================================================
  * §S8.1 ① + F1/F4：文件根本不存在 ⇒ 用内置默认值照常启动
- * 新口径：单文件、八分类、128 容量上限。默认表共 5+11+5+49+3+5+4+5 = 87 项。
+ * 新口径：单文件、八分类、128 容量上限。变长 camera.ch 不预建槽位，
+ * 无相机时默认项共 5+11+5+1+3+5+4+5 = 39 项。
  * 反向证伪：若默认值表被清空 / 补齐逻辑不跑，items 与各默认值断言立刻失败。
  * ========================================================================= */
 static void case_defaults_startup(void)
@@ -195,11 +199,9 @@ static void case_defaults_startup(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c1: stat");
     chk(st.loaded == 0, "c1: loaded == 0 (started from built-in defaults)");
-    /* 8 个一级分类的全部默认键：sys 5 + net 11 + probe 5 + camera 49 +
-     * switch 3 + elec 5 + netthr 4 + sensor 5 = 87 */
-    chk(st.items == 87u, "c1: all 87 built-in defaults materialised");
+    chk(st.items == 39u, "c1: 39 non-array defaults materialised");
     chk(st.from_file == 0u, "c1: nothing came from the file");
-    chk(st.from_default == 87u, "c1: everything came from defaults");
+    chk(st.from_default == 39u, "c1: everything came from defaults");
     chk(st.invalid == 0u, "c1: a missing file is NOT an invalid value");
     chk(st.version == 0u, "c1: version is 0 when there is no file");
     chk(st.dirty == 0, "c1: not dirty right after open");
@@ -213,8 +215,8 @@ static void case_defaults_startup(void)
         "c1: probe.interval_ms default 5000");
     chk(iv_config_get_str(c, "camera.search", &s) == IV_OK && strcmp(s, "off") == 0,
         "c1: camera.search default off");
-    chk(iv_config_get_bool(c, "camera.ch.0.record", &bv) == IV_OK && bv == 0,
-        "c1: camera.ch.0.record default false");
+    chk(iv_config_get_bool(c, "camera.ch.0.record", &bv) == IV_ENOENT,
+        "c1: an empty camera array does not invent slot 0");
     chk(iv_config_get_str(c, "switch.ip", &s) == IV_OK && s[0] == '\0',
         "c1: switch.ip default empty");
     chk(iv_config_get_dbl(c, "elec.volt_high", &dv) == IV_OK && dv == 0.0,
@@ -273,7 +275,8 @@ static void case_read_typed(void)
         "  \"sys\": { \"transport\": { \"mode\": 2 }, \"debug\": { \"mode\": true } },\n"
         "  \"net\": { \"ip\": \"10.0.0.5\" },\n"
         "  \"elec\": { \"volt_high\": 60.5 },\n"
-        "  \"feature\": { \"enabled\": true, \"name\": \"x y\" }\n"
+        "  \"feature\": { \"enabled\": true, \"name\": \"x y\", "
+        "\"quoted\\\"key\": 7 }\n"
         "}\n";
     char            pf[200];
     iv_config_t    *c;
@@ -298,7 +301,7 @@ static void case_read_typed(void)
     chk(st.version == 7u, "c2: version read from _meta");
     /* 文件给了 4 个已知键 + 2 个未知键，其余全部按默认补齐 */
     chk(st.invalid == 0u, "c2: no invalid key");
-    chk(st.from_file == 6u, "c2: six keys came from the file");
+    chk(st.from_file == 7u, "c2: seven keys came from the file");
     chk(st.crc_mismatch == 0, "c2: no crc in the file => no mismatch warning");
 
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "10.0.0.5") == 0,
@@ -312,6 +315,8 @@ static void case_read_typed(void)
         "c2: unknown key with a space is preserved verbatim");
     chk(iv_config_get_bool(c, "feature.enabled", &bv) == IV_OK && bv == 1,
         "c2: unknown boolean preserved");
+    chk(iv_config_get_int(c, "feature.quoted\"key", &iv) == IV_OK && iv == 7,
+        "c2: an unknown key containing a quote is readable");
     chk(iv_config_origin(c, "feature.name", &org) == IV_OK && org == IV_CFG_FROM_FILE,
         "c2: unknown key origin is FILE");
 
@@ -343,7 +348,20 @@ static void case_read_typed(void)
     chk(iv_config_origin(c, "net.ip", &org) == IV_OK && org == IV_CFG_FROM_FILE,
         "c2: origin reports FILE");
 
+    /* 向前兼容契约：未知顶层分类不能只在内存里“看起来存在”，save 后也必须保留。 */
+    chk(iv_config_save(c, NULL, 0u) == IV_OK, "c2: save with an unknown top-level class");
     iv_config_close(c);
+    c = reopen_cfg();
+    chk(c != NULL, "c2: reopen after preserving the unknown class");
+    if (c != NULL) {
+        chk(iv_config_get_str(c, "feature.name", &s) == IV_OK && strcmp(s, "x y") == 0,
+            "c2: unknown top-level data survives save/reopen");
+        chk(iv_config_get_bool(c, "feature.enabled", &bv) == IV_OK && bv == 1,
+            "c2: unknown top-level boolean survives save/reopen");
+        chk(iv_config_get_int(c, "feature.quoted\"key", &iv) == IV_OK && iv == 7,
+            "c2: an escaped object key survives save/reopen");
+        iv_config_close(c);
+    }
 }
 
 /* ===========================================================================
@@ -355,6 +373,7 @@ static void case_single_handle(void)
 {
     iv_config_t *c1;
     iv_config_t *c2;
+    char         alias[200];
 
     c1 = reopen_cfg();
     chk(c1 != NULL, "c3: first open");
@@ -363,6 +382,13 @@ static void case_single_handle(void)
 
     c2 = reopen_cfg();
     chk(c2 == NULL, "c3: a SECOND handle for the same file is refused");
+    snprintf(alias, sizeof(alias), "%s/", g_dir);
+    chk(iv_config_open(alias, IV_CFG_NAME) == NULL,
+        "c3: a trailing-slash alias cannot bypass the single-handle rule");
+    snprintf(alias, sizeof(alias), "%s/.", g_dir);
+    chk(iv_config_open(alias, IV_CFG_NAME) == NULL,
+        "c3: a dot-path alias cannot bypass the directory identity check");
+    chk(iv_config_open(g_dir, "other") == NULL, "c3: the single-file API rejects other names");
 
     iv_config_close(c1);
     /* 关掉之后必须能再开 —— 否则"拒绝"变成了"永久占用" */
@@ -453,6 +479,10 @@ static void case_set_memory_then_save(void)
         chk(iv_config_set_str(c, NULL, "y") == IV_EINVAL, "c4: NULL key");
         chk(iv_config_set_str(c, "ok.key", NULL) == IV_EINVAL, "c4: NULL value");
         chk(iv_config_set_bool(NULL, "ok.key", 1) == IV_EINVAL, "c4: NULL handle");
+        chk(iv_config_set_dbl(c, "elec.volt_high", NAN) == IV_EINVAL,
+            "c4: NaN cannot be represented in JSON");
+        chk(iv_config_set_dbl(c, "elec.volt_high", INFINITY) == IV_EINVAL,
+            "c4: infinity cannot be represented in JSON");
         chk(iv_config_set_int(c, "ok.key", 1) == IV_OK, "c4: a normal unknown key is settable");
 
         iv_config_close(c);
@@ -482,9 +512,9 @@ static void case_fill_and_origin(void)
         return;
 
     chk(iv_config_stat(c, &st) == IV_OK, "c5: stat");
-    chk(st.items == 87u, "c5: the whole default table is materialised");
+    chk(st.items == 39u, "c5: all non-array defaults are materialised");
     chk(st.from_file == 1u, "c5: exactly one key came from the file");
-    chk(st.from_default == 86u, "c5: eighty-six were filled from defaults");
+    chk(st.from_default == 38u, "c5: thirty-eight were filled from defaults");
     chk(st.invalid == 0u, "c5: a MISSING key is not an INVALID key");
     chk(st.loaded == 1, "c5: the file itself loaded fine");
 
@@ -505,7 +535,7 @@ static void case_fill_and_origin(void)
  * F4：文件把子树写成标量（`"net": 5`）必须判非法并剔除，不能让它把整棵
  *     net.* 默认子树挡在门外。
  * 反向证伪：去掉 item_check() 里的 is_default_parent 分支后，invalid 会退回 0，
- *           而 items 也不再是 87 —— 这正是 F6 静默清空运行中配置的那条路。
+ *           而 items 也不再是 39 —— 这正是 F6 静默清空运行中配置的那条路。
  * ========================================================================= */
 static void case_parent_scalar_rejected(void)
 {
@@ -525,7 +555,7 @@ static void case_parent_scalar_rejected(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c6: stat");
     chk(st.invalid == 1u, "c6: the scalar that shadows a subtree is counted as invalid");
-    chk(st.items == 87u, "c6: the whole net.* default subtree is still there");
+    chk(st.items == 39u, "c6: the whole non-array default set is still there");
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && s[0] == '\0',
         "c6: net.* is usable again (defaulted empty)");
     chk(iv_config_get_int(c, "net", &iv) == IV_ENOENT, "c6: the offending key itself is gone");
@@ -712,7 +742,7 @@ static void case_key_prefix_conflict(void)
 }
 
 /* ===========================================================================
- * §S8.1 ③：JSON 数组（camera.ch）——元素＝条目、array_len、下标越界/空洞
+ * §S8.1 ③：JSON 数组（camera.ch）——真实长度、逐元素默认、下标越界/空洞
  * 反向证伪：
  *   ① 去掉 item_check() 的下标越界判定 ⇒ "ch.9 refused" 会变成成功；
  *   ② 去掉空洞判定 ⇒ "gap refused" 会变成成功；
@@ -740,7 +770,7 @@ static void case_array_support(void)
     if (c == NULL)
         return;
 
-    /* 数组元素按"一个元素＝一个条目"存：两根路的字段都要读得到 */
+    /* 两路相机的字段都要读得到 */
     chk(iv_config_get_str(c, "camera.ch.0.vendor", &s) == IV_OK && strcmp(s, "hk") == 0,
         "c10: element 0 vendor");
     chk(iv_config_get_bool(c, "camera.ch.0.record", &bv) == IV_OK && bv == 1,
@@ -754,18 +784,14 @@ static void case_array_support(void)
     chk(iv_config_get_str(c, "camera.ch.1.ip", &s) == IV_OK && strcmp(s, "2.2.2.2") == 0,
         "c10: element 1 ip");
 
-    /* array_len：按"最大下标 + 1"计。默认表给足 camera.ch.0..5 六个槽 ⇒ 恒为 6，
-     * 与文件里写了几路无关（文件只决定"值"，不决定"槽位"）。 */
-    chk(iv_config_array_len(c, "camera.ch", &n) == IV_OK && n == 6u,
-        "c10: array length is 6 (the default table stamps slots 0..5)");
+    chk(iv_config_array_len(c, "camera.ch", &n) == IV_OK && n == 2u,
+        "c10: array length follows the two elements in the file");
     chk(iv_config_array_len(c, "camera.zzz", &n) == IV_OK && n == 0u,
         "c10: an array nobody declared has length 0");
     chk(iv_config_array_len(c, "camera.ch", NULL) == IV_EINVAL, "c10: NULL n");
     chk(iv_config_array_len(c, "a..b", &n) == IV_EINVAL, "c10: a malformed arr_key");
 
-    /* 下标越界，且**不构成空洞**：ch.6 的下标 0..5 全在（默认表铺满）⇒
-     * 只有"越界判定"能拒它，空洞判定不会替它兜底。这条专门钉死越界规则本身。
-     * 反向证伪：把 `idx >= IV_CFG_ARR_MAX` 改成恒假 ⇒ 本用例 save 会变 IV_OK。 */
+    /* 下标越界：范围判定必须优先于空洞判定，detail 要明确指出 out of range。 */
     chk(iv_config_set_str(c, "camera.ch.6.vendor", "oob") == IV_OK,
         "c10: set element 6 (one past the 6-slot cap, no gap)");
     detail[0] = '\0';
@@ -821,8 +847,7 @@ static void case_array_support(void)
         }
     }
 
-    /* 空数组与"根本没有数组"等价：一份完全不含 camera.ch 的文件 ⇒ 默认表补齐后
-     * 槽位仍在（6），但"一个键都没从文件读到"这件事由 from_file 反映。 */
+    /* 0 路：空数组与“根本没有数组”等价，不能再被默认表扩成 6 路。 */
     {
         char         pf3[200];
         iv_config_t *c3;
@@ -835,9 +860,42 @@ static void case_array_support(void)
         if (c3 != NULL) {
             chk(iv_config_stat(c3, &st3) == IV_OK && st3.from_file == 0u,
                 "c10: nothing came from the file");
-            chk(iv_config_array_len(c3, "camera.ch", &n) == IV_OK && n == 6u,
-                "c10: slots are still stamped by the default table");
+            chk(iv_config_array_len(c3, "camera.ch", &n) == IV_OK && n == 0u,
+                "c10: an absent camera array has length 0");
             iv_config_close(c3);
+        }
+    }
+
+    /* 1 路与 6 路：长度必须跟实际数组一致，且每个已存在元素才补字段默认。 */
+    {
+        static const char ONE[] =
+            "{\"camera\":{\"ch\":[{\"vendor\":\"solo\"}]}}\n";
+        static const char SIX[] =
+            "{\"camera\":{\"ch\":[{\"vendor\":\"0\"},{\"vendor\":\"1\"},"
+            "{\"vendor\":\"2\"},{\"vendor\":\"3\"},{\"vendor\":\"4\"},"
+            "{\"vendor\":\"5\"}]}}\n";
+        iv_config_t *cx;
+
+        chk(write_file(pf, ONE, 0644u) == 0, "c10: seed one camera");
+        cx = reopen_cfg();
+        chk(cx != NULL, "c10: open one-camera config");
+        if (cx != NULL) {
+            chk(iv_config_array_len(cx, "camera.ch", &n) == IV_OK && n == 1u,
+                "c10: one camera stays one camera");
+            chk(iv_config_get_bool(cx, "camera.ch.0.record", &bv) == IV_OK && bv == 0,
+                "c10: defaults are filled only inside the existing element");
+            chk(iv_config_get_str(cx, "camera.ch.1.vendor", &s) == IV_ENOENT,
+                "c10: slot 1 is not invented");
+            iv_config_close(cx);
+        }
+
+        chk(write_file(pf, SIX, 0644u) == 0, "c10: seed six cameras");
+        cx = reopen_cfg();
+        chk(cx != NULL, "c10: open six-camera config");
+        if (cx != NULL) {
+            chk(iv_config_array_len(cx, "camera.ch", &n) == IV_OK && n == 6u,
+                "c10: six cameras stay six cameras");
+            iv_config_close(cx);
         }
     }
 }
@@ -875,6 +933,8 @@ static void case_comment_roundtrip(void)
     chk(iv_config_set_int(c, "sys.transport.mode", 1) == IV_OK, "c11: set an int");
     chk(iv_config_set_bool(c, "sys.debug.mode", 1) == IV_OK, "c11: set a bool");
     chk(iv_config_set_str(c, "net.ip", "172.16.0.9") == IV_OK, "c11: set a string");
+    chk(iv_config_set_str(c, "camera.ch.0.vendor", "hk") == IV_OK,
+        "c11: create exactly one camera element");
 
     chk(iv_config_save(c, NULL, 0u) == IV_OK, "c11: save");
     iv_config_close(c);
@@ -900,7 +960,7 @@ static void case_comment_roundtrip(void)
     chk(iv_config_stat(c, &st) == IV_OK, "c11: stat after round-trip");
     chk(st.loaded == 1, "c11: the rendered file parses back cleanly");
     chk(st.invalid == 0u, "c11: no value was rejected on the round-trip");
-    chk(st.items == 87u, "c11: all keys survived the round-trip");
+    chk(st.items == 47u, "c11: 39 base keys plus one 8-field camera survived");
 
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "172.16.0.9") == 0,
         "c11: the string survived");
@@ -916,12 +976,12 @@ static void case_comment_roundtrip(void)
     chk(iv_config_get_dbl(c, "sensor.temp_low", &dv) == IV_OK && dv == -5.5,
         "c11: the fractional double survived exactly");
 
-    /* 元素也走过往返：默认表给足 6 个槽 ⇒ 渲染成 6 元素数组、读回仍是 6 */
+    /* 数组元素也走过往返：只创建 1 路，读回仍必须是 1 路。 */
     {
         unsigned n = 0u;
 
-        chk(iv_config_array_len(c, "camera.ch", &n) == IV_OK && n == 6u,
-            "c11: all six array slots survive the array render");
+        chk(iv_config_array_len(c, "camera.ch", &n) == IV_OK && n == 1u,
+            "c11: the single array element survives the array render");
     }
 
     iv_config_close(c);
@@ -941,6 +1001,8 @@ static void case_hot_reload(void)
     char         pf[200];
     char         stage[200];
     char         other[200];
+    char         long_name[96];
+    char         long_path[280];
     iv_config_t *c;
     int64_t      iv = 0;
     uint32_t     rl = 0u;
@@ -972,7 +1034,15 @@ static void case_hot_reload(void)
     chk(iv_config_watch_poll(c, &rl) == IV_OK && rl == 0u,
         "c12: another file in the same directory does not trigger a reload");
 
-    /* 外部原子写 #1 */
+    /* 先排入一个长文件名事件。旧实现的事件缓冲只有约 56 字节，read 会 EINVAL 且
+     * 队头永远消费不掉；紧随其后的真实配置事件也就永远到不了。 */
+    memset(long_name, 'x', sizeof(long_name));
+    memcpy(long_name + sizeof(long_name) - 6u, ".tmp", 5u);
+    long_name[sizeof(long_name) - 1u] = '\0';
+    path_of(long_path, sizeof(long_path), long_name);
+    chk(write_file(long_path, "{}\n", 0644u) == 0, "c12: queue a long unrelated filename event");
+
+    /* 外部原子写 #1：必须越过前面的长事件正常生效 */
     chk(write_file(stage, V1, 0644u) == 0, "c12: stage the new content");
     chk(rename(stage, pf) == 0, "c12: atomic swap #1");
     rl = 0u;
@@ -980,6 +1050,7 @@ static void case_hot_reload(void)
     chk(iv_config_get_int(c, "sys.report.interval_s", &iv) == IV_OK && iv == 120,
         "c12: the new value is live");
     chk(iv_config_version(c) == 50u, "c12: the version follows the file");
+    (void)unlink(long_path);
 
     /* 外部原子写 #2 —— watch 目录的证伪点 */
     chk(write_file(stage, V2, 0644u) == 0, "c12: stage the second revision");
@@ -996,7 +1067,7 @@ static void case_hot_reload(void)
 /* ===========================================================================
  * §S8.1 ⑥ + F6/F7：热更新事务粒度＝**按一级分类子树**
  *   一份新文件里同时改好 net 与 probe，但 probe 里塞一个越界值 ⇒
- *   只拒 probe、net 的新值照常采用；订阅者**收到通知**（因为至少一个分类采用）。
+ *   只拒 probe、net 的新值照常采用；只订阅 net 的回调收到通知，probe 回调不收。
  *   再来一份"整份语法坏"的文件 ⇒ 整份拒绝、旧值一字不动、**一个都不通知**。
  *
  * 反向证伪：
@@ -1050,9 +1121,16 @@ static void case_per_class_transaction(void)
     n2.count = 0;
     n1.last[0] = '\0';
     n2.last[0] = '\0';
-    chk(iv_config_subscribe(c, on_notify, &n1) == IV_OK, "c13: subscribe #1");
-    chk(iv_config_subscribe(c, on_notify, &n2) == IV_OK, "c13: subscribe #2");
-    chk(iv_config_subscribe(c, NULL, NULL) == IV_EINVAL, "c13: NULL callback rejected");
+    n1.last_mask = 0u;
+    n2.last_mask = 0u;
+    chk(iv_config_subscribe(c, IV_CFG_CLASS_MASK(IV_CFG_CLS_NET), on_notify, &n1) == IV_OK,
+        "c13: subscribe net");
+    chk(iv_config_subscribe(c, IV_CFG_CLASS_MASK(IV_CFG_CLS_PROBE), on_notify, &n2) == IV_OK,
+        "c13: subscribe probe");
+    chk(iv_config_subscribe(c, 0u, on_notify, &n1) == IV_EINVAL,
+        "c13: empty class mask rejected");
+    chk(iv_config_subscribe(c, IV_CFG_CLASS_MASK_ALL, NULL, NULL) == IV_EINVAL,
+        "c13: NULL callback rejected");
 
     /* (a) 混合：probe 冲突、net 好。
      * 先把 probe.interval_ms 在运行期改成 9000（≠ 默认 5000）—— 这是"旧值"，
@@ -1062,11 +1140,13 @@ static void case_per_class_transaction(void)
     chk(iv_config_save(c, NULL, 0u) == IV_OK, "c13: persist the seeded value");
     n1.count = 0;
     n2.count = 0; /* save() 自己也会通知，先把计数器清零，只看下面这次 reload */
+    n1.last_mask = 0u;
+    n2.last_mask = 0u;
     chk(write_file(stage, MIXED, 0644u) == 0, "c13: stage a mixed file");
     chk(rename(stage, pf) == 0, "c13: swap in the mixed file");
     rl = 99u;
     chk(iv_config_watch_poll(c, &rl) == IV_OK, "c13: poll the mixed file");
-    chk(rl >= 1u, "c13: at least one class was adopted (net)");
+    chk(rl == 1u, "c13: exactly one class changed (net)");
     /* net 的新值必须生效 —— 这是"按分类"的核心证伪点 */
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "10.9.9.9") == 0,
         "c13: net was still adopted despite probe being invalid");
@@ -1075,12 +1155,18 @@ static void case_per_class_transaction(void)
     /* probe 分类整块回退**旧值** 9000（不是默认 5000）—— 区分"真回退"与"没回退" */
     chk(iv_config_get_int(c, "probe.interval_ms", &iv) == IV_OK && iv == 9000,
         "c13: the invalid probe class rolled back to its OLD value, not the parse-time default");
-    chk(n1.count == 1 && n2.count == 1, "c13: subscribers were notified (a class was adopted)");
+    chk(n1.count == 1 && n2.count == 0,
+        "c13: only the subscriber for the changed net class was notified");
+    chk((n1.last_mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_NET)) != 0u &&
+            (n1.last_mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_PROBE)) == 0u,
+        "c13: callback mask names net but not the rejected probe class");
     chk(strcmp(n1.last, IV_CFG_NAME) == 0, "c13: the callback receives the config name");
 
     /* (b) 整份语法坏 ⇒ 全拒、不通知、旧值不动 */
     n1.count = 0;
     n2.count = 0;
+    n1.last_mask = 0u;
+    n2.last_mask = 0u;
     chk(write_file(stage, BAD_SYNTAX, 0644u) == 0, "c13: stage a broken file");
     chk(rename(stage, pf) == 0, "c13: swap in the broken file");
     rl = 99u;
@@ -1095,19 +1181,42 @@ static void case_per_class_transaction(void)
     chk(write_file(stage, GOOD, 0644u) == 0, "c13: stage a good file");
     chk(rename(stage, pf) == 0, "c13: swap in the good file");
     rl = 0u;
-    chk(iv_config_watch_poll(c, &rl) == IV_OK && rl >= 1u, "c13: the good file reloads");
+    chk(iv_config_watch_poll(c, &rl) == IV_OK && rl == 2u,
+        "c13: the good file changes net and probe");
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "10.8.8.8") == 0,
         "c13: the new good value is live");
     chk(iv_config_get_int(c, "probe.interval_ms", &iv) == IV_OK && iv == 8000,
         "c13: the previously-rejected class now accepts a good value");
     chk(n1.count == 1 && n2.count == 1, "c13: both subscribers were notified");
+    chk(n1.last_mask == (IV_CFG_CLASS_MASK(IV_CFG_CLS_NET) |
+                         IV_CFG_CLASS_MASK(IV_CFG_CLS_PROBE)) &&
+            n2.last_mask == n1.last_mask,
+        "c13: both callbacks receive the exact changed-class mask");
 
     /* (d) 程序自己 save() 也要通知 */
     n1.count = 0;
     n2.count = 0;
+    n1.last_mask = 0u;
+    n2.last_mask = 0u;
     chk(iv_config_set_str(c, "net.ip", "10.7.7.7") == IV_OK, "c13: set a new value");
     chk(iv_config_save(c, NULL, 0u) == IV_OK, "c13: save");
-    chk(n1.count == 1 && n2.count == 1, "c13: save() notifies subscribers too");
+    chk(n1.count == 1 && n2.count == 0, "c13: save() only notifies the net subscriber");
+    chk(n1.last_mask == IV_CFG_CLASS_MASK(IV_CFG_CLS_NET),
+        "c13: save() reports only the changed net class");
+
+    /* (e) 把同一个值再 set 一次不是配置变化，不能制造脏状态或重复通知。 */
+    n1.count = 0;
+    n2.count = 0;
+    chk(iv_config_set_str(c, "net.ip", "10.7.7.7") == IV_OK, "c13: set the same value");
+    {
+        iv_cfg_stat_t st;
+
+        chk(iv_config_stat(c, &st) == IV_OK && st.dirty == 0,
+            "c13: setting the same value leaves the handle clean");
+    }
+    chk(iv_config_save(c, NULL, 0u) == IV_OK, "c13: a clean save still succeeds");
+    chk(n1.count == 0 && n2.count == 0,
+        "c13: saving an unchanged value does not notify subscribers");
 
     iv_config_close(c);
 }
@@ -1209,43 +1318,25 @@ static void case_reactor_integration(void)
 }
 
 /* ===========================================================================
- * 句柄池、配置名校验、未开 watch 就 poll、NULL 安全
- * 本用例同时是**句柄泄漏探测器**：要求 4 个槽恰好空出 4 个。
- * 注意单句柄约束：同一 <dir>/<name> 只能开一个 ⇒ 这里用**不同 name** 填满池子。
+ * 单文件名约束、句柄复用、未开 watch 就 poll、NULL 安全
  * ========================================================================= */
 static void case_pool_and_misc(void)
 {
-    iv_config_t *h[4];
-    char         nm[8];
-    int          i;
+    iv_config_t *c = reopen_cfg();
 
-    for (i = 0; i < 4; i++) {
-        nm[0] = 'h';
-        nm[1] = (char)('1' + i);
-        nm[2] = '\0';
-        h[i]  = iv_config_open(g_dir, nm);
-        chk(h[i] != NULL, "c16: open until the handle pool is full");
-    }
-    chk(iv_config_open(g_dir, "h9") == NULL, "c16: the 5th handle is refused");
-    /* 单句柄：不同 name 但同名重复也要拒 */
-    chk(iv_config_open(g_dir, "h1") == NULL, "c16: a duplicate name is refused too");
-
-    iv_config_close(h[0]);
-    {
-        iv_config_t *again = iv_config_open(g_dir, "h9");
-
-        chk(again != NULL, "c16: a freed slot is reusable");
-        iv_config_close(again);
-    }
-    for (i = 1; i < 4; i++)
-        iv_config_close(h[i]);
+    chk(c != NULL, "c16: open the single config");
+    iv_config_close(c);
+    c = reopen_cfg();
+    chk(c != NULL, "c16: a released slot is reusable");
+    iv_config_close(c);
 
     iv_config_close(NULL); /* 必须安全 */
 
-    /* 配置名校验（防拼出目录外的路径） */
+    /* 配置名固定为 IV_CFG_NAME，其他名字一律拒绝。 */
     chk(iv_config_open(g_dir, "") == NULL, "c16: an empty name is rejected");
     chk(iv_config_open(g_dir, "a/b") == NULL, "c16: '/' in the name is rejected");
     chk(iv_config_open(g_dir, "../esc") == NULL, "c16: '..' in the name is rejected");
+    chk(iv_config_open(g_dir, "other") == NULL, "c16: a second config name is rejected");
     chk(iv_config_open(NULL, NULL) == NULL, "c16: NULL name is rejected");
 
     /* 没开 watch 就 poll */

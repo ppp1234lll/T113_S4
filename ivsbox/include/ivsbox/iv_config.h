@@ -6,12 +6,12 @@
  *
  * 八个功能与本文件的落点（对应计划 §S8「本步要实现的八个功能」）：
  *   F1 读配置      iv_config_open()
- *   F2 按名取参数  iv_config_get_str() / _get_int() / _get_bool() / _origin()
+ *   F2 按名取参数  iv_config_get_str() / _get_int() / _get_bool() / _get_dbl() / _origin()
  *   F3 改参数保存  iv_config_set_*() → iv_config_save()
  *   F4 缺就补默认  内置默认值表 + iv_config_fill_defaults()，open() 时自动补齐
  *   F5 抗断电写盘  iv_config_save() 内部：tmp → fsync → rename → fsync(目录)
  *   F6 热更新      iv_config_watch_fd() / iv_config_watch_poll()
- *   F7 事务通知    iv_config_subscribe()，全部校验通过才替换内存再逐个通知
+ *   F7 事务通知    iv_config_subscribe()，按分类提交后只通知值实际变化的分类
  *
  * 落点与分层：实现放 `src/modules/config/`、进 `libivmodules.a`；`libivcore` /
  * `libivhal` 里**不得出现 json-c 符号**，所以本头文件**不暴露任何 json-c 类型**，
@@ -46,10 +46,10 @@
  * 业务键一律写在**顶层**（点分键去掉点就是它的嵌套层级，不再套一层 `data` 容器）；
  * 只有 `_` 前缀留给元数据（`_meta`），`set_*()` 也拒绝以 `_` 开头的键，两者不会撞名。
  *
- * **JSON 数组**（§S8.1 新增能力）：`camera.ch` 是数组，**一个数组元素＝一个条目**，
- * 条目键形如 `camera.ch.0.vendor`（元素下标进点分键）。这样容量口径与普通键统一
- * （架构 §10.2「数组按元素计」），不必为数组单独做一套存储。元素个数上限
- * IV_CFG_ARR_MAX，下标越界判非法。空数组合法。
+ * **JSON 数组**（§S8.1 新增能力）：`camera.ch` 是数组，元素字段的条目键形如
+ * `camera.ch.0.vendor`（元素下标进点分键）。数组长度独立记录，默认值只补到文件中
+ * 实际存在的元素；因此 0 / 1 / 6 路都能准确表达。元素个数上限 IV_CFG_ARR_MAX，
+ * 下标越界或中间空洞判非法。空数组合法。
  *
  * **double**（§S8.1 新增能力）：`IV_CFG_T_DBL` 用于 `elec.*` / `sensor.*` 的
  * 物理量阈值（电压 / 电流 / 功率 / 倾斜度 / 温度 / 湿度）。范围校验用 double
@@ -251,8 +251,9 @@ int iv_config_set_dbl(iv_config_t *c, const char *key, double val);
 
 /*
  * 数组元素个数（§S8.1）。`arr_key` 是数组本身的点分键（如 `camera.ch`）。
- * 判据＝内存里以 `arr_key.` 开头、且这一段是**纯十进制下标**的条目里，
- * 最大的下标 + 1（数组元素连续；删掉中间元素会留空洞，空洞按下标存在性判定）。
+ * `camera.ch` 返回解析时记录的真实 JSON 数组长度；其他数组按内存里以
+ * `arr_key.` 开头、且这一段是**纯十进制下标**的条目之最大下标 + 1 计算。
+ * 数组元素连续；删掉中间元素会留空洞，空洞按下标存在性判定。
  * `*n` 返回 0..IV_CFG_ARR_MAX；数组不存在（一个元素都没写）返回 IV_OK 且 *n = 0
  * —— 空数组与"根本没有这个数组"在配置语义上等价，都表示"未配置任何一路"。
  * `arr_key` 不是合法键 ⇒ IV_EINVAL。
@@ -274,10 +275,11 @@ int iv_config_fill_defaults(iv_config_t *c, int *filled, char *detail, size_t de
  * 步骤：整体校验（类型/范围/跨字段）→ 写 `<path>.tmp` → fsync 文件 →
  * rename 覆盖 → fsync 目录（保证改名本身落盘，见计划 §S8 坑 3）。
  * 校验失败 ⇒ IV_EINVAL，**一个字段都不落盘**，`detail` 里给出错的键名与原因；
- * 写盘失败 ⇒ IV_EIO / IV_ENOSPC，同样是"旧文件保持原样"。
+ * rename 前写盘失败 ⇒ IV_EIO / IV_ENOSPC，旧文件保持原样；rename 已成功但目录
+ * fsync 失败 ⇒ IV_EIO，内存保持 dirty，表示文件已替换但掉电持久性未确认。
  * 成功 ⇒ 内容版本号 +1，并刷新 crc；磁盘上要么是完整旧配置、要么是完整新配置（F5）。
- * `detail` 可为 NULL（cap 为 0）。保存成功后会把自身触发的 inotify 事件抽干，
- * 避免 F6 把自己的保存当成"外部改动"再重载一次。
+ * `detail` 可为 NULL（cap 为 0）。保存后不盲目抽干 inotify 队列；自己的事件会在
+ * F6 比较新旧分类时识别为“值未变化”，避免吞掉同时到达的外部更新。
  * ------------------------------------------------------------------------- */
 int iv_config_save(iv_config_t *c, char *detail, size_t detail_cap);
 
@@ -313,7 +315,7 @@ int iv_config_watch_fd(iv_config_t *c);
  *       分类，其余分类的新改动照常生效」）。
  *   整个文件解析失败（语法坏、截断、顶层不是对象）⇒ **整份拒绝**、旧值一字不动，
  *   因为解析失败时连"哪些键属于哪个分类"都拿不到。
- *   通知（F7）**只发给受影响分类的订阅者**：至少有一个分类被采用 ⇒ 通知；
+ *   通知（F7）**只发给受影响分类的订阅者**：至少有一个分类的值实际变化 ⇒ 通知；
  *   全部分类都被拒 ⇒ 一个订阅者都不发。
  *   任一路径被拒都打告警，并把被拒的分类名写进日志（F6 的"坏配置不停服"）。
  *
@@ -321,8 +323,8 @@ int iv_config_watch_fd(iv_config_t *c);
  *   - `iv_config_open()`（启动，此时没有"旧配置"可留）⇒ **逐键**回退默认、照常启动，
  *     非法键数记在 `iv_cfg_stat_t.invalid`；"缺字段"不算非法（那是 F4 的正常补齐）。
  *   - `iv_config_watch_poll()`（运行期，手里有一份好的旧配置）⇒ 见上，按分类子树
- *     分别拒绝；`*reloads` 记本次**采用了新值的分类数**（0 = 全被拒）。
- * `*reloads` 返回本次成功应用新值的分类数（可为 NULL）。
+ *     分别拒绝；`*reloads` 记本次**值实际发生变化的分类数**（0 = 无有效变化）。
+ * `*reloads` 返回本次值实际发生变化的分类数（可为 NULL）。
  * 返回 IV_OK（即使没有命中事件也算成功）、IV_EAGAIN（无事件且 fd 未就绪）、
  * IV_ESTATE（未开启 watch）。
  */
@@ -330,17 +332,21 @@ int iv_config_watch_poll(iv_config_t *c, uint32_t *reloads);
 
 /* ---------------------------------------------------------------------------
  * F7 事务通知
- * 配置生效后**在 reactor 线程内**逐个回调。契约：单次事件内要么所有订阅者都收到、
- * 要么一个都不收到 —— 一个分类都没被采用时一个都不调用，所以回调里看到的一定是
- * 合法的新配置。粒度是**按一级分类子树**（§S8.1）：只要至少一个分类被采用就通知
- * 全部订阅者（回调内自己用 `iv_config_class_of()` / 版本号判断关不关心）。
+ * 配置生效后**在 reactor 线程内**逐个回调。订阅时登记关心的一级分类位图，只有
+ * `class_mask` 与本次 `changed_mask` 相交的订阅者才收到通知；回调拿到的
+ * `changed_mask` 是整次事务实际变化的分类集合。未知顶层扩展键不属于业务分类，
+ * 不触发分类订阅。
  * `name` 参数传的是**配置名**（单文件下恒为 "ivsbox"）。
  * 回调内**禁止**再调用本模块的写入接口（set_ / save / open）—— 会改到正在
  * 分发的状态；只读的 get_ 系列可以。
  * ------------------------------------------------------------------------- */
-typedef void (*iv_cfg_notify_fn)(iv_config_t *c, const char *name, void *user);
+#define IV_CFG_CLASS_MASK(cls) (1u << (unsigned)(cls))
+#define IV_CFG_CLASS_MASK_ALL  ((1u << IV_CFG_CLASS_N) - 1u)
 
-int iv_config_subscribe(iv_config_t *c, iv_cfg_notify_fn fn, void *user);
+typedef void (*iv_cfg_notify_fn)(iv_config_t *c, const char *name, uint32_t changed_mask,
+                                 void *user);
+
+int iv_config_subscribe(iv_config_t *c, uint32_t class_mask, iv_cfg_notify_fn fn, void *user);
 
 /* ---------------------------------------------------------------------------
  * 内置默认值表的只读查询（给 Web / 诊断用：显示"这个键的出厂默认是什么"）

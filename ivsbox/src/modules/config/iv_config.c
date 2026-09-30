@@ -25,6 +25,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,7 @@ static char s_render_buf[CFG_FILE_MAX];
 /* 解析期间的"非法值落在哪个分类"位图（§S8.1 按分类子树事务用）。
  * 与上面两个缓冲同理：单线程契约下不做重入保护，parse_into 进出时清零。 */
 static unsigned s_cls_bad;
+static int      s_parse_fatal;
 
 static void cls_mark_bad(const char *key)
 {
@@ -268,6 +270,9 @@ struct iv_config {
     char name[IV_CFG_NAME_MAX];
     char path[IV_CFG_PATH_MAX];
     char tmppath[IV_CFG_PATH_MAX];
+    dev_t dir_dev;
+    ino_t dir_ino;
+    int   dir_id_valid;
 
     uint32_t schema;
     uint64_t version;
@@ -275,6 +280,8 @@ struct iv_config {
     int      crc_mismatch;
     int      invalid;
     int      dirty;
+    unsigned dirty_classes;
+    unsigned camera_count;
     /* §S8.1：本次加载中"哪个一级分类出现过非法值"的位图（bit = iv_cfg_class_t）。
      * 事务粒度＝按分类子树，重载时用它决定"哪些分类整块拒绝、哪些照常采用"。 */
     unsigned cls_bad;
@@ -287,6 +294,7 @@ struct iv_config {
 
     iv_cfg_notify_fn subs_fn[IV_CFG_SUBS_MAX];
     void            *subs_user[IV_CFG_SUBS_MAX];
+    uint32_t         subs_mask[IV_CFG_SUBS_MAX];
     unsigned         n_subs;
 };
 
@@ -300,6 +308,8 @@ typedef struct {
     int        crc_mismatch;
     int        invalid;
     int        dirty;
+    unsigned   dirty_classes;
+    unsigned   camera_count;
     unsigned   cls_bad;
 } cfg_snapshot_t;
 
@@ -335,6 +345,30 @@ static int path_join(char *out, size_t cap, const char *dir, const char *name)
     out[dl] = '/';
     memcpy(out + dl + 1u, name, nl);
     out[dl + 1u + nl] = '\0';
+    return 0;
+}
+
+/* 目录字符串的最小规范化：折叠重复斜杠并去掉末尾斜杠（根目录除外）。
+ * 已存在目录还会用 stat(dev,ino) 做最终身份比较，因此 `x/.`、符号链接等别名也
+ * 无法绕过单句柄约束。 */
+static int dir_normalize(char *out, size_t cap, const char *in)
+{
+    size_t r = 0u, w = 0u;
+
+    if (in == NULL || in[0] == '\0' || cap == 0u)
+        return -1;
+    while (in[r] != '\0') {
+        char ch = in[r++];
+
+        if (ch == '/' && w > 0u && out[w - 1u] == '/')
+            continue;
+        if (w + 1u >= cap)
+            return -1;
+        out[w++] = ch;
+    }
+    while (w > 1u && out[w - 1u] == '/')
+        w--;
+    out[w] = '\0';
     return 0;
 }
 
@@ -503,9 +537,8 @@ static void item_reset_to_default(iv_config_t *c, const char *key)
 /* ---------------------------------------------------------------------------
  * 数组支持（§S8.1）
  *
- * 模型：**一个数组元素＝一个条目**，元素下标进点分键（`camera.ch.0.vendor`）。
- * 为什么不把整个数组塞进一个条目：容量口径与普通键统一（架构 §10.2「数组按元素
- * 计」），且 range/enum 校验天然对每个元素的每个字段生效，不必为数组写一套。
+ * 模型：数组长度单独记录，元素字段按普通叶子条目保存，元素下标进点分键
+ * （`camera.ch.0.vendor`）。这样 range/enum 校验仍能直接复用普通键的规则。
  *
  * 代价：需要两道额外检查 ——
  *   ① 下标必须 < IV_CFG_ARR_MAX，否则一份写着 `camera.ch.99.x` 的文件会白白吃容量；
@@ -571,6 +604,38 @@ static int array_prefix_of(const char *key, char *buf, size_t cap)
     return 0;
 }
 
+/* `camera.ch.<idx>.<field>` 的槽号。返回 1=匹配、0=不是相机数组字段。 */
+static int camera_slot_index(const char *key, unsigned *idx)
+{
+    static const char prefix[] = "camera.ch.";
+    const char       *p;
+    const char       *dot;
+    size_t            len;
+    unsigned          v = 0u;
+
+    if (key == NULL || strncmp(key, prefix, sizeof(prefix) - 1u) != 0)
+        return 0;
+    p   = key + sizeof(prefix) - 1u;
+    dot = strchr(p, '.');
+    if (dot == NULL || dot[1] == '\0')
+        return 0;
+    len = (size_t)(dot - p);
+    if (!seg_is_index(p, len, &v))
+        return 0;
+    if (idx != NULL)
+        *idx = v;
+    return 1;
+}
+
+static void mark_dirty_class(iv_config_t *c, const char *key)
+{
+    int cls = iv_config_class_of(key);
+
+    c->dirty = 1;
+    if (cls >= 0)
+        c->dirty_classes |= IV_CFG_CLASS_MASK((unsigned)cls);
+}
+
 /* key 是否占着某个已知默认键的**祖先路径**（如 "net" 之于 "net.wan.mode"）。
  * 默认表只列叶子，所以这种键一定是"把子树写成了标量"的形态冲突。 */
 static int is_default_parent(const char *key)
@@ -603,6 +668,15 @@ static int item_check(const iv_config_t *c, const cfg_item_t *it, int strict, co
 {
     const cfg_default_t *d = default_find(it->key);
     const char          *aseg;
+
+    if (!key_ok(it->key) || it->key[0] == '_') {
+        *why = "invalid key";
+        return 0;
+    }
+    if (it->type == IV_CFG_T_DBL && !isfinite(it->v.d)) {
+        *why = "non-finite double";
+        return 0;
+    }
 
     /* ② / ③：数组下标检查（对已知与未知键都做） */
     aseg = array_index_seg(it->key);
@@ -842,7 +916,7 @@ static uint16_t items_crc(const iv_config_t *c)
 
 /* 把一个 JSON 叶子写进条目表；类型不支持（null）则丢弃并告警。
  * §S8.1 新增：`json_type_double` 与 `json_type_array` 不再被 `default:` 丢弃。
- * 数组按"元素＝条目"展平，元素内的字段拼进键（`camera.ch.0.vendor`）。 */
+ * 数组按元素记录长度，元素内字段展平为点分键（`camera.ch.0.vendor`）。 */
 static void flatten_leaf(iv_config_t *c, const char *key, json_object *val, int *invalid)
 {
     cfg_item_t *it;
@@ -851,6 +925,7 @@ static void flatten_leaf(iv_config_t *c, const char *key, json_object *val, int 
     it = item_touch(c, key);
     if (it == NULL) {
         IV_LOG_W(CFG_MOD, "%s: too many keys, '%s' ignored", c->name, key);
+        s_parse_fatal = 1;
         return;
     }
 
@@ -924,6 +999,8 @@ static void flatten_array(iv_config_t *c, const char *prefix, json_object *arr, 
         cls_mark_bad(prefix);
         n = (size_t)IV_CFG_ARR_MAX;
     }
+    if (strcmp(prefix, "camera.ch") == 0)
+        c->camera_count = (unsigned)n;
 
     for (size_t i = 0u; i < n; i++) {
         json_object *el = json_object_array_get_idx(arr, (int)i);
@@ -955,6 +1032,7 @@ static void flatten_array(iv_config_t *c, const char *prefix, json_object *arr, 
         }
         if (pl + 1u + il + 1u > sizeof(full)) {
             IV_LOG_W(CFG_MOD, "%s: array key '%s.%s' too long, ignored", c->name, prefix, idxbuf);
+            s_parse_fatal = 1;
             continue;
         }
         memcpy(full, prefix, pl);
@@ -980,6 +1058,7 @@ static void flatten(iv_config_t *c, const char *prefix, json_object *obj, unsign
 
         if (depth > (unsigned)IV_CFG_DEPTH_MAX) {
             IV_LOG_W(CFG_MOD, "%s: '%s' nested too deep, ignored", c->name, key);
+            s_parse_fatal = 1;
             continue;
         }
         if (p[0] == '_' && prefix[0] == '\0')
@@ -989,6 +1068,7 @@ static void flatten(iv_config_t *c, const char *prefix, json_object *obj, unsign
             need = strlen(p) + 1u;
             if (need > (size_t)IV_CFG_KEY_MAX) {
                 IV_LOG_W(CFG_MOD, "%s: key '%s' too long, ignored", c->name, p);
+                s_parse_fatal = 1;
                 continue;
             }
             str_copy(full, sizeof(full), p);
@@ -996,6 +1076,7 @@ static void flatten(iv_config_t *c, const char *prefix, json_object *obj, unsign
             need = strlen(prefix) + 1u + strlen(p) + 1u;
             if (need > (size_t)IV_CFG_KEY_MAX) {
                 IV_LOG_W(CFG_MOD, "%s: key '%s.%s' too long, ignored", c->name, prefix, p);
+                s_parse_fatal = 1;
                 continue;
             }
             str_copy(full, sizeof(full), prefix);
@@ -1038,8 +1119,25 @@ static long file_read_all(const char *path, char *buf, size_t cap)
         if (n == 0)
             break;
         used += (size_t)n;
-        if (used >= cap - 1u)
-            break; /* 超限：交给解析失败处理，不吃更多内存 */
+        if (used >= cap - 1u) {
+            char extra;
+
+            for (;;) {
+                n = read(fd, &extra, 1u);
+                if (n < 0 && errno == EINTR)
+                    continue;
+                break;
+            }
+            if (n > 0) {
+                (void)close(fd);
+                return IV_ERANGE; /* 明确拒绝超限文件，不能解析一个被截断的前缀 */
+            }
+            if (n < 0) {
+                (void)close(fd);
+                return IV_EIO;
+            }
+            break;
+        }
     }
     (void)close(fd);
     buf[used] = '\0';
@@ -1062,7 +1160,9 @@ static int parse_into(iv_config_t *c, const char *text, unsigned len, uint32_t *
     *has_crc  = 0;
 
     c->n_items = 0u;
-    s_cls_bad  = 0u; /* §S8.1：每次解析都从零开始记"哪个分类有非法值" */
+    c->camera_count = 0u;
+    s_cls_bad       = 0u; /* §S8.1：每次解析都从零开始记"哪个分类有非法值" */
+    s_parse_fatal   = 0;
 
     tok = json_tokener_new();
     if (tok == NULL)
@@ -1101,11 +1201,13 @@ static int parse_into(iv_config_t *c, const char *text, unsigned len, uint32_t *
     flatten(c, "", root, 1u, &bad);
     json_object_put(root);
     *invalid = bad;
+    if (s_parse_fatal)
+        return IV_EFULL;
     return IV_OK;
 }
 
 /* 补齐默认表里、但内存中没有的键（与前缀冲突的跳过并告警），返回补了几条 */
-static int fill_missing_defaults(iv_config_t *c)
+static int fill_missing_defaults(iv_config_t *c, unsigned *class_mask)
 {
     size_t i;
     int    filled = 0;
@@ -1113,8 +1215,14 @@ static int fill_missing_defaults(iv_config_t *c)
     for (i = 0; i < CFG_DEFAULT_N; i++) {
         const cfg_default_t *d = &s_defaults[i];
         unsigned             j;
+        unsigned             camera_idx = 0u;
         size_t               dl;
         int                  conflict = 0;
+
+        /* camera.ch 是变长数组：只给文件/调用方实际建立的元素补字段默认值。
+         * 不能把 0..5 六个槽无条件盖进内存，否则 0/1 路都会被误报成 6 路。 */
+        if (camera_slot_index(d->key, &camera_idx) && camera_idx >= c->camera_count)
+            continue;
 
         if (item_find(c, d->key) != NULL)
             continue;
@@ -1137,7 +1245,13 @@ static int fill_missing_defaults(iv_config_t *c)
             continue;
         }
         item_reset_to_default(c, d->key);
-        filled++;
+        if (item_find(c, d->key) != NULL) {
+            int cls = iv_config_class_of(d->key);
+
+            filled++;
+            if (class_mask != NULL && cls >= 0)
+                *class_mask |= IV_CFG_CLASS_MASK((unsigned)cls);
+        }
     }
     return filled;
 }
@@ -1164,27 +1278,92 @@ static int cross_fix_by_default(iv_config_t *c)
 static void snap_take(const iv_config_t *c, cfg_snapshot_t *s)
 {
     memcpy(s->items, c->items, sizeof(s->items));
-    s->n_items      = c->n_items;
-    s->schema       = c->schema;
-    s->version      = c->version;
-    s->loaded       = c->loaded;
-    s->crc_mismatch = c->crc_mismatch;
-    s->invalid      = c->invalid;
-    s->dirty        = c->dirty;
+    s->n_items       = c->n_items;
+    s->schema        = c->schema;
+    s->version       = c->version;
+    s->loaded        = c->loaded;
+    s->crc_mismatch  = c->crc_mismatch;
+    s->invalid       = c->invalid;
+    s->dirty         = c->dirty;
+    s->dirty_classes = c->dirty_classes;
+    s->camera_count  = c->camera_count;
     s->cls_bad      = c->cls_bad;
 }
 
 static void snap_restore(iv_config_t *c, const cfg_snapshot_t *s)
 {
     memcpy(c->items, s->items, sizeof(c->items));
-    c->n_items      = s->n_items;
-    c->schema       = s->schema;
-    c->version      = s->version;
-    c->loaded       = s->loaded;
-    c->crc_mismatch = s->crc_mismatch;
-    c->invalid      = s->invalid;
-    c->dirty        = s->dirty;
+    c->n_items       = s->n_items;
+    c->schema        = s->schema;
+    c->version       = s->version;
+    c->loaded        = s->loaded;
+    c->crc_mismatch  = s->crc_mismatch;
+    c->invalid       = s->invalid;
+    c->dirty         = s->dirty;
+    c->dirty_classes = s->dirty_classes;
+    c->camera_count  = s->camera_count;
     c->cls_bad      = s->cls_bad;
+}
+
+static const cfg_item_t *snap_item_find(const cfg_snapshot_t *s, const char *key)
+{
+    unsigned i;
+
+    for (i = 0u; i < s->n_items; i++) {
+        if (strcmp(s->items[i].key, key) == 0)
+            return &s->items[i];
+    }
+    return NULL;
+}
+
+static int item_value_equal(const cfg_item_t *a, const cfg_item_t *b)
+{
+    if (a == NULL || b == NULL || a->type != b->type)
+        return 0;
+    switch (a->type) {
+    case IV_CFG_T_STR:
+        return strcmp(a->v.s, b->v.s) == 0;
+    case IV_CFG_T_INT:
+        return a->v.i == b->v.i;
+    case IV_CFG_T_DBL:
+        return a->v.d == b->v.d;
+    case IV_CFG_T_BOOL:
+    default:
+        return a->v.b == b->v.b;
+    }
+}
+
+static int class_changed(const iv_config_t *c, const cfg_snapshot_t *old, unsigned cls)
+{
+    unsigned i;
+    unsigned now_n = 0u, old_n = 0u;
+
+    for (i = 0u; i < c->n_items; i++) {
+        if (iv_config_class_of(c->items[i].key) == (int)cls) {
+            const cfg_item_t *prev = snap_item_find(old, c->items[i].key);
+
+            now_n++;
+            if (!item_value_equal(&c->items[i], prev))
+                return 1;
+        }
+    }
+    for (i = 0u; i < old->n_items; i++) {
+        if (iv_config_class_of(old->items[i].key) == (int)cls)
+            old_n++;
+    }
+    return now_n != old_n;
+}
+
+static void notify_subscribers(iv_config_t *c, uint32_t changed_mask)
+{
+    unsigned i;
+
+    if (changed_mask == 0u)
+        return;
+    for (i = 0u; i < c->n_subs; i++) {
+        if (c->subs_fn[i] != NULL && (c->subs_mask[i] & changed_mask) != 0u)
+            c->subs_fn[i](c, c->name, changed_mask, c->subs_user[i]);
+    }
 }
 
 /*
@@ -1220,7 +1399,7 @@ static int load_from_disk(iv_config_t *c)
         IV_LOG_W(CFG_MOD, "%s: file crc mismatch (file=0x%04X), accepted with warning", c->name,
                  (unsigned)fcr);
 
-    (void)fill_missing_defaults(c); /* 缺字段是正常补齐，不计入 invalid */
+    (void)fill_missing_defaults(c, NULL); /* 缺字段是正常补齐，不计入 invalid */
     if (!cross_fix_by_default(c))
         invalid++;
     c->invalid   = invalid;
@@ -1285,45 +1464,51 @@ static void rj_indent(rj_t *w, unsigned n)
     }
 }
 
+/* JSON 字符串（同时供字符串值与对象键使用）。 */
+static void rj_quoted(rj_t *w, const char *s)
+{
+    char buf[64];
+    const char *p = s;
+
+    rj_put(w, "\"", 1u);
+    for (; *p != '\0'; p++) {
+        switch (*p) {
+        case '"':
+            rj_put(w, "\\\"", 2u);
+            break;
+        case '\\':
+            rj_put(w, "\\\\", 2u);
+            break;
+        case '\n':
+            rj_put(w, "\\n", 2u);
+            break;
+        case '\r':
+            rj_put(w, "\\r", 2u);
+            break;
+        case '\t':
+            rj_put(w, "\\t", 2u);
+            break;
+        default:
+            if ((unsigned char)*p < 0x20u) {
+                snprintf(buf, sizeof(buf), "\\u%04x", (unsigned)(unsigned char)*p);
+                rj_str(w, buf);
+            } else {
+                rj_put(w, p, 1u);
+            }
+        }
+    }
+    rj_put(w, "\"", 1u);
+}
+
 /* 渲染一个标量值 */
 static void rj_scalar(rj_t *w, const cfg_item_t *it)
 {
     char buf[64];
 
     switch (it->type) {
-    case IV_CFG_T_STR: {
-        const char *p = it->v.s;
-
-        rj_put(w, "\"", 1u);
-        for (; *p != '\0'; p++) {
-            switch (*p) {
-            case '"':
-                rj_put(w, "\\\"", 2u);
-                break;
-            case '\\':
-                rj_put(w, "\\\\", 2u);
-                break;
-            case '\n':
-                rj_put(w, "\\n", 2u);
-                break;
-            case '\r':
-                rj_put(w, "\\r", 2u);
-                break;
-            case '\t':
-                rj_put(w, "\\t", 2u);
-                break;
-            default:
-                if ((unsigned char)*p < 0x20u) {
-                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned)(unsigned char)*p);
-                    rj_str(w, buf);
-                } else {
-                    rj_put(w, p, 1u);
-                }
-            }
-        }
-        rj_put(w, "\"", 1u);
+    case IV_CFG_T_STR:
+        rj_quoted(w, it->v.s);
         break;
-    }
     case IV_CFG_T_INT:
         snprintf(buf, sizeof(buf), "%lld", (long long)it->v.i);
         rj_str(w, buf);
@@ -1409,12 +1594,17 @@ static void rj_array(rj_t *w, const cfg_item_t *sorted, unsigned lo, unsigned hi
         memcpy(epre, sorted[i].key, (size_t)(np - sorted[i].key) + nl);
         epre[(size_t)(np - sorted[i].key) + nl] = '\0';
 
-        /* 本元素成员区间 [i, j) */
-        for (j = i; j < hi; j++) {
-            size_t el = strlen(epre);
+        /* 本元素成员区间 [i, j)。标量数组元素的键恰好等于 epre；对象元素则
+         * 以 `epre.` 开头。旧实现只接受后一种，遇到标量时 j==i 导致死循环。 */
+        if (strcmp(sorted[i].key, epre) == 0) {
+            j = i + 1u;
+        } else {
+            for (j = i; j < hi; j++) {
+                size_t el = strlen(epre);
 
-            if (strncmp(sorted[j].key, epre, el) != 0 || sorted[j].key[el] != '.')
-                break;
+                if (strncmp(sorted[j].key, epre, el) != 0 || sorted[j].key[el] != '.')
+                    break;
+            }
         }
 
         if (!first)
@@ -1422,11 +1612,15 @@ static void rj_array(rj_t *w, const cfg_item_t *sorted, unsigned lo, unsigned hi
         first = 0;
         rj_put(w, "\n", 1u);
         rj_indent(w, indent);
-        rj_put(w, "{", 1u);
-        rj_object(w, sorted, i, j, epre, indent + 2u);
-        rj_put(w, "\n", 1u);
-        rj_indent(w, indent);
-        rj_put(w, "}", 1u);
+        if (strcmp(sorted[i].key, epre) == 0) {
+            rj_scalar(w, &sorted[i]);
+        } else {
+            rj_put(w, "{", 1u);
+            rj_object(w, sorted, i, j, epre, indent + 2u);
+            rj_put(w, "\n", 1u);
+            rj_indent(w, indent);
+            rj_put(w, "}", 1u);
+        }
 
         i = j;
     }
@@ -1479,9 +1673,8 @@ static void rj_object(rj_t *w, const cfg_item_t *sorted, unsigned lo, unsigned h
             first = 0;
             rj_put(w, "\n", 1u);
             rj_indent(w, indent);
-            rj_put(w, "\"", 1u);
-            rj_str(w, seg);
-            rj_put(w, "\": ", 3u);
+            rj_quoted(w, seg);
+            rj_put(w, ": ", 2u);
 
             if (seg_is_index(nextp, nlen, &idx)) {
                 char ap[IV_CFG_KEY_MAX];
@@ -1541,12 +1734,67 @@ static void rj_object(rj_t *w, const cfg_item_t *sorted, unsigned lo, unsigned h
             rj_put(w, "\n", 1u);
             rj_indent(w, indent);
             str_copy(kbuf, sizeof(kbuf), k);
-            rj_put(w, "\"", 1u);
-            rj_str(w, kbuf);
-            rj_put(w, "\": ", 3u);
+            rj_quoted(w, kbuf);
+            rj_put(w, ": ", 2u);
             rj_scalar(w, &sorted[i]);
         }
         i++;
+    }
+}
+
+/* 渲染八个已知分类之外的顶层扩展键。它们不参与业务校验，但必须原样保留，
+ * 否则旧固件一次 save 就会把新固件写入的扩展分类静默抹掉。 */
+static void rj_unknown_tops(rj_t *w, const cfg_item_t *sorted, unsigned count)
+{
+    unsigned i = 0u;
+
+    while (i < count) {
+        const char *key = sorted[i].key;
+        const char *dot;
+        size_t      tl;
+        unsigned    j;
+        char        top[IV_CFG_SEG_MAX];
+
+        if (iv_config_class_of(key) >= 0) {
+            i++;
+            continue;
+        }
+        dot = strchr(key, '.');
+        tl  = (dot != NULL) ? (size_t)(dot - key) : strlen(key);
+        if (tl == 0u || tl >= sizeof(top)) {
+            i++;
+            continue;
+        }
+        memcpy(top, key, tl);
+        top[tl] = '\0';
+
+        for (j = i + 1u; j < count; j++) {
+            const char *jk = sorted[j].key;
+
+            if (strncmp(jk, top, tl) != 0 || (jk[tl] != '.' && jk[tl] != '\0'))
+                break;
+        }
+
+        rj_put(w, ",\n  ", 4u);
+        rj_quoted(w, top);
+        rj_put(w, ": ", 2u);
+        if (dot == NULL) {
+            rj_scalar(w, &sorted[i]);
+        } else {
+            const char *next = dot + 1u;
+            const char *nd   = strchr(next, '.');
+            size_t      nl   = (nd != NULL) ? (size_t)(nd - next) : strlen(next);
+            unsigned    idx  = 0u;
+
+            if (seg_is_index(next, nl, &idx)) {
+                rj_array(w, sorted, i, j, top, 4u);
+            } else {
+                rj_put(w, "{", 1u);
+                rj_object(w, sorted, i, j, top, 4u);
+                rj_put(w, "\n  }", 4u);
+            }
+        }
+        i = j;
     }
 }
 
@@ -1599,12 +1847,14 @@ static long render_json(const iv_config_t *c, uint64_t version)
 
         rj_str(&w, "\n  // ");
         rj_str(&w, s_classes[cls].desc);
-        rj_put(&w, "\n  \"", 4u);
-        rj_str(&w, ck);
-        rj_put(&w, "\": {", 4u);
+        rj_put(&w, "\n  ", 3u);
+        rj_quoted(&w, ck);
+        rj_put(&w, ": {", 3u);
         rj_object(&w, sorted, lo, hi, ck, 4u);
         rj_put(&w, "\n  }", 4u);
     }
+
+    rj_unknown_tops(&w, sorted, c->n_items);
 
     /* 任何一级分类都没成员时也要保证 `_meta` 后有合法收尾（逗号已按需处理） */
     rj_put(&w, "\n}\n", 3u);
@@ -1629,7 +1879,8 @@ static int fsync_dir(const char *dir)
     return 0;
 }
 
-/* 抽干进程自己产生的 inotify 事件（保存后调用，避免 F6 把自己的写当外部改动） */
+/* 建立 watch 后抽干极短窗口内可能排入的历史事件。保存后不能调用：那会吞掉
+ * 同时到达的外部更新；自己的保存事件由新旧值比较识别为无变化。 */
 static void watch_drain(iv_config_t *c)
 {
     char buf[512];
@@ -1648,19 +1899,40 @@ iv_config_t *iv_config_open(const char *dir, const char *name)
 {
     const char  *d = (dir != NULL && dir[0] != '\0') ? dir : IV_CFG_DIR_DEFAULT;
     iv_config_t *c = NULL;
+    char         ndir[IV_CFG_PATH_MAX];
+    struct stat  dst;
+    int          dir_id_valid = 0;
     unsigned     i;
     int          rc;
 
-    if (!name_ok(name))
+    if (!name_ok(name) || strcmp(name, IV_CFG_NAME) != 0)
         return NULL;
+    if (dir_normalize(ndir, sizeof(ndir), d) != 0)
+        return NULL;
+
+    /* 目录按需创建：F4 要求“文件不存在也照常启动”。目录存在时记录 dev+ino，
+     * 用真实目录身份而不是调用方字符串做单句柄判定。 */
+    if (mkdir(ndir, 0755) != 0 && errno != EEXIST)
+        IV_LOG_W(CFG_MOD, "mkdir '%s' failed: %s (defaults stay in memory)", ndir,
+                 strerror(errno));
+    if (stat(ndir, &dst) == 0 && S_ISDIR(dst.st_mode))
+        dir_id_valid = 1;
 
     /* §S8.1 单句柄约束：同一份 <dir>/<name> 只允许一个活跃句柄。
      * 单文件下两个句柄各持一份内存副本 ⇒ A 改了 B 看不见、B 一 save 又把 A 的
-     * 改动覆盖掉。这一步必须在**分槽之前**做，否则会白白占掉一个槽。 */
+     * 改动覆盖掉。优先比较目录 dev+ino，可挡住尾斜杠、`/.` 与符号链接别名。 */
     for (i = 0; i < (unsigned)IV_CFG_HANDLES; i++) {
-        if (s_pool[i].used && strcmp(s_pool[i].name, name) == 0 &&
-            strcmp(s_pool[i].dir, d) == 0) {
-            IV_LOG_E(CFG_MOD, "'%s' under '%s' is already open (single-handle rule)", name, d);
+        int same_dir;
+
+        if (!s_pool[i].used || strcmp(s_pool[i].name, name) != 0)
+            continue;
+        if (dir_id_valid && s_pool[i].dir_id_valid)
+            same_dir = (s_pool[i].dir_dev == dst.st_dev && s_pool[i].dir_ino == dst.st_ino);
+        else
+            same_dir = (strcmp(s_pool[i].dir, ndir) == 0);
+        if (same_dir) {
+            IV_LOG_E(CFG_MOD, "'%s' under '%s' is already open (single-handle rule)", name,
+                     ndir);
             return NULL;
         }
     }
@@ -1681,20 +1953,13 @@ iv_config_t *iv_config_open(const char *dir, const char *name)
     c->ifd  = -1;
     c->wd   = -1;
     c->schema = IV_CFG_SCHEMA_DEFAULT;
-
-    if (strlen(d) + 1u > (size_t)IV_CFG_PATH_MAX || path_join(c->dir, sizeof(c->dir), d, "") != 0) {
-        memset(c, 0, sizeof(*c));
-        c->ifd = -1;
-        return NULL;
-    }
-    /* 去掉 path_join(dir,"") 留下的尾斜杠（根目录 "/" 本身除外） */
-    {
-        size_t dl = strlen(c->dir);
-
-        if (dl > 1u && c->dir[dl - 1u] == '/')
-            c->dir[dl - 1u] = '\0';
-    }
+    str_copy(c->dir, sizeof(c->dir), ndir);
     str_copy(c->name, sizeof(c->name), name);
+    if (dir_id_valid) {
+        c->dir_dev      = dst.st_dev;
+        c->dir_ino      = dst.st_ino;
+        c->dir_id_valid = 1;
+    }
 
     {
         char   file[IV_CFG_NAME_MAX + 8u]; /* "<name>.json" */
@@ -1725,11 +1990,6 @@ iv_config_t *iv_config_open(const char *dir, const char *name)
         }
     }
 
-    /* 目录按需创建：F4 要求"文件不存在也照常启动"，补完默认要有地方落盘 */
-    if (mkdir(c->dir, 0755) != 0 && errno != EEXIST)
-        IV_LOG_W(CFG_MOD, "mkdir '%s' failed: %s (defaults stay in memory)", c->dir,
-                 strerror(errno));
-
     rc = load_from_disk(c);
     if (rc == IV_OK) {
         c->loaded = 1;
@@ -1742,7 +2002,8 @@ iv_config_t *iv_config_open(const char *dir, const char *name)
         c->invalid      = 0;
         c->version      = 0u;
         c->n_items      = 0u;
-        (void)fill_missing_defaults(c);
+        c->camera_count = 0u;
+        (void)fill_missing_defaults(c, NULL);
         (void)cross_fix_by_default(c);
         IV_LOG_W(CFG_MOD, "%s: '%s' unusable (rc=%d), start with %u default keys", c->name,
                  c->path, rc, c->n_items);
@@ -1844,6 +2105,18 @@ int iv_config_origin(const iv_config_t *c, const char *key, iv_cfg_origin_t *out
  * 公开 API：F3
  * ------------------------------------------------------------------------- */
 
+static void set_post_update(iv_config_t *c, const char *key)
+{
+    unsigned idx = 0u;
+
+    if (camera_slot_index(key, &idx) && idx < (unsigned)IV_CFG_ARR_MAX &&
+        idx + 1u > c->camera_count) {
+        c->camera_count = idx + 1u;
+        (void)fill_missing_defaults(c, NULL);
+    }
+    mark_dirty_class(c, key);
+}
+
 int iv_config_set_str(iv_config_t *c, const char *key, const char *val)
 {
     cfg_item_t *it;
@@ -1852,13 +2125,18 @@ int iv_config_set_str(iv_config_t *c, const char *key, const char *val)
         return IV_EINVAL;
     if (strlen(val) >= (size_t)IV_CFG_STR_MAX)
         return IV_ERANGE;
+    it = item_find(c, key);
+    if (it != NULL && it->type == IV_CFG_T_STR && strcmp(it->v.s, val) == 0) {
+        it->origin = (uint8_t)IV_CFG_FROM_FILE;
+        return IV_OK;
+    }
     it = item_touch(c, key);
     if (it == NULL)
         return IV_EFULL;
     it->type   = IV_CFG_T_STR;
     it->origin = (uint8_t)IV_CFG_FROM_FILE;
     str_copy(it->v.s, sizeof(it->v.s), val);
-    c->dirty = 1;
+    set_post_update(c, key);
     return IV_OK;
 }
 
@@ -1868,29 +2146,40 @@ int iv_config_set_int(iv_config_t *c, const char *key, int64_t val)
 
     if (c == NULL || !c->used || key == NULL || !key_ok(key) || key[0] == '_')
         return IV_EINVAL;
+    it = item_find(c, key);
+    if (it != NULL && it->type == IV_CFG_T_INT && it->v.i == val) {
+        it->origin = (uint8_t)IV_CFG_FROM_FILE;
+        return IV_OK;
+    }
     it = item_touch(c, key);
     if (it == NULL)
         return IV_EFULL;
     it->type   = IV_CFG_T_INT;
     it->origin = (uint8_t)IV_CFG_FROM_FILE;
     it->v.i    = val;
-    c->dirty   = 1;
+    set_post_update(c, key);
     return IV_OK;
 }
 
 int iv_config_set_bool(iv_config_t *c, const char *key, int val)
 {
     cfg_item_t *it;
+    int         normalized = val ? 1 : 0;
 
     if (c == NULL || !c->used || key == NULL || !key_ok(key) || key[0] == '_')
         return IV_EINVAL;
+    it = item_find(c, key);
+    if (it != NULL && it->type == IV_CFG_T_BOOL && it->v.b == normalized) {
+        it->origin = (uint8_t)IV_CFG_FROM_FILE;
+        return IV_OK;
+    }
     it = item_touch(c, key);
     if (it == NULL)
         return IV_EFULL;
     it->type   = IV_CFG_T_BOOL;
     it->origin = (uint8_t)IV_CFG_FROM_FILE;
-    it->v.b    = val ? 1 : 0;
-    c->dirty   = 1;
+    it->v.b    = normalized;
+    set_post_update(c, key);
     return IV_OK;
 }
 
@@ -1900,15 +2189,20 @@ int iv_config_set_dbl(iv_config_t *c, const char *key, double val)
 
     if (c == NULL || !c->used || key == NULL || !key_ok(key) || key[0] == '_')
         return IV_EINVAL;
-    if (val != val) /* NaN：JSON 里没有 NaN 字面量，写出去会产不出合法文件 */
+    if (!isfinite(val)) /* JSON 没有 NaN/Infinity 字面量，写出去会产不出合法文件 */
         return IV_EINVAL;
+    it = item_find(c, key);
+    if (it != NULL && it->type == IV_CFG_T_DBL && it->v.d == val) {
+        it->origin = (uint8_t)IV_CFG_FROM_FILE;
+        return IV_OK;
+    }
     it = item_touch(c, key);
     if (it == NULL)
         return IV_EFULL;
     it->type   = IV_CFG_T_DBL;
     it->origin = (uint8_t)IV_CFG_FROM_FILE;
     it->v.d    = val;
-    c->dirty   = 1;
+    set_post_update(c, key);
     return IV_OK;
 }
 
@@ -1920,6 +2214,10 @@ int iv_config_array_len(const iv_config_t *c, const char *arr_key, unsigned *n)
 
     if (c == NULL || !c->used || arr_key == NULL || n == NULL || !key_ok(arr_key))
         return IV_EINVAL;
+    if (strcmp(arr_key, "camera.ch") == 0) {
+        *n = c->camera_count;
+        return IV_OK;
+    }
     al = strlen(arr_key);
 
     for (i = 0u; i < c->n_items; i++) {
@@ -1986,6 +2284,7 @@ int iv_config_save(iv_config_t *c, char *detail, size_t detail_cap)
     const char *k2  = NULL;
     long        n;
     uint64_t    nver;
+    uint32_t    changed_mask;
     int         fd;
 
     if (c == NULL || !c->used)
@@ -2009,6 +2308,7 @@ int iv_config_save(iv_config_t *c, char *detail, size_t detail_cap)
 
     /* 2) 渲染（版本号先算新值，写进文件的就是新版本） */
     nver = c->version + 1u;
+    changed_mask = c->dirty_classes;
     n    = render_json(c, nver);
     if (n < 0)
         return (int)n;
@@ -2049,41 +2349,42 @@ int iv_config_save(iv_config_t *c, char *detail, size_t detail_cap)
         (void)unlink(c->tmppath);
         return IV_EIO;
     }
-    if (fsync_dir(c->dir) != 0)
-        IV_LOG_W(CFG_MOD, "%s: fsync dir failed: %s (rename may not be durable)", c->name,
-                 strerror(errno));
-
     c->version = nver;
     c->loaded  = 1;
-    c->dirty   = 0;
     c->crc_mismatch = 0;
-    watch_drain(c); /* 自己的写不该被 F6 当成外部改动 */
+    if (fsync_dir(c->dir) != 0) {
+        /* rename 已经发生，不能假装“旧文件仍在”；保留 dirty 让调用方知道需要重试，
+         * 同时返回 EIO 表示掉电持久性尚未确认。 */
+        c->dirty = 1;
+        IV_LOG_E(CFG_MOD, "%s: fsync dir failed: %s (durability not confirmed)", c->name,
+                 strerror(errno));
+        return IV_EIO;
+    }
+
+    c->dirty         = 0;
+    c->dirty_classes = 0u;
     IV_LOG_I(CFG_MOD, "%s: saved %u keys, version=%llu", c->name, c->n_items,
              (unsigned long long)c->version);
 
     /* F7：程序主动保存同样要通知依赖方（此时配置一定合法） */
-    {
-        unsigned i;
-
-        for (i = 0; i < c->n_subs; i++) {
-            if (c->subs_fn[i] != NULL)
-                c->subs_fn[i](c, c->name, c->subs_user[i]);
-        }
-    }
+    notify_subscribers(c, changed_mask);
     return IV_OK;
 }
 
 int iv_config_fill_defaults(iv_config_t *c, int *filled, char *detail, size_t detail_cap)
 {
-    int n;
+    unsigned class_mask = 0u;
+    int      n;
 
     if (c == NULL || !c->used)
         return IV_EINVAL;
-    n = fill_missing_defaults(c);
+    n = fill_missing_defaults(c, &class_mask);
     if (filled != NULL)
         *filled = n;
-    if (n > 0)
+    if (n > 0) {
         c->dirty = 1;
+        c->dirty_classes |= class_mask;
+    }
     return iv_config_save(c, detail, detail_cap);
 }
 
@@ -2124,7 +2425,10 @@ int iv_config_watch_fd(iv_config_t *c)
 
 int iv_config_watch_poll(iv_config_t *c, uint32_t *reloads)
 {
-    char  buf[sizeof(struct inotify_event) + IV_CFG_NAME_MAX + 8u];
+    union {
+        struct inotify_event align;
+        char                 bytes[4096];
+    } event_buf;
     char  target[IV_CFG_NAME_MAX + 8u];
     int   hit = 0;
     int   saw = 0;
@@ -2137,26 +2441,40 @@ int iv_config_watch_poll(iv_config_t *c, uint32_t *reloads)
     snprintf(target, sizeof(target), "%s.json", c->name);
 
     for (;;) {
-        ssize_t n = read(c->ifd, buf, sizeof(buf));
+        ssize_t n = read(c->ifd, event_buf.bytes, sizeof(event_buf.bytes));
         char   *p;
         ssize_t left;
 
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            break; /* EAGAIN：本轮读干 */
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break; /* 本轮读干 */
+            IV_LOG_E(CFG_MOD, "%s: inotify read failed: %s", c->name, strerror(errno));
+            if (reloads != NULL)
+                *reloads = 0u;
+            return IV_EIO;
         }
         if (n == 0)
             break;
         saw = 1;
 
-        for (p = buf, left = n; left >= (ssize_t)sizeof(struct inotify_event);) {
+        for (p = event_buf.bytes, left = n; left >= (ssize_t)sizeof(struct inotify_event);) {
             const struct inotify_event *ev = (const struct inotify_event *)p;
+            size_t                      ev_size = sizeof(struct inotify_event) + ev->len;
 
+            if (ev_size > (size_t)left) {
+                IV_LOG_E(CFG_MOD, "%s: malformed inotify event batch", c->name);
+                if (reloads != NULL)
+                    *reloads = 0u;
+                return IV_EIO;
+            }
+            if ((ev->mask & IN_Q_OVERFLOW) != 0u)
+                hit = 1; /* 队列溢出后事件不可信，强制从磁盘完整重同步 */
             if (ev->len > 0u && strcmp(ev->name, target) == 0)
                 hit = 1;
-            p += sizeof(struct inotify_event) + ev->len;
-            left -= (ssize_t)(sizeof(struct inotify_event) + ev->len);
+            p += ev_size;
+            left -= (ssize_t)ev_size;
         }
     }
 
@@ -2179,12 +2497,13 @@ int iv_config_watch_poll(iv_config_t *c, uint32_t *reloads)
      *        - 该分类被标 bad   ⇒ 从旧快照把该分类的条目整块搬回来（回退旧值）。
      *      注意：这里**不把"缺键"当非法** —— 外部手工编辑删掉几个键是正常操作，
      *      fill_missing_defaults 已按默认值补齐，属采用。
-     *   4) 只要**至少一个分类采用了新值**就通知订阅者（F7）；全被拒则一个都不通知。
+     *   4) 比较新旧快照，只对**值实际变化**的分类通知对应订阅者（F7）。
      *      版本号沿用文件里的值（若文件没写 version，则沿用旧版本号，见下）。 */
     {
         cfg_snapshot_t snap;
         int            rc;
-        unsigned       adopted = 0u;
+        uint32_t       changed_mask = 0u;
+        unsigned       changed = 0u;
 
         snap_take(c, &snap);
         rc = load_from_disk(c);
@@ -2228,53 +2547,33 @@ int iv_config_watch_poll(iv_config_t *c, uint32_t *reloads)
                             *dst = snap.items[i];
                     }
                 }
+                if (cls == (unsigned)IV_CFG_CLS_CAMERA)
+                    c->camera_count = snap.camera_count;
                 IV_LOG_W(CFG_MOD, "%s: reload: class '%s' rejected (invalid value), kept old",
                          c->name, ck);
             }
         }
 
-        /* 统计采用新值的分类数（用于 reloads 返回与是否需要通知） */
+        /* 只把值实际变化的分类放进通知位图；版本/来源变化不触发业务重配。 */
         {
             unsigned cls;
 
             for (cls = 0u; cls < IV_CFG_CLASS_N; cls++) {
-                if ((c->cls_bad & (1u << cls)) == 0u) {
-                    const char *ck = s_classes[cls].key;
-                    size_t      cl = strlen(ck);
-                    unsigned    i;
-
-                    for (i = 0u; i < c->n_items; i++) {
-                        if (strncmp(c->items[i].key, ck, cl) == 0 && c->items[i].key[cl] == '.') {
-                            adopted++;
-                            break;
-                        }
-                    }
+                if ((c->cls_bad & (1u << cls)) == 0u && class_changed(c, &snap, cls)) {
+                    changed_mask |= IV_CFG_CLASS_MASK(cls);
+                    changed++;
                 }
             }
         }
 
-        if (adopted == 0u) {
-            /* 一个分类都没采用（例如文件里全是坏分类）⇒ 不算重载、不通知 */
-            IV_LOG_W(CFG_MOD, "%s: reload adopted nothing, subscribers not notified", c->name);
-            if (reloads != NULL)
-                *reloads = 0u;
-            return IV_OK;
-        }
-
         c->loaded       = 1;
-        c->crc_mismatch = 0; /* 重载后重新渲染会刷新 crc，不再报旧文件的 crc 不符 */
-        IV_LOG_I(CFG_MOD, "%s: reloaded %u keys (%u class(es) adopted), version=%llu", c->name,
-                 c->n_items, adopted, (unsigned long long)c->version);
-        {
-            unsigned i;
-
-            for (i = 0; i < c->n_subs; i++) {
-                if (c->subs_fn[i] != NULL)
-                    c->subs_fn[i](c, c->name, c->subs_user[i]);
-            }
-        }
+        c->dirty        = 0;
+        c->dirty_classes = 0u;
+        IV_LOG_I(CFG_MOD, "%s: reloaded %u keys (%u class(es) changed), version=%llu", c->name,
+                 c->n_items, changed, (unsigned long long)c->version);
+        notify_subscribers(c, changed_mask);
         if (reloads != NULL)
-            *reloads = adopted;
+            *reloads = changed;
         return IV_OK;
     }
 }
@@ -2283,14 +2582,16 @@ int iv_config_watch_poll(iv_config_t *c, uint32_t *reloads)
  * 公开 API：F7 订阅
  * ------------------------------------------------------------------------- */
 
-int iv_config_subscribe(iv_config_t *c, iv_cfg_notify_fn fn, void *user)
+int iv_config_subscribe(iv_config_t *c, uint32_t class_mask, iv_cfg_notify_fn fn, void *user)
 {
-    if (c == NULL || !c->used || fn == NULL)
+    if (c == NULL || !c->used || fn == NULL || class_mask == 0u ||
+        (class_mask & ~IV_CFG_CLASS_MASK_ALL) != 0u)
         return IV_EINVAL;
     if (c->n_subs >= (unsigned)IV_CFG_SUBS_MAX)
         return IV_EFULL;
     c->subs_fn[c->n_subs]   = fn;
     c->subs_user[c->n_subs] = user;
+    c->subs_mask[c->n_subs] = class_mask;
     c->n_subs++;
     return IV_OK;
 }

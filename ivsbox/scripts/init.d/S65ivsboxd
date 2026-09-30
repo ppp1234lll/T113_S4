@@ -1,15 +1,17 @@
 #!/bin/sh
 # IVSBox 主控服务 sysvinit 脚本（M1-S10）
 # 不用 procd：板端没有 procd，用 start-stop-daemon 后台拉起。
+# 2026-09-30（F1 修正）：start() 只拉起 monitor.sh，**主控由 monitor 唯一拉起**
+# （见 monitor.sh 文件头）——init 直启主控会绕过熔断，跨复位 failsafe 被架空。
 
 IVSBOX_USER=${IVSBOX_USER:-root}
 IVSBOX_GROUP=${IVSBOX_GROUP:-root}
 
 IVSBOX_HOME=/mnt/UDISK/ivsbox
 CURRENT=$IVSBOX_HOME/current
-BIN=$CURRENT/bin/ivsboxd
 # monitor.sh 的熔断状态文件（缺口清单 G8）。restart 时清掉它 = 人工解除熔断。
 MONITOR_STATE=$IVSBOX_HOME/.monitor.state
+# 主控 pidfile 的写者只有 monitor（它是唯一拉起方）；本脚本 stop() 只读它。
 PIDFILE=/var/run/ivsboxd.pid
 MONITOR_PIDFILE=/var/run/ivsbox_monitor.pid
 
@@ -30,17 +32,17 @@ start() {
     # 属主交给运行用户（当前未建 ivsbox 用户时默认 root）
     chown -R "$IVSBOX_USER:$IVSBOX_GROUP" "$IVSBOX_HOME" /var/run/ivsbox 2>/dev/null || true
 
-    # 拉起主控
+    # 只拉起 monitor 守护循环，由它做主控的唯一拉起方（开机后至多晚一个轮询周期，
+    # 默认 5 s）。**不在这里直接 start-stop-daemon 主控**：开机直启会绕过 monitor
+    # 的 failsafe 熔断 —— 熔断期内每次复位后 init 都再送一次 ivsboxd 运行、每次
+    # 都重新武装看门狗，"跨复位继续熔断"就不成立，持续的运行期崩溃循环会变成
+    # 30 分钟一轮的整机复位风暴（2026-09-30 复核 F1）。
     /sbin/start-stop-daemon --start --background --make-pidfile \
-        --pidfile "$PIDFILE" --exec "$BIN" --chuid "$IVSBOX_USER:$IVSBOX_GROUP" || {
+        --pidfile "$MONITOR_PIDFILE" --exec "$CURRENT/scripts/monitor.sh" \
+        --chuid "$IVSBOX_USER:$IVSBOX_GROUP" || {
         echo "FAIL"
         return 1
     }
-
-    # 同时拉起 monitor 守护循环（进程崩溃后自动重拉）
-    /sbin/start-stop-daemon --start --background --make-pidfile \
-        --pidfile "$MONITOR_PIDFILE" --exec "$CURRENT/scripts/monitor.sh" \
-        --chuid "$IVSBOX_USER:$IVSBOX_GROUP" 2>/dev/null || true
 
     echo "OK"
 }

@@ -84,6 +84,20 @@ static void path_cat(char *out, size_t cap, const char *base, const char *suffix
     memcpy(out + bl, suffix, sl + 1u);
 }
 
+/* 删除数据库及其 WAL/SHM/备份文件 */
+static void remove_db(const char *path)
+{
+    char tmp[260];
+
+    (void)unlink(path);
+    path_cat(tmp, sizeof(tmp), path, "-wal");
+    (void)unlink(tmp);
+    path_cat(tmp, sizeof(tmp), path, "-shm");
+    (void)unlink(tmp);
+    path_cat(tmp, sizeof(tmp), path, ".corrupt");
+    (void)unlink(tmp);
+}
+
 static void quiet_sink(int level, const char *module, const char *line, void *user)
 {
     (void)level;
@@ -104,7 +118,7 @@ static void case_open_and_basic(void)
 
     path_of(sub, sizeof(sub), "sub");
     path_of(path, sizeof(path), "sub/control.db");
-    (void)unlink(path);
+    remove_db(path);
     (void)rmdir(sub);
 
     chk(iv_db_open(path, &db) == IV_OK, "d1: open with autocreate");
@@ -118,7 +132,7 @@ static void case_open_and_basic(void)
         "d1: count rows");
 
     iv_db_close(db);
-    (void)unlink(path);
+    remove_db(path);
     (void)rmdir(sub);
 }
 
@@ -132,7 +146,7 @@ static void case_transaction_rollback(void)
     int64_t    v;
 
     path_of(path, sizeof(path), "tx.db");
-    (void)unlink(path);
+    remove_db(path);
 
     chk(iv_db_open(path, &db) == IV_OK, "d2: open");
     chk(iv_db_exec(db, "CREATE TABLE t2(id INTEGER PRIMARY KEY, val INTEGER);") == IV_OK,
@@ -149,7 +163,7 @@ static void case_transaction_rollback(void)
         "d2: rollback left only seed row");
 
     iv_db_close(db);
-    (void)unlink(path);
+    remove_db(path);
 }
 
 /* ---------------------------------------------------------------------------
@@ -163,7 +177,7 @@ static void case_wal_enabled(void)
     iv_db_t   *db;
 
     path_of(path, sizeof(path), "wal.db");
-    (void)unlink(path);
+    remove_db(path);
 
     chk(iv_db_open(path, &db) == IV_OK, "d3: open");
     chk(iv_db_exec(db, "CREATE TABLE t3(id INTEGER PRIMARY KEY);") == IV_OK,
@@ -176,9 +190,7 @@ static void case_wal_enabled(void)
     chk(file_exists(wal), "d3: wal file exists");
 
     iv_db_close(db);
-    (void)unlink(path);
-    (void)unlink(wal);
-    (void)unlink(shm);
+    remove_db(path);
 }
 
 /* ---------------------------------------------------------------------------
@@ -193,7 +205,7 @@ static void case_corrupt_recovery(void)
     const char garbage[] = "this is not a sqlite database";
 
     path_of(path, sizeof(path), "corrupt.db");
-    (void)unlink(path);
+    remove_db(path);
 
     chk(write_file(path, garbage, strlen(garbage)) == 0, "d4: write garbage");
 
@@ -211,8 +223,7 @@ static void case_corrupt_recovery(void)
         "d4: read back");
 
     iv_db_close(db);
-    (void)unlink(path);
-    (void)unlink(corrupt);
+    remove_db(path);
 }
 
 /* ---------------------------------------------------------------------------
@@ -224,13 +235,13 @@ static void case_integrity(void)
     iv_db_t   *db;
 
     path_of(path, sizeof(path), "integ.db");
-    (void)unlink(path);
+    remove_db(path);
 
     chk(iv_db_open(path, &db) == IV_OK, "d5: open");
     chk(iv_db_check_integrity(db) == IV_OK, "d5: integrity ok");
 
     iv_db_close(db);
-    (void)unlink(path);
+    remove_db(path);
 }
 
 /* ---------------------------------------------------------------------------
@@ -248,7 +259,7 @@ static void case_invalid_inputs(void)
         "d6: scalar NULL out");
     chk(iv_db_check_integrity(NULL) == IV_EINVAL, "d6: integrity NULL db");
     iv_db_close(db);
-    (void)unlink("/tmp/ivsbox_test.db");
+    remove_db("/tmp/ivsbox_test.db");
 }
 
 int main(void)

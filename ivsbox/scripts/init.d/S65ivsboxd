@@ -1,0 +1,73 @@
+#!/bin/sh
+# IVSBox 主控服务 sysvinit 脚本（M1-S10）
+# 不用 procd：板端没有 procd，用 start-stop-daemon 后台拉起。
+
+IVSBOX_USER=${IVSBOX_USER:-root}
+IVSBOX_GROUP=${IVSBOX_GROUP:-root}
+
+IVSBOX_HOME=/mnt/UDISK/ivsbox
+CURRENT=$IVSBOX_HOME/current
+BIN=$CURRENT/bin/ivsboxd
+PIDFILE=/var/run/ivsboxd.pid
+MONITOR_PIDFILE=/var/run/ivsbox_monitor.pid
+
+start() {
+    echo -n "Starting ivsboxd: "
+
+    # 预建运行目录（UDISK 由 S60mount_udisk 挂载，本脚本编号必须 > 60）
+    for d in config db queue ota secure releases; do
+        mkdir -p "$IVSBOX_HOME/$d"
+    done
+    mkdir -p "$IVSBOX_HOME/log"
+    mkdir -p /var/run/ivsbox
+
+    # 属主交给运行用户（当前未建 ivsbox 用户时默认 root）
+    chown -R "$IVSBOX_USER:$IVSBOX_GROUP" "$IVSBOX_HOME" /var/run/ivsbox 2>/dev/null || true
+
+    # 拉起主控
+    /sbin/start-stop-daemon --start --background --make-pidfile \
+        --pidfile "$PIDFILE" --exec "$BIN" --chuid "$IVSBOX_USER:$IVSBOX_GROUP" || {
+        echo "FAIL"
+        return 1
+    }
+
+    # 同时拉起 monitor 守护循环（进程崩溃后自动重拉）
+    /sbin/start-stop-daemon --start --background --make-pidfile \
+        --pidfile "$MONITOR_PIDFILE" --exec "$CURRENT/scripts/monitor.sh" \
+        --chuid "$IVSBOX_USER:$IVSBOX_GROUP" 2>/dev/null || true
+
+    echo "OK"
+}
+
+stop() {
+    echo -n "Stopping ivsboxd: "
+
+    # 先发 TERM，让 ivsboxd 走 iv_watchdog_disable() 正常停机，避免整机被复位
+    /sbin/start-stop-daemon --stop --pidfile "$PIDFILE" --signal TERM --retry 20
+
+    # 停 monitor
+    /sbin/start-stop-daemon --stop --pidfile "$MONITOR_PIDFILE" --signal TERM --retry 5 2>/dev/null || true
+
+    echo "OK"
+}
+
+restart() {
+    stop
+    start
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart|force-reload)
+        restart
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

@@ -44,6 +44,7 @@ PROVISION_SRCS:= $(wildcard tools/provision/src/*.c)
 
 TEST_SRCS     := $(wildcard tests/unit/*.c)
 FUZZ_SRCS     := $(wildcard tests/fuzz/*.c)
+ITEST_SRCS    := $(wildcard tests/integration/*.c)
 
 # -----------------------------------------------------------------------------
 # 对象文件
@@ -60,6 +61,7 @@ PROVISION_OBJS:= $(patsubst %.c,$(BUILD_DIR)/%.o,$(PROVISION_SRCS))
 
 TEST_OBJS     := $(patsubst tests/unit/%.c,$(BUILD_DIR)/tests/unit/%.o,$(TEST_SRCS))
 FUZZ_OBJS     := $(patsubst tests/fuzz/%.c,$(BUILD_DIR)/tests/fuzz/%.o,$(FUZZ_SRCS))
+ITEST_OBJS    := $(patsubst tests/integration/%.c,$(BUILD_DIR)/tests/integration/%.o,$(ITEST_SRCS))
 
 # -----------------------------------------------------------------------------
 # 目标产物
@@ -90,11 +92,12 @@ endif
 
 TEST_BINS     := $(patsubst tests/unit/%.c,$(BUILD_DIR)/tests/unit/%,$(TEST_SRCS))
 FUZZ_BINS     := $(patsubst tests/fuzz/%.c,$(BUILD_DIR)/tests/fuzz/%,$(FUZZ_SRCS))
+ITEST_BINS    := $(patsubst tests/integration/%.c,$(BUILD_DIR)/tests/integration/%,$(ITEST_SRCS))
 
 # -----------------------------------------------------------------------------
 # 公共伪目标
 # -----------------------------------------------------------------------------
-.PHONY: all host arm test asan tsan fuzz analyze analyze-build package package-copy clean help
+.PHONY: all host arm test itest asan tsan fuzz analyze analyze-build package package-copy clean help
 
 all: host
 
@@ -104,11 +107,23 @@ host:
 arm:
 	$(MAKE) TARGET=arm build
 
-build: $(BINS) $(TEST_BINS)
+build: $(BINS) $(TEST_BINS) $(ITEST_BINS)
 
 test:
 	$(MAKE) TARGET=host $(TEST_BINS)
 	@for t in $(TEST_BINS); do \
+		echo "RUN $$t"; \
+		"$$t" || exit 1; \
+	done
+
+# 集成测试。**刻意不并入 make test**：单测自包含（任何环境都能跑），而本目标
+# 的前提是"外部服务已在跑"（ivsboxd 已在接听点监听）。并进 make test 会让 CI
+# 因"没起服务"而假红，那是测试体系的坏味道。
+#   VM：`build/host/ivsboxd &` 之后 `make itest`
+#   板端：`/etc/init.d/S65ivsboxd start` 之后直接跑 build/arm/tests/integration/*
+itest:
+	$(MAKE) TARGET=host $(ITEST_BINS)
+	@for t in $(ITEST_BINS); do \
 		echo "RUN $$t"; \
 		"$$t" || exit 1; \
 	done
@@ -167,6 +182,7 @@ help:
 	@echo "  test     - build and run unit tests"
 	@echo "  asan     - build and run tests with ASan/UBSan"
 	@echo "  tsan     - build and run tests with TSan (host only, exclusive with asan)"
+	@echo "  itest    - build and run integration tests (requires a running ivsboxd)"
 	@echo "  fuzz     - build fuzz targets"
 	@echo "  analyze  - build with GCC -fanalyzer"
 	@echo "  package  - copy ARM binaries to packaging/"
@@ -189,7 +205,7 @@ help:
 # .PRECIOUS 只禁止删除、不改变其他任何语义。
 # 注意：不要写成不带前置条件的 `.SECONDARY:` —— 那会让 make 认为所有目标都不需重编，
 # `make arm` 会直接报"对 build 无需做任何事"而什么都不产出（2026-09-24 实测踩过）。
-.PRECIOUS: $(TEST_OBJS) $(FUZZ_OBJS)
+.PRECIOUS: $(TEST_OBJS) $(FUZZ_OBJS) $(ITEST_OBJS)
 
 # 版本戳：只在 Git 短哈希真的变化时刷新 mtime，从触发相关 .o 重编。
 # 少了这一步会出现"提交后哈希变了、二进制里仍是旧哈希"的静默不一致。
@@ -239,6 +255,10 @@ $(PROVISION_BIN): $(PROVISION_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILD_DIR)/tests/unit/%: $(BUILD_DIR)/tests/unit/%.o $(LIBMODULES) $(LIBHAL) $(LIBCORE)
+	@mkdir -p $(dir $@)
+	$(CC) $(LDFLAGS) -o $@ $< -L$(BUILD_DIR) -livmodules -livhal -livcore $(LDLIBS)
+
+$(BUILD_DIR)/tests/integration/%: $(BUILD_DIR)/tests/integration/%.o $(LIBMODULES) $(LIBHAL) $(LIBCORE)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $< -L$(BUILD_DIR) -livmodules -livhal -livcore $(LDLIBS)
 

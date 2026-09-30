@@ -8,6 +8,8 @@ IVSBOX_GROUP=${IVSBOX_GROUP:-root}
 IVSBOX_HOME=/mnt/UDISK/ivsbox
 CURRENT=$IVSBOX_HOME/current
 BIN=$CURRENT/bin/ivsboxd
+# monitor.sh 的熔断状态文件（缺口清单 G8）。restart 时清掉它 = 人工解除熔断。
+MONITOR_STATE=$IVSBOX_HOME/.monitor.state
 PIDFILE=/var/run/ivsboxd.pid
 MONITOR_PIDFILE=/var/run/ivsbox_monitor.pid
 
@@ -18,7 +20,11 @@ start() {
     for d in config db queue ota secure releases; do
         mkdir -p "$IVSBOX_HOME/$d"
     done
-    mkdir -p "$IVSBOX_HOME/log"
+    # 日志根目录与 iv_log 的默认 root 保持一致（/mnt/UDISK/log，见计划 §0）；
+    # monitor.sh 的告警文件（monitor-alert.log）也落在这里。
+    # 原写 `mkdir -p "$IVSBOX_HOME/log"` 与 iv_log 的实际落点不是同一个目录，
+    # 属冗余且误导，2026-09-30 更正。
+    mkdir -p /mnt/UDISK/log
     mkdir -p /var/run/ivsbox
 
     # 属主交给运行用户（当前未建 ivsbox 用户时默认 root）
@@ -53,6 +59,11 @@ stop() {
 }
 
 restart() {
+    # 人工解除 monitor.sh 的熔断（缺口清单 G8）：restart 是显式的人工动作，而开机
+    # 流程（rcS）只会调 start、不会调 restart，所以在这里清熔断状态是安全的。
+    # **不能放进 start()** —— 那样整机复位后 init 又会把计数清零，"跨复位的崩溃
+    # 历史"就永远攒不起来，熔断等于没有。
+    rm -f "$MONITOR_STATE"
     stop
     start
 }

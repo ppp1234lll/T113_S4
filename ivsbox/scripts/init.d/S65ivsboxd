@@ -42,11 +42,12 @@ start() {
 stop() {
     echo -n "Stopping ivsboxd: "
 
-    # 先发 TERM，让 ivsboxd 走 iv_watchdog_disable() 正常停机，避免整机被复位
-    /sbin/start-stop-daemon --stop --pidfile "$PIDFILE" --signal TERM --retry 20
-
-    # 停 monitor
+    # 先停 monitor：monitor 每 5s 轮询一次，若先杀 ivsboxd，它会在轮询窗口里把主控
+    # 重新拉起，造成"停不干净"。必须先把重启方干掉，再停主控。
     /sbin/start-stop-daemon --stop --pidfile "$MONITOR_PIDFILE" --signal TERM --retry 5 2>/dev/null || true
+
+    # 再发 TERM，让 ivsboxd 走 iv_watchdog_disable() 正常停机，避免整机被复位
+    /sbin/start-stop-daemon --stop --pidfile "$PIDFILE" --signal TERM --retry 20
 
     echo "OK"
 }

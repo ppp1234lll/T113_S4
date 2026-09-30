@@ -30,11 +30,33 @@ GIT_VER := $(if $(strip $(GIT_VER)),$(strip $(GIT_VER)),unknown)
 CFLAGS  += -DIV_GIT_VER='"$(GIT_VER)"'
 
 # -----------------------------------------------------------------------------
+# vendored 第三方库（third_party/<lib>/）
+# -----------------------------------------------------------------------------
+# 头文件搜索路径：让 src/modules/** 能 `#include "minmea.h"`。core/hal 不用它，
+# 但这里是通用规则、按目录分流代价大，故统一放开 —— 纪律改由"目录可见性"守：
+# 谁引了第三方，一眼能从 `#include` 的名字看出来（第三方头名不叫 iv_*）。
+THIRD_PARTY_INC := third_party/minmea
+CFLAGS += $(addprefix -I,$(THIRD_PARTY_INC))
+
+# third_party 源码**按上游原样编译**：**去掉本工程的 `-Werror`**，否则为了编过
+# 就得去改上游文件，而那会让"vendored 文件一字未改、可用 SHA256 复核"不再成立。
+# 保留 `-Wall -Wextra` 只是为了看得见上游的警告（不阻塞构建）。
+# 用递归展开（`=`）而不是立即展开（`:=`）：这样后续任何对 CFLAGS 的追加都会带进来。
+CFLAGS_THIRD_PARTY = $(filter-out -Werror,$(CFLAGS))
+
+# -----------------------------------------------------------------------------
 # 源文件发现（非递归，按目录通配）
 # -----------------------------------------------------------------------------
 CORE_SRCS     := $(wildcard src/core/*.c)
 HAL_SRCS      := $(wildcard src/hardware/*.c)
 MODULES_SRCS  := $(wildcard src/modules/*.c src/modules/*/*.c)
+
+# vendored 第三方源码（third_party/<lib>/*.c）编进 libivmodules —— 依赖方向允许
+# modules 层使用外部代码（架构 §15.5），core / hal 仍然只允许 libc。
+# 目前只有 minmea（NMEA 解析，M2-S2.5）：来源、commit 与 SHA256 见
+# third_party/minmea/README.ivsbox.md。
+THIRD_PARTY_SRCS := $(wildcard third_party/*/*.c)
+MODULES_SRCS     += $(THIRD_PARTY_SRCS)
 APP_SRCS      := $(wildcard src/app/*.c)
 
 MEDIA_SRCS    := $(wildcard media/src/*.c)
@@ -221,6 +243,12 @@ FORCE:
 $(BUILD_DIR)/%.o: %.c $(VER_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+# third_party 更有针对性（stem 更短），make 会优先匹配这条：
+# 用不带 -Werror 的标志编译上游源码，理由见文件头 THIRD_PARTY_INC 那段注释。
+$(BUILD_DIR)/third_party/%.o: third_party/%.c $(VER_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS_THIRD_PARTY) -MMD -MP -c -o $@ $<
 
 $(LIBCORE): $(CORE_OBJS)
 	@mkdir -p $(dir $@)

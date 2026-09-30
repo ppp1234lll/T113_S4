@@ -16,7 +16,9 @@ LDFLAGS := $(LDFLAGS_COMMON)
 # 本变量被全部 13 处链接行共用（主程序 + 全部单测 + fuzz），落这一处即全生效。
 # 宿主头文件来自 libjson-c-dev 0.15（libjson-c.so -> .so.5）；板端 sysroot 是
 # json-c 0.13.1（libjson-c.so -> .so.4）⇒ 代码只准用 0.13 的 API 子集。
-LDLIBS  := -lpthread -ljson-c -lsqlite3
+LDLIBS  := -lpthread -ljson-c -lsqlite3 -lm
+# -lm：M2-S2.5 的 iv_gps 用 cos/sqrt 做位移判定的近似换算（equirectangular）。
+# 宿主与板端（glibc）都自带 libm.so，不引入新的运行期依赖。
 
 # 默认 host 带调试信息
 ifeq ($(DEBUG),)

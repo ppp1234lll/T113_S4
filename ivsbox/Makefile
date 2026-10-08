@@ -290,9 +290,11 @@ $(BUILD_DIR)/tests/integration/%: $(BUILD_DIR)/tests/integration/%.o $(LIBMODULE
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $< -L$(BUILD_DIR) -livmodules -livhal -livcore $(LDLIBS)
 
-$(BUILD_DIR)/tests/fuzz/%: $(BUILD_DIR)/tests/fuzz/%.o
+# fuzz 目标链接三个静态库：fuzz harness 会调用被测模块（如 fuzz_frame → iv_frame）。
+# 原先不链库是"没有 fuzz 用例"时期的占位写法，首个 fuzz 用例落地后必须带上。
+$(BUILD_DIR)/tests/fuzz/%: $(BUILD_DIR)/tests/fuzz/%.o $(LIBMODULES) $(LIBHAL) $(LIBCORE)
 	@mkdir -p $(dir $@)
-	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $< -L$(BUILD_DIR) -livmodules -livhal -livcore $(LDLIBS)
 
 # -----------------------------------------------------------------------------
 # 自动依赖

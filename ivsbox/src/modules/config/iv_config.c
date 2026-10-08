@@ -372,6 +372,42 @@ static int dir_normalize(char *out, size_t cap, const char *in)
     return 0;
 }
 
+/* 逐级建目录（mkdir -p 语义，缺口清单 G20）。原实现只建一级：UDISK 被 mkfs
+ * 重置（架构 §10.5 挂载失败即静默重建）后父目录 `/mnt/UDISK/ivsbox` 缺失，
+ * 整条路径创建失败 ⇒ 配置静默回落默认值、inotify watch 失效、save 永远 EIO，
+ * 热更新永久失效，板端只留两行 WARN/ERR（2026-09-30 R1 实测）。
+ * 与 `src/core/iv_db.c` 的 mkdir_p 保持同语义：两个模块的建目录行为必须一致。
+ * 成功 / 已存在返回 0，其他失败返回 -1（errno 保持 mkdir 的值）。 */
+static int mkdir_p(const char *path)
+{
+    char   buf[IV_CFG_PATH_MAX];
+    char  *p;
+    size_t len;
+
+    len = strlen(path);
+    if (len == 0u || len >= sizeof(buf))
+        return -1;
+
+    memcpy(buf, path, len + 1u);
+
+    /* 去掉末尾斜杠 */
+    while (len > 1u && buf[len - 1u] == '/')
+        buf[--len] = '\0';
+
+    for (p = buf + 1u; *p != '\0'; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(buf, 0755) != 0 && errno != EEXIST)
+                return -1;
+            *p = '/';
+        }
+    }
+    if (mkdir(buf, 0755) != 0 && errno != EEXIST)
+        return -1;
+
+    return 0;
+}
+
 /* §S8.1：单文件下默认表不再按配置名过滤（只有一份配置），键全局唯一。 */
 static const cfg_default_t *default_find(const char *key)
 {
@@ -1910,10 +1946,11 @@ iv_config_t *iv_config_open(const char *dir, const char *name)
     if (dir_normalize(ndir, sizeof(ndir), d) != 0)
         return NULL;
 
-    /* 目录按需创建：F4 要求“文件不存在也照常启动”。目录存在时记录 dev+ino，
+    /* 目录按需创建：F4 要求“文件不存在也照常启动”。必须**逐级**创建（G20）：
+     * 只建一级时 UDISK 重置后父目录缺失会静默失效。目录存在时记录 dev+ino，
      * 用真实目录身份而不是调用方字符串做单句柄判定。 */
-    if (mkdir(ndir, 0755) != 0 && errno != EEXIST)
-        IV_LOG_W(CFG_MOD, "mkdir '%s' failed: %s (defaults stay in memory)", ndir,
+    if (mkdir_p(ndir) != 0)
+        IV_LOG_W(CFG_MOD, "mkdir -p '%s' failed: %s (defaults stay in memory)", ndir,
                  strerror(errno));
     if (stat(ndir, &dst) == 0 && S_ISDIR(dst.st_mode))
         dir_id_valid = 1;

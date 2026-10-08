@@ -1381,6 +1381,63 @@ static void case_dir_autocreate(void)
     (void)rmdir(sub);
 }
 
+/* ===========================================================================
+ * G20：父目录整级缺失时必须递归创建（mkdir -p 语义）
+ * 实际故障面（板端 R1 实测）：UDISK 被 mkfs 重置后 `/mnt/UDISK/ivsbox` 缺失，
+ * 旧实现只建一级 ⇒ 目录建不出来、inotify watch 失效、save 永远 EIO，
+ * 配置静默回落默认值且热更新永久失效 —— 现场只看到两行 WARN/ERR。
+ * 反向证伪点：把实现改回单级 mkdir，本用例三条关键断言将全部失败 ——
+ *   ① 两级目录都建不出来；② watch_fd < 0（inotify_add_watch ENOENT）；
+ *   ③ save != IV_OK（open tmp ENOENT ⇒ EIO）。
+ *   （实际证伪执行按用户 2026-10-08 指示后置）
+ * ========================================================================= */
+static void case_dir_recursive_create(void)
+{
+    char         deep[200];
+    char         sub[200];
+    char         pf[240];
+    struct stat  sb;
+    iv_config_t *c;
+    int64_t      iv = 0;
+
+    path_of(deep, sizeof(deep), "deep");
+    path_of(sub, sizeof(sub), "deep/mid");
+    path_of(pf, sizeof(pf), "deep/mid/ivsbox.json");
+
+    /* 起点干净：确保 "deep" 整级都不存在（rmdir 对不存在路径返回 -1，无害） */
+    (void)unlink(pf);
+    (void)rmdir(sub);
+    (void)rmdir(deep);
+
+    c = iv_config_open(sub, IV_CFG_NAME);
+    chk(c != NULL, "c18: open under a missing parent still returns a handle");
+    if (c == NULL)
+        return;
+
+    chk(stat(sub, &sb) == 0 && S_ISDIR(sb.st_mode),
+        "c18: the missing parent level is created too (recursive mkdir)");
+    chk(iv_config_watch_fd(c) >= 0, "c18: inotify watch works on the created directory");
+
+    chk(iv_config_set_int(c, "sys.report.interval_s", 33) == IV_OK, "c18: set a value");
+    chk(iv_config_save(c, NULL, 0u) == IV_OK,
+        "c18: save lands in the freshly created deep path (was EIO with a single mkdir)");
+
+    iv_config_close(c);
+
+    c = iv_config_open(sub, IV_CFG_NAME);
+    chk(c != NULL, "c18: reopen");
+    if (c != NULL) {
+        chk(iv_config_get_int(c, "sys.report.interval_s", &iv) == IV_OK && iv == 33,
+            "c18: the saved value reads back from the deep directory");
+        iv_config_close(c);
+    }
+
+    /* 清理（规则 6）：先删文件再逐级删目录 */
+    (void)unlink(pf);
+    (void)rmdir(sub);
+    (void)rmdir(deep);
+}
+
 /* ---------------------------------------------------------------------------
  * 收尾：把本用例造出来的东西全部删掉（AGENTS.md 规则 6）
  * ------------------------------------------------------------------------- */
@@ -1389,7 +1446,7 @@ static void cleanup(void)
     static const char *const files[] = {
         "ivsbox.json",      "ivsbox.json.tmp", "ivsbox.stage",   "unrelated.json",
         "h1.json",          "h2.json",         "h3.json",        "h4.json",
-        "h9.json",          "auto/ivsbox.json",
+        "h9.json",          "auto/ivsbox.json", "deep/mid/ivsbox.json",
     };
     char   p[240];
     size_t i;
@@ -1399,6 +1456,10 @@ static void cleanup(void)
         (void)unlink(p);
     }
     path_of(p, sizeof(p), "auto");
+    (void)rmdir(p);
+    path_of(p, sizeof(p), "deep/mid");
+    (void)rmdir(p);
+    path_of(p, sizeof(p), "deep");
     (void)rmdir(p);
     (void)rmdir(g_dir);
 }
@@ -1442,6 +1503,7 @@ int main(void)
     case_reactor_integration();
     case_pool_and_misc();
     case_dir_autocreate();
+    case_dir_recursive_create();
 
     cleanup();
 
@@ -1450,6 +1512,6 @@ int main(void)
         return 1;
     }
     printf("test_config passed (S8 F1-F7 + S8.1 single-file/8-class/array/double/"
-           "comment-roundtrip/per-class transaction)\n");
+           "comment-roundtrip/per-class transaction + G20 dir-recursive-create)\n");
     return 0;
 }

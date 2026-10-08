@@ -44,11 +44,9 @@ ivsbox/
 ├── tests/                  测试
 │   ├── unit/               单元测试（Host 上 make test 运行）
 │   ├── fuzz/               模糊测试（帧/协议输入边界）
-│   └── integration/        集成测试（模拟器对联、IPC、SQLite）
+│   └── integration/        集成测试（真机对联、IPC、SQLite）
 ├── tools/                  按需工具（非常驻）
-│   ├── provision/          出厂工装：写设备 ID / MAC
-│   ├── uart_simulator/     采集板串口模拟器（单测与故障注入）
-│   └── platform_simulator/ 云平台模拟器（断线/丢包注入）
+│   └── provision/          出厂工装：写设备 ID / MAC
 ├── media/                  ivsbox-media 媒体进程：RTSP 抓图、断网录像、媒体索引、音频广播
 ├── web/                    ivsbox-web 管理进程：REST API、静态页面、摄像机受控代理
 ├── updater/                ivsbox-updater 升级器：验签、双版本切换、回滚（按需 root 运行）

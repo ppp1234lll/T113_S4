@@ -96,13 +96,13 @@ void iv_framer_feed(iv_framer_t *fr, const uint8_t *buf, size_t len,
             break;
 
         case ST_LEN_H:
-            fr->need = (uint16_t)((uint16_t)b << 8);
+            fr->need = b; /* 小端：高字节在后 */
             fr->crc = iv_crc8(&b, 1, fr->crc);
             fr->state = ST_LEN_L;
             break;
 
         case ST_LEN_L:
-            fr->need = (uint16_t)(fr->need | b);
+            fr->need = (uint16_t)(fr->need | ((uint16_t)b << 8));
             fr->crc = iv_crc8(&b, 1, fr->crc);
             if (fr->need > IV_FRAME_DATA_MAX) {
                 fr->stats.too_long++;
@@ -196,8 +196,8 @@ int iv_frame_build(uint16_t head, uint8_t cmd, const void *data, uint16_t len,
     out[0] = (uint8_t)(head >> 8);
     out[1] = (uint8_t)(head & 0xFF);
     out[2] = cmd;
-    out[3] = (uint8_t)(len >> 8);
-    out[4] = (uint8_t)(len & 0xFF);
+    out[3] = (uint8_t)(len & 0xFF); /* 小端 */
+    out[4] = (uint8_t)(len >> 8);
     if (len != 0)
         memcpy(&out[5], data, len);
 

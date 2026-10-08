@@ -123,8 +123,8 @@ static size_t mk(uint8_t *out, uint16_t head, uint8_t cmd,
     out[0] = (uint8_t)(head >> 8);
     out[1] = (uint8_t)(head & 0xFF);
     out[2] = cmd;
-    out[3] = (uint8_t)(len >> 8);
-    out[4] = (uint8_t)(len & 0xFF);
+    out[3] = (uint8_t)(len & 0xFF); /* 小端：单片机源码 com.c 确认 */
+    out[4] = (uint8_t)(len >> 8);
     for (i = 0; i < len; i++)
         out[5 + i] = data[i];
     crc = iv_crc8(&out[2], 3, IV_CRC8_SEED_INIT);
@@ -323,17 +323,13 @@ int main(void)
         iv_link_send(&lk, IV_FRAME_CMD_QUERY, req, 1, 700, on_done, NULL);
         iv_link_tick(&lk, 800);
         chk(g_chg.n == 2 && g_chg.up[1] == 0, "DOWN after 3 consecutive failures");
-        /* 坏帧不置 UP */
+        /* 坏帧不置 UP：用正常组帧再打坏 CRC 字节（避免手写字节受字节序影响） */
         rec_reset();
-        f[0] = 0x0F;
-        f[1] = 0x0F;
-        f[2] = 0xE1;
-        f[3] = 0x00;
-        f[4] = 0x01;
-        f[5] = 0xAA; /* 坏 CRC */
-        f[6] = 0xFF;
-        f[7] = 0xFF;
-        iv_link_recv(&lk, f, 8, 900);
+        {
+            size_t nb = mk(f, IV_FRAME_HEAD_UP, IV_FRAME_CMD_QUERY, req, 1);
+            f[nb - 3] ^= 0xFF; /* CRC 字节位置（len 后紧跟） */
+            iv_link_recv(&lk, f, nb, 900);
+        }
         chk(iv_link_is_up(&lk) == 0, "bad frame does not bring link UP");
         /* 合法帧 → UP */
         {

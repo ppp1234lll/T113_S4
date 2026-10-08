@@ -66,8 +66,8 @@ static size_t mk(uint8_t *out, uint8_t cmd, const uint8_t *data, uint16_t len)
     out[0] = 0x0F;
     out[1] = 0x0F;
     out[2] = cmd;
-    out[3] = (uint8_t)(len >> 8);
-    out[4] = (uint8_t)(len & 0xFF);
+    out[3] = (uint8_t)(len & 0xFF); /* 小端：单片机源码 com.c 确认 */
+    out[4] = (uint8_t)(len >> 8);
     for (i = 0; i < len; i++)
         out[5 + i] = data[i];
     crc = iv_crc8(&out[2], 3, IV_CRC8_SEED_INIT);
@@ -282,10 +282,10 @@ int main(void)
         chk(iv_framer_stats(NULL) == NULL, "stats NULL");
     }
 
-    /* ---- 12) 连续同步字节流：每 5 个 0F 被切成一帧"cmd=0x0F、len=0x0F0F"的
-     * 超长候选帧丢弃（SEARCH0→S1 也要吃一个 0F；同步字两字节相同的固有歧义，
-     * 真实帧 cmd 不会是 0x0F）—— 不死锁、不越界、计数正确；残留的半截帧由
-     * 帧超时复位兜底，之后正常帧照常解出 ---- */
+    /* ---- 12) 连续同步字节流：0F 流被按"每 5 字节一帧"切成 cmd=0x0F、
+     * len=0x0F0F 的超长候选帧丢弃（同步字两字节相同的固有歧义，真实帧
+     * cmd 不会是 0x0F）—— 不死锁、不越界、计数正确；残留的半截帧由帧超时
+     * 复位兜底（否则后续正常帧会被当作它的 data 吞掉），之后正常帧照常解出 ---- */
     {
         uint8_t syncs[64];
         memset(syncs, 0x0F, sizeof(syncs));

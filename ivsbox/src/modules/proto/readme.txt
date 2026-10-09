@@ -13,10 +13,15 @@ src/modules/proto  ——  云平台私有协议：二进制 ACK 型控制帧 + 
   iv_proto.c    文本帧组包 `iv_proto_text_frame()`、二进制组包
                 `iv_proto_bin_build()`、解析器 `iv_proto_parser_feed()`、
                 协议上下文 recv/ack/heartbeat/send/send_text
+  iv_queue.c    持久上报队列（M3-S3.4）：断线期间待上报数据的**落盘有界队列**。
+                按序号分段文件 `<dir>/<16位序号>.q`（文件头 24B + 载荷）+
+                内存索引；四级优先级（门禁/控制 > 告警 > 状态 > 媒体）用于
+                超限淘汰，补传顺序按序号；open 恢复、peek/ack 补传、
+                损坏段文件与 .tmp 残留自愈。落点 `/mnt/UDISK/ivsbox/queue/`。
   .gitkeep      目录占位
 
 【实现状态】
-  已实现（功能开发计划 M2-S2.4）。
+  协议层已实现（功能开发计划 M2-S2.4）；持久上报队列 iv_queue.c 已实现（M3-S3.4）。
 
 【约定与注意事项】
   - 二进制控制/查询帧（双向）：`头2 | ver(0x11) | TYPE:2 | ID:3 | CMD | QN1:4 |

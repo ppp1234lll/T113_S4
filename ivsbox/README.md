@@ -29,7 +29,8 @@ ivsbox/
 │   ├── core/               平台无关基础件：错误码、日志、CRC、定时器、IPC 编解码、SQLite 封装
 │   ├── hardware/           Linux 硬件抽象：串口(termios)、netlink、看门狗、时钟
 │   └── modules/            业务模块，一个子目录一个模块，禁止互改私有数据
-│       ├── link/           UART 板间链路（帧解析、可靠层、状态镜像）
+│       ├── link/           UART 板间链路（帧解析、可靠层）
+│       ├── status/         采集板状态镜像（IO/阈值/继电器权威镜像）
 │       ├── proto/          云平台私有协议（表驱动路由、分级发送队列、持久上报队列）
 │       ├── netmgr/         网络管理（rtnetlink 监听、双 WAN 切换状态机）
 │       ├── gps/            GPS 定位与时间源管理

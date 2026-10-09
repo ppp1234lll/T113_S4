@@ -3,13 +3,18 @@
 # 不用 procd：板端没有 procd，用 start-stop-daemon 后台拉起。
 # 2026-09-30（F1 修正）：start() 只拉起 monitor.sh，**主控由 monitor 唯一拉起**
 # （见 monitor.sh 文件头）——init 直启主控会绕过熔断，跨复位 failsafe 被架空。
+# 2026-09-30（用户定稿）：**程序放 rootfs 的 /opt/ivsbox，数据留 UDISK**——
+# 程序不再随 UDISK 挂载失败（S60mount_udisk 会 mkfs 清空）或整片重刷一起丢。
 
 IVSBOX_USER=${IVSBOX_USER:-root}
 IVSBOX_GROUP=${IVSBOX_GROUP:-root}
 
+# 程序（bin/scripts）：rootfs，无挂载时序要求。
+IVSBOX_APP=/opt/ivsbox
+# 数据（config/db/queue/ota/secure/releases ＋ 熔断状态）：UDISK，由 S60mount_udisk
+# 挂载，本脚本编号必须 > 60。
 IVSBOX_HOME=/mnt/UDISK/ivsbox
-CURRENT=$IVSBOX_HOME/current
-# monitor.sh 的熔断状态文件（缺口清单 G8）。restart 时清掉它 = 人工解除熔断。
+# monitor.sh 的熔断状态文件（缺口清单 G8）在数据侧。restart 时清掉它 = 人工解除熔断。
 MONITOR_STATE=$IVSBOX_HOME/.monitor.state
 # 主控 pidfile 的写者只有 monitor（它是唯一拉起方）；本脚本 stop() 只读它。
 PIDFILE=/var/run/ivsboxd.pid
@@ -18,7 +23,11 @@ MONITOR_PIDFILE=/var/run/ivsbox_monitor.pid
 start() {
     echo -n "Starting ivsboxd: "
 
-    # 预建运行目录（UDISK 由 S60mount_udisk 挂载，本脚本编号必须 > 60）
+    # 预建程序目录（rootfs 内，无挂载时序要求）
+    for d in bin scripts; do
+        mkdir -p "$IVSBOX_APP/$d"
+    done
+    # 预建数据目录（UDISK 由 S60mount_udisk 挂载，本脚本编号必须 > 60）
     for d in config db queue ota secure releases; do
         mkdir -p "$IVSBOX_HOME/$d"
     done
@@ -30,7 +39,7 @@ start() {
     mkdir -p /var/run/ivsbox
 
     # 属主交给运行用户（当前未建 ivsbox 用户时默认 root）
-    chown -R "$IVSBOX_USER:$IVSBOX_GROUP" "$IVSBOX_HOME" /var/run/ivsbox 2>/dev/null || true
+    chown -R "$IVSBOX_USER:$IVSBOX_GROUP" "$IVSBOX_APP" "$IVSBOX_HOME" /var/run/ivsbox 2>/dev/null || true
 
     # 只拉起 monitor 守护循环，由它做主控的唯一拉起方（开机后至多晚一个轮询周期，
     # 默认 5 s）。**不在这里直接 start-stop-daemon 主控**：开机直启会绕过 monitor
@@ -38,7 +47,7 @@ start() {
     # 都重新武装看门狗，"跨复位继续熔断"就不成立，持续的运行期崩溃循环会变成
     # 30 分钟一轮的整机复位风暴（2026-09-30 复核 F1）。
     /sbin/start-stop-daemon --start --background --make-pidfile \
-        --pidfile "$MONITOR_PIDFILE" --exec "$CURRENT/scripts/monitor.sh" \
+        --pidfile "$MONITOR_PIDFILE" --exec "$IVSBOX_APP/scripts/monitor.sh" \
         --chuid "$IVSBOX_USER:$IVSBOX_GROUP" || {
         echo "FAIL"
         return 1

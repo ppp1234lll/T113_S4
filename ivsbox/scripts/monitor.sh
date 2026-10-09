@@ -21,6 +21,12 @@
 # （不拉起 ⇒ 看门狗无人武装 ⇒ 不会再触发下一次复位），冷却到期后自动恢复监护。
 # 为此状态文件放 UDISK（/var/run 是 tmpfs，复位即丢）。
 #
+# ============================ 程序 / 数据落点（2026-09-30 用户定稿） ============================
+# **程序（bin/scripts）落 rootfs 的 `/opt/ivsbox`**（与 Go 版运维箱同口径）；
+# **数据（config/db/queue/ota/releases/secure ＋ 本脚本的熔断状态 ＋ 日志）留 UDISK**
+# 的 `/mnt/UDISK/ivsbox`。程序在 rootfs 的直接收益：不受 `S60mount_udisk` 挂载失败
+# 即 `mkfs.ext4` 清空 UDISK 的牵连（程序本体不会被连带清掉）。
+#
 # ============================ 时间基准（G9 同款纪律） ============================
 # 窗口与冷却的计时一律用**单调秒**（/proc/uptime 的整数部分），不用墙钟 date +%s：
 # 板子开机时钟不可信、后续对时会跳变，墙钟会让熔断提前到期、崩溃计数提前清零
@@ -38,7 +44,7 @@
 #   IVSBOX_RESTART_WINDOW      统计窗口秒数（默认 300）
 #   IVSBOX_FAILSAFE_COOLDOWN   failsafe 持续秒数（默认 1800）
 #   IVSBOX_POLL_S              轮询间隔秒数（默认 5）
-#   IVSBOX_HOME / IVSBOX_LOG_ROOT / IVSBOX_PIDFILE
+#   IVSBOX_APP_DIR / IVSBOX_HOME / IVSBOX_LOG_ROOT / IVSBOX_PIDFILE
 #                              路径覆盖（默认同生产部署；仅验证/联调用）
 #   注意 1：改短计数类参数只用于验证（例如把上限设成 2、窗口 30 s），生产保持默认。
 #   注意 2：**IVSBOX_POLL_S 必须显著小于看门狗超时（16 s，建议 ≤ 10）** ——
@@ -46,9 +52,10 @@
 #           轮询一旦 ≥ 16 s，一次普通崩溃也会升级成整机复位。
 
 IVSBOX_HOME=${IVSBOX_HOME:-/mnt/UDISK/ivsbox}
+# 程序目录（bin/ivsboxd 所在）：2026-09-30 起落 rootfs /opt/ivsbox；数据仍在 IVSBOX_HOME。
+IVSBOX_APP_DIR=${IVSBOX_APP_DIR:-/opt/ivsbox}
 IVSBOX_LOG_ROOT=${IVSBOX_LOG_ROOT:-/mnt/UDISK/log}
 IVSBOX_PIDFILE=${IVSBOX_PIDFILE:-/var/run/ivsboxd.pid}
-CURRENT=$IVSBOX_HOME/current
 STATE=$IVSBOX_HOME/.monitor.state
 ALERT=$IVSBOX_LOG_ROOT/monitor-alert.log
 
@@ -145,9 +152,9 @@ while true; do
             RC=$((RC + 1))
             state_write "$WS" "$RC" "$FS"
             # 用 `( ... ) &` + `exec`：子 shell 被 exec 成 ivsboxd 本体，$! 即 ivsboxd 的真实 pid。
-            # 不能写 `cd "$CURRENT" && ./bin/ivsboxd ... &` —— `&` 作用于整条 AND 列表，
+            # 不能写 `cd "$IVSBOX_APP_DIR" && ./bin/ivsboxd ... &` —— `&` 作用于整条 AND 列表，
             # 会多留一个常驻的 monitor.sh 空壳进程，且 $! 拿到的是空壳而不是 ivsboxd 的 pid。
-            ( cd "$CURRENT" && exec ./bin/ivsboxd >/dev/null 2>&1 ) &
+            ( cd "$IVSBOX_APP_DIR" && exec ./bin/ivsboxd >/dev/null 2>&1 ) &
             # 回写 pidfile：monitor 是唯一拉起方，必须让 pidfile 始终指向真实进程。
             # 不写这一步，崩溃重启后 pidfile 仍是旧 pid，init 脚本的 stop 会打空、停不掉服务。
             echo $! > "$IVSBOX_PIDFILE" 2>/dev/null || true

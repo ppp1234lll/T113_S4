@@ -137,7 +137,7 @@ static const cfg_default_t s_defaults[] = {
     /* ---- sys. 基础配置（架构 §10.2） ---- */
     D_BOOL(IV_CFG_CLS_SYS, "sys.debug.mode", "调试模式（开＝保留调试口与详细日志）", "false"),
     D_INT(IV_CFG_CLS_SYS, "sys.reboot.hour", "定时重启时间（每天几点，0-23；-1＝不重启）", -1, -1, 23),
-    D_INT(IV_CFG_CLS_SYS, "sys.report.interval_s", "定时上报间隔（秒）", 60, 5, 3600),
+    D_INT(IV_CFG_CLS_SYS, "sys.report.interval_s", "定时上报间隔（秒）", 300, 5, 3600),
     D_INT(IV_CFG_CLS_SYS, "sys.transport.mode",
           "传输模式：1=有线 2=无线 3=有线+无线 4=自动选择", 4, 1, 4),
     D_INT(IV_CFG_CLS_SYS, "sys.sample.period_ms", "采集周期（毫秒）", 1000, 100, 60000),

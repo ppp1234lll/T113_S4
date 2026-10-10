@@ -251,12 +251,14 @@ int main(void)
         chk(g_rx.n == 0, "lying LEN: no delivery");
     }
 
-    /* ---- 4) ## 文本帧黄金校验（含协议样例回归） ---- */
+    /* ---- 4) ## 上报帧黄金校验（CRC 只覆盖 &&数据区&&，长度=整段） ---- */
     {
         uint8_t out[64];
         size_t olen = sizeof(out);
         const char *seg = "QN=0;TID=22855;VER=11;DEVTYPE=0400;CP=&&DT=1&&";
+        const char *suf = "&&DT=1&&";
         size_t seg_len = strlen(seg);
+        size_t suf_len = strlen(suf);
         uint8_t crc;
         char crc_hex[3];
         int rc;
@@ -267,15 +269,21 @@ int main(void)
         chk(out[0] == '#' && out[1] == '#', "text head");
         chk(out[2] == '0' && out[3] == '0' &&
             out[4] == (uint8_t)('0' + seg_len / 10u) &&
-            out[5] == (uint8_t)('0' + seg_len % 10u), "text len ascii");
+            out[5] == (uint8_t)('0' + seg_len % 10u),
+            "text len ascii (whole seg)");
         chk(memcmp(&out[6], seg, seg_len) == 0, "text seg");
         chk(out[6 + seg_len + 2] == '#' && out[6 + seg_len + 3] == '#',
             "text tail");
 
-        crc = iv_crc8(seg, seg_len, IV_CRC8_SEED_INIT);
+        /* CRC 只覆盖段内第一个 "&&" 起到段尾（权威：指令表 + com.c strstr） */
+        crc = iv_crc8(suf, suf_len, IV_CRC8_SEED_INIT);
         snprintf(crc_hex, sizeof(crc_hex), "%02x", crc);
         chk(out[6 + seg_len] == (uint8_t)crc_hex[0] &&
-            out[6 + seg_len + 1] == (uint8_t)crc_hex[1], "text crc hex");
+            out[6 + seg_len + 1] == (uint8_t)crc_hex[1],
+            "text crc hex covers &&data&& only");
+        /* 本用例必须有区分力：整段 CRC 与后缀 CRC 必须不同 */
+        chk(iv_crc8(seg, seg_len, IV_CRC8_SEED_INIT) != crc,
+            "whole-seg crc differs (case has discriminating power)");
 
         /* 长度探测 */
         olen = 0;
@@ -287,17 +295,48 @@ int main(void)
         rc = iv_proto_text_frame(seg, seg_len, out, &olen);
         chk(rc == IV_ERANGE && olen == 8u + seg_len, "text ERANGE");
 
-        /* 空数据段 */
+        /* 缺数据区（段内无 "&&"）→ IV_EINVAL（畸形段，拒绝发出） */
+        olen = sizeof(out);
+        rc = iv_proto_text_frame("QN=0;TID=1;CP=", 14, out, &olen);
+        chk(rc == IV_EINVAL, "text no-&& EINVAL");
+
+        /* 空段 → 无 "&&" → IV_EINVAL */
         olen = sizeof(out);
         rc = iv_proto_text_frame("", 0, out, &olen);
-        chk(rc == IV_OK && olen == 8u, "text empty seg");
+        chk(rc == IV_EINVAL, "text empty EINVAL");
 
-        /* 超上限 */
+        /* 超上限（范围检查先于 && 检查） */
         {
             static char big[IV_PROTO_TXT_DATA_MAX + 2];
             olen = sizeof(out);
             rc = iv_proto_text_frame(big, IV_PROTO_TXT_DATA_MAX + 1u, out, &olen);
             chk(rc == IV_ERANGE, "text over max");
+        }
+
+        /* ## 查询响应 JSON 帧：## + json + ##，无长度、无尾 CRC */
+        {
+            const char *js = "{\"code\":0,\"qn\":\"1\",\"data\":{}}";
+            size_t js_len = strlen(js);
+
+            olen = sizeof(out);
+            rc = iv_proto_json_frame(js, js_len, out, &olen);
+            chk(rc == IV_OK, "json_frame ok");
+            chk(olen == 4u + js_len, "json_frame len");
+            chk(out[0] == '#' && out[1] == '#', "json head");
+            chk(out[2 + js_len] == '#' && out[3 + js_len] == '#', "json tail");
+            chk(memcmp(&out[2], js, js_len) == 0, "json body");
+
+            olen = 0;
+            rc = iv_proto_json_frame(js, js_len, NULL, &olen);
+            chk(rc == IV_OK && olen == 4u + js_len, "json probe");
+
+            olen = 3u + js_len;
+            rc = iv_proto_json_frame(js, js_len, out, &olen);
+            chk(rc == IV_ERANGE && olen == 4u + js_len, "json ERANGE");
+
+            olen = sizeof(out);
+            rc = iv_proto_json_frame(js, IV_PROTO_TXT_DATA_MAX + 1u, out, &olen);
+            chk(rc == IV_ERANGE, "json over max");
         }
     }
 
@@ -365,24 +404,40 @@ int main(void)
         chk(memcmp(&g_tx.buf[0][2], &want[2], want_len - 2) == 0,
             "heartbeat bytes");
 
-        /* send_text */
+        /* send_text（上报帧：长度=整段、CRC 覆盖 &&数据区&&） */
         rec_reset();
         chk(iv_proto_init(&pf, &id, on_tx, NULL) == IV_OK, "ctx init 4");
-        chk(iv_proto_send_text(&pf, "QN=0;", 5) == IV_OK, "send_text ok");
-        chk(g_tx.n == 1 && g_tx.len[0] == 8u + 5u, "send_text len");
-        chk(memcmp(g_tx.buf[0], "##0005QN=0;", 11) != 0 ? 1 : 1, "no-op");
-        /* 前 6 字节 '##0005' + seg 'QN=0;' */
-        chk(g_tx.buf[0][0] == '#' && g_tx.buf[0][1] == '#' &&
-            g_tx.buf[0][2] == '0' && g_tx.buf[0][3] == '0' &&
-            g_tx.buf[0][4] == '0' && g_tx.buf[0][5] == '5' &&
-            memcmp(&g_tx.buf[0][6], "QN=0;", 5) == 0, "send_text bytes");
+        {
+            const char *seg = "QN=0;CP=&&DT=1&&";
+            size_t seg_len = strlen(seg);
+            chk(iv_proto_send_text(&pf, seg, seg_len) == IV_OK, "send_text ok");
+            chk(g_tx.n == 1 && g_tx.len[0] == 8u + seg_len, "send_text len");
+            chk(g_tx.buf[0][0] == '#' && g_tx.buf[0][1] == '#' &&
+                memcmp(&g_tx.buf[0][6], seg, seg_len) == 0, "send_text bytes");
+        }
+
+        /* 缺 "&&" 的上报段 ⇒ IV_EINVAL，且一帧都不发 */
+        rec_reset();
+        chk(iv_proto_send_text(&pf, "QN=0;", 5) == IV_EINVAL,
+            "send_text no-&& EINVAL");
+        chk(g_tx.n == 0, "send_text EINVAL sends nothing");
+
+        /* send_json（查询响应帧：## + json + ##，无长度无尾 CRC） */
+        rec_reset();
+        chk(iv_proto_send_json(&pf, "{\"code\":0}", 10) == IV_OK,
+            "send_json ok");
+        chk(g_tx.n == 1 && g_tx.len[0] == 4u + 10u, "send_json len");
+        chk(memcmp(g_tx.buf[0], "##{\"code\":0}##", 14) == 0, "send_json bytes");
 
         g_tx_rc = IV_EFULL;
         chk(iv_proto_send(&pf, 0xE1u, 0, 0, NULL, 0) == IV_EFULL,
             "binary queue failure propagated");
-        chk(iv_proto_send_text(&pf, "x", 1) == IV_EFULL,
+        chk(iv_proto_send_text(&pf, "QN=0;CP=&&DT=1&&",
+                                 strlen("QN=0;CP=&&DT=1&&")) == IV_EFULL,
             "text queue failure propagated");
-        chk(pf.tx_frames == 1u, "failed queue writes not counted");
+        chk(iv_proto_send_json(&pf, "{}", 2) == IV_EFULL,
+            "json queue failure propagated");
+        chk(pf.tx_frames == 2u, "failed queue writes not counted");
         g_tx_rc = IV_OK;
 
         /* NULL 入参 */
@@ -390,10 +445,12 @@ int main(void)
         chk(iv_proto_ack(NULL, 0xE1, 1) == IV_EINVAL, "ack NULL");
         chk(iv_proto_heartbeat(NULL) == IV_EINVAL, "hb NULL");
         chk(iv_proto_send_text(NULL, "x", 1) == IV_EINVAL, "text NULL");
+        chk(iv_proto_send_json(NULL, "x", 1) == IV_EINVAL, "json NULL");
         iv_proto_recv(NULL, f_e1, 8); /* NULL 不崩溃 */
 
-        /* 统计计数（最后一次 init4 + send_text） */
-        chk(pf.rx_frames == 0u && pf.tx_frames == 1u, "counters rx0tx1");
+        /* 统计计数（init4 后：send_text 成功 1 帧 + send_json 成功 1 帧；
+         * 中间那次 no-&& 的 EINVAL 不计） */
+        chk(pf.rx_frames == 0u && pf.tx_frames == 2u, "counters rx0tx2");
     }
 
     if (g_fail == 0)

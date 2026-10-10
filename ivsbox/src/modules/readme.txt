@@ -22,6 +22,7 @@ src/modules  ——  libivmodules：业务模块层（一个子目录一个模�
   probe/                统一探活引擎（链路/ICMP/TCP/应用层四层探活与统计判定）
   proto/                云平台私有协议与持久上报队列
   recovery/             自愈策略引擎（故障确认→断电重启→验证→熔断）
+  report/               上报装配层（采集板链路→状态镜像→平台报文→持久队列→TCP 传输）
   snmp/                 SNMP 采集与品牌 OID 模板
   status/               采集板状态镜像（IO/阈值/继电器在内存中的权威副本）
   tunnel/               可选远程访问通道（暂缓，平台立项后启用）

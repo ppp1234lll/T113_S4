@@ -1,12 +1,16 @@
 /*
- * ivsboxd 主控进程入口（M1-S10 骨架装配）
+ * ivsboxd 主控进程入口（M1-S10 骨架装配 + M3 业务装配）
  *
  * 启动顺序（已钉死）：
- *   日志 → 配置 → SQLite → 慢任务池 → Reactor → 本地通道服务 → 健康线程
+ *   日志 → 配置 → SQLite → 慢任务池 → Reactor → 本地通道服务 → 看门狗
+ *   → M3 业务装配（netlink/probe/netmgr/report）→ 健康线程
  * 然后 iv_reactor_run() 进入主循环，直到收到 SIGTERM/SIGINT 后干净退出。
  *
- * 本文件只负责装配与生命周期，不含业务逻辑；业务逻辑后续按模块拆分。
+ * 本文件只负责装配与生命周期，不含业务逻辑。M3 的四条链（S3.1 netlink /
+ * S3.2 probe / S3.3 netmgr / S3.6 report）的接线封装在 `iv_agent`
+ * （libivmodules）里；本文件只从配置读参数、拉起它、并在退出时按逆序关停。
  */
+#include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -17,7 +21,9 @@
 #include <unistd.h>
 
 #include "ivsbox/ivsbox.h"
+#include "ivsbox/iv_agent.h"
 #include "ivsbox/iv_chan.h"
+#include "ivsbox/iv_clock.h"
 #include "ivsbox/iv_config.h"
 #include "ivsbox/iv_db.h"
 #include "ivsbox/iv_health.h"
@@ -37,6 +43,9 @@ static iv_health_t   *g_health;
 static iv_config_t   *g_cfg;
 static iv_db_t       *g_db;
 static int            g_wd_fd = -1;
+
+/* M3 业务装配（约 35 KB，必须放静态区/堆，勿放栈） */
+static iv_agent_t     g_agent;
 
 /* 本地通道 */
 static int       g_listen_fd = -1;
@@ -67,6 +76,10 @@ static void app_shutdown(void)
         iv_health_destroy(g_health);
         g_health = NULL;
     }
+
+    /* M3 装配层：必须在 reactor 销毁前摘除其定时器/事件并关闭串口与平台连接 */
+    iv_agent_close(&g_agent);
+
     if (g_pool != NULL) {
         iv_taskpool_destroy(g_pool);
         g_pool = NULL;
@@ -273,6 +286,76 @@ static int mkdir_for_channel(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * M3 业务装配：从配置读取参数，拉起网络侧与上报链
+ * ------------------------------------------------------------------------- */
+/* 配置里的点分十进制 IPv4 → 网络序；空串/非法返回 0（＝未配） */
+static uint32_t cfg_ip_be(const char *key)
+{
+    const char      *s = NULL;
+    struct in_addr   in;
+
+    if (iv_config_get_str(g_cfg, key, &s) != IV_OK || s == NULL || s[0] == '\0')
+        return 0u;
+    if (inet_pton(AF_INET, s, &in) != 1)
+        return 0u;
+    return in.s_addr; /* 已是网络序 */
+}
+
+static int agent_setup(void)
+{
+    iv_agent_cfg_t ac;
+    const char    *h;
+    int64_t        v;
+
+    iv_agent_cfg_default(&ac);
+
+    /* 平台地址：有线优先、为空则退回无线。
+     * ⚠ 按"活动出口"选 wired/wireless 地址的语义尚未冻结（架构 §18.1 登记项），
+     *   本步先按此策略取值；地址/端口均为空时 iv_report 不开平台链路。 */
+    h = NULL;
+    (void)iv_config_get_str(g_cfg, "net.server.wired.host", &h);
+    if (h == NULL || h[0] == '\0') {
+        h = NULL;
+        (void)iv_config_get_str(g_cfg, "net.server.wireless.host", &h);
+        if (h != NULL && h[0] != '\0' &&
+            iv_config_get_int(g_cfg, "net.server.wireless.port", &v) == IV_OK)
+            ac.server_port = (uint16_t)v;
+    } else if (iv_config_get_int(g_cfg, "net.server.wired.port", &v) == IV_OK) {
+        ac.server_port = (uint16_t)v;
+    }
+    ac.server_host = (h != NULL && h[0] != '\0') ? h : NULL;
+
+    /* 定时上报间隔（配置单位秒 → 毫秒） */
+    if (iv_config_get_int(g_cfg, "sys.report.interval_s", &v) == IV_OK && v > 0)
+        ac.report_ms = (uint32_t)v * 1000u;
+
+    /* 传输模式：1=有线 2=无线 3=双 4=自动（与 iv_netmgr_mode_t 同值） */
+    if (iv_config_get_int(g_cfg, "sys.transport.mode", &v) == IV_OK)
+        ac.mode = (iv_netmgr_mode_t)v;
+
+    /* 探活目标与节拍（探活失败阈值同时作为状态机判失败阈值，同源） */
+    ac.probe_target_be[0] = cfg_ip_be("probe.target1");
+    ac.probe_target_be[1] = cfg_ip_be("probe.target2");
+    if (iv_config_get_int(g_cfg, "probe.interval_ms", &v) == IV_OK)
+        ac.probe_interval_ms = (uint32_t)v;
+    if (iv_config_get_int(g_cfg, "probe.timeout_ms", &v) == IV_OK)
+        ac.probe_timeout_ms = (uint32_t)v;
+    if (iv_config_get_int(g_cfg, "probe.max_fail", &v) == IV_OK) {
+        ac.probe_fail_n = (uint32_t)v;
+        ac.nm_fail_n    = (uint32_t)v;
+    }
+
+    /* devid（TID）暂无配置键来源：待工厂身份分区（/dev/by-name/private）读取落地 */
+    ac.devid = 0u;
+
+    if (iv_agent_open(&g_agent, &ac, g_reactor, iv_clock_monotonic_ms()) != IV_OK) {
+        IV_LOG_E(APP_MOD, "agent open failed");
+        return -1;
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
  * 骨架初始化
  * ------------------------------------------------------------------------- */
 static int app_init(void)
@@ -356,7 +439,12 @@ static int app_init(void)
     if (watchdog_setup() != 0)
         return -1;
 
-    /* 9. 健康线程（必须在 reactor 创建之后、run 之前） */
+    /* 9. M3 业务装配：网络侧（netlink/probe/netmgr）+ 控制板上报链（report）
+     *    必须在 reactor 创建之后（其定时器/fd 都要挂到 reactor）。 */
+    if (agent_setup() != 0)
+        return -1;
+
+    /* 10. 健康线程（必须在 reactor 创建之后、run 之前） */
     g_health = iv_health_start_default(g_reactor, g_pool, g_wd_fd);
     if (g_health == NULL) {
         IV_LOG_E(APP_MOD, "health start failed");

@@ -210,6 +210,17 @@ void iv_report_on_serial(iv_report_t *rp, uint64_t now_ms);
 /* 立即触发一次上报入队（E2「立即上报设备状态」用；也供现场排障手动催报）。 */
 int iv_report_trigger(iv_report_t *rp, uint64_t now_ms);
 
+/*
+ * 重连平台传输（S3.3 双 WAN 切换事务里 close_old_tcp + reconnect 两步的合体）：
+ * 关掉绑定旧出口的 TCP，再用**原 host/port** 重新发起连接。只动传输层，
+ * **不碰串口 / 队列 / 协议层** —— 队列里未确认的数据全部保留，连接重建后
+ * 由取件泵按序号补传（架构 §7.2「关闭绑定旧接口的 TCP，再用新出口重建」）。
+ * 切到新出口后的**平台地址选择**（`net.server.wired.*` / `.wireless.*` 的语义）
+ * 尚未冻结，故本步沿用原地址；待平台侧确认后再扩展为"按活动出口选地址"。
+ *   IV_OK ；IV_EINVAL（rp 为 NULL）；IV_ESTATE（未 open 或平台链路未启动）
+ */
+int iv_report_reconnect(iv_report_t *rp, uint64_t now_ms);
+
 /* 关闭：从 Reactor 摘事件/定时器、关串口与传输、关队列。 */
 void iv_report_close(iv_report_t *rp);
 

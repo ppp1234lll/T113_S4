@@ -24,6 +24,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | S3.6 上报装配层（控制板数据 → 平台报文 → 队列 → 传输）（M3 第五步） | 已实现（VM 全量验证 ＋ 反向证伪通过） | 2026-10-10 11:41 | 新增 `include/ivsbox/iv_report.h` ＋ `src/modules/report/iv_report.c`（进 `libivmodules`）＋ `tests/unit/test_report.c`（7 组）＋ `tests/integration/test_e2e_report.c`（首个自包含集成用例）。*落点由计划原文 `src/app/` 更正为 `src/modules/report/`*（app 层 `.c` 不进静态库 ⇒ 单测链接不到符号）。*补齐 S2.4 交出的装配层缺口*：采集板 `ttySAC5`→`iv_serial`→`iv_frame`→`iv_link`→`iv_status`，周期/触发上报组 `##` 帧入 S3.4 队列、S3.5 取件泵按序补传；平台查询经 `iv_proto` 路由回填 QN。*协议口径按用户 2026-10-10 三项拍板冻结*（上报帧 CRC 只覆盖 `&&数据区&&`、查询响应 `##`+JSON+`##`、`crc`=`ver+devtype+tid+cmd`）。VM `make test` *25/25*、asan/tsan/analyze/arm 全绿零告警；E2E（假采集板 pty ＋ 假平台回环 TCP、零 mock）9 组全过；反向证伪 4 条机制级变异均按预期。详见本文件 2026-10-10 11:41 节。
 | S2 流程审查修复 | 部分实现（未接主入口） | 2026-10-10 08:47 | 协议帧尾校验与发送失败传播、UART 控制动作禁自动重发、E1 全量镜像刷新、新增 Reactor 串口装配；本机四个相关单测及静态分析通过，未硬件联调。
 | S2 与 S3.6 合并适配 | 已实现（模块与上报装配层；主入口待接） | 2026-10-10 15:23 | 保留 S3.6 新平台协议，发送拒绝传至平台/串口回调；串口掉线清镜像并重连；本机单测、Linux VM 25 项单测、host/ARM 构建及相关 E2E 均通过。
+| M3 收口·装配层 iv_agent（S3.1~S3.6 接入 ivsboxd） | 已实现 | 2026-10-10 17:41 | 新增 `iv_agent.h`/`iv_agent.c`（libivmodules）把 netlink/probe/netmgr/report 四链装配成一个可运行整体，`main.c` 从配置读参后 `iv_agent_open`；`iv_report` 增 `iv_report_reconnect()` 接 netmgr 切换钩子（切出口后重建平台 TCP、队列未确认数据保留）。VM host/arm/analyze 零告警、test/asan/tsan 各 26/26；VM netns 建 dummy 接口冒烟：`agent up: wan0=usb0(if3) wan1=eth0(if2) mode=4`、拔插网卡无崩溃、SIGTERM 优雅退出。详见本文件 2026-10-10 17:41 节。
 |===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
@@ -1086,3 +1087,32 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 * 合并后本机 MinGW 的 `test_proto`、`test_link`、`test_status`、`test_s2_uart` 均退出码 0。
 * 构建 VM `tqt113`：`make test` 25/25 通过，`make host` 与 `make arm` 均退出码 0；独立运行 `test_e2e_report` 通过，输出包含 `serial-reconnect`。
 * `make itest` 在首个 `test_ctl_snapshot` 因未预先运行 `ivsboxd` 而停止；本次相关 E2E 用例已单独通过。本轮未进行硬件联调；VM 的临时源码和日志用毕清理。
+
+== 2026-10-10 17:41 M3 收口（装配层 iv_agent）
+
+=== 干了什么事
+
+* 新增 `include/ivsbox/iv_agent.h` ＋ `src/modules/agent/iv_agent.c`（进 `libivmodules`），把 M3 四个模块装配成一个可运行整体：网络侧 `iv_netlink`→`iv_probe`→`iv_netmgr`，控制板侧上报链全在 `iv_report`（S3.6，内含 S2.2/S2.3/S2.4/S2.6/S3.4/S3.5）。本层只做三件事——按配置 open 四条链、把回调互相转接、按固定节拍驱动 tick（probe 200 ms / netmgr 1 s）。
+* `iv_report` 新增 `iv_report_reconnect(rp, now_ms)`：close 旧 transport（先留 `tr.host/port` 副本）→ 用原址 `iv_transport_open()` 重开；只碰传输层，队列未确认数据保留。
+* `main.c` 新增 `agent_setup()`：从 `iv_config` 读 `sys.transport.mode`、`net.server.wired.host`/`wireless.host`（＋端口）、`probe.target1`/`target2`、`probe.interval_ms`/`timeout_ms`/`max_fail`、`sys.report.interval_s`，装成 `iv_agent_cfg_t` 后 `iv_agent_open()`；`app_shutdown()` 里 `iv_agent_close()`（须在 reactor 销毁前）。
+
+=== 解决什么问题
+
+* M3 的 S3.1~S3.6 六个模块都已完成并各自验证，但**都没接进 `ivsboxd` 主进程**：`main.c` 停在 M1-S10 骨架、不含任何 M3 include，链路在真实进程里跑不起来。
+* "双 WAN 切出口后平台 TCP 重建"这一环此前无处可接：`iv_report` 的 transport 只在 open 时建立、没有重连入口，而 `iv_netmgr` 的切换事务需要 `close_old_tcp`/`reconnect` 钩子。
+
+=== 影响范围
+
+* `main.c` 启动顺序新增一步（看门狗之后、健康线程之前）：M3 业务装配；退出时新增 `iv_agent_close()`（在健康线程销毁之后、taskpool/reactor 销毁之前）。
+* `iv_report` 接口新增一个函数（纯增量，不改既有签名）；`iv_agent` 是新模块目录，经 Makefile 通配自动纳入构建，**未改任何构建脚本**。
+* 分层不变：`iv_agent` 落 `libivmodules`（依赖 hal 的 `iv_netlink`/`iv_clock` 与其它 modules），`main.c` 只做参数转发。
+
+=== 验证方式与结果
+
+* 构建 VM `tqt113`（`gcc 11.4.0`）：`make host`/`make arm`/`make analyze` 全 **RC=0 零告警**；ARM 出 **ELF32 ARM EABI5**、`build/arm/ivsboxd` 136 820 B。
+* 回归：`make test` **26/26**、`make asan` **26/26**、`setarch -R make tsan` **26/26**，均 **0 FAIL**（与改动前 26 项一致，无回归）。
+* 运行时装配冒烟（VM `unshare -rmn` 内 `ip link add eth0/usb0 type dummy`，`/mnt` 挂 tmpfs）：`./build/host/ivsboxd` 启动日志
+  `report layer up: devid=0 devtype=0400 serial_fd=-1 server=(none):0`
+  `agent up: wan0=usb0(if3) wan1=eth0(if2) mode=4 server=(none):0`
+  `ivsboxd initialized, entering reactor`；`ip link set usb0 down` / `up` 事件被消化、进程无崩溃；`kill -TERM` 后 `signal 15 received, stopping` → `shutting down ivsboxd` → `taskpool destroyed`（优雅退出）。VM 上串口 `/dev/ttySAC5`、UDS 目录、平台地址缺失均为按设计降级（各有 WARN/ERR 日志，不阻断启动）。
+* **未做（如实登记）**：① §16.2 场景 1/2（拔线/弱网/回切/补传）验收 —— 用户 2026-10-10 定为"仅编译＋既有回归"，待真平台地址/真机；② **反向证伪**：本轮无新增单测，故无"FAIL 行"式证伪对象；③ 平台地址"按活动出口选 wired/wireless"语义未冻结，暂按"有线优先、空则无线"；④ `devid`（TID）/`mod`（型号）无配置键来源，分别取 0 / NULL；⑤ probe 的 TCP fd 每次 tick 动态创建，未逐个挂 Reactor，改在 200 ms 定时器内统一驱动。

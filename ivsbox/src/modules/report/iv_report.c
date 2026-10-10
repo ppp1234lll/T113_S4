@@ -397,6 +397,55 @@ int iv_report_trigger(iv_report_t *rp, uint64_t now_ms)
     return rep_send_report(rp);
 }
 
+/*
+ * 重连平台传输（S3.3 切换事务的 close_old_tcp + reconnect 合体）：只动传输层，
+ * 串口/队列/协议层原样保留 —— 队列里未确认的数据在连接重建后由取件泵补传。
+ */
+int iv_report_reconnect(iv_report_t *rp, uint64_t now_ms)
+{
+    char               host[IV_TRANSPORT_HOST_MAX];
+    uint16_t           port;
+    iv_transport_cfg_t tc;
+    int                rc;
+
+    if (rp == NULL)
+        return IV_EINVAL;
+    if (!rp->opened)
+        return IV_ESTATE;
+    if (!rp->tr.opened)
+        return IV_ESTATE; /* 平台链路未启动（host/port 未配）→ 无重连可言 */
+
+    /* close 前留一份地址副本；open 内部会再拷一次，故栈副本足够 */
+    memcpy(host, rp->tr.host, sizeof(host));
+    host[sizeof(host) - 1u] = '\0';
+    port = rp->tr.port;
+
+    (void)iv_transport_close(&rp->tr);
+
+    memset(&tc, 0, sizeof(tc));
+    tc.host       = host;
+    tc.port       = port;
+    tc.io         = NULL; /* 内置真实 socket */
+    rp->pump.pull = pump_pull;
+    rp->pump.ack  = pump_ack;
+    rp->pump.arg  = rp;
+    tc.pump       = &rp->pump;
+    tc.on_rx      = tr_on_rx;
+    tc.rx_arg     = rp;
+    tc.on_state   = tr_on_state;
+    tc.state_arg  = rp;
+
+    rc = iv_transport_open(&rp->tr, &tc);
+    rp->now_ms = now_ms;
+    if (rc == IV_OK)
+        IV_LOG_I(REP_MOD, "transport reconnect on route switch: %s:%u",
+                 host, (unsigned)port);
+    else
+        IV_LOG_W(REP_MOD, "transport reconnect failed (%d): %s:%u", rc,
+                 host, (unsigned)port);
+    return rc;
+}
+
 /* ---------------------------------------------------------------------------
  * Reactor 回调（仅 reactor 模式使用）
  * ------------------------------------------------------------------------- */

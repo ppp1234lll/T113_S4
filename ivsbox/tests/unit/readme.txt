@@ -29,6 +29,7 @@ tests/unit  ——  单元测试：自包含、可脱离一切外部环境运行
     test_proto.c        iv_proto 平台协议：二进制与 ## 文本组帧黄金校验、解析/粘包、路由与自动 ACK、心跳
     test_gps.c          iv_gps：minmea 上游校验和样本 + 动态构造样本，无效定位不采信、校时三道闸
     test_status.c       iv_status 状态镜像：0xE1 全量/0xC1 门事件/0xC2 事件按 TAG 增量、valid 位、snapshot JSON
+    test_s2_uart.c      采集板串口装配：假串口和 Reactor 验查询、部分写、应答、断线重连与停止
   配置（modules，M1-S8）
     test_config.c       iv_config：单文件口径、单句柄约束、数组/double 类型、中文注释往返、按一级分类子树的热更新事务
 

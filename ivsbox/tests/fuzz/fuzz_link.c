@@ -32,13 +32,14 @@ static double now_sec(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-static void on_tx(const uint8_t *b, size_t len, void *arg)
+static int on_tx(const uint8_t *b, size_t len, void *arg)
 {
     volatile uint8_t sink = 0;
     (void)arg;
     while (len--)
         sink ^= *b++;
     (void)sink;
+    return IV_OK;
 }
 
 static void on_done(int rc, uint8_t cmd, const uint8_t *data, uint16_t len, void *arg)

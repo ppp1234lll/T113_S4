@@ -23,6 +23,7 @@ include/ivsbox  ——  全部公共头文件（跨层接口声明）
   iv_log.h              统一日志门面（日期目录+小时文件落盘、级别过滤、故障码风暴抑制）
   iv_proto.h            云平台私有协议（二进制 ACK 帧 + ## 字符串数据帧，只做协议不做传输）
   iv_reactor.h          epoll 事件循环 Reactor（所有 fd 事件的唯一分发中心）
+  iv_s2_uart.h          采集板串口装配接口（串口、可靠层、状态镜像的 Reactor 单写者）
   iv_ret.h              本地有符号返回码（负数）；与 iv_err.h 是两套，严禁混用
   iv_serial.h           串口 termios 薄封装（raw + 零流控 + 非阻塞，只搬字节）
   iv_status.h           采集板状态镜像（IO/阈值/继电器在内存中的权威副本）

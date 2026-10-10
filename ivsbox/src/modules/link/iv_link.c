@@ -121,13 +121,17 @@ void iv_link_tick(iv_link_t *lk, uint32_t now_ms)
     for (i = 0; i < IV_LINK_INFLIGHT_MAX; i++) {
         uint8_t frame[IV_FRAME_MAX];
         int n;
+        int failure_rc = IV_ETIMEDOUT;
 
         if (!lk->txn[i].active)
             continue;
         if ((int32_t)(now_ms - lk->txn[i].deadline_ms) < 0)
             continue;
 
-        if (lk->txn[i].retries < lk->cfg.max_retries) {
+        /* 控制动作没有事务号：应答丢失时重发可能再次执行，D1/D2 只发一次。 */
+        if (lk->txn[i].cmd != IV_FRAME_CMD_POWER &&
+            lk->txn[i].cmd != IV_FRAME_CMD_REBOOT &&
+            lk->txn[i].retries < lk->cfg.max_retries) {
             /* 重传：用槽内原件重组同一帧，重排 deadline */
             n = iv_frame_build(IV_FRAME_HEAD_DOWN, lk->txn[i].cmd,
                                lk->txn[i].data, lk->txn[i].len,
@@ -135,8 +139,11 @@ void iv_link_tick(iv_link_t *lk, uint32_t now_ms)
             lk->txn[i].retries++;
             lk->txn[i].deadline_ms = now_ms + lk->cfg.timeout_ms;
             if (n > 0)
-                lk->on_tx(frame, (size_t)n, lk->arg);
-            continue;
+                failure_rc = lk->on_tx(frame, (size_t)n, lk->arg);
+            else
+                failure_rc = n;
+            if (failure_rc == IV_OK)
+                continue;
         }
 
         /* 重传耗尽：摘槽后判失败 */
@@ -152,7 +159,7 @@ void iv_link_tick(iv_link_t *lk, uint32_t now_ms)
                     link_set_up(lk, 0);
             }
             if (done != NULL)
-                done(IV_ETIMEDOUT, cmd, NULL, 0, cb_arg);
+                done(failure_rc, cmd, NULL, 0, cb_arg);
         }
     }
 }
@@ -195,7 +202,11 @@ int iv_link_send(iv_link_t *lk, uint8_t cmd, const void *data, uint16_t len,
     if (len != 0)
         memcpy(lk->txn[slot].data, data, len);
 
-    lk->on_tx(frame, (size_t)n, lk->arg);
+    n = lk->on_tx(frame, (size_t)n, lk->arg);
+    if (n != IV_OK) {
+        memset(&lk->txn[slot], 0, sizeof(lk->txn[slot]));
+        return n;
+    }
     return IV_OK;
 }
 

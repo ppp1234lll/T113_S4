@@ -3,7 +3,7 @@
  *
  * 覆盖：
  *   1) 0xE1 查询应答 → 全量刷新；valid 位逐位置 1；APOWER/AKW 用首字节判定
- *   2) 字段缺失（部分 key 不存在）→ 已填字段不动、未填字段保持初值
+ *   2) 新一轮全量应答缺字段 → 旧字段失效；继电器组须三路齐全
  *   3) 字段解析鲁棒：多余空白 / 字段顺序乱 / 数字带小数
  *   4) 坏 JSON（缺引号、缺冒号）→ 全部 valid 不变（不静默归零）
  *   5) 0xC1 箱门（data=0x01）→ DS=2 / valid.DS=1
@@ -97,15 +97,16 @@ int main(void)
         chk(st.valid.ELEC && st.data.ELEC[2] == 3.5f, "ELEC[2]");
     }
 
-    /* ---- 2) 字段缺失：未填字段 valid 不变 ---- */
+    /* ---- 2) 全量同步：缺字段清旧值；三路组不完整不可标有效 ---- */
     {
-        iv_status_init(&st);
-        const char *json = "{\"V\":110.0,\"hv\":200}";
+        const char *json = "{\"V\":110.0,\"hv\":200,\"RELAY1\":1}";
         iv_status_handle_query(&st, (const uint8_t *)json, (uint16_t)strlen(json));
         chk(st.valid.V && st.data.V == 110.0f, "partial V");
         chk(st.valid.hv && st.data.hv == 200, "partial hv");
-        chk(!st.valid.A && !st.valid.T, "unfilled A/T remain 0");
-        chk(st.data.A == 0.0f, "unfilled A value untouched");
+        chk(!st.valid.A && !st.valid.T && !st.valid.DS, "old fields invalidated");
+        chk(st.data.A == 0.0f && st.data.DS == 0, "old values cleared");
+        chk(!st.valid.RELAY && !st.valid.CHV, "incomplete groups invalid");
+        chk(st.data.APOWER[0] == '\0', "old string cleared");
     }
 
     /* ---- 3) 解析鲁棒：多余空白 / 字段顺序乱 / 数字带小数 ---- */
@@ -119,16 +120,20 @@ int main(void)
 
     /* ---- 4) 坏 JSON（缺引号、缺冒号）→ valid 全 0 ---- */
     {
-        iv_status_init(&st);
+        st.data.V = 123.0f;
+        st.valid.V = 1;
         const char *json1 = "{V:220.0}";           /* 缺引号 */
         const char *json2 = "{\"V\" 220.0}";       /* 缺冒号 */
         const char *json3 = "not even json";
+        const char *json4 = "{\"V\":9.0,broken}"; /* 前缀合法，后缀损坏 */
         iv_status_handle_query(&st, (const uint8_t *)json1, (uint16_t)strlen(json1));
-        chk(!st.valid.V, "bad json (no quote) -> V not filled");
+        chk(st.valid.V && st.data.V == 123.0f, "bad json preserves old V");
         iv_status_handle_query(&st, (const uint8_t *)json2, (uint16_t)strlen(json2));
-        chk(!st.valid.V, "bad json (no colon) -> V not filled");
+        chk(st.valid.V && st.data.V == 123.0f, "bad colon preserves old V");
         iv_status_handle_query(&st, (const uint8_t *)json3, (uint16_t)strlen(json3));
-        chk(!st.valid.V, "not-json -> V not filled");
+        chk(st.valid.V && st.data.V == 123.0f, "not-json preserves old V");
+        iv_status_handle_query(&st, (const uint8_t *)json4, (uint16_t)strlen(json4));
+        chk(st.valid.V && st.data.V == 123.0f, "malformed suffix preserves old V");
     }
 
     /* ---- 5) 0xC1 箱门 → DS=2 ---- */

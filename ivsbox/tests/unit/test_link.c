@@ -40,6 +40,7 @@ static struct {
     size_t   len;
     int      n;
 } g_tx;
+static int g_tx_rc;
 
 static struct {
     int      rc[MAX_REC];
@@ -64,19 +65,23 @@ static struct {
 static void rec_reset(void)
 {
     memset(&g_tx, 0, sizeof(g_tx));
+    g_tx_rc = IV_OK;
     memset(&g_done, 0, sizeof(g_done));
     memset(&g_up, 0, sizeof(g_up));
     memset(&g_chg, 0, sizeof(g_chg));
 }
 
-static void on_tx(const uint8_t *bytes, size_t len, void *arg)
+static int on_tx(const uint8_t *bytes, size_t len, void *arg)
 {
     (void)arg;
+    if (g_tx_rc != IV_OK)
+        return g_tx_rc;
     if (g_tx.n < MAX_REC && len <= sizeof(g_tx.buf)) {
         memcpy(g_tx.buf, bytes, len);
         g_tx.len = len;
     }
     g_tx.n++;
+    return IV_OK;
 }
 
 static void on_done(int rc, uint8_t cmd, const uint8_t *data, uint16_t len, void *arg)
@@ -200,7 +205,7 @@ int main(void)
             "done after retransmitted request answered");
     }
 
-    /* ---- 3) 重传耗尽判失败 + 槽释放 ---- */
+    /* ---- 3) 电源控制不重传，超时后槽释放 ---- */
     {
         iv_link_cfg_t cfg = { 100, 2, 3 };
 
@@ -208,14 +213,18 @@ int main(void)
         iv_link_init(&lk, &cfg, on_tx, on_up, on_chg, NULL);
         iv_link_send(&lk, IV_FRAME_CMD_POWER, req, 1, 0, on_done, NULL);
         iv_link_tick(&lk, 100);
-        iv_link_tick(&lk, 200);
-        chk(g_tx.n == 3 && g_done.n == 0, "three sends, still pending");
-        iv_link_tick(&lk, 300);
+        chk(g_tx.n == 1, "power command sent only once");
         chk(g_done.n == 1 && g_done.rc[0] == IV_ETIMEDOUT &&
                 g_done.cmd[0] == IV_FRAME_CMD_POWER,
-            "retries exhausted -> IV_ETIMEDOUT");
+            "power timeout -> IV_ETIMEDOUT");
         chk(iv_link_send(&lk, IV_FRAME_CMD_POWER, req, 1, 400, on_done, NULL) == IV_OK,
             "slot released after failure");
+        iv_link_tick(&lk, 500);
+        chk(g_tx.n == 2, "second explicit command also sent only once");
+        chk(iv_link_send(&lk, IV_FRAME_CMD_REBOOT, req, 1, 600, on_done, NULL) == IV_OK,
+            "send reboot");
+        iv_link_tick(&lk, 700);
+        chk(g_tx.n == 3 && g_done.n == 3, "reboot also not retransmitted");
     }
 
     /* ---- 4) 同 cmd 并发 EBUSY / 表满 EFULL ---- */
@@ -385,6 +394,27 @@ int main(void)
         chk(iv_link_is_up(&lk) == 0, "downlink frame does not set UP");
         iv_link_reset(&lk);
         chk(iv_link_is_up(&lk) == 0, "reset clears link state");
+    }
+
+    /* ---- 11) 发送队列拒绝首发/重传时，错误可见且槽可复用 ---- */
+    {
+        iv_link_cfg_t cfg = { 100, 2, 3 };
+        rec_reset();
+        iv_link_init(&lk, &cfg, on_tx, on_up, on_chg, NULL);
+        g_tx_rc = IV_EFULL;
+        chk(iv_link_send(&lk, IV_FRAME_CMD_QUERY, req, 1, 0, on_done, NULL) == IV_EFULL,
+            "initial queue failure propagated");
+        chk(g_done.n == 0, "initial queue failure has no done callback");
+        g_tx_rc = IV_OK;
+        chk(iv_link_send(&lk, IV_FRAME_CMD_QUERY, req, 1, 0, on_done, NULL) == IV_OK,
+            "slot reusable after initial queue failure");
+        g_tx_rc = IV_EFULL;
+        iv_link_tick(&lk, 100);
+        chk(g_done.n == 1 && g_done.rc[0] == IV_EFULL,
+            "retransmit queue failure reported to caller");
+        g_tx_rc = IV_OK;
+        chk(iv_link_send(&lk, IV_FRAME_CMD_QUERY, req, 1, 200, on_done, NULL) == IV_OK,
+            "slot reusable after retransmit queue failure");
     }
 
     if (g_fail == 0)

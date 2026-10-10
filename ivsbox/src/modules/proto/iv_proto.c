@@ -108,6 +108,8 @@ int iv_proto_bin_build(uint8_t *out, size_t out_cap, size_t *out_len,
         return IV_OK;
     if (out_cap < total)
         return IV_ERANGE;
+    if (data == NULL && len != 0)
+        return IV_EINVAL;
 
     out[OFF_HEAD + 0] = (uint8_t)(IV_PROTO_HEAD_UP >> 8);
     out[OFF_HEAD + 1] = (uint8_t)(IV_PROTO_HEAD_UP & 0xFF);
@@ -127,7 +129,7 @@ int iv_proto_bin_build(uint8_t *out, size_t out_cap, size_t *out_len,
     out[OFF_QN2 + 2]  = (uint8_t)(qn2 >> 8);
     out[OFF_QN2 + 3]  = (uint8_t)(qn2);
     out[OFF_LEN]      = (uint8_t)len;
-    if (len != 0 && data != NULL)
+    if (len != 0)
         memcpy(&out[OFF_DATA], data, len);
 
     crc = frame_crc(out, total);
@@ -209,6 +211,13 @@ void iv_proto_parser_feed(iv_proto_parser_t *ps, const uint8_t *buf, size_t len,
                 }
             }
 
+            /* CRC 不覆盖帧尾，必须单独校验，不能把坏帧交给命令路由。 */
+            if (ps->buf[total - 2u] != (uint8_t)(IV_PROTO_TAIL >> 8) ||
+                ps->buf[total - 1u] != (uint8_t)IV_PROTO_TAIL) {
+                parser_reset(ps);
+                continue;
+            }
+
             /* 帧尾必须在最后两字节（帧内其它位置出现 0xFFFF 不管——LEN 已定界） */
             if (on_frame != NULL) {
                 iv_proto_frame_t f;
@@ -283,7 +292,9 @@ int iv_proto_send(iv_proto_t *pf, uint8_t cmd, uint32_t qn1, uint32_t qn2,
                             pf->id.devid, cmd, qn1, qn2, data, len);
     if (rc != IV_OK)
         return rc;
-    pf->on_tx(buf, blen, pf->tx_arg);
+    rc = pf->on_tx(buf, blen, pf->tx_arg);
+    if (rc != IV_OK)
+        return rc;
     pf->tx_frames++;
     return IV_OK;
 }
@@ -314,7 +325,9 @@ int iv_proto_send_text(iv_proto_t *pf, const char *seg, size_t seg_len)
     rc = iv_proto_text_frame(seg, seg_len, buf, &tlen);
     if (rc != IV_OK)
         return rc;
-    pf->on_tx(buf, tlen, pf->tx_arg);
+    rc = pf->on_tx(buf, tlen, pf->tx_arg);
+    if (rc != IV_OK)
+        return rc;
     pf->tx_frames++;
     return IV_OK;
 }

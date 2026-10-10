@@ -14,6 +14,7 @@ src/modules/link  ——  采集板 UART 链路：成帧 + 命令级可靠收发
                 帧尾校验、帧超时复位；并把 cmd+data 编成完整帧字节
   iv_link.c     命令级可靠层：下发→同 cmd 应答配对、超时重传、无配对帧上交、
                 链路状态维护（对接 S2.6 状态镜像的重建）
+  iv_s2_uart.c  串口装配：Reactor 驱动收发、E1 查询、断线清镜像及重连；待 main.c 接入
   .gitkeep      目录占位
 
 【实现状态】
@@ -32,10 +33,10 @@ src/modules/link  ——  采集板 UART 链路：成帧 + 命令级可靠收发
     `on_done` 在事务槽**摘除之后**调用，回调里再 `send()` / `clear()` 不会踩正在用
     的槽（与 iv_taskpool "on_done 锁外调用"同一纪律）。
   - 配对规则＝同 cmd 在飞事务唯一（同 cmd 第二笔返回 `IV_EBUSY`）；协议无请求号/
-    ACK/事务号，**重传可能重复执行**（0xD1 重启 0x02、0xD2 设备重启），由应用层
-    确认动作语义；**不做内容去重**（无序列号，重复帧交 S2.6 内容比较天然幂等）。
+    ACK/事务号，D1/D2 控制动作不自动重传，仍需应用层确认结果；**不做内容去重**。
   - 返回码（iv_ret.h）：`iv_link_send` → `IV_OK`/`IV_EINVAL`/`IV_ERANGE`/`IV_EBUSY`/
-    `IV_EFULL`；`on_done` 的 rc → `IV_OK`/`IV_ETIMEDOUT`（重传耗尽）/`IV_ECANCELED`；
+    `IV_EFULL` 或发送回调错误；`on_done` 的 rc → `IV_OK`/`IV_ETIMEDOUT`（重传耗尽）/
+    `IV_ECANCELED`/发送回调错误；
     `iv_frame_build` → `IV_OK`(>0 字节数)/`IV_EINVAL`/`IV_ERANGE`/`IV_ENOSPC`。
 
 【相关文档】

@@ -3,8 +3,8 @@
  *
  * 设计口径与协议事实见 include/ivsbox/iv_status.h 文件头与架构 §18.2。
  *
- * JSON 提取：自研极简解析（strstr + atof/atoi），只接受扁平 `"key":<value>`
- * 紧邻语法；不处理嵌套、转义、字符串值。提取失败 → 字段保持当前值。
+ * JSON 提取：先校验完整的扁平对象，再提取固定键；不处理嵌套和转义。
+ * 全量应答事务式替换镜像，缺失字段失效；坏应答保留上一份镜像。
  *
  * 单写者：装配层（Reactor 单线程）调入口，内部零锁。
  */
@@ -91,6 +91,51 @@ static int json_get_string(const char *json, const char *key, char *out, size_t 
     return 1;
 }
 
+/* 本协议应答仅有扁平键值：先验完整结构，再做固定键提取。 */
+static const char *json_skip_ws(const char *p)
+{
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return p;
+}
+
+static int json_flat_complete(const char *json)
+{
+    const char *p = json_skip_ws(json);
+    char *endp;
+
+    if (*p++ != '{') return 0;
+    p = json_skip_ws(p);
+    if (*p == '}') return *json_skip_ws(p + 1) == '\0';
+    for (;;) {
+        if (*p++ != '"') return 0;
+        while (*p != '\0' && *p != '"') {
+            if (*p == '\\') return 0; /* 固定键不使用转义 */
+            p++;
+        }
+        if (*p++ != '"') return 0;
+        p = json_skip_ws(p);
+        if (*p++ != ':') return 0;
+        p = json_skip_ws(p);
+        if (*p == '"') {
+            p++;
+            while (*p != '\0' && *p != '"') {
+                if (*p == '\\') return 0;
+                p++;
+            }
+            if (*p++ != '"') return 0;
+        } else {
+            if (*p != '-' && (*p < '0' || *p > '9')) return 0;
+            (void)strtod(p, &endp);
+            if (endp == p) return 0;
+            p = endp;
+        }
+        p = json_skip_ws(p);
+        if (*p == '}') return *json_skip_ws(p + 1) == '\0';
+        if (*p++ != ',') return 0;
+        p = json_skip_ws(p);
+    }
+}
+
 /* ---- 公开 API ---- */
 
 void iv_status_init(iv_status_t *st)
@@ -102,58 +147,76 @@ void iv_status_init(iv_status_t *st)
 void iv_status_handle_query(iv_status_t *st, const uint8_t *json, uint16_t len)
 {
     char buf[1024];
+    iv_status_t next;
+    unsigned relay_seen = 0, chv_seen = 0, cha_seen = 0;
+    unsigned power_seen = 0, elec_seen = 0;
     double d;
     long l;
     int i;
 
     if (st == NULL || json == NULL || len == 0) return;
-    /* json 长度一般 < 200 B；超长截断即可（足以吞下 27 个键的应答） */
-    if (len >= sizeof(buf)) len = (uint16_t)(sizeof(buf) - 1);
+    /* 全量应答不能截断后当成完整快照；坏应答保留上一份镜像。 */
+    if (len >= sizeof(buf) || memchr(json, '\0', len) != NULL) return;
     memcpy(buf, json, len);
     buf[len] = '\0';
+    if (!json_flat_complete(buf)) return;
 
-    if (json_get_double(buf, "V",  &d)) { st->data.V = (float)d; st->valid.V = 1; }
-    if (json_get_double(buf, "A",  &d)) { st->data.A = (float)d; st->valid.A = 1; }
-    if (json_get_double(buf, "H",  &d)) { st->data.H = (float)d; st->valid.H = 1; }
-    if (json_get_double(buf, "T",  &d)) { st->data.T = (float)d; st->valid.T = 1; }
-    if (json_get_long  (buf, "DS", &l)) { st->data.DS = (int32_t)l; st->valid.DS = 1; }
-    if (json_get_long  (buf, "P",  &l)) { st->data.P  = (int32_t)l; st->valid.P  = 1; }
-    if (json_get_long  (buf, "SPD",&l)) { st->data.SPD= (int32_t)l; st->valid.SPD= 1; }
-    if (json_get_long  (buf, "PA", &l)) { st->data.PA = (int32_t)l; st->valid.PA = 1; }
-    if (json_get_long  (buf, "PV", &l)) { st->data.PV = (int32_t)l; st->valid.PV = 1; }
-    if (json_get_string(buf, "APOWER", st->data.APOWER, sizeof(st->data.APOWER))) {
+    memset(&next, 0, sizeof(next));
+    if (json_get_double(buf, "V",  &d)) { next.data.V = (float)d; next.valid.V = 1; }
+    if (json_get_double(buf, "A",  &d)) { next.data.A = (float)d; next.valid.A = 1; }
+    if (json_get_double(buf, "H",  &d)) { next.data.H = (float)d; next.valid.H = 1; }
+    if (json_get_double(buf, "T",  &d)) { next.data.T = (float)d; next.valid.T = 1; }
+    if (json_get_long  (buf, "DS", &l)) { next.data.DS = (int32_t)l; next.valid.DS = 1; }
+    if (json_get_long  (buf, "P",  &l)) { next.data.P  = (int32_t)l; next.valid.P  = 1; }
+    if (json_get_long  (buf, "SPD",&l)) { next.data.SPD= (int32_t)l; next.valid.SPD= 1; }
+    if (json_get_long  (buf, "PA", &l)) { next.data.PA = (int32_t)l; next.valid.PA = 1; }
+    if (json_get_long  (buf, "PV", &l)) { next.data.PV = (int32_t)l; next.valid.PV = 1; }
+    if (json_get_string(buf, "APOWER", next.data.APOWER, sizeof(next.data.APOWER))) {
         /* "已填"由首字节非零判定 */
     }
-    if (json_get_string(buf, "AKW",    st->data.AKW,    sizeof(st->data.AKW))) {
+    if (json_get_string(buf, "AKW",    next.data.AKW,    sizeof(next.data.AKW))) {
         /* 同上 */
     }
 
-    if (json_get_long(buf, "hv", &l)) { st->data.hv = (int32_t)l; st->valid.hv = 1; }
-    if (json_get_long(buf, "lv", &l)) { st->data.lv = (int32_t)l; st->valid.lv = 1; }
-    if (json_get_long(buf, "ov", &l)) { st->data.ov = (int32_t)l; st->valid.ov = 1; }
-    if (json_get_long(buf, "tu", &l)) { st->data.tu = (int32_t)l; st->valid.tu = 1; }
-    if (json_get_long(buf, "tl", &l)) { st->data.tl = (int32_t)l; st->valid.tl = 1; }
-    if (json_get_long(buf, "hu", &l)) { st->data.hu = (int32_t)l; st->valid.hu = 1; }
-    if (json_get_long(buf, "hl", &l)) { st->data.hl = (int32_t)l; st->valid.hl = 1; }
-    if (json_get_long(buf, "sl", &l)) { st->data.sl = (int32_t)l; st->valid.sl = 1; }
-    if (json_get_long(buf, "ld", &l)) { st->data.ld = (int32_t)l; st->valid.ld = 1; }
+    if (json_get_long(buf, "hv", &l)) { next.data.hv = (int32_t)l; next.valid.hv = 1; }
+    if (json_get_long(buf, "lv", &l)) { next.data.lv = (int32_t)l; next.valid.lv = 1; }
+    if (json_get_long(buf, "ov", &l)) { next.data.ov = (int32_t)l; next.valid.ov = 1; }
+    if (json_get_long(buf, "tu", &l)) { next.data.tu = (int32_t)l; next.valid.tu = 1; }
+    if (json_get_long(buf, "tl", &l)) { next.data.tl = (int32_t)l; next.valid.tl = 1; }
+    if (json_get_long(buf, "hu", &l)) { next.data.hu = (int32_t)l; next.valid.hu = 1; }
+    if (json_get_long(buf, "hl", &l)) { next.data.hl = (int32_t)l; next.valid.hl = 1; }
+    if (json_get_long(buf, "sl", &l)) { next.data.sl = (int32_t)l; next.valid.sl = 1; }
+    if (json_get_long(buf, "ld", &l)) { next.data.ld = (int32_t)l; next.valid.ld = 1; }
 
     /* 继电器（3 个，键为 RELAY1/2/3 / CHV1/2/3 / CHA1/2/3 / POWER1/2/3 / ELEC1/2/3） */
     for (i = 0; i < 3; i++) {
         char k[16];
         snprintf(k, sizeof(k), "RELAY%d", i + 1);
-        if (json_get_long(buf, k, &l)) { st->data.RELAY[i] = (int32_t)l; }
+        if (json_get_long(buf, k, &l)) { next.data.RELAY[i] = (int32_t)l; relay_seen++; }
         snprintf(k, sizeof(k), "CHV%d", i + 1);
-        if (json_get_double(buf, k, &d)) { st->data.CHV[i] = (float)d; }
+        if (json_get_double(buf, k, &d)) { next.data.CHV[i] = (float)d; chv_seen++; }
         snprintf(k, sizeof(k), "CHA%d", i + 1);
-        if (json_get_double(buf, k, &d)) { st->data.CHA[i] = (float)d; }
+        if (json_get_double(buf, k, &d)) { next.data.CHA[i] = (float)d; cha_seen++; }
         snprintf(k, sizeof(k), "POWER%d", i + 1);
-        if (json_get_double(buf, k, &d)) { st->data.POWER[i] = (float)d; }
+        if (json_get_double(buf, k, &d)) { next.data.POWER[i] = (float)d; power_seen++; }
         snprintf(k, sizeof(k), "ELEC%d", i + 1);
-        if (json_get_double(buf, k, &d)) { st->data.ELEC[i] = (float)d; }
+        if (json_get_double(buf, k, &d)) { next.data.ELEC[i] = (float)d; elec_seen++; }
     }
-    st->valid.RELAY = st->valid.CHV = st->valid.CHA = 1;
-    st->valid.POWER = st->valid.ELEC = 1;
+    next.valid.RELAY = relay_seen == 3;
+    next.valid.CHV = chv_seen == 3;
+    next.valid.CHA = cha_seen == 3;
+    next.valid.POWER = power_seen == 3;
+    next.valid.ELEC = elec_seen == 3;
+    /* 没有任何已识别字段时视为坏应答，保留上次有效镜像。 */
+    if (!(next.valid.V || next.valid.A || next.valid.H || next.valid.T ||
+          next.valid.DS || next.valid.P || next.valid.SPD || next.valid.PA ||
+          next.valid.PV || next.valid.hv || next.valid.lv || next.valid.ov ||
+          next.valid.tu || next.valid.tl || next.valid.hu || next.valid.hl ||
+          next.valid.sl || next.valid.ld || next.data.APOWER[0] ||
+          next.data.AKW[0] || relay_seen || chv_seen || cha_seen ||
+          power_seen || elec_seen))
+        return;
+    *st = next;
 }
 
 void iv_status_handle_upstream(uint8_t cmd, const uint8_t *data, uint16_t len, void *arg)

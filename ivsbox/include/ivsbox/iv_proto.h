@@ -148,8 +148,9 @@ typedef struct {
  * 传输抽象（用户 2026-10-09 拍板：TCP 传输归 M3，本层只认回调）
  * ------------------------------------------------------------------------- */
 
-/* 本层要发出的字节（传输层写 socket；返回后缓冲即可复用） */
-typedef void (*iv_proto_tx_cb)(const uint8_t *bytes, size_t len, void *arg);
+/* 传输层接受字节到发送队列后返回 IV_OK；失败返回负码。
+ * 返回后缓冲即可复用，异步发送须先复制。 */
+typedef int (*iv_proto_tx_cb)(const uint8_t *bytes, size_t len, void *arg);
 
 /* ---------------------------------------------------------------------------
  * ## 字符串帧组包辅助
@@ -250,7 +251,7 @@ int iv_proto_route(iv_proto_t *pf, uint8_t cmd, iv_proto_cmd_cb cb, void *arg);
  *   命中   → 调 handler（handler 自己决定是否回 ACK/数据）；
  *   未命中 → 自动回 ACK：DATA[0]=IV_PROTO_ACK_OK（保守"已收到"语义，
  *            与 MCU 参考实现的 default 分支一致——未知命令也回 0x01）。
- * CRC 错帧静默丢弃并计数（不回错误帧——链路上可能有噪声，回错误帧会放大流量）。
+ * CRC/帧尾错帧静默丢弃（不回错误帧——链路噪声下避免放大流量）。
  */
 void iv_proto_recv(iv_proto_t *pf, const uint8_t *buf, size_t len);
 
@@ -260,7 +261,8 @@ int iv_proto_ack(iv_proto_t *pf, uint8_t cmd, uint8_t code);
 /* 发心跳（CMD=0xFF、QN=0、DATA={0x01}） */
 int iv_proto_heartbeat(iv_proto_t *pf);
 
-/* 发原始二进制帧（组帧 + on_tx；qn 由调用方给，例如查询响应回填平台 QN） */
+/* 发原始二进制帧（组帧 + on_tx；队列拒绝时原样返回负码，不计入 tx_frames）。
+ * qn 由调用方给，例如查询响应回填平台 QN。 */
 int iv_proto_send(iv_proto_t *pf, uint8_t cmd, uint32_t qn1, uint32_t qn2,
                   const void *data, uint16_t len);
 

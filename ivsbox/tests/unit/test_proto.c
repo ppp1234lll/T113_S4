@@ -5,7 +5,7 @@
  *   1) 二进制组帧黄金校验：build 的字节流与独立手工组帧逐字节比对；
  *   2) 二进制解析：完整帧 → 字段全对；半包逐字节喂 → 同样交付；
  *   3) 粘包：两帧一次 feed 各自交付；帧头噪声前置 → 仍交付；
- *   4) 坏 CRC 整帧丢弃且不影响后续帧；LEN 撒谎（超出缓冲）→ 丢弃回同步；
+ *   4) 坏 CRC/帧尾整帧丢弃且不影响后续帧；LEN 撒谎不误交付；
  *   5) ## 文本帧组包黄金校验（含样例回归：长度域 4 位、CRC 2 位小写 hex）；
  *   6) ## 文本帧长度探测与 IV_ERANGE；
  *   7) 路由：命中 handler、未命中自动 ACK(0x01)、重注册 IV_EEXIST、表满 IV_EFULL；
@@ -65,15 +65,19 @@ static struct {
     size_t   len[8];
     int      n;
 } g_tx;
+static int g_tx_rc;
 
-static void on_tx(const uint8_t *bytes, size_t len, void *arg)
+static int on_tx(const uint8_t *bytes, size_t len, void *arg)
 {
     (void)arg;
+    if (g_tx_rc != IV_OK)
+        return g_tx_rc;
     if (g_tx.n < 8 && len <= sizeof(g_tx.buf[0])) {
         memcpy(g_tx.buf[g_tx.n], bytes, len);
         g_tx.len[g_tx.n] = len;
     }
     g_tx.n++;
+    return IV_OK;
 }
 
 /* ---- 帧回调记录 ---- */
@@ -111,6 +115,7 @@ static void handler(const iv_proto_frame_t *f, void *arg)
 static void rec_reset(void)
 {
     memset(&g_tx, 0, sizeof(g_tx));
+    g_tx_rc = IV_OK;
     memset(&g_rx, 0, sizeof(g_rx));
     g_hit = 0;
     memset(&g_hit_f, 0, sizeof(g_hit_f));
@@ -149,6 +154,8 @@ int main(void)
         chk(iv_proto_bin_build(out, sizeof(out), &blen, 0x400, 1, 0xE1, 0, 0,
                                NULL, IV_PROTO_BIN_DATA_MAX + 1u) == IV_ERANGE,
             "bin_build range");
+        chk(iv_proto_bin_build(out, sizeof(out), &blen, 0x400, 1, 0xE1, 0, 0,
+                               NULL, 1) == IV_EINVAL, "bin_build rejects NULL data");
 
         /* 长度探测 */
         blen = 0;
@@ -199,7 +206,7 @@ int main(void)
         chk(g_rx.f[1].len == 0 && g_rx.f[1].data == NULL, "zero-len data NULL");
     }
 
-    /* ---- 3) 坏 CRC / LEN 撒谎 ---- */
+    /* ---- 3) 坏 CRC / 帧尾 / LEN 撒谎 ---- */
     {
         static iv_proto_parser_t ps;
         uint8_t f1[64], f2[64];
@@ -218,6 +225,19 @@ int main(void)
             iv_proto_parser_feed(&ps, both, l1 + l2, on_frame, NULL);
             chk(g_rx.n == 1 && g_rx.f[0].cmd == 0xE2u,
                 "bad CRC dropped, next frame ok");
+        }
+
+        rec_reset();
+        iv_proto_parser_init(&ps);
+        l1 = mk_down(f1, 0x0400u, 0x010203u, 0xE1u, 1u, 2u, NULL, 0);
+        f1[l1 - 1] = 0x00; /* CRC 仍正确，仅帧尾损坏 */
+        {
+            uint8_t both[128];
+            memcpy(both, f1, l1);
+            memcpy(&both[l1], f2, l2);
+            iv_proto_parser_feed(&ps, both, l1 + l2, on_frame, NULL);
+            chk(g_rx.n == 1 && g_rx.f[0].cmd == 0xE2u,
+                "bad tail dropped, next frame ok");
         }
 
         /* LEN 撒谎：把 LEN 改成 0xFF，帧体按小 LEN 给——会吞掉后续字节直到
@@ -357,6 +377,14 @@ int main(void)
             g_tx.buf[0][4] == '0' && g_tx.buf[0][5] == '5' &&
             memcmp(&g_tx.buf[0][6], "QN=0;", 5) == 0, "send_text bytes");
 
+        g_tx_rc = IV_EFULL;
+        chk(iv_proto_send(&pf, 0xE1u, 0, 0, NULL, 0) == IV_EFULL,
+            "binary queue failure propagated");
+        chk(iv_proto_send_text(&pf, "x", 1) == IV_EFULL,
+            "text queue failure propagated");
+        chk(pf.tx_frames == 1u, "failed queue writes not counted");
+        g_tx_rc = IV_OK;
+
         /* NULL 入参 */
         chk(iv_proto_send(NULL, 0xE1, 0, 0, NULL, 0) == IV_EINVAL, "send NULL");
         chk(iv_proto_ack(NULL, 0xE1, 1) == IV_EINVAL, "ack NULL");
@@ -369,7 +397,7 @@ int main(void)
     }
 
     if (g_fail == 0)
-        printf("test_proto passed (build/parse/sticky/crc/text/route/ack/hb/null)\n");
+        printf("test_proto passed (build/parse/sticky/crc/tail/text/route/ack/hb/null)\n");
     else
         printf("test_proto FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

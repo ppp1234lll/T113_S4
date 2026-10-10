@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T113 运维终端 v5 架构 缺口与风险清单</title>
+<style>
+  :root { color-scheme: light; }
+  body { margin: 0 auto; max-width: 1040px; padding: 2.5rem 1.5rem 5rem;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei",
+                      "PingFang SC", "Hiragino Sans GB", sans-serif;
+         line-height: 1.75; color: #1f2328; background: #fff;
+         font-size: 15px; -webkit-text-size-adjust: 100%; }
+  h1, h2, h3 { line-height: 1.35; font-weight: 600; }
+  h1 { font-size: 1.75em; margin: 0 0 .8em; padding-bottom: .4em; border-bottom: 2px solid #d0d7de; }
+  h2 { font-size: 1.35em; margin: 2.2em 0 .8em; padding-bottom: .3em; border-bottom: 1px solid #e3e6ea; }
+  h3 { font-size: 1.12em; margin: 1.8em 0 .6em; }
+  p { margin: .7em 0; }
+  ul, ol { margin: .7em 0; padding-left: 1.7em; }
+  li { margin: .3em 0; }
+  strong { font-weight: 600; }
+  del { color: #6a737d; }
+  code { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+         font-size: .88em; background: #f0f1f3; padding: .15em .38em; border-radius: 4px;
+         overflow-wrap: anywhere; }
+  pre { background: #f6f8fa; border: 1px solid #e3e6ea; border-radius: 6px; padding: .9em 1em; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: .94em; display: block; overflow-x: auto; }
+  th, td { border: 1px solid #d0d7de; padding: .5em .7em; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; font-weight: 600; white-space: nowrap; }
+  tbody tr:nth-child(even) td { background: #fcfcfd; }
+  blockquote { margin: 1em 0; padding: .3em 1.1em; border-left: 4px solid #d0d7de;
+               background: #f6f8fa; color: #3f4650; }
+  blockquote p { margin: .5em 0; }
+  hr { border: 0; border-top: 1px solid #d0d7de; margin: 2.5em 0; }
+  @media print { body { max-width: none; padding: 0; font-size: 12px; } table { display: table; } }
+</style>
+</head>
+<body>
+<h1>T113 运维终端 v5 架构 缺口与风险清单</h1>
+<blockquote>
+<p>评审对象：<code>F:\debug\T113_TCP\T113运维终端-系统架构设计-v5-整合版.md</code>（723 行 / 19 章）对比基线：<code>T113运维终端-功能架构设计-v4-Linux原生版.md</code>（952 行 / 80KB）评审日期：2026-09-22 信息来源：外部评审（5 条）+ 本次复核补充（新增 14 条）用途：作为 v5 定稿前的问题登记册。<strong>P0 项未关闭前不建议冻结 §18 并进入 M1 编码。</strong> 关闭状态：<strong>2026-09-30 14:09 更新</strong>（第 0 层文档清账回写 ＋ G8 板端 E2E 实证后转"已关闭"），逐条状态见 §1.1（已关闭 4 / 部分关闭 10 / 未关闭 6）。</p>
+</blockquote>
+<hr>
+<h2>0. 总体结论</h2>
+<p><strong>架构骨架可用，细节完备度不足。</strong> v5 相对 v4 是"提纯"而非"整合"：新增了工程治理章节（H2 标题 14 → 20 个），同时删掉了功能实现级细节（文档量 952 → 723 行）。</p>
+<table>
+<thead>
+<tr><th>维度</th><th>评分（0~5）</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td>进程与并发模型</td><td>5</td><td>单 Reactor + 2 有界 worker + 健康线程，业务路径无锁</td></tr>
+<tr><td>状态与数据所有权</td><td>5</td><td>一库一写者，Web 不直连业务库</td></tr>
+<tr><td>可测试性</td><td>5</td><td>fuzz + 故障注入 + 72h 长稳 + 10 条验收场景</td></tr>
+<tr><td>网络与双 WAN</td><td>4</td><td>已修正 v4 的"只改路由不重连"错误；缺计费保护策略</td></tr>
+<tr><td>进程通信 IPC</td><td>4</td><td>SEQPACKET + 版本化头 + SO_PEERCRED；缺大数据路径</td></tr>
+<tr><td>OTA 与回滚</td><td>4</td><td>应用/系统双路径已拆开；缺提权触发机制</td></tr>
+<tr><td>安全边界</td><td>4</td><td>强制签名 + 服务白名单；提权路径有缺口</td></tr>
+<tr><td>媒体与存储</td><td>3</td><td>上限全是符号无数字</td></tr>
+<tr><td><strong>资源预算与可落地性</strong></td><td><strong>2</strong></td><td><strong>本清单最大短板</strong></td></tr>
+</tbody>
+</table>
+<p><strong>v5 已修正 v4 的两处硬错（值得保留）</strong></p>
+<ol>
+<li>双 WAN：v4 §5.3"切换 = netlink 改路由（毫秒级），不是应用重连"是错的。v5 §7.2 明确 "普通 TCP 不能跨接口迁移，'只改路由不重连'不作为实现方案"，切换事务含关闭旧接口 TCP + 新出口重建。</li>
+<li>OTA：v4 把"应用 A/B"与"系统 U-Boot A/B"混为一谈；v5 §11.2/§11.3 拆成两条独立路径。</li>
+</ol>
+<hr>
+<h2>1. 优先级总表</h2>
+<table>
+<thead>
+<tr><th>ID</th><th>缺口</th><th>严重度</th><th>来源</th><th>主要影响</th><th>关闭阶段</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>G1</strong></td><td>进程级资源预算缺失（只有上限符号，无数字）</td><td>P0</td><td>外部评审 ④</td><td>硬件选型误判、参数拍脑袋</td><td>M0 / §18</td></tr>
+<tr><td><strong>G2</strong></td><td>喂狗判据与慢任务混淆，弱网易误复位</td><td>P0</td><td>本次</td><td>现场"设备无故重启"</td><td>M1</td></tr>
+<tr><td><strong>G3</strong></td><td>非特权进程拉起 root 升级器的提权路径未定义</td><td>P0</td><td>本次</td><td>安全关键路径设计缺口</td><td>M0 / §18</td></tr>
+<tr><td><strong>G4</strong></td><td>Web 下载媒体文件的跨进程路径自相矛盾</td><td>P0</td><td>本次</td><td>功能无法实现或破坏所有权声明</td><td>M1</td></tr>
+<tr><td><strong>G5</strong></td><td>启动顺序与就绪分级未定义</td><td>P0</td><td>外部评审 ③</td><td>冷启动打摆子、启动期被狗复位</td><td>M1</td></tr>
+<tr><td><strong>G6</strong></td><td>慢任务池容量无量化验证（固定 2 worker）</td><td>P0</td><td>外部评审 ②</td><td>探活样本饿死 → 切换/自愈判据失真</td><td>M4 前</td></tr>
+<tr><td><strong>G7</strong></td><td>模块边界无强制手段</td><td>P1</td><td>外部评审 ①</td><td>纪律靠自觉，几个版本后腐化</td><td>M1</td></tr>
+<tr><td><strong>G8</strong></td><td>procd respawn 无熔断</td><td>P1</td><td>本次</td><td>崩溃循环被掩盖成"一直在重启"</td><td>M1</td></tr>
+<tr><td><strong>G9</strong></td><td>时间跳变对媒体/审计/自愈/平台的连带影响</td><td>P1</td><td>外部评审 ⑤</td><td>录像索引错乱、TLS 连不上、熔断失效</td><td>M3</td></tr>
+<tr><td><strong>G10</strong></td><td>现场诊断能力缺失（core dump + 远程取证通道）</td><td>P1</td><td>外部评审 ⑤</td><td>现场故障无法取证</td><td>M5</td></tr>
+<tr><td><strong>G11</strong></td><td>五类版本缺兼容矩阵</td><td>P1</td><td>本次</td><td>部分升级导致不可预期行为</td><td>M1</td></tr>
+<tr><td><strong>G12</strong></td><td>错误码字典 / IPC 方法 ID 未进 §18 冻结项</td><td>P1</td><td>本次</td><td>接口漂移</td><td>M1</td></tr>
+<tr><td><strong>G13</strong></td><td>§2 功能表缺阶段映射，"三进程协作"无主责</td><td>P2</td><td>本次</td><td>追踪性弱</td><td>M0</td></tr>
+<tr><td><strong>G14</strong></td><td>自愈动作依赖 UART，断链时规则空转</td><td>P2</td><td>本次</td><td>无意义动作失败审计刷屏</td><td>M4</td></tr>
+<tr><td><strong>G15</strong></td><td>平台 TLS 与"服务端无感知"冲突未定位</td><td>P2</td><td>本次</td><td>安全与兼容两条约束在实施期打架</td><td>M0</td></tr>
+<tr><td><strong>G16</strong></td><td>缺省"无线优先"会烧 4G 流量（<code>revert</code>/<code>billing_guard</code> 丢失）；<strong>2026-09-30 更新</strong>：现口径为 <code>sys.transport.mode</code>(1~4) + <code>netthr.*</code></td><td>P2</td><td>本次</td><td>真金白银的流量费</td><td>M3</td></tr>
+<tr><td><strong>G17</strong></td><td>media 参数是否进配置未说明（<strong>2026-09-30 更新</strong>：§10.2 已改单文件，<code>config/media.json</code> 不存在）</td><td>P2</td><td>本次</td><td>配置重载路径不清</td><td>M1</td></tr>
+<tr><td><strong>G18</strong></td><td>TLS 握手 / 配置 <code>fsync</code> 是否在 Reactor 回调内未排除</td><td>P2</td><td>本次</td><td>主循环阻塞 → 误喂狗</td><td>M1</td></tr>
+<tr><td><strong>G19</strong></td><td>隧道帧结构等实现级参数在 v5 丢失</td><td>P2</td><td>本次</td><td>M3 需回头重做决策</td><td>M3 前</td></tr>
+</tbody>
+</table>
+<p><strong>严重度定义</strong></p>
+<ul>
+<li><strong>P0</strong>：编码前必须冻结或解决，否则返工或产生现场故障。</li>
+<li><strong>P1</strong>：进入对应阶段前必须解决。</li>
+<li><strong>P2</strong>：随文档迭代补齐，不阻塞主线。</li>
+</ul>
+<h3>1.1 关闭状态回写（2026-09-30，规则 1）</h3>
+<blockquote>
+<p>本节由<strong>第 0 层文档清账</strong>追加，<strong>只记状态，不改动下面各条评审原文</strong>（规则 2 / 规则 7）。状态三档：<strong>已关闭</strong>＝缺口所指问题已由代码或文档消除；<strong>部分关闭</strong>＝口径已定但实现未落地或有残留项； <strong>未关闭</strong>＝尚未处理。依据一律指向可复核的文件，不写"应该没问题"这类话。</p>
+</blockquote>
+<table>
+<thead>
+<tr><th>ID</th><th>状态</th><th>依据 / 剩余项</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>G1</strong> 资源预算缺失</td><td>部分关闭</td><td><strong>2026-09-30 已采骨架期实测</strong>（见附录 A.1）：<code>ivsboxd</code> 空载 <code>VmRSS</code> <strong>1876 kB</strong>、<code>VmPeak</code> 28316 kB、<code>Threads</code> <strong>4</strong>、fd <strong>12</strong>、CPU ≈0.1%。剩余：满载工况（3 路录像 ＋ Web ＋ media）实测；附录 A 的"起步假设"因此<strong>仍不可整体替换</strong> —— 实测远低于假设（1.83 MiB vs 6~10 MB），差在 TLS / 平台连接 / 状态镜像 / 媒体都还没进来。<strong>另：本板 DRAM 实测为 256 MB</strong>（<code>/proc/cmdline</code> 的 <code>androidboot.dramsize=256</code>，<code>MemTotal</code> 225344 kB），<strong>G1 正文的"片内 128MB DDR3"是错的</strong>，附录 A 的"128MB 下余量"推算需按 256 MB 重算</td></tr>
+<tr><td><strong>G2</strong> 喂狗判据与慢任务混淆</td><td><strong>已关闭</strong></td><td>S6 落地：判据＝主循环进度号 ＋ 该进度号最近一次变化的时刻；慢任务<strong>不参与喂狗</strong>，改用 deadline 健康租约（超期才恢复 <code>stuck_ms</code> 判死）；<code>stuck_ms(10s)+interval(1s) &lt; 16s</code> 由 <code>#if + #error</code> 编译期钉死；16s 上限与"判死后约 16 s 整机精确复位"均已板端实证。<strong>一处取舍</strong>：判死现场走 stderr 最小现场、不落盘，理由见计划 §S6 第 4 条（避免"日志系统卡住"与"主循环卡住"互为因果）</td></tr>
+<tr><td><strong>G3</strong> 提权路径未定义</td><td>未关闭</td><td>架构 §11 / §13.1 仍只写"由 <code>ivsbox-updater</code> 执行、root 按需运行"，触发机制与防篡改未写。归属 M7-S7.2</td></tr>
+<tr><td><strong>G4</strong> Web 下载媒体文件路径矛盾</td><td>部分关闭</td><td>架构 §5.1 已定"大块数据不走通道，只传路径 / 文件描述符"，§8.3 定为"平台分片上传 ＋ HTTP Range 下载"；原建议的 A / B / C 三方案取舍未在架构中显式定案。剩余：M5 / M6 落地时写明</td></tr>
+<tr><td><strong>G5</strong> 启动顺序与就绪分级</td><td>部分关闭</td><td>S10 已固定装配顺序（日志→配置→DB→taskpool→Reactor→本地通道→健康线程）、init 脚本编号 &gt; 60 的硬约束、看门狗启动自检"实际超时 &gt; 判据窗口"。剩余：架构仍未写 L0~L5 就绪分级表；OTA 确认窗口 vs L4 最坏达成时间未定（M7）</td></tr>
+<tr><td><strong>G6</strong> 慢任务池容量无量化验证</td><td>未关闭</td><td>当前队列满返回 <code>IV_EBUSY</code>（有界失败、不积压不泄漏），但原建议的"丢最旧 ＋ 计数告警"与"分池 ＋ token bucket 限流"均未采纳。归属 M4 前</td></tr>
+<tr><td><strong>G7</strong> 模块边界无强制手段</td><td>部分关闭</td><td>原建议的 CMake <code>target_link_libraries</code> 已由"<strong>链接顺序 ＋ <code>-Wl,--no-undefined</code></strong>"替代且更强（架构 §15.5），越界即链接失败；<code>libivcore</code> 仅 libc 的纪律已写死。剩余：<code>scripts/ci/check_layering.sh</code> 未加回；模块私有头"目录即边界"未强制（当前只有 <code>src/modules/config/</code> 一个模块）</td></tr>
+<tr><td><strong>G8</strong> respawn 无熔断</td><td><strong>已关闭</strong>（2026-09-30 14:09 板端 E2E 实证）</td><td><strong>熔断已落地并经三轮验证</strong>：<code>monitor.sh</code> 窗口计数 ＋ failsafe（默认 5 次 / 300 s，冷却 1800 s），状态落 UDISK <code>.monitor.state</code>（写后 <code>sync</code>）、告警落 <code>/mnt/UDISK/log/monitor-alert.log</code>。<strong>同日复核发现初版两处缺陷并已修</strong>：① init 直启主控<strong>绕过 failsafe</strong>（复位后每次开机都免费跑一轮 ivsboxd、每次重新武装看门狗 ⇒ 持续运行期崩溃变成 30 分钟一轮的整机复位风暴）⇒ 改为 <strong><code>S65ivsboxd</code> 只拉起 monitor、monitor 是主控唯一拉起方</strong>；② 计时用墙钟 <code>date +%s</code> 违反 G9 单调纪律 ⇒ 改 <strong><code>/proc/uptime</code> 单调秒</strong>，启动时对状态做跨开机消毒（FS≠0 ⇒ 只继承"在熔断"、冷却重计满一轮，封死"陈旧巨值 FS ⇒ 永久熔断"；WS&gt;uptime ⇒ 窗口作废重开）。另修正表述：整机复位只发生在<strong>最后实例已武装看门狗</strong>的崩溃（S6 板端实证），启动早期崩溃不复位、板子静默等冷却，两种形态都可接受。已验证：板端同会话熔断/到期恢复（初版，参数 2 次/60 s/8 s）；编译 VM 四场景全过（崩溃熔断告警、持久化巨值 FS 钳制＋熔断期不拉起＋到期恢复、陈旧窗口作废、坏状态自愈）。<strong>验证三（真实整机 E2E，2026-09-30 13:28~13:31，板端告警日志原文）</strong>：测试参数 2 次 / 600 s / 冷却 120 s / 轮询 2 s —— 13:28:30 两次运行期 <code>kill -9</code> 后进熔断（state <code>14128 2 14256</code>，CRASH LOOP 告警落盘、不再拉起）→ 看门狗<strong>真复位整机</strong>（最后实例已武装，timeout=16 s）→ 13:29:23 重启后 monitor 读持久化状态 <code>resuming failsafe from persisted state, cooldown restarted (120s), ivsboxd will NOT be started</code>（<strong>F1 唯一拉起方 ＋ F2 跨开机消毒实测生效；无二次复位</strong>——取证时 uptime 连续增长至 1091 s）→ 13:31:25 <code>failsafe expired after 120s, resuming normal supervision</code>，ivsboxd <strong>仅此刻启动一次</strong>（<code>watchdog armed, timeout=16s</code>）。测试后已移除测试参数、恢复生产版（restart 后 state <code>1092 1 0</code>）。人工解除＝<code>S65ivsboxd restart</code>（<strong>只有 <code>restart</code> 清状态</strong>；放进 <code>start</code> 会让复位后每次清零，熔断等于没有）</td></tr>
+<tr><td><strong>G9</strong> 时间跳变连带影响</td><td>部分关闭</td><td>时长 / 窗口一律 <code>CLOCK_MONOTONIC</code> 已在 S2 / S4 / S5 / S6 落地（<code>iv_clock</code>、Reactor timerfd、taskpool cond 绑 MONOTONIC、日志风暴窗口）。剩余：TLS 时间死锁（M2）、录像切片命名与 media.db <code>ts</code> 字段（M6）、自愈熔断（M4）、开锁有效期与隧道 token（M4 / M8）、墙钟"可信标志"未定义</td></tr>
+<tr><td><strong>G10</strong> 现场诊断能力缺失</td><td>部分关闭</td><td>日志已改为自写落盘 <code>/mnt/UDISK/log/&lt;YYYY-MM-DD&gt;/&lt;HH&gt;.log</code>（不依赖 syslogd / logd），<code>iv_health</code> 判死打最小现场。剩余：core dump 策略未定；远程取证只读服务名未加进 §9.4 白名单（M8）</td></tr>
+<tr><td><strong>G11</strong> 五类版本缺兼容矩阵</td><td>部分关闭</td><td>通道消息头已带 <code>version</code> 字段（S7）；配置有 <code>_meta.schema</code> 但<strong>只记录不校验</strong>（已在代码说明登记 TODO）。剩余：统一兼容矩阵 ＋ 三条规则；IPC 版本不匹配时的行为未定义</td></tr>
+<tr><td><strong>G12</strong> 错误码 / 方法 ID 未进冻结项</td><td>部分关闭</td><td><strong>错误码字典已落地</strong>：<code>iv_err</code> 与单片机工程共用同一 uint32 码空间、<code>iv_strerror()</code> 返回稳定符号名、<code>test_err.c</code> 逐条钉死码值。剩余：<strong>方法 ID 表未定义</strong>（S7 只做帧头与 <code>system.snapshot</code> 一处方法名，S7 已登记"方法路由未实现"）；两项均未补进架构 §18 冻结项</td></tr>
+<tr><td><strong>G13</strong> §2 功能表缺阶段映射</td><td><strong>已关闭</strong></td><td>架构 §2 现表已有"子系统 / 归属进程 / 阶段"三列</td></tr>
+<tr><td><strong>G14</strong> 自愈动作依赖 UART</td><td>未关闭</td><td>链路不可用时"抑制动作 ＋ 告警 ＋ 不计入熔断"的分支未写。归属 M4-S4.4</td></tr>
+<tr><td><strong>G15</strong> 平台 TLS 与字节级兼容张力</td><td>未关闭</td><td>§13.2 仍写"若现网暂不支持，形成明确整改项"。归属 M2 / M3</td></tr>
+<tr><td><strong>G16</strong> 无线优先烧 4G 流量</td><td>部分关闭</td><td>口径已改为 <code>sys.transport.mode</code>(1~4) ＋ <code>netthr.*</code>，<code>net.wan.*</code> 六项已删（§10.2）。剩余：原 <code>revert</code> / <code>billing_guard</code> 的等价语义（流量阈值内不回切）<strong>尚未补回</strong>，归属 M3 前</td></tr>
+<tr><td><strong>G17</strong> media 参数是否进配置</td><td><strong>已关闭</strong></td><td>§10.2 已改单文件并明确"尚未成形的模块参数，等各自模块落地时按同一模型追加为新的顶层分类"；§10.1 明确配置唯一写入者是 <code>ivsboxd</code>，media 为只读消费方</td></tr>
+<tr><td><strong>G18</strong> TLS / 配置 fsync 是否在 Reactor 回调内</td><td>部分关闭（一处与建议相反）</td><td>TLS 未开始。<strong>配置 <code>save()</code>（含文件与目录 fsync）当前按"单线程契约"在 Reactor 线程内同步执行</strong>，与原建议"下沉 worker、完成后事件回投"相反 —— 需在 M5-S5.4（Web 改配置链路）落地时复评并二选一</td></tr>
+<tr><td><strong>G19</strong> 隧道帧结构实现级参数丢失</td><td>未关闭</td><td>待 M8 立项时按附录 B 从 v4 取回</td></tr>
+<tr><td><strong>G20</strong> 配置目录只建一级，UDISK 被重置后配置静默失效</td><td><strong>已关闭</strong>（2026-10-08 修复；证伪执行与板端复跑按"测试后置"指示后补）</td><td>板端 R1 实测日志：<code>mkdir '/mnt/UDISK/ivsbox/config' failed: No such file or directory (defaults stay in memory)</code>，随后 <code>inotify_add_watch</code> 亦失败（ERR 级）。根因：<code>src/modules/config/iv_config.c</code> 的"按需建目录"只建<strong>一级</strong>，父目录 <code>/mnt/UDISK/ivsbox</code> 缺失时不补；而 <code>src/core/iv_db.c</code> 是递归建目录，两者行为不一致。触发路径现实：<code>S60mount_udisk</code> 挂载失败会 <code>mkfs.ext4</code> 静默清空 UDISK（架构 §10.5），此后若部署目录未重建，<strong>配置全部回落内置默认值且热更新永久失效</strong>，现场只看到两行 WARN/ERR。<strong>修法（2026-10-08 落地）</strong>：取"<code>mkdir -p</code> 语义" —— <code>src/modules/config/iv_config.c</code> 内实现 <code>mkdir_p()</code>（去尾斜杠、逐级 <code>mkdir(0755)</code>、<code>EEXIST</code> 放过、errno 保留），<code>iv_config_open()</code> 改调它；语义与 <code>src/core/iv_db.c</code> 的 <code>mkdir_p</code> 对齐（不抽公共 helper：最小改动、不动 core 公共 API）。<strong>证据</strong>：新增 <code>tests/unit/test_config.c</code> <strong>c18 用例</strong>（父目录两级缺失下 open / watch / save / 读回全链路，可反向证伪）；VM <code>make test</code> / <code>asan</code> / <code>tsan</code> <strong>15/15</strong>、<code>make arm</code> 零告警；<strong>反向证伪</strong>：把 <code>mkdir_p()</code> 改回"只建一级"后 c18 关键断言全 FAIL（父级未建 / watch 失效 / save 非 OK）。板端 ARM <code>test_config</code> 复跑按 2026-10-08 用户"测试后置"指示缓办（修复为通用 POSIX 逐级 mkdir，无平台相关行为）</td></tr>
+</tbody>
+</table>
+<p><strong>小结</strong>：20 条中<strong>已关闭 5 条</strong>（G2 / G8 / G13 / G17 / G20）、<strong>部分关闭 10 条</strong>（G1 / G4 / G5 / G7 / G9 / G10 / G11 / G12 / G16 / G18）、<strong>未关闭 5 条</strong>（G3 / G6 / G14 / G15 / G19）。P0 六条（G1~G6）中<strong>已关闭 2 条（G2 / G8 —— G8 熔断本轮完成真实整机复位 E2E、转已关闭）</strong>、部分关闭 3 条（G1 / G4 / G5）、未关闭 2 条（G3 / G6）—— G3（升级器提权路径）与 G6（慢任务池容量）建议在 M2 早期定案；<strong>G20 已于 2026-10-08 修复关闭</strong>（VM 四段验证通过，板端复跑按"测试后置"指示后补）。</p>
+<hr>
+<h2>2. P0 缺口详情</h2>
+<h3>G1　进程级资源预算缺失</h3>
+<p><strong>现状</strong></p>
+<ul>
+<li>§4.1 仅有"限制 CPU/内存"一句；所有上限（队列、连接、码率、<code>media.max_channels</code>）都是符号，无数字。</li>
+<li>§18 第 9 条已把"Flash/内存/CPU 预算"列为冻结项 —— <strong>有位置，没内容</strong>。</li>
+<li>v4 至少有 cgroup 配额行（§5.4）与依赖体积/可否省略表（附录 A），<strong>v5 全部删除</strong>。</li>
+</ul>
+<p><strong>风险后果</strong>：T113-S3 为 2×Cortex-A7 + 片内 128MB DDR3，需同时容纳 <code>ivsboxd</code>（TLS + SQLite + 状态镜像）、 HTTP 服务、FFmpeg remux 1~3 路写 SD、logd、procd、4G 拨号栈。<strong>没有量级锚点，参数会被拍脑袋</strong>，且到 M6 才会第一次真正讨论，届时改动成本最高。</p>
+<p><strong>建议措施</strong></p>
+<ol>
+<li>在 §18 增补"资源预算"为第 10 类冻结项，并给出附录级估算表（见本文附录 A）作为起步假设。</li>
+<li>把 cgroup 从 §14 的"待确认组件"提回架构正文 —— 它是 media 隔离的<strong>实现手段</strong>，不是可选依赖。</li>
+<li><code>media.max_channels</code> 的缺省值由预算表倒推（建议缺省 2，硬上限 3~4），不得独立配置。</li>
+<li>同时核算<strong>文件描述符</strong>上限：探活并发 × socket + ONVIF/SNMP + IPC + 录像会话，与系统缺省 <code>ulimit -n</code>（常为 1024）比对。</li>
+</ol>
+<p><strong>验收方式</strong>：M1 阶段在真实 BSP 上跑空载 + 3 路录像，输出 <code>VmRSS</code> / <code>VmPeak</code> / fd 计数实测表。</p>
+<hr>
+<h3>G2　喂狗判据与慢任务混淆</h3>
+<p><strong>现状</strong></p>
+<ul>
+<li>§4.2：慢任务池处理 SNMP、ONVIF、RTSP 能力探测、DNS。</li>
+<li>§12.3："主循环或<strong>关键模块</strong>超出预算时记录最小故障信息并停止喂狗。"</li>
+</ul>
+<p><strong>风险后果</strong>：4G 弱网下 SNMP 超时、DNS 挂起、ONVIF SOAP 无响应都是<strong>正常现象</strong>。若健康判据包含"慢任务进度"，一次 30s 的 SNMP 阻塞即触发喂狗超时 → 整机复位 → 现场表现为"设备无故重启"，且日志里看不到原因（复位时来不及落盘）。</p>
+<p><strong>建议措施</strong></p>
+<ol>
+<li>明确写死：<strong>健康判据只看主事件循环的原子进度号 + 关键链路时间戳</strong>；慢任务只做"超时计数 + 告警"，<strong>不参与喂狗</strong>。</li>
+<li>给出时间关系式：<code>watchdog timeout &gt; procd 重启间隔 + 进程启动到首次喂狗的时间</code>，否则 <code>ivsboxd</code> 正常崩溃重启也会被硬件狗咬。</li>
+<li>停止喂狗前的最小故障信息必须先 <code>fsync</code> 落盘（否则复位即失证据）。</li>
+</ol>
+<p><strong>验收方式</strong>：故障注入 —— 人为把 SNMP 目标指向黑洞地址（30s 超时），观察设备不复位且产生告警。</p>
+<hr>
+<h3>G3　非特权进程拉起 root 升级器的提权路径未定义</h3>
+<p><strong>现状</strong></p>
+<ul>
+<li>§4.1 / §13.1：<code>ivsbox-updater</code> 为 root、按需运行；<code>ivsbox-provision</code> 仅工厂模式可运行。</li>
+<li>全文<strong>未说明由谁、通过什么机制</strong>启动它们。<code>ivsboxd</code> 是普通用户 + 少量 capabilities。</li>
+<li>§11.2 的"连续启动失败计数"存储位置与防篡改也未写。</li>
+</ul>
+<p><strong>风险后果</strong>：这是全文唯一一处权限设计缺口，且正在安全关键路径上。实现者若自行发明机制（如给 <code>ivsboxd</code> 加 setuid 辅助程序、或让 <code>ivsboxd</code> 直接持 root），会把整个特权模型推翻。</p>
+<p><strong>建议措施</strong></p>
+<ol>
+<li>固定触发方式（推荐：<code>procd</code>/<code>ubus</code> 受限服务，或预约定路径的触发文件）。</li>
+<li>硬约束：<strong>不可传入路径/命令参数</strong>（不接受任何来自网络或 Web 的目标路径）； <code>ivsbox-updater</code> 必须<strong>自行重新验签</strong>，不信任调用方的校验结果。</li>
+<li>回滚计数落在受保护存储（如工厂分区或带签名的状态文件），并说明防篡改手段。</li>
+<li>量产后关闭 <code>ivsbox-provision</code> 入口（§13.1 有方向，需给出具体机制）。</li>
+</ol>
+<hr>
+<h3>G4　Web 下载媒体文件的跨进程路径自相矛盾</h3>
+<p><strong>现状</strong></p>
+<ul>
+<li>§9.1 Web 页面含"媒体：图片、录像、下载"。</li>
+<li>§10.1 / §4.4：媒体文件归 <code>ivsbox-media</code>；<code>ivsbox-web</code> 是"无特权用户、不访问媒体目录"。</li>
+<li>§5.1 仅含糊写了"超限数据通过文件句柄、任务 ID 或分片协议传递"。</li>
+</ul>
+<p><strong>风险后果</strong>：需求与约束直接冲突，实现者必须自行选择，选择结果会影响权限模型。</p>
+<p><strong>建议措施</strong>（三选一，写进架构）</p>
+<table>
+<thead>
+<tr><th>方案</th><th>说明</th><th>代价</th></tr>
+</thead>
+<tbody>
+<tr><td>A（推荐）</td><td><code>ivsbox-media</code> 经 <code>SCM_RIGHTS</code> 传 fd 给 Web</td><td>权限不扩散，天然支持 Range 定位；实现稍复杂</td></tr>
+<tr><td>B</td><td>给 Web 一个只读白名单媒体目录</td><td>简单，但破坏"媒体文件唯一归 media"的声明</td></tr>
+<tr><td>C</td><td>Web 反向代理到 media 自身的 <code>127.0.0.1</code> HTTP 服务</td><td>实现最省；media 需开监听口，须限本机 + 鉴权</td></tr>
+</tbody>
+</table>
+<p>同时明确"未确认数据补传队列"的文件读写权限归属。</p>
+<hr>
+<h3>G5　启动顺序与就绪分级未定义</h3>
+<p><strong>现状</strong></p>
+<ul>
+<li>§4.1 仅"所有常驻进程由 procd 管理"；§5.1 仅"服务重启后客户端重新连接并重新订阅事件"。</li>
+<li>未定义初始化分级、启动时间预算、主控未就绪时 media/web 的重连退避。</li>
+</ul>
+<p><strong>风险后果</strong></p>
+<ol>
+<li><code>procd</code> 并发拉起三个常驻进程 → media/web 在 <code>ivsboxd</code> socket 尚不存在时连接失败 → 若无可退避重连，即 respawn 循环（冷启动打摆子）。</li>
+<li>与 G2 联动：首次喂狗时机未定义 → 启动期可能被狗复位。</li>
+<li>§11.2 的 OTA 确认窗口（60s）若小于弱网下 L4 达成时间 → <strong>误回滚</strong>。</li>
+</ol>
+<p><strong>建议措施</strong>：补一节"启动顺序与就绪分级"，至少按下表定义，并把两条时间约束写成硬约束。</p>
+<table>
+<thead>
+<tr><th>级别</th><th>内容</th><th>目标时间</th><th>依赖</th></tr>
+</thead>
+<tbody>
+<tr><td>L0</td><td>核心就绪：IPC socket bind、UART 打开</td><td>~2s</td><td>本地</td></tr>
+<tr><td>L1</td><td>门禁/开锁可执行 → <strong>首次喂狗</strong></td><td>~4s</td><td>UART</td></tr>
+<tr><td>L2</td><td>Web 本地运维可用（可登录看状态）</td><td>~8s</td><td>IPC</td></tr>
+<tr><td>L3</td><td>双 WAN 选路 + 探活启动</td><td>~12s</td><td>内核/模组</td></tr>
+<tr><td>L4</td><td>平台连接 + 会话恢复 + 补传</td><td>~20s</td><td>外部网络</td></tr>
+<tr><td>L5</td><td>设备面首轮探测（摄像机/SNMP/ONVIF）</td><td>可延迟</td><td>外部设备</td></tr>
+</tbody>
+</table>
+<p><strong>两条硬约束</strong></p>
+<ul>
+<li><code>watchdog timeout &gt; L1 达成时间</code>，首次喂狗前不得开狗；</li>
+<li><code>OTA 确认窗口 &gt; L4 最坏达成时间</code>（弱网下可达数十秒）。</li>
+</ul>
+<p>另需明确：L0 之前 media/web 的重连退避参数（建议指数退避 + 上限），以及"平台不可达时以 L5 之外的能力降级运行"的语义。</p>
+<hr>
+<h3>G6　慢任务池容量无量化验证</h3>
+<p><strong>现状</strong></p>
+<ul>
+<li>§4.2："固定两个 worker……队列长度固定，满时返回忙状态。"</li>
+<li>§16.1 集成测试无"多摄像机并发探测"场景。</li>
+</ul>
+<p><strong>风险后果（比"排队超时"更严重）</strong>：按 M4 现实负载估算，32 台摄像机 × （SNMP ~2s + ONVIF ~1s + RTSP 探活 ~2s）≈ <strong>160 秒工作量/轮</strong>，2 个 worker = 80 秒墙钟。若巡检周期为 30 秒，则<strong>队列永久积压，worker 100% 时间在超时重试</strong>。此时真正的问题不是"某次探测慢"，而是<strong>探活样本被饿死</strong> —— 双 WAN 的 <code>fail_n</code>/<code>ok_n</code> 滞回判据、自愈引擎的"连续失败 N 次"、上游同源判断全部建立在这套样本上，样本陈旧会导致 <strong>切换与重启的决策依据错误</strong>。</p>
+<p><strong>建议措施</strong></p>
+<ol>
+<li>§16.1 增补量化场景："N 台摄像机（按现场实际路数）并发 SNMP + ONVIF + RTSP 探测"，给出 N、巡检周期、最坏单次耗时的预算表。</li>
+<li>队列满改为<strong>丢最旧 + 计数告警</strong>，而不是只返回忙 —— 否则积压永远不可见。</li>
+<li>对"worker 数可配"持保留意见：worker 数是并发上界，同时也是内存消耗上界，开放配置后现场必然被调大。建议改为<strong>分池 + 按轮预算限流</strong>：控制类快任务（ICMP 等）留在 Reactor，设备探测类单独成池，配合 token bucket 限流，宁可拉长周期也不允许积压。</li>
+</ol>
+<hr>
+<h2>3. P1 缺口详情</h2>
+<h3>G7　模块边界无强制手段</h3>
+<p><strong>现状</strong>：§6 给出 5 条依赖规则（全部为散文），§15 仅提到"Host：……和静态分析"。 <strong>并且这是相对 v3 的回退</strong> —— v3 工程结构含 <code>scripts/ci/check_layering.sh</code>，v5 §15 只留 <code>scripts/init.d/</code>。</p>
+<p><strong>判断修正</strong>：<strong>"<code>ivsboxd</code> 是大单体"本身不是风险</strong>。128MB 内存 + 2×A7 的板子上，继续拆进程只会让每个进程各带一份 libc/mbedTLS，并把业务状态切成跨进程事务。真正的风险是<strong>边界靠自觉</strong>。因此落点应是编译期强制，而非"拆进程"。</p>
+<p><strong>建议措施</strong></p>
+<ol>
+<li><code>include/ivsbox/</code> 只放公共头；<code>src/modules/&lt;x&gt;/</code> 的私有头不进公共 include 路径（目录即边界）。</li>
+<li><code>core</code> / <code>hal</code> / 各 module 分别编成静态库，用 CMake <code>target_link_libraries</code> 把依赖方向写死 —— <strong>越界直接链接失败</strong>，比扫描 include 硬得多。</li>
+<li><code>check_layering.sh</code> 作为兜底重新加回并进 CI。</li>
+</ol>
+<hr>
+<h3>G8　procd respawn 无熔断</h3>
+<p><strong>现状</strong>：§12.3 表格仅"服务级：procd <code>respawn</code>"。§4.1 说"主控异常由 procd 先拉起，无法恢复时由硬件看门狗复位整机"，但未定义"无法恢复"的判据。</p>
+<p><strong>风险后果</strong>：进程崩溃循环会被 respawn 掩盖成"设备一直在重启"，问题在日志里表现为噪音而非故障。</p>
+<p><strong>建议措施</strong>：设置 respawn 次数上限；超限进入 failsafe 并<strong>停止喂狗</strong>（让硬件兜底），同时产生最高级别告警。明确"无法恢复"= 单位时间内 respawn 次数超阈值。</p>
+<hr>
+<h3>G9　时间跳变对媒体/审计/自愈/平台的连带影响</h3>
+<p><strong>现状</strong>：§7.7 只写了"小偏差渐进校正，大偏差在记录审计后设置，避免日志时间反复跳变"。</p>
+<p><strong>风险后果</strong>（外部评审提了命名与索引，实际影响面更大）</p>
+<ol>
+<li><strong>录像切片</strong>：§8.2 按 1~5 分钟切片，若文件名含本地时间，时钟回跳会造成文件名乱序甚至覆盖。</li>
+<li><strong>media.db 索引</strong>：§10.3 未规定 <code>ts</code> 字段时区，回跳会造成区间查询错乱。</li>
+<li><strong>TLS 时间死锁（最严重）</strong>：设备上电时 RTC 未同步 → 时间回到 1970 或默认值 → 证书有效期校验失败（"certificate not yet valid"）→ <strong>平台连不上</strong> → NTP/平台授时也拿不到 → 永久无法自愈。这是一个鸡生蛋的死锁，必须在设计上打破。</li>
+<li><strong>自愈熔断失效</strong>：§7.6 的"冷却、每小时/每天上限、时间窗口"全部依赖墙钟。时钟跳变会让频率限制算错 —— 可能绕过熔断造成重启风暴，也可能误熔断。</li>
+<li>门禁开锁的"有效期"、隧道 token 的 <code>ttl_s</code>、审计时间戳同样依赖时钟。</li>
+</ol>
+<p><strong>建议措施</strong></p>
+<ol>
+<li><strong>分离时钟</strong>：所有时长、窗口、超时、退避一律用 <code>CLOCK_MONOTONIC</code>；墙钟只用于"给人看的时间戳"和证书校验。</li>
+<li>墙钟增加"<strong>可信标志</strong>"：未同步前，媒体索引存"UTC + 单调计数"双字段，切片文件名用单调序号而非本地时间。</li>
+<li>时间不可信时放宽 TLS 证书时间校验（仅限时间维度，<strong>不得</strong>放宽链与主机名校验），或预置平台证书的时间容错窗口，明确记录该降级的审计。</li>
+<li>大偏差跳变前先归档当前媒体索引批次，避免跨批次查询错乱。</li>
+</ol>
+<hr>
+<h3>G10　现场诊断能力缺失</h3>
+<p><strong>现状</strong></p>
+<ol>
+<li><strong>core dump：v4 有（"core dump 留证"），v5 §12.1 全部删除</strong>，且 §13.1 权限表未涉及。</li>
+<li><strong>远程取证通道</strong>：§9.4 白名单只列了 <code>web</code>、<code>camera:&lt;id&gt;</code>、<code>media:&lt;id&gt;</code>， <strong>没有日志/状态取证服务名</strong> —— 断网录像出问题时无法远程取证。</li>
+</ol>
+<p><strong>建议措施</strong></p>
+<ol>
+<li>补 core dump 策略：是否启用、存放路径（建议 <code>/mnt/UDISK/ivsbox/core/</code>）、单个大小上限、总配额与滚动策略、是否随故障日志上报。</li>
+<li>§9.4 白名单增补只读诊断服务名（如 <code>log</code> / <code>diag</code>），并明确： <strong>只读、限速、有大小上限、不提供 shell、全部操作记审计</strong>。</li>
+<li>明确"media 崩溃/录像异常"场景的取证步骤（这是最容易现场扯皮的一类故障）。</li>
+</ol>
+<hr>
+<h3>G11　五类版本缺兼容矩阵</h3>
+<p><strong>现状</strong>：§5.1 定义了 IPC 协议版本，§10.2 定义了配置 schema 版本，但无统一视图。 §4.2 未定义 IPC 版本不匹配时的行为（拒绝并告警 vs 静默降级）。</p>
+<p><strong>建议措施</strong>：补一张兼容矩阵，覆盖 <strong>IPC / DB schema / 配置 schema / 平台协议 / 采集板协议</strong> 五类版本，并明确三条规则：</p>
+<ol>
+<li>三个常驻进程必须同 release、整体重启；</li>
+<li>IPC 版本不匹配 → <strong>拒绝连接并告警</strong>，不得静默降级；</li>
+<li>DB / 配置 schema 升级必须向前兼容一个版本（可读旧、写新）。</li>
+</ol>
+<hr>
+<h3>G12　错误码字典 / IPC 方法 ID 未进 §18 冻结项</h3>
+<p><strong>现状</strong>：§9.2 说"API 返回稳定错误码"，§7.1 提到"失败细分码"，但全文无错误码表； §5.2 只列了若干典型方法名，无完整方法 ID 表。§18 的 9 类冻结项未包含这两项。</p>
+<p><strong>建议措施</strong>：把"错误码字典（探活失败细分码 + 平台/业务错误码 + IPC 错误码）" 与"IPC 方法 ID 表"补入 §18 冻结项，与平台协议、UART 协议同级别管理。</p>
+<hr>
+<h2>4. P2 缺口详情</h2>
+<table>
+<thead>
+<tr><th>ID</th><th>现状</th><th>建议</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>G13</strong></td><td>§2 功能表只有"核心/条件能力/硬件待确认/平台待确认"，无 M0~M8 映射；第 18 项"归属：三个常驻进程协作"等于无归属</td><td>增加阶段列；每项指定<strong>主责进程</strong>，协作方列为消费方</td></tr>
+<tr><td><strong>G14</strong></td><td>自愈动作（断电/上电）全部由采集板执行（§7.6 + §2 第 7 项），但未定义 UART 断链时的行为</td><td>增加显式分支：链路不可用 → 抑制动作 + 告警 + <strong>不计入熔断</strong>，否则链路故障期会刷出大量无意义的动作失败审计</td></tr>
+<tr><td><strong>G15</strong></td><td>§13.2"平台连接使用 TLS……若现网暂不支持，形成明确整改项"，与 §1.3"私有协议默认字节级兼容"存在张力</td><td>降级为与 §2 第 22 项相同的"平台待确认"标记，M0 明确"若平台不支持 TLS，谁让步"</td></tr>
+<tr><td><strong>G16</strong></td><td>§7.2 缺省"无线优先、恢复后切回无线"；v4 的 <code>wan.revert = auto|no_revert</code> 与 <code>billing_guard</code>（流量阈值内不回切）<strong>已删除</strong>。<strong>2026-09-30 更新</strong>：§10.2 现行口径为 <code>sys.transport.mode</code>(1~4) + <code>netthr.*</code>，原 <code>net.wan.*</code> 六项已删</td><td>补回两个配置项的语义（落在 <code>sys.transport.mode</code> 的"自动选择"分支与 <code>netthr.*</code> 上）—— 缺省行为会消耗 4G 流量费，属真金白银的需求</td></tr>
+<tr><td><strong>G17</strong></td><td>§4.4 只说了 Web 不写配置，未说明 media 参数是否进配置。<strong>2026-09-30 更新</strong>：§10.2 已改为单文件 <code>ivsbox.json</code> + 8 个一级分类，<strong>尚未列 media 分类</strong>，原文引用的 <code>config/media.json</code> 已不存在</td><td>明确：media <strong>只读</strong>（不做写者）；其参数等 media 模块落地时按同一模型<strong>追加为新的顶层分类</strong>，重载由 ivsboxd 事件通知</td></tr>
+<tr><td><strong>G18</strong></td><td>§4.2 排除的是"DNS、同步 SNMP、同步 ONVIF、长时间文件 IO"；<strong>TLS 握手与配置 <code>fsync + rename</code> 未明确排除</strong></td><td>明确 TLS 握手走非阻塞状态机或交给 worker；配置写入（含目录 fsync）在 worker 完成，完成后事件回投 Reactor 提交状态</td></tr>
+<tr><td><strong>G19</strong></td><td>隧道帧结构等实现级参数在 v5 丢失</td><td>见附录 B，按需从 v4 取回</td></tr>
+</tbody>
+</table>
+<hr>
+<h2>附录 A　资源预算估算草表（起步假设，必须 M0 实测替换）</h2>
+<blockquote>
+<p>说明：下表为<strong>量级估算</strong>，用于给参数取值提供锚点，<strong>不得作为结论使用</strong>。实测方法：空载与 3 路录像两种工况下采集 <code>/proc/&lt;pid&gt;/status</code> 的 <code>VmRSS</code>/<code>VmPeak</code>、 <code>ls /proc/&lt;pid&gt;/fd | wc -l</code>、<code>cat /proc/meminfo</code>。</p>
+</blockquote>
+<table>
+<thead>
+<tr><th>项</th><th>起步假设</th><th>备注</th></tr>
+</thead>
+<tbody>
+<tr><td>内核 + 系统保留 + 页缓存</td><td>25~35 MB</td><td>页缓存可回收，但写 SD 时会增长</td></tr>
+<tr><td>logd + procd + netifd + udhcpc + nftables</td><td>4~6 MB</td><td>系统组件</td></tr>
+<tr><td><code>ivsboxd</code></td><td>6~10 MB</td><td>SQLite cache 建议 ≤2MB、mbedTLS ~0.5MB、状态镜像</td></tr>
+<tr><td><code>ivsbox-web</code></td><td>4~8 MB</td><td>代理缓冲 + 静态资源 + TLS</td></tr>
+<tr><td><code>ivsbox-media</code>（空闲）</td><td>3~5 MB</td><td></td></tr>
+<tr><td><code>ivsbox-media</code>（每路 RTSP remux）</td><td>8~15 MB</td><td>含 4~8MB 网络/IO 缓冲；<strong>不转码</strong></td></tr>
+<tr><td>4G 拨号栈</td><td>3~6 MB</td><td>QMI/ppp + 热插拔脚本</td></tr>
+<tr><td><strong>合计（3 路录像）</strong></td><td><strong>70~100 MB</strong></td><td>128MB 下余量约 25~55MB，<strong>无压力测试余量</strong></td></tr>
+</tbody>
+</table>
+<p><strong>结论</strong>：<code>media.max_channels</code> 缺省值应由本表倒推（建议缺省 2，硬上限 3~4）。另需单独核算文件描述符总额，并与系统缺省 <code>ulimit -n</code> 比对。</p>
+<h3>A.1 骨架期实测（2026-09-30，TQ113）</h3>
+<blockquote>
+<p>由"第 0 层清账 / R1~R3"补测。<strong>只有骨架（M1-S10）的数字</strong>：无平台连接、无 TLS、无媒体、无 SNMP / ONVIF、无业务状态镜像 —— 因此只能当"地板值"，<strong>不能当满载预算</strong>。</p>
+</blockquote>
+<p><strong>方法</strong>：板上运行 ARM 版 <code>ivsboxd</code>（<code>build/arm/ivsboxd</code>，md5 <code>d4969d2afd8329564680bbb08258bef8</code>），空载（Reactor 空闲轮询 1 s 超时 ＋ 健康线程 1 s 一次 ＋ 2 个 worker 空闲），启动后 8 s 与 28 s 各采一次 <code>/proc/&lt;pid&gt;/status</code> 与 <code>/proc/&lt;pid&gt;/fd</code>。</p>
+<table>
+<thead>
+<tr><th>项</th><th>实测</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>VmRSS</code></td><td><strong>1876 kB（≈1.83 MiB）</strong></td><td>两次采样一致（8 s / 28 s），无增长</td></tr>
+<tr><td><code>VmPeak</code></td><td>28316 kB</td><td>峰值与 <code>VmSize</code> 相等 ⇒ 从未真正碰过全部虚拟地址空间</td></tr>
+<tr><td><code>VmSize</code></td><td>28316 kB（≈27.7 MiB）</td><td>静态库 ＋ JSON / SQLite 映射的地址空间，<strong>不等于占用</strong></td></tr>
+<tr><td><code>Threads</code></td><td><strong>4</strong></td><td>main ＋ 2 worker ＋ health，与架构 §4.2 的设计一致</td></tr>
+<tr><td>fd 数</td><td><strong>12</strong></td><td>远低于缺省 <code>ulimit -n</code>（1024）</td></tr>
+<tr><td>CPU</td><td>20 s 内 2 tick（user 1 ＋ sys 1，USER_HZ＝100）⇒ <strong>约 0.1%</strong></td><td>空闲轮询的开销极低</td></tr>
+</tbody>
+</table>
+<p>整机基线（同一时刻）：<code>MemTotal</code> 225344 kB、<code>MemFree</code> 118696 kB、<code>MemAvailable</code> 164848 kB。</p>
+<p><strong>与原假设的差异</strong>：附录 A 给 <code>ivsboxd</code> 的起步假设是 <strong>6~10 MB</strong>，实测骨架期只有 <strong>1.83 MiB</strong> —— 差额来自"TLS ＋ 平台连接 ＋ 业务状态镜像 ＋ SQLite 实例负载"尚未进入。<strong>故附录 A 仍不可整体替换</strong>，满载工况（含 3 路录像、Web、media）的实测留待 M6 前补。</p>
+<p><strong>顺带更正两处假设</strong>：</p>
+<ol>
+<li>附录 A 把 <code>logd + procd + …</code> 计为系统组件，但板端<strong>没有 procd</strong>（2026-09-30 实测，见架构 §4.1），日志也不依赖 logd（<code>iv_log</code> 自写落盘）。</li>
+<li>实测 <code>MemTotal</code> ＝ <strong>225344 kB（约 220 MiB）</strong>，<code>/proc/cmdline</code> 另有 <strong><code>androidboot.dramsize=256</code></strong> （2026-09-30 二次取证）⇒ <strong>本板 DRAM 是 256 MB</strong>，G1 正文"片内 128MB DDR3"<strong>是错的</strong>；附录 A 的"128MB 下余量 25~55 MB"等推算<strong>须按 256 MB 重算</strong>（本表暂不改写，待 M6 前与满载实测一并替换）。</li>
+</ol>
+<hr>
+<h2>附录 B　v5 相对 v4 丢失的实现级参数（建议按需搬回对应小节）</h2>
+<p>搬回成本极低，收益是验收可直接判定。</p>
+<table>
+<thead>
+<tr><th>类别</th><th>v4 中的具体内容</th><th>v5 现状</th></tr>
+</thead>
+<tbody>
+<tr><td>隧道</td><td><code>TUN_OPEN</code> / <code>TUN_OPEN_ACK</code> / <code>TUN_DATA</code>(≤8KB) / <code>TUN_CLOSE</code>；token <code>ttl_s=300</code>；流分 CONTROL / BULK 两级（有线 512kbps、4G 256kbps）</td><td>只剩"受控多路复用"</td></tr>
+<tr><td>平台重连</td><td>指数退避序列 <code>1,2,4,8,16,30s</code>（上限 30s）+ 抖动</td><td>无</td></tr>
+<tr><td>SNMP</td><td>OID 模板匹配优先级（精确 &gt; 通配 &gt; generic）；<code>scale</code> / <code>offset</code> 换算；"立即测试 + 热重载"</td><td>只剩"品牌/型号模板"</td></tr>
+<tr><td>日志</td><td>运行日志保留 14 天 / 故障日志 90 天；<code>/data/log/run|fault</code> 路径</td><td>只剩"故障日志保留更长"</td></tr>
+<tr><td>双 WAN</td><td><code>wan.revert = auto|no_revert</code>；<code>billing_guard</code></td><td>删除（见 G16）</td></tr>
+<tr><td>配置</td><td>"U 盘导入"作为第三种配置来源</td><td>删除</td></tr>
+<tr><td>音频</td><td>"静默时段"</td><td>删除</td></tr>
+<tr><td>附录</td><td>附录 A 依赖清单（含体积/可否省略）、附录 B 设计取舍速查</td><td>无附录</td></tr>
+<tr><td>媒体</td><td>cgroup 限 CPU/内存</td><td>仅剩"限制 CPU/内存"文字</td></tr>
+<tr><td>诊断</td><td>core dump 留证</td><td>删除（见 G10）</td></tr>
+</tbody>
+</table>
+<hr>
+<h2>附录 C　评审方法与数据</h2>
+<ul>
+<li><strong>文档量对比</strong>：v4 = 952 行 / 79.7KB；v5 = 723 行 / 36.2KB（体积 -55%）。</li>
+<li><strong>结构对比</strong>：v5 的 H2 标题 20 个 vs v4 的 14 个 —— 说明 v5 是"<strong>新增治理章节 + 删减功能细节</strong>"，而非标题字面意义上的"整合"。这一点决定了不能假设"v4 的信息都在 v5 里"。</li>
+<li><strong>核查手段</strong>：逐条把 v5 的约束（§4.1、§4.2、§5.1、§9.4、§10.1、§12.3、§13.1、§15、§18）与 v4 对应章节（§2.1、§4.6、§4.19、§4.22、§5.4、§5.8、附录 A/B）对读，凡 v5 出现"上限/限制/更长/按需"等模糊限定词处，回查 v4 是否有具体数值。</li>
+</ul>
+<hr>
+<h2>附录 D　建议的关闭顺序</h2>
+<ol>
+<li><strong>M0 冻结项</strong>：G1（预算表）、G3（提权机制）、G15（TLS 定位）→ 更新 §18。</li>
+<li><strong>M1 编码前</strong>：G2（喂狗判据）、G4（媒体文件路径）、G5（启动分级）、G7（编译期边界）、G8（respawn 熔断）、G11、G12、G17、G18。</li>
+<li><strong>M3 前</strong>：G9（时钟分离）、G16（计费保护）。</li>
+<li><strong>M4 前</strong>：G6（并发探测量化 + 分池限流）、G14（UART 断链抑制）。</li>
+<li><strong>M5 前</strong>：G10（诊断能力）。</li>
+<li><strong>随迭代</strong>：G13、G19。</li>
+</ol>
+</body>
+</html>

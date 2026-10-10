@@ -21,6 +21,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | G20 配置目录递归创建（UDISK 重置后配置不再静默失效） | 已实现 | 2026-10-08 10:00 | `iv_config.c` 新增 `mkdir_p()`（与 `iv_db.c` 同语义），`iv_config_open()` 改逐级建目录；`test_config.c` 新增 c18 用例（父目录两级缺失下 open/watch/save/读回全链路，可反向证伪）。VM `test`/`asan`/`tsan` *15/15*、`arm` 零告警；反向证伪点已设（改回单级 `mkdir` ⇒ c18 关键断言应全 FAIL；执行按用户 2026-10-08 指示后置）。板端复跑按用户"测试后置"指示后补。详见本文件 2026-10-08 节。
 | S2.4 平台协议——协议层（M2 第五步；TCP 传输划归 M3） | 已实现（协议层） | 2026-10-09 11:14 | 新增 `iv_proto.h` / `iv_proto.c` / `test_proto.c`。二进制帧（F0F0/0F0F 双头＋ver/devtype/devid/cmd/qn1/qn2/len/data/crc8/FFFF）与 ## 文本帧两类组包解析；命令路由表（未命中自动 ACK 0x01）；CRC8 复用 S3。*口径变更：TCP 传输移 M3，本层经 on_tx/recv 回调解耦，单测零 socket*。实现中被单测抓出并修复帧头预写偏移 +1 的真 bug。VM `test` *19/19*、asan/tsan/analyze 全绿、`arm` 出 ARM EABI5；板端 `/tmp/test_proto` 输出与 Host 逐字一致。详见本文件 2026-10-09 节。
 | 程序与数据分家（程序迁 rootfs `/opt/ivsbox`，数据留 UDISK） | 已实现 | 2026-10-09 11:38 | 三个部署脚本的程序目录由 `/mnt/UDISK/ivsbox/current` 迁到 `/opt/ivsbox`：`monitor.sh` 新增 `IVSBOX_APP_DIR`、`S65ivsboxd` 新增 `IVSBOX_APP` 并预建/chown 程序目录、`start_ivsbox.sh` nohup 路径同步；熔断/守护逻辑一行未动。架构 §10/§11.2、计划 §0/§S10/§S7.2/§S7.3、闭环流程同步。*来源：旧会话 trae-opt 的未提交改动（用户 2026-09-30 拍板），本轮人工适配到 main 最新脚本后落库*。VM `sh -n` 三脚本全过。详见本文件 2026-10-09 11:38 节。
+| S3.6 上报装配层（控制板数据 → 平台报文 → 队列 → 传输）（M3 第五步） | 已实现（VM 全量验证 ＋ 反向证伪通过） | 2026-10-10 11:41 | 新增 `include/ivsbox/iv_report.h` ＋ `src/modules/report/iv_report.c`（进 `libivmodules`）＋ `tests/unit/test_report.c`（7 组）＋ `tests/integration/test_e2e_report.c`（首个自包含集成用例）。*落点由计划原文 `src/app/` 更正为 `src/modules/report/`*（app 层 `.c` 不进静态库 ⇒ 单测链接不到符号）。*补齐 S2.4 交出的装配层缺口*：采集板 `ttySAC5`→`iv_serial`→`iv_frame`→`iv_link`→`iv_status`，周期/触发上报组 `##` 帧入 S3.4 队列、S3.5 取件泵按序补传；平台查询经 `iv_proto` 路由回填 QN。*协议口径按用户 2026-10-10 三项拍板冻结*（上报帧 CRC 只覆盖 `&&数据区&&`、查询响应 `##`+JSON+`##`、`crc`=`ver+devtype+tid+cmd`）。VM `make test` *25/25*、asan/tsan/analyze/arm 全绿零告警；E2E（假采集板 pty ＋ 假平台回环 TCP、零 mock）9 组全过；反向证伪 4 条机制级变异均按预期。详见本文件 2026-10-10 11:41 节。
 |===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
@@ -975,3 +976,58 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 === 板端验证口径（与 VM 的差异，务必记牢）
 
 板子只有 `eth0` 一条*可用* WAN（`usb0` 无拨号脚本、当前 DOWN），把默认出口真切过去会*切断唯一管理链路*；故板端只做*安全*的真机验证：让状态机"切到 eth0"，实际效果是*新增一条同样指向 `eth0` 的 `metric 100` 默认路由*（DHCP 的 `metric 204` 那条与 `192.168.2.0/24` 直连路由都不动，SSH 走直连路由，不受影响），验完即删并确认还原。*"真切换"的等价证据由 VM netns 提供*。
+
+== 2026-10-10 11:41 S3.6 上报装配层（M3 第五步）
+
+=== 干了什么事
+
+- *`ivsbox/include/ivsbox/iv_report.h`（新增）*：接口与全部口径契约（文件头登记数据段字段表、三处与指令表不一致的处置、两条发送路由、`DS` 语义待确认）。
+  - 环境注入 `iv_report_env_t`：`cns[6]` / `mn[2]` / `csq`（`<0` = 未知 ⇒ 不上传该字段）/ `have_loc` / `lat` / `lng` / `err`。
+  - 配置 `iv_report_cfg_t`：串口路径、平台 host/port（NULL 或空 ⇒ 不启平台链路）、队列目录、`devid`/`devtype`、三个周期（report/heartbeat/poll）、`mod`/`sv`。
+  - 句柄 `iv_report_t`：内嵌 `iv_status_t` / `iv_link_t` / `iv_proto_t` / `iv_queue_t` / `iv_transport_t`，以及取件泵本体 `iv_transport_pump_t`（*传输层只存指针，故本体须在装配层持有*）；串口发送暂存 512 B、四个到期时刻、九项统计。*零 malloc*（约 15 KB）。
+  - API：`cfg_default` / `init` / `open(rp,cfg,r,now_ms)` / `step(now_ms)` / `on_serial` / `trigger` / `close`；纯函数 `build_seg` / `query_crc` / `build_query_json`；只读读数 7 个；测试辅助 2 个。
+- *`ivsbox/src/modules/report/iv_report.c`（新增，进 `libivmodules.a`）*：见下"解决什么问题"；含串口薄包装（部分写前移、溢出即丢弃并计数）、采集板/平台各路回调、组包与三个定时器驱动。
+- *`ivsbox/tests/unit/test_report.c`（新增，7 组断言 c01~c07）*：c01 黄金数据段（逐字节）＋该段被 `iv_proto_text_frame` 接受且 CRC 只覆盖 `&&数据区&&`；c02 未刷新字段不上传；c03 `DS=2` 原值直传；c04 `CNS`/`MN`/`CSQ`/`LAT`/`LNG`/`ERR` 条件字段；c05 NULL / `dt` 非法 / `IV_ERANGE`；c06 `query_crc` 黄金（`110400101E3`→`0x06`、`110400101E1`→`0x08`）＋区分力断言；c07 E3 JSON 黄金＋NULL 降级＋`ERANGE`。
+- *`ivsbox/tests/integration/test_e2e_report.c`（新增；首个自包含集成用例，9 组 c00~c09）*：假采集板＝pty 对、假平台＝回环真 TCP、队列＝临时目录，*零 mock*。
+- *`ivsbox/src/modules/config/iv_config.c`*：`sys.report.interval_s` 默认值 `60`→`300`（对齐指令表 0xF5 示例 300 s）。
+- *`ivsbox/src/modules/proto/iv_proto.c` ＋ `iv_proto.h`（S2.4 口径修正）*：`##` 上报帧 CRC 改"只覆盖段内第一个 `&&` 起到段尾"、长度域＝*整段字符数*、段内必含 `&&` 否则 `IV_EINVAL`；新增 `iv_proto_json_frame()` / `iv_proto_send_json()`（`##`+JSON+`##`）。
+- *文档同步*：架构新增 §18.1（平台帧与上行数据段冻结）；`功能开发计划.md` 多处；`src/modules/readme.txt`；新建 `src/modules/report/readme.txt`；重写 `tests/integration/readme.txt`。
+
+=== 解决什么问题
+
+- *补齐 S2.4 交出的装配层缺口*：S2.4 明确"只做协议不做传输"、把"上报/查询响应的业务数据生成"留给装配层 —— 此前 `iv_status_snapshot_json()` 与 `iv_proto_send_text()` 全仓库无人调用、没有拼 `QN=0;TID=..;VER=..;DEVTYPE=..;CP=&&K=V;…&&` 的代码。本层把 M2 的采集板链路、S3.4 队列、S3.5 传输与 S2.4 协议*拼成端到端可运行的一层*。
+- *两条发送路由刻意分开*：周期/立即上报*入队*（断线自然积压、恢复按序补传，与 `iv_queue` 的"至少一次"闭环）；查询应答/ACK/心跳走 `on_tx` *直发*（非 UP 时传输层返回 `IV_ESTATE`，不积压过期帧）。队列里存的是*已组好的整帧线路字节*，补传时纯透传、不重新组帧。
+- *平台协议口径按权威冻结*（用户 2026-10-10 三项拍板）：① 上报帧 CRC8 只覆盖 `&&数据区&&`；② 查询响应帧＝`##`+JSON+`##`（无长度域、无尾 CRC）；③ 查询响应 `crc`＝`ver+devtype+tid+cmd`（cmd 取被应答的命令号，E3 → `110400101E3` → `0x06`）。
+- *`DS` 无权威定义 ⇒ 不猜*：指令表字段表里没有 `DS` 行，只有示例串 `T=31.33;DS=1;P=0;` 有它，故*原值直传*采集板 `DS`（1 关 / 2 开）并显式登记待平台确认（架构 §18.1 E.1）。
+- *可测*：纯函数（组包/CRC/JSON）与装配逻辑分离；reporter 的串口/平台/队列都可换成 pty/回环 TCP/临时目录 ⇒ 端到端路径能*零 mock* 断言。
+
+=== 影响范围
+
+- *新增依赖*：无新外部库（仅 libc 与既有 pthread）；`Makefile` *一字未改*（`src/modules/*/*.c`、`tests/unit/*.c`、`tests/integration/*.c` 均通配收集）；架构 §15.5 模块计数 ＋1（`report/`）。
+- *S2.4 口径修正的连带*：`iv_proto.c` 的 `text_frame` 改了 CRC 覆盖范围与长度域语义 ⇒ 原"按整段算 CRC"的单测黄金值同步更新，并加区分力断言 `iv_crc8(seg,seg_len,0) != crc`。
+- *配置默认值变更*：`sys.report.interval_s` 由 60 s 改 300 s（已核对 `test_config.c` 不依赖该默认值，无回归）。
+- *未接进主进程（登记）*：本轮*不动 `main.c`* —— M3 的 S3.1~S3.5 也尚未接进 `ivsboxd`，且另一会话 `codex-issues` 对 `main.c` 有未提交大改（规则 7.7）⇒ 装配进主进程、配置键（`sys.report.interval_s`/平台地址/队列上限）读取接线一并登记为后续动作。
+
+=== 验证方式与结果
+
+- *编译 VM（Ubuntu 22.04 / gcc 11.4，`ssh tqt113`）*：
+  - `make test` *25/25 全过零告警*（`test_report passed (seg/frame/query-crc/json/env)`、`test_proto passed (build/parse/sticky/crc/text/route/ack/hb/null)`）；
+  - `make host` rc=0；`make asan`（25/25）、`setarch -R make tsan`（25/25）、`make analyze` rc=0 零告警、`make arm` rc=0 零告警出 *ELF32 ARM EABI5*（`build/arm/ivsboxd` 86572 B）；
+  - 集成：`test_e2e_report passed (poll/mirror/report/queue/replay/query/ack)` rc=0。
+- *E2E 9 组（零 mock）*：c01 `0xE1` 轮询帧字节级黄金；c02 `0xE1` 应答→镜像刷新（`st.valid.T`/`V`/`DS`/`RELAY`）；c03 平台 UP；c04 立即上报→平台收到（字段顺序 / `##` 壳 / `&&数据区&&` CRC 独立复算对比）；c05 断开→入队积压 3 条（`CSQ` 11/12/13）；c06 恢复→*按序补发（到达顺序＝序号顺序）且队列清空*；c07 E3 查询→`qn` 原值回填 ＋ `crc`＝`06`；c08 未注册命令→回 ACK(0x01)；c09 close。
+- *反向证伪 4 条机制级变异（判据 `grep -c '^FAIL:'`，基线 0）*：
+  - ① CRC 覆盖改回整段 ⇒ *TOTAL FAIL=3*（`test_proto` 1 ＋ `test_report` 1 ＋ E2E 1）；
+  - ② `DS` 做 1↔2 映射 ⇒ *TOTAL FAIL=3*（`test_report` 2 ＋ E2E 1）；
+  - ③ done 回调配对判据由 `IV_FRAME_CMD_QUERY` 改 `IV_FRAME_CMD_THRESH` ⇒ *TOTAL FAIL=8，且全在 E2E*（两个单测各 0）—— 正说明 E2E 补了单测盲区；
+  - ④ 上报绕过队列直发 ⇒ *TOTAL FAIL=6*（全在 E2E）。
+  - 恢复后重编确认回全绿。
+- *板端（2026-10-10，TQ113 `armv7l`／内核 `5.4.61-rt37`）*：ARM 版 `test_report` / `test_proto` / `test_e2e_report` 上板实跑*全部过、RC=0*，结果行与 Host *逐字一致*；三份 ARM 二进制 md5 与 VM 一致（`807265f0b117997ad8389f6100311c8f`／`7baf455937dc037f132fc23de9627aee`／`51f0a3a3abe06bacf42ff4eabb22ee02`）。板端有 `/mnt/UDISK`，故无 Host 上那条 `iv_log: cannot create /mnt/UDISK/log/...` 告警。*仍待办*：用*真实采集板*硬件跑 E2E（本轮采集板由 pty 模拟）。
+- 临时产物（本机 `%TEMP%/wb_s36`、VM `/tmp/wb_s36*`、`/tmp/probe*` 等）用毕即删。
+
+=== 实现中修掉的真缺陷（细节）
+
+`iv_link` 的 done 回调是*逐笔*登记的：`iv_link_init()` 只收 `on_tx`/`on_upstream`/`on_change`/`arg`，*不收* done；done 在每次 `iv_link_send()` 时单独传入，且 `iv_link_recv()` 里有 `if (done != NULL)`。`rep_poll()` 初版错传 `NULL` ⇒ 0xE1 应答被静默丢弃、*状态镜像永不刷新*。
+
+*为何单测没抓到*：纯函数单测只验组包，不跑"发查询 → 收应答 → 刷新镜像"这条链路；只有 E2E 的 c02 能跑通它。
+
+*修复*：`rep_poll()` 改传 `on_link_done, rp`，并加前向声明与注释（写明"done 逐笔登记、传 NULL 会吞掉应答"）。

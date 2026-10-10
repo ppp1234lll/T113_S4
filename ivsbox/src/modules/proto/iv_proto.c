@@ -40,18 +40,46 @@ static uint8_t frame_crc(const uint8_t *buf, size_t total)
     return iv_crc8(&buf[OFF_VER], cover, IV_CRC8_SEED_INIT);
 }
 
+/*
+ * 在 seg[0..seg_len) 内找第一个 "&&"，返回其下标；找不到返回 -1。
+ * 不依赖 NUL 结尾（seg 是显式长度的一段文本，未必以 '\0' 收尾）。
+ */
+static long report_suffix_off(const char *seg, size_t seg_len)
+{
+    size_t i;
+
+    if (seg == NULL || seg_len < 2u)
+        return -1;
+    for (i = 0; i + 1u < seg_len; i++) {
+        if (seg[i] == '&' && seg[i + 1u] == '&')
+            return (long)i;
+    }
+    return -1;
+}
+
 /* ---------------------------------------------------------------------------
- * ## 文本帧
+ * ## 上报文本帧
+ *
+ * 长度域＝整段字符数；CRC8 **只覆盖数据区**（段内第一个 "&&" 起到段尾）。
+ * 详见 iv_proto.h 文件头"## 周期上报帧"。
  * ------------------------------------------------------------------------- */
 int iv_proto_text_frame(const char *seg, size_t seg_len,
                         uint8_t *out, size_t *out_len)
 {
-    size_t need;
+    static const char hex[] = "0123456789abcdef";
+    size_t  need;
+    long    off;
+    uint8_t crc;
 
     if (seg == NULL && seg_len != 0)
         return IV_EINVAL;
     if (seg_len > IV_PROTO_TXT_DATA_MAX)
         return IV_ERANGE;
+
+    /* 先定位数据区（CRC 覆盖范围的起点）。无 '&&' ⇒ 畸形段，拒绝。 */
+    off = report_suffix_off(seg, seg_len);
+    if (off < 0)
+        return IV_EINVAL;
 
     need = IV_PROTO_TXT_FIXED + seg_len; /* ## + 4 + seg + 2 + ## */
     if (out == NULL || *out_len == 0) {
@@ -73,14 +101,49 @@ int iv_proto_text_frame(const char *seg, size_t seg_len,
     if (seg_len != 0)
         memcpy(&out[6], seg, seg_len);
 
-    {
-        static const char hex[] = "0123456789abcdef";
-        uint8_t crc = iv_crc8(seg, seg_len, IV_CRC8_SEED_INIT);
-        out[6 + seg_len]     = (uint8_t)hex[crc >> 4];
-        out[6 + seg_len + 1] = (uint8_t)hex[crc & 0x0Fu];
-    }
+    /* CRC 只算 [off, seg_len)——即 `&&数据区&&`，不含前缀 */
+    crc = iv_crc8(seg + off, seg_len - (size_t)off, IV_CRC8_SEED_INIT);
+    out[6 + seg_len]     = (uint8_t)hex[crc >> 4];
+    out[6 + seg_len + 1] = (uint8_t)hex[crc & 0x0Fu];
     out[6 + seg_len + 2] = '#';
     out[6 + seg_len + 3] = '#';
+
+    *out_len = need;
+    return IV_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * ## 查询响应 JSON 帧
+ *
+ * ## + JSON + ##（**无长度域、无尾 CRC**，与上报帧不同壳）。
+ * 详见 iv_proto.h 文件头"## 查询响应帧"。
+ * ------------------------------------------------------------------------- */
+int iv_proto_json_frame(const char *json, size_t json_len,
+                        uint8_t *out, size_t *out_len)
+{
+    size_t need;
+
+    if (json == NULL && json_len != 0)
+        return IV_EINVAL;
+    if (json_len > IV_PROTO_TXT_DATA_MAX)
+        return IV_ERANGE;
+
+    need = IV_PROTO_JSON_FIXED + json_len; /* ## + json + ## */
+    if (out == NULL || *out_len == 0) {
+        *out_len = need;
+        return IV_OK;
+    }
+    if (*out_len < need) {
+        *out_len = need;
+        return IV_ERANGE;
+    }
+
+    out[0] = '#';
+    out[1] = '#';
+    if (json_len != 0)
+        memcpy(&out[2], json, json_len);
+    out[2 + json_len] = '#';
+    out[3 + json_len] = '#';
 
     *out_len = need;
     return IV_OK;
@@ -315,6 +378,22 @@ int iv_proto_send_text(iv_proto_t *pf, const char *seg, size_t seg_len)
     if (rc != IV_OK)
         return rc;
     pf->on_tx(buf, tlen, pf->tx_arg);
+    pf->tx_frames++;
+    return IV_OK;
+}
+
+int iv_proto_send_json(iv_proto_t *pf, const char *json, size_t json_len)
+{
+    uint8_t buf[IV_PROTO_JSON_FIXED + IV_PROTO_TXT_DATA_MAX];
+    size_t jlen = sizeof(buf);
+    int rc;
+
+    if (pf == NULL)
+        return IV_EINVAL;
+    rc = iv_proto_json_frame(json, json_len, buf, &jlen);
+    if (rc != IV_OK)
+        return rc;
+    pf->on_tx(buf, jlen, pf->tx_arg);
     pf->tx_frames++;
     return IV_OK;
 }

@@ -15,14 +15,23 @@
  *       高/低两个 32 位字（QN1 高位字、QN2 低位字，大端字节序在线路上）；
  *     - 响应帧 CMD = 原命令，DATA[0] = 0x01 成功 / 0x70~0x7F 错误码。
  *
- *   ── ## 字符串数据帧（设备→平台，周期上报与查询响应）──
+ *   ── ## 周期上报帧（设备→平台）──
  *     ## + 4 位 ASCII 十进制长度 + 数据段 + 2 位 ASCII 十六进制 CRC8 + ##
- *     - 长度＝数据段字符数（4 位前导零）；
- *     - CRC8 对**数据段**计算（含前后 &&），与 MCU 的 calc_crc8 同参；
- *     - 数据段两种形态：
- *         周期上报: QN=0;TID=..;VER=..;DEVTYPE=..;CP=&&K=V;K=V;...&&
- *         查询响应: {"code":0,"qn":"...","data":{...}}（具体键由各命令决定，
- *                   本层不解析其内容，只负责打包成 ## 帧）。
+ *     - 长度＝**整段**字符数（4 位前导零，含 `QN=..;…;CP=` 前缀）；
+ *     - CRC8 **只覆盖数据区**，即数据段内**第一个 `&&` 起到段尾**的那一段
+ *       （`&&K=V;K=V;…&&`），与 MCU 的 calc_crc8 同参；**不含** `QN=..;CP=` 前缀。
+ *       依据：指令表《正常上报》文案 + 参考实现 `com.c` 的
+ *       `p = strstr(data,"&&"); crc = calc_crc8(p, strlen(p));`（2026-10-10 核对）。
+ *       数据段内**必须**含 `&&`，否则本层返回 `IV_EINVAL`（缺数据区是畸形段，
+ *       发出去平台必拒——宁可失败不发）。
+ *     - 数据段形态：QN=0;TID=..;VER=..;DEVTYPE=..;CP=&&K=V;K=V;...&&
+ *
+ *   ── ## 查询响应帧（设备→平台，**与上报帧不同壳**）──
+ *     ## + JSON + ##
+ *     - **无 4 位长度域、无尾 2 位 CRC**（依据《指令-通用版》"查询指令" sheet
+ *       的多个示例，如 `##{"code":0,"qn":"…","data":{…}}##`）；
+ *     - 其内部 `crc` 字段是 **JSON 的一个键**，由装配层按业务公式生成，
+ *       本层不解析内容、只负责套 `##` 壳。
  *
  * ============================ 职责边界（用户 2026-10-09 拍板） ============================
  * **只做协议，不做传输**：TCP 连接、断线重连、出口选择全部归 M3 网络管理。
@@ -62,8 +71,10 @@ extern "C" {
 
 /* 二进制帧固定部分长度（头2+ver1+type2+id3+cmd1+qn8+len1+crc1+tail2） */
 #define IV_PROTO_BIN_FIXED    21u
-/* ## 帧固定部分长度（## + 4 位长度 + 2 位 CRC + ##） */
+/* ## 上报帧固定部分长度（## + 4 位长度 + 2 位 CRC + ##） */
 #define IV_PROTO_TXT_FIXED    8u
+/* ## 查询响应帧固定部分长度（## + … + ##；**无**长度域与尾 CRC） */
+#define IV_PROTO_JSON_FIXED   4u
 
 /* 二进制帧 DATA 上限。LEN 字段 1 字节（0~255）；255 同时留足心跳/ACK 空间。 */
 #define IV_PROTO_BIN_DATA_MAX 255u
@@ -156,13 +167,23 @@ typedef void (*iv_proto_tx_cb)(const uint8_t *bytes, size_t len, void *arg);
  * ------------------------------------------------------------------------- */
 
 /*
- * 把数据段打包成完整 ## 帧：
- *   ## + %04u(len) + <data> + %02x(crc8(data)) + ##
- * data 段 CRC8 与 MCU 的 calc_crc8 同参（seed 0、逐位 SMBUS）。
+ * 把上报数据段打包成完整 ## 帧：
+ *   ## + %04u(整段长度) + <seg> + %02x(crc8(`&&数据区&&`)) + ##
+ * CRC8 **只覆盖段内第一个 "&&" 起到段尾**（`&&K=V;…&&`），不含 `QN=..;CP=` 前缀，
+ * 与 MCU 的 calc_crc8 同参（seed 0、逐位 SMBUS）。**段内无 "&&" ⇒ IV_EINVAL**。
  * out_len 实际写入字节数（含 ##）。out 为 NULL 或 *out_len 为 0 时只做长度
  * 探测（*out_len 返回所需长度）；缓冲不足返回 IV_ERANGE 且不动 out 内容。
+ * seg_len > IV_PROTO_TXT_DATA_MAX ⇒ IV_ERANGE。
  */
 int iv_proto_text_frame(const char *seg, size_t seg_len,
+                        uint8_t *out, size_t *out_len);
+
+/*
+ * 把查询响应 JSON 打包成完整 ## 帧：## + <json> + ##（**无长度域、无尾 CRC**）。
+ * json_len > IV_PROTO_TXT_DATA_MAX ⇒ IV_ERANGE；NULL+0 非法组合 ⇒ IV_EINVAL。
+ * out 为 NULL 或 *out_len 为 0 时只做长度探测；缓冲不足返回 IV_ERANGE。
+ */
+int iv_proto_json_frame(const char *json, size_t json_len,
                         uint8_t *out, size_t *out_len);
 
 /* ---------------------------------------------------------------------------
@@ -264,8 +285,11 @@ int iv_proto_heartbeat(iv_proto_t *pf);
 int iv_proto_send(iv_proto_t *pf, uint8_t cmd, uint32_t qn1, uint32_t qn2,
                   const void *data, uint16_t len);
 
-/* 发 ## 文本帧（组帧 + on_tx；用于周期上报与查询响应） */
+/* 发 ## 上报帧（组帧 + on_tx；用于周期上报） */
 int iv_proto_send_text(iv_proto_t *pf, const char *seg, size_t seg_len);
+
+/* 发 ## 查询响应 JSON 帧（组帧 + on_tx） */
+int iv_proto_send_json(iv_proto_t *pf, const char *json, size_t json_len);
 
 #ifdef __cplusplus
 }

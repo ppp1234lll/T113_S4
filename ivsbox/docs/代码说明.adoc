@@ -29,6 +29,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | S3.9 4G 数据面自动拉起与运行期看护 | 已实现（板端实测：三次重启 ＋ `AT+RESET` 掉线自愈） | 2026-10-12 11:03 | 新增 `ivsbox/scripts/init.d/S62usb4g`（编号 62>60）＋ `Makefile` 的 `package-copy` 显式补入（该 target 是列举式非通配）。*先把 §18.3 ⚠② 查清、结论与原纪录不同*：**开机侧本就可用**（镜像 udev 冷插拔链路 `S10udev`→`11-usb-autodial.rules`→`usb-EC200G-inserted.sh` 会拨号，禁用本脚本后连跑两次重启 `usb0` 均自动 UP+IPv4）；**真正缺口在运行期**（PDP 掉线后无重拨；开工时板子自 10-08 连跑 4 天，`usb0` 停 DOWN、`QNETDEVCTL?=0,0,0,0`）。脚本＝**开机幂等兜底 ＋ 30 s 看护**：`healthy` 不碰 AT，`degraded` 才恢复（AT 口自动探测、`usbnet`/`CPIN` 校验、仅在 PDP 未激活时 `AT+QNETDEVCTL=1,1,1`）。实测三次 reboot 后 usb0 自动 UP+IP、看护常驻；`AT+RESET` 注入后约 10 s 自愈；`sh -n` 通过。详见本文件 2026-10-12 11:03 节。
 | S3.1 补同步链路查询 ＋ `iv_agent` 开局摸底 | 已实现（VM 全量验证 ＋ 反向证伪 2 条 ＋ 板端 ARM 验收通过） | 2026-10-12 15:00 | 新增 `iv_netlink_link_up()`（`SIOCGIFFLAGS`，零 netlink 请求、未 attach 可用、返回码加 `IV_ENOENT`）＋ `iv_agent_open()` 开局逐条 WAN 摸底；`test_agent_switch.c` 删掉真网卡模式的 promisc 顶事件补偿，`test_netlink.c` 新增 c13。*判据＝`IFF_UP && IFF_RUNNING` 而非 `UP && LOWER_UP`*：`ifreq.ifr_flags` 是 `short`，`IFF_LOWER_UP=0x10000` 装不下（板端实测 `ioctl=0x1043`、`ip` 同刻报 LOWER_UP；sysfs 亦无该位）⇒ 如实写"语义等价代理"。VM `make test` 26/26、`asan`/`tsan` 0 FAIL、netns 用例与 `test_e2e_report` RC=0；反向证伪 2 条（4 行／1 行 FAIL）；板端 ARM `test_netlink` ＋ 真网卡 `test_agent_switch` 均 RC=0、路由逐字还原。详见本文件文末 2026-10-12 15:00 节。 |
 | iv_link 帧超时（gap_ms）默认打开 —— 修"半截帧永久卡死状态机" | 已实现（VM 全量验证 ＋ 反向证伪 2 条 ＋ 板端 ARM 验收通过） | 2026-10-12 16:16 | `iv_link_cfg_t` 增 `gap_ms`（0＝关闭）＋ 新增 `IV_LINK_GAP_MS_DEFAULT=500u`；`iv_link_init()` 传 `cfg.gap_ms`（原写死 0）；`iv_link_tick()` 调 `iv_framer_tick()`（超时检查搭既有 200 ms 总线节拍，不新增定时器/fd/线程）。原状：全库无 `iv_framer_tick()` 调用点 ⇒ 半截帧（采集板发一半掉电）令状态机永久停在收 data、后续帧全被吃成 data、串口链路永久失效。取值硬约束：`gap_ms` 必须 > tick 周期（200 ms），否则被节拍切开的正常帧会被误判成半帧。既有单测/fuzz 的 cfg 位置初始化补第 4 字段 `0u`（语义逐字不变）＋ 新增第 12 组用例（半帧复位 ＋ gap=0 对照）。VM `test` **25/25**、`asan`/`tsan` 0 FAIL、host/arm/analyze 零告警、`test_e2e_report`/`test_agent_switch` RC=0；**反向证伪 2 条各 4 行 FAIL**；板端 ARM `test_link` RC=0、输出与 Host 逐字一致、md5 与 VM ARM 一致。详见本文件文末 2026-10-12 16:16 节。 |
+| A1 装配层配置接线：平台地址"按活动出口选"（＋ 三项口径纠正） | 已实现（VM 全量验证 ＋ 反向证伪 2 条 ＋ 板端 ARM 验收通过） | 2026-10-12 16:50 | `iv_report` 增**自持目标地址** `srv_host`/`srv_port` ＋ `iv_report_set_server()`（只改副本、不主动断连）；`reconnect()` 一律按副本重连。`iv_agent_cfg_t` 的单一 `server_host/port` 改为 `srv_host[IV_WAN_N]`/`srv_port[IV_WAN_N]`（下标＝`iv_wan_t`）；`agent_initial_wan()` 定初始活动口（只有 `WIRED_ONLY` 从有线起步），`agent_reconnect()` 按 **netmgr 传入的 `new_ifindex` 反推**出口换址后重连，`agent_pick_host()` 实现"本口没配回退另一口"。`main.c` 读 `net.server.{wireless,wired}.{host,port}` 四条键。**口径纠正（按架构 §10.2，与上一轮口头建议不同）**：① 身份不进配置 ⇒ `devid` 不设键（待 S5.5 读 `private`）；② 网口由 `sys.transport.mode` 隐含、原 `net.wan.*` 六项已删 ⇒ 网卡名与 netmgr 阈值不新增键；③ 切换门限正源是 `netthr.loss_count`（现状由 `probe.max_fail` 同源喂，本轮未动，登记待办）。**行为变更**：初启选址由"有线优先"变"按初始活动出口（默认无线优先）"。验证：VM `test` **25/25**、`asan`/`tsan` 0 FAIL、host/arm/analyze 零告警、`test_e2e_report` 与 `test_agent_switch`(netns) **RC=0 · 0 FAIL**（后者 6 条新地址断言在真 TCP 上证实"无线→有线→无线"换址）；**反向证伪 2 条各 3 行 FAIL**（出口反推失效／`set_server` 变空操作）；板端 ARM `test_report` RC=0、md5 `c3619640…`、输出与 Host 逐字一致，`test_agent_switch` 板端 SKIP（无 `unshare`）RC=0。**未做**：`netthr.loss_count` 接线、`ok_n`/`hold_s`/`stable_s` （架构缺键）、`devid`/`mod` 来源。详见本文件文末 2026-10-12 16:50 节。 |
 |===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
@@ -1372,3 +1373,43 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 * *反向证伪 2 条（机制级）*：① `iv_link_init()` 把 gap 传回 `0` ⇒ 第 12 组用例 **4** 行 FAIL；② 删掉 `iv_link_tick()` 里的 `iv_framer_tick()` 调用 ⇒ 同样 **4** 行 FAIL。**基线 0 行 FAIL、两条还原后复验 0 行 FAIL、源文件与备份 diff 一致** ⇒ "传参"与"节拍驱动"两个环节都被钉住（只改一处同样会红）。
 * *板端（2026-10-12 16:1x，TQ113 `armv7l`）*：ARM 版 `test_link` md5 `4674c7bab7db472b0047c17d99d70cc5`（与 VM ARM 产物一致）、输出与 Host **逐字一致**（含 `/framegap`）、**RC=0**；跑完 `rm -f /tmp/test_link_fg` 清理。
 * *未做（如实登记）*：真采集板半帧现场注入（待 `ttySAC5` 现场）；`gap_ms` 配置化；板端长稳观察 `resets` 计数。
+
+
+== 2026-10-12 16:50 A1 装配层配置接线：平台地址"按活动出口选"（＋ 三项口径纠正）
+
+=== 干了什么事
+
+* `include/ivsbox/iv_report.h` / `src/modules/report/iv_report.c`：句柄新增**自持目标地址** `char srv_host[IV_TRANSPORT_HOST_MAX]` ＋ `uint16_t srv_port`；`iv_report_open()` 从 `cfg.server_host/port` 拷入并据此建连；`iv_report_reconnect()` 一律按这份副本重连（不再从 `rp->tr.host` 回取）；新增 `iv_report_set_server(rp, host, port)`——**只改写副本、不主动断连**（下一次 `reconnect` 生效），host 空/port 0 清空（此后 reconnect 返回 `IV_ESTATE`），host 超长返回 `IV_ERANGE`。
+* `include/ivsbox/iv_agent.h` / `src/modules/agent/iv_agent.c`：cfg 的 `server_host`/`server_port` 改为 `srv_host[IV_WAN_N]`/`srv_port[IV_WAN_N]`（下标＝`iv_wan_t`，与既有 `wan_name[IV_WAN_N]` 同风格）；新增 `agent_initial_wan()`（初始活动出口：只有 `WIRED_ONLY` 从有线起步，其余从无线起步，与 netmgr 初始态 `WIRELESS_UP` 对齐）与 `agent_pick_host()`（按出口取址，**本口没配则回退另一口**）；`iv_agent_open()` 按初始活动出口选址填 `rc.server_host/port`；`agent_reconnect()` 改为"按 **`new_ifindex` 反推**目标出口 → `iv_report_set_server()` 换址 → `iv_report_reconnect()` 断旧连新"。
+* `src/app/main.c`：新增 `cfg_str()`/`cfg_port()` 两个助手，平台地址改读 `net.server.wireless.{host,port}` 与 `net.server.wired.{host,port}` 四条键（删掉原来的"有线优先、空则无线"静态选择逻辑）。
+* 测试：`test_report.c` 新增第 8 组（`set_server` 边界：NULL / 未 open）＋ `test_agent_switch.c` 新增两个回环地址常量、`listen_port()` 改绑 `INADDR_ANY`、cfg 填两条地址、k01/k04/k06 各加两条断言（`srv_host` 与 `tr.host`）。
+
+=== 解决什么问题
+
+* 改动前：装配层只有**一个**平台地址（`server_host/port`），`main.c` 按"有线优先、为空则退无线"**静态**取值 ⇒ 与架构 §10.2 给出的**两组**地址（`net.server.wired.*` / `.wireless.*`）不匹配；netmgr 切出口后平台 TCP 虽然重建，但**建到的是同一条（可能已不可达的）地址**。
+* 改动后：平台地址按**当前活动出口**选，且在出口切换时通过 `set_server()` 换址后再重连 —— 即架构 §7.2「关闭绑定旧接口的 TCP，再用新出口重建」的**完整**语义（原来只做对了一半：断与重建有，换址没有）。
+
+=== 三项口径纠正（重要，按架构 §10.2 原话，取代上一轮的口头建议）
+
+1. **`devid` 不设配置键**。架构 §10.2：「**身份不进配置**：设备 ID、MAC 由 `private` 分区读取，JSON 里**不落键**（避免双源不一致）」⇒ `devid` 的正确来源是 `/dev/by-name/private`（出厂工装 S5.5，未实现），**不是** `sys.devid`。
+2. **网卡名与 netmgr 阈值不新增配置键**。架构 §10.2：「`sys.transport.mode` …**"用哪个网口"由它隐含** —— 原 `net.wan.mode` / `primary_if` / `backup_if` / `fail_n` / `ok_n` / `hold_s` 六项已删除」⇒ `usb0`/`eth0` 保持编译期默认（§18.3 平台事实），不引入 `net.wan.*`。
+3. **切换门限的正源是 `netthr.*`**。架构同处：「切换门限由 `netthr.*` 承担」⇒ `nm_fail_n` 应由 `netthr.loss_count` 提供；现状是 `probe.max_fail` 同源喂 `probe_fail_n` 与 `nm_fail_n`。**本轮刻意不动**（改动会引入"两个键影响同一阈值"的双源问题、且默认值恰好都是 3 ⇒ 行为不变却多一处口径歧义），登记为待办，等拍板。
+
+=== 行为变更（必须明示）
+
+* 初启选址由"**有线优先**"变为"**按初始活动出口**（默认无线优先）"。现场若**同时**配了两条平台地址，自动模式（`sys.transport.mode=4`）下会**先用无线那条**；`mode=1`（仅有线）从有线起步。
+* **只配一条地址的现场不受影响**：本口没配会回退另一口，与原来的行为等价；两条都空 ⇒ 不启平台链路（与原来一致）。
+
+=== 影响范围
+
+* `iv_report`：`cfg.server_host` 语义收窄为"**首建**连接的地址"（原样留存供诊断），实际使用改由自持副本承载；新增一个接口，无破坏性变更。`iv_report_t` 体积 +136 字节（128+2+对齐）。
+* `iv_agent`：`iv_agent_cfg_t` 的地址字段由 2 个变 4 个（数组化），**调用方（`main.c`、集成用例）必须同步改**；命名空间与 `wan_name[IV_WAN_N]` 一致。
+* 未覆盖 / 登记待办：`nm_fail_n` 的键源（见口径纠正 3）；`ok_n`/`hold_s`/`stable_s` 在架构 §10.2 **无对应键**（走编译期默认 2/30/10）；`devid`（S5.5）；`mod` 型号串取值（待用户给，当前 NULL → 空串）。
+
+=== 验证方式与结果
+
+* *构建/回归（VM `tqt113`，gcc 11.4.0）*：`make host`/`make arm`/`make analyze` **RC=0 且 `grep -E "warning:|error:"` 命中 0**（ARM 出 ELF32 ARM EABI5）；`make test` **25/25 · 0 FAIL**；`make asan` / `setarch -R make tsan` 各 **0 FAIL**。
+* *集成（真 I/O）*：`test_e2e_report` **RC=0 · 0 FAIL**；`test_agent_switch`（私有 netns：真 netlink 事件、真默认路由改动、真 TCP、真 pty）**RC=0 · 0 FAIL**，其中新增 6 条地址断言全过 —— `k01` 开链用无线地址、`k04` 拔线切有线后 `srv_host` **与** `tr.host` 都变成有线地址（**真的按新址重连**）、`k06` 回切后都变回无线地址。用例把平台监听改为 `INADDR_ANY` 并用 `127.0.0.1`/`127.0.0.2` 两个回环地址区分两条出口（同端口）。
+* *反向证伪 2 条（机制级）*：① `agent_reconnect()` 的出口反推失效（`w = i;` ⇒ 恒 `IV_WAN_WIRELESS`）⇒ **3** 行 FAIL（`k04 platform addr switched…`、`k04 transport really re-dials…`、`test_agent_switch FAILED (2)`）；② `iv_report_set_server()` 变空操作（删掉副本写入两行）⇒ 同样 **3** 行 FAIL。基线 0 FAIL、两条还原后复验 0 FAIL、源文件与备份 diff 一致 ⇒ "装配层选址"与"report 层改址"两个环节都被钉住。
+* *板端（2026-10-12 16:4x，TQ113 `armv7l`）*：ARM 版 `test_report` md5 `c3619640e875d9afa7f4a3931bd9b91a`（与 VM ARM 产物一致）、输出与 Host **逐字一致**、**RC=0**；`test_agent_switch` 板端 **SKIP**（镜像无 `unshare`，用例自降级为 SKIP 并返回 0）、**RC=0**；两个产物跑完 `rm -f` 清理。
+* *未做（如实登记）*：真机现场（真平台地址＋真采集板 `ttySAC5`）；`REALNIC` 模式未跑（本轮不涉真网卡语义，且板端 4G 看护在跑，避免再动管理链路）。

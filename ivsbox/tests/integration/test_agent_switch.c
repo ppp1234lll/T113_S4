@@ -104,6 +104,11 @@
 /* 两张 WAN 的接口名（架构 §18.3 冻结：无线=usb0 / 有线=eth0） */
 #define WAN_WL        "usb0"
 #define WAN_WD        "eth0"
+/* 两条出口各自的平台地址（同一监听端口、**不同回环地址**）：
+ * 127.0.0.1 = 无线口、127.0.0.2 = 有线口 —— 用来钉住"换出口时平台地址跟着换"
+ * （监听套接字绑 INADDR_ANY，故两个地址都能连上）。 */
+#define SRV_WL        "127.0.0.1"
+#define SRV_WD        "127.0.0.2"
 /* 「已进入私有 netns」的环境标记；未置位则自重启 */
 #define NS_ENV        "IV_AGENT_TEST_NETNS"
 /* 「真网卡模式」环境标记（板端无 unshare/dummy，直接跑真 usb0/eth0） */
@@ -227,7 +232,9 @@ static int listen_port(uint16_t in_port, uint16_t *out_port)
     (void)setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
     memset(&sa, 0, sizeof sa);
     sa.sin_family      = AF_INET;
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    /* 绑 INADDR_ANY（而非 INADDR_LOOPBACK）：本用例用 127.0.0.1 / 127.0.0.2
+     * 两个回环地址区分无线口/有线口的平台地址，二者同端口、都指向本套接字。 */
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
     sa.sin_port        = htons(in_port);
     if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 ||
         listen(ls, 4) != 0 ||
@@ -606,8 +613,10 @@ static int scenario(void)
     iv_agent_cfg_default(&cfg);
     cfg.serial_path  = slave_path;
     cfg.queue_dir    = qdir;
-    cfg.server_host  = "127.0.0.1";
-    cfg.server_port  = port;
+    cfg.srv_host[IV_WAN_WIRELESS] = SRV_WL;
+    cfg.srv_port[IV_WAN_WIRELESS] = port;
+    cfg.srv_host[IV_WAN_WIRED]    = SRV_WD;
+    cfg.srv_port[IV_WAN_WIRED]    = port;
     cfg.devid        = 0x101u;
     cfg.mod          = "AGENT-MOD";
     cfg.sv           = "AGENT-SV";
@@ -635,6 +644,10 @@ static int scenario(void)
     chk(iv_agent_netmgr_state(&g_agent) == IV_NETMGR_WIRELESS_UP,
         "k01 initial state WIRELESS_UP (无线优先)");
     chk(iv_agent_active_wan(&g_agent) == IV_WAN_WIRELESS, "k01 initial active = wireless");
+    chk(strcmp(iv_agent_report(&g_agent)->srv_host, SRV_WL) == 0,
+        "k01 platform addr = the wireless one (按初始活动出口选址)");
+    chk(strcmp(iv_agent_report(&g_agent)->tr.host, SRV_WL) == 0,
+        "k01 transport really dials the wireless addr");
     /* 装配把接口名解析成了 ifindex；解析不到整条链就不成立，必须钉死 */
     chk(g_agent.wan_ifindex[IV_WAN_WIRELESS] > 0, "k01 wireless ifindex resolved");
     chk(g_agent.wan_ifindex[IV_WAN_WIRED] > 0, "k01 wired ifindex resolved");
@@ -725,6 +738,10 @@ static int scenario(void)
     chk(iv_netmgr_switches(&g_agent.nm) == 1u,
         "k04 switch transaction fired (route change AND reconnect both returned OK)");
     chk(iv_agent_active_wan(&g_agent) == IV_WAN_WIRED, "k04 active WAN -> wired");
+    chk(strcmp(iv_agent_report(&g_agent)->srv_host, SRV_WD) == 0,
+        "k04 platform addr switched to the wired one (按活动出口选地址)");
+    chk(strcmp(iv_agent_report(&g_agent)->tr.host, SRV_WD) == 0,
+        "k04 transport really re-dials the wired addr");
     chk(iv_agent_netmgr_state(&g_agent) == IV_NETMGR_WIRED_UP, "k04 state WIRED_UP");
     chk(iv_agent_active_ifindex(&g_agent) == g_agent.wan_ifindex[IV_WAN_WIRED],
         "k04 active ifindex == resolved eth0 ifindex");
@@ -807,9 +824,13 @@ static int scenario(void)
     pump_agent(master, 3);
     chk(iv_netmgr_switches(&g_agent.nm) == 2u, "k06 switched back to wireless after hold_s");
     chk(iv_agent_active_wan(&g_agent) == IV_WAN_WIRELESS, "k06 active WAN -> wireless");
+    chk(strcmp(iv_agent_report(&g_agent)->srv_host, SRV_WL) == 0,
+        "k06 platform addr back to the wireless one");
     chk(iv_agent_netmgr_state(&g_agent) == IV_NETMGR_WIRELESS_UP, "k06 state WIRELESS_UP");
 
     chk(wait_transport_up(60), "k06 transport UP on the restored platform");
+    chk(strcmp(iv_agent_report(&g_agent)->tr.host, SRV_WL) == 0,
+        "k06 transport re-dials the wireless addr");
     cs = accept_ms(ls, 2000);
     chk(cs >= 0, "k06 platform accepted the reconnected TCP");
     if (cs >= 0)

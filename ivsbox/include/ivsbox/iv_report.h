@@ -129,8 +129,8 @@ typedef struct {
  * ------------------------------------------------------------------------- */
 typedef struct {
     const char *serial_path;  /* NULL → IV_REPORT_SERIAL_DEFAULT */
-    const char *server_host;  /* 平台地址；NULL 或空串 → **不启动平台链路** */
-    uint16_t    server_port;
+    const char *server_host;  /* **首建**连接的平台地址；NULL 或空串 → 不启动平台链路 */
+    uint16_t    server_port;  /* 运行期改址走 iv_report_set_server()（按活动出口选） */
     const char *queue_dir;    /* NULL → IV_QUEUE_DIR_DEFAULT */
     uint32_t    devid;        /* 设备唯一标识（TID，以 %x 十六进制上报） */
     uint16_t    devtype;      /* 0 → IV_PROTO_DEVTYPE_DEFAULT(0x0400) */
@@ -143,6 +143,14 @@ typedef struct {
 
 typedef struct {
     iv_report_cfg_t cfg;
+
+    /* 平台目标地址（**本层自持副本**）：`iv_report_open()` 从 cfg 拷入，
+     * 运行期由 `iv_report_set_server()` 改写（装配层按当前活动出口选地址），
+     * `iv_report_reconnect()` 一律以本副本重连。
+     * 与 `cfg.server_host` 的分工：那里是"配置注入值"（原样留存用于诊断），
+     * 这里是"下一次建连实际使用的地址"。 */
+    char           srv_host[IV_TRANSPORT_HOST_MAX];
+    uint16_t       srv_port;
 
     iv_status_t    st;   /* 采集板状态镜像（S2.6） */
     iv_link_t      lk;   /* 采集板可靠层（S2.3） */
@@ -215,11 +223,21 @@ int iv_report_trigger(iv_report_t *rp, uint64_t now_ms);
  * 关掉绑定旧出口的 TCP，再用**原 host/port** 重新发起连接。只动传输层，
  * **不碰串口 / 队列 / 协议层** —— 队列里未确认的数据全部保留，连接重建后
  * 由取件泵按序号补传（架构 §7.2「关闭绑定旧接口的 TCP，再用新出口重建」）。
- * 切到新出口后的**平台地址选择**（`net.server.wired.*` / `.wireless.*` 的语义）
- * 尚未冻结，故本步沿用原地址；待平台侧确认后再扩展为"按活动出口选地址"。
- *   IV_OK ；IV_EINVAL（rp 为 NULL）；IV_ESTATE（未 open 或平台链路未启动）
+ * 一律使用本层自持的**当前目标地址**（`srv_host`/`srv_port`）—— 装配层可在调用前
+ * 先用 `iv_report_set_server()` 换成"当前活动出口"对应的那条地址（`net.server.
+ * wired.*` / `.wireless.*`），即"**按活动出口选平台地址**"。
+ *   IV_OK ；IV_EINVAL（rp 为 NULL）；IV_ESTATE（未 open 或目标地址未配置/已清空）
  */
 int iv_report_reconnect(iv_report_t *rp, uint64_t now_ms);
+
+/*
+ * 设置**下一次建连**使用的平台地址（**不主动断连**：在用连接原样保留，
+ * 由 `iv_report_reconnect()` 关闭并按新址重开）。`host` 为空 / `port` 为 0
+ * ⇒ 清空目标地址（此后 `iv_report_reconnect()` 返回 IV_ESTATE）。
+ * 改写的是本层自持副本，**不动** `cfg.server_host`。
+ *   IV_OK ；IV_EINVAL（rp 为 NULL 或未 open）；IV_ERANGE（host 超长）
+ */
+int iv_report_set_server(iv_report_t *rp, const char *host, uint16_t port);
 
 /* 关闭：从 Reactor 摘事件/定时器、关串口与传输、关队列。 */
 void iv_report_close(iv_report_t *rp);

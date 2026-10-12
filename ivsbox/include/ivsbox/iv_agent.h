@@ -46,11 +46,17 @@
  *     创建/销毁的，逐个注册会让 Reactor 注册表频繁抖动。改为在 probe 定时器
  *     （`IV_AGENT_PROBE_TICK_MS`）里对该时刻的全部 fd 调一次 on_readable /
  *     on_writable —— 两者对"不认识的 fd"返回错误码而不误处理，循环调用安全。
- *   - **平台地址为空则不启平台链路**：`server_host` 空时 iv_report 内部不开传输，
- *     `iv_agent_netmgr` 的换出口重连钩子此时是空转（`iv_report_reconnect`
- *     返回 IV_ESTATE）。现场填入 `net.server.*.host/port` 后自然生效。
- *   - **devid（TID）/ mod（型号）无配置键来源**：本步分别取配置注入值与 NULL，
- *     待工厂身份读取（private 分区）落地后接入。
+ *   - **平台地址按活动出口选**：`srv_host[IV_WAN_N]` / `srv_port[IV_WAN_N]` 下标＝
+ *     `iv_wan_t`，分别来自 `net.server.wireless.*` 与 `net.server.wired.*`。
+ *     开链时按**初始活动出口**取（只有 `WIRED_ONLY` 模式从有线起步，其余从无线起步，
+ *     与 netmgr 初始态 `WIRELESS_UP` 一致）；换出口时在 `reconnect` 钩子里按
+ *     **netmgr 传入的 new_ifindex** 反推目标出口再取址，并交给
+ *     `iv_report_set_server()` 生效。**本口没配则回退另一口**；两口都空 ⇒
+ *     不启平台链路（`iv_report_reconnect` 返回 `IV_ESTATE` 空转）。
+ *   - **devid（TID）/ mod（型号）无配置键来源**：按架构 §10.2「身份不进配置」，
+ *     devid 应由工厂身份分区（`/dev/by-name/private`，S5.5）读取 ⇒ **不设配置键**；
+ *     mod（硬件型号串）与 `sv` 同类，属**编译期事实**，待用户给型号串后定为默认值。
+ *     当前二者分别取 0 与 NULL（→ 空串）。
  */
 #ifndef IVSBOX_IV_AGENT_H
 #define IVSBOX_IV_AGENT_H
@@ -86,8 +92,10 @@ typedef struct {
     /* ---- 控制板上报链（S3.6）---- */
     const char *serial_path; /* NULL → 默认 /dev/ttySAC5 */
     const char *queue_dir;   /* NULL → 默认 /mnt/UDISK/ivsbox/queue */
-    const char *server_host; /* 平台地址；NULL/"" → 平台链路不启动 */
-    uint16_t    server_port;
+    /* 平台地址：下标＝iv_wan_t（IV_WAN_WIRELESS / IV_WAN_WIRED）；
+     * 某口 NULL/"" 或 port=0 ⇒ 该口无地址（自动回退另一口）。 */
+    const char *srv_host[IV_WAN_N];
+    uint16_t    srv_port[IV_WAN_N];
     const char *mod;         /* 硬件型号串（E3 应答）；NULL → "" */
     const char *sv;          /* 软件版本串（E3 应答）；NULL → 由本层填 iv_version */
     uint32_t    devid;       /* 设备标识（TID） */

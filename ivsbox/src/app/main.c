@@ -301,29 +301,40 @@ static uint32_t cfg_ip_be(const char *key)
     return in.s_addr; /* 已是网络序 */
 }
 
+/* 配置里的字符串：空/未配 → NULL（指针指向配置模块内部缓冲，配置存活期内有效） */
+static const char *cfg_str(const char *key)
+{
+    const char *s = NULL;
+
+    if (iv_config_get_str(g_cfg, key, &s) != IV_OK || s == NULL || s[0] == '\0')
+        return NULL;
+    return s;
+}
+
+/* 配置里的端口：未配/越界 → 0（0 ＝ 该条地址无效） */
+static uint16_t cfg_port(const char *key)
+{
+    int64_t v = 0;
+
+    if (iv_config_get_int(g_cfg, key, &v) != IV_OK || v <= 0 || v > 65535)
+        return 0u;
+    return (uint16_t)v;
+}
+
 static int agent_setup(void)
 {
     iv_agent_cfg_t ac;
-    const char    *h;
     int64_t        v;
 
     iv_agent_cfg_default(&ac);
 
-    /* 平台地址：有线优先、为空则退回无线。
-     * ⚠ 按"活动出口"选 wired/wireless 地址的语义尚未冻结（架构 §18.1 登记项），
-     *   本步先按此策略取值；地址/端口均为空时 iv_report 不开平台链路。 */
-    h = NULL;
-    (void)iv_config_get_str(g_cfg, "net.server.wired.host", &h);
-    if (h == NULL || h[0] == '\0') {
-        h = NULL;
-        (void)iv_config_get_str(g_cfg, "net.server.wireless.host", &h);
-        if (h != NULL && h[0] != '\0' &&
-            iv_config_get_int(g_cfg, "net.server.wireless.port", &v) == IV_OK)
-            ac.server_port = (uint16_t)v;
-    } else if (iv_config_get_int(g_cfg, "net.server.wired.port", &v) == IV_OK) {
-        ac.server_port = (uint16_t)v;
-    }
-    ac.server_host = (h != NULL && h[0] != '\0') ? h : NULL;
+    /* 平台地址：**按活动出口取**（下标＝iv_wan_t）—— 两条分开配置，活动出口由
+     * sys.transport.mode ＋ netmgr 状态机决定；本口没配则回退另一口（iv_agent 内）。
+     * 两条都为空 ⇒ 不启平台链路（iv_report 内部 idle）。 */
+    ac.srv_host[IV_WAN_WIRELESS] = cfg_str("net.server.wireless.host");
+    ac.srv_port[IV_WAN_WIRELESS] = cfg_port("net.server.wireless.port");
+    ac.srv_host[IV_WAN_WIRED]    = cfg_str("net.server.wired.host");
+    ac.srv_port[IV_WAN_WIRED]    = cfg_port("net.server.wired.port");
 
     /* 定时上报间隔（配置单位秒 → 毫秒） */
     if (iv_config_get_int(g_cfg, "sys.report.interval_s", &v) == IV_OK && v > 0)

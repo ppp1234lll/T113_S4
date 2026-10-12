@@ -403,8 +403,6 @@ int iv_report_trigger(iv_report_t *rp, uint64_t now_ms)
  */
 int iv_report_reconnect(iv_report_t *rp, uint64_t now_ms)
 {
-    char               host[IV_TRANSPORT_HOST_MAX];
-    uint16_t           port;
     iv_transport_cfg_t tc;
     int                rc;
 
@@ -412,19 +410,14 @@ int iv_report_reconnect(iv_report_t *rp, uint64_t now_ms)
         return IV_EINVAL;
     if (!rp->opened)
         return IV_ESTATE;
-    if (!rp->tr.opened)
-        return IV_ESTATE; /* 平台链路未启动（host/port 未配）→ 无重连可言 */
-
-    /* close 前留一份地址副本；open 内部会再拷一次，故栈副本足够 */
-    memcpy(host, rp->tr.host, sizeof(host));
-    host[sizeof(host) - 1u] = '\0';
-    port = rp->tr.port;
+    if (rp->srv_host[0] == '\0' || rp->srv_port == 0u)
+        return IV_ESTATE; /* 目标地址未配置/已清空 → 无可重连 */
 
     (void)iv_transport_close(&rp->tr);
 
     memset(&tc, 0, sizeof(tc));
-    tc.host       = host;
-    tc.port       = port;
+    tc.host       = rp->srv_host; /* 自持副本；open 内部会再拷一次 */
+    tc.port       = rp->srv_port;
     tc.io         = NULL; /* 内置真实 socket */
     rp->pump.pull = pump_pull;
     rp->pump.ack  = pump_ack;
@@ -439,11 +432,34 @@ int iv_report_reconnect(iv_report_t *rp, uint64_t now_ms)
     rp->now_ms = now_ms;
     if (rc == IV_OK)
         IV_LOG_I(REP_MOD, "transport reconnect on route switch: %s:%u",
-                 host, (unsigned)port);
+                 rp->srv_host, (unsigned)rp->srv_port);
     else
         IV_LOG_W(REP_MOD, "transport reconnect failed (%d): %s:%u", rc,
-                 host, (unsigned)port);
+                 rp->srv_host, (unsigned)rp->srv_port);
     return rc;
+}
+
+int iv_report_set_server(iv_report_t *rp, const char *host, uint16_t port)
+{
+    size_t n;
+
+    if (rp == NULL || !rp->opened)
+        return IV_EINVAL;
+
+    if (host == NULL || host[0] == '\0' || port == 0u) {
+        /* 清空：下一次重连不再建链（在用连接不动，是否断由调用方决定） */
+        memset(rp->srv_host, 0, sizeof(rp->srv_host));
+        rp->srv_port = 0u;
+        return IV_OK;
+    }
+
+    n = strlen(host);
+    if (n >= sizeof(rp->srv_host))
+        return IV_ERANGE;
+
+    memcpy(rp->srv_host, host, n + 1u);
+    rp->srv_port = port;
+    return IV_OK;
 }
 
 /* ---------------------------------------------------------------------------
@@ -509,6 +525,11 @@ int iv_report_open(iv_report_t *rp, const iv_report_cfg_t *cfg,
     rp->now_ms = now_ms;
     rp->env.csq = -1;
 
+    /* 平台目标地址：拷进本层自持副本（运行期可经 iv_report_set_server 改写） */
+    if (c.server_host != NULL)
+        (void)snprintf(rp->srv_host, sizeof(rp->srv_host), "%.127s", c.server_host);
+    rp->srv_port = c.server_port;
+
     /* 1. 协议层（on_tx 直发到传输层）+ 查询路由 */
     id.devtype = c.devtype;
     id.devid   = c.devid;
@@ -546,12 +567,12 @@ int iv_report_open(iv_report_t *rp, const iv_report_cfg_t *cfg,
     }
 
     /* 5. 平台传输（host 空则不启动） */
-    if (c.server_host != NULL && c.server_host[0] != '\0' && c.server_port != 0u) {
+    if (rp->srv_host[0] != '\0' && rp->srv_port != 0u) {
         iv_transport_cfg_t tc;
 
         memset(&tc, 0, sizeof(tc));
-        tc.host         = c.server_host;
-        tc.port         = c.server_port;
+        tc.host         = rp->srv_host; /* open 内部会再拷一次，副本生命周期足够 */
+        tc.port         = rp->srv_port;
         tc.io           = NULL; /* 内置真实 socket */
         rp->pump.pull   = pump_pull;
         rp->pump.ack    = pump_ack;
@@ -565,7 +586,7 @@ int iv_report_open(iv_report_t *rp, const iv_report_cfg_t *cfg,
         rc = iv_transport_open(&rp->tr, &tc);
         if (rc != IV_OK)
             IV_LOG_W(REP_MOD, "transport open failed (%d): %s:%u", rc,
-                     c.server_host, (unsigned)c.server_port);
+                     rp->srv_host, (unsigned)rp->srv_port);
     } else {
         IV_LOG_W(REP_MOD, "platform server not configured, transport idle");
     }
@@ -581,8 +602,8 @@ int iv_report_open(iv_report_t *rp, const iv_report_cfg_t *cfg,
     IV_LOG_I(REP_MOD,
              "report layer up: devid=%x devtype=%04x serial_fd=%d server=%s:%u",
              (unsigned)c.devid, (unsigned)c.devtype, rp->serial_fd,
-             (c.server_host != NULL) ? c.server_host : "(none)",
-             (unsigned)c.server_port);
+             (rp->srv_host[0] != '\0') ? rp->srv_host : "(none)",
+             (unsigned)rp->srv_port);
     return IV_OK;
 }
 

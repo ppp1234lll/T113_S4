@@ -261,8 +261,21 @@ int main(void)
                 == IV_ERANGE, "c07 small cap ERANGE");
     }
 
+    /* ---- 8) 平台地址运行期改写（set_server）的边界（零副作用：不 open） ---- */
+    {
+        static iv_report_t rp;
+
+        iv_report_init(&rp);
+        chk(iv_report_set_server(NULL, "127.0.0.1", 1u) == IV_EINVAL, "c08 NULL rp");
+        chk(iv_report_set_server(&rp, "127.0.0.1", 1u) == IV_EINVAL,
+            "c08 not opened -> EINVAL");
+        chk(iv_report_set_server(&rp, NULL, 0u) == IV_EINVAL,
+            "c08 clear on closed -> EINVAL");
+        chk(iv_report_reconnect(&rp, 0u) == IV_ESTATE, "c08 reconnect on closed -> ESTATE");
+    }
+
     if (g_fail == 0)
-        printf("test_report passed (seg/frame/query-crc/json/env)\n");
+        printf("test_report passed (seg/frame/query-crc/json/env/set-server)\n");
     else
         printf("test_report FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

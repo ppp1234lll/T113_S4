@@ -36,6 +36,36 @@ static int wan_ifindex_of(const char *name)
     return (int)if_nametoindex(name);
 }
 
+/* 初始活动出口：与 iv_netmgr 的起始态对齐 —— 只有"仅有线"模式从有线起步，
+ * 其余（自动 / 仅无线 / 双 WAN）都以无线为初始活动口（netmgr 初始态 WIRELESS_UP）。 */
+static iv_wan_t agent_initial_wan(iv_netmgr_mode_t mode)
+{
+    return (mode == IV_NETMGR_MODE_WIRED_ONLY) ? IV_WAN_WIRED : IV_WAN_WIRELESS;
+}
+
+/* 按指定出口取平台地址：**本口没配则回退另一口**；两口都没配 → NULL（不启平台链路）。
+ * port 出参同步置为选中那条的端口（未选中时置 0）。 */
+static const char *agent_pick_host(const iv_agent_cfg_t *cfg, int w, uint16_t *port)
+{
+    int i;
+
+    for (i = 0; i < IV_WAN_N; i++) {
+        int         x = (i == 0)
+                            ? w
+                            : ((w == IV_WAN_WIRELESS) ? IV_WAN_WIRED : IV_WAN_WIRELESS);
+        const char *h = cfg->srv_host[x];
+
+        if (h != NULL && h[0] != '\0' && cfg->srv_port[x] != 0u) {
+            if (port != NULL)
+                *port = cfg->srv_port[x];
+            return h;
+        }
+    }
+    if (port != NULL)
+        *port = 0u;
+    return NULL;
+}
+
 /* ---------------------------------------------------------------------------
  * 配置 / 生命周期
  * ------------------------------------------------------------------------- */
@@ -74,6 +104,7 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     iv_report_cfg_t            rc;
     iv_probe_cfg_t             pc;
     iv_netmgr_cfg_t            mc;
+    iv_netmgr_mode_t           mode;
     const iv_netmgr_txn_ops_t *dflt;
     uint32_t                   dst;
     int                        w;
@@ -92,10 +123,11 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
         a->wan_ifindex[w] = wan_ifindex_of(cfg->wan_name[w]);
 
     /* ---- 1. 控制板上报链（S3.6：内含 serial/frame/link/status/proto/queue/transport）---- */
+    mode = (cfg->mode != 0) ? (iv_netmgr_mode_t)cfg->mode : IV_NETMGR_MODE_AUTO;
     iv_report_cfg_default(&rc);
     rc.serial_path  = (cfg->serial_path != NULL) ? cfg->serial_path : IV_REPORT_SERIAL_DEFAULT;
-    rc.server_host  = cfg->server_host;
-    rc.server_port  = cfg->server_port;
+    /* 平台地址按**初始活动出口**取（本口没配则回退另一口；两口都空 ⇒ 不启平台链路） */
+    rc.server_host  = agent_pick_host(cfg, agent_initial_wan(mode), &rc.server_port);
     rc.queue_dir    = cfg->queue_dir;
     rc.mod          = cfg->mod;
     rc.sv           = (cfg->sv != NULL) ? cfg->sv : iv_version_string();
@@ -173,7 +205,7 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
 
     /* ---- 4. netmgr（switch_route 复用默认；reconnect 接上报链）---- */
     iv_netmgr_cfg_default(&mc);
-    mc.mode = (cfg->mode != 0) ? cfg->mode : IV_NETMGR_MODE_AUTO;
+    mc.mode = mode;
     for (w = 0; w < IV_WAN_N; w++) {
         mc.wan[w].ifindex = a->wan_ifindex[w];
         (void)snprintf(mc.wan[w].name, sizeof(mc.wan[w].name), "%s",
@@ -212,8 +244,8 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
              cfg->wan_name[IV_WAN_WIRELESS], a->wan_ifindex[IV_WAN_WIRELESS],
              cfg->wan_name[IV_WAN_WIRED], a->wan_ifindex[IV_WAN_WIRED],
              (int)mc.mode,
-             (cfg->server_host != NULL) ? cfg->server_host : "(none)",
-             (unsigned)cfg->server_port);
+             (rc.server_host != NULL) ? rc.server_host : "(none)",
+             (unsigned)rc.server_port);
     return IV_OK;
 }
 
@@ -382,12 +414,36 @@ static void on_nm_timer(void *arg)
         a->nm_timer = iv_timer_add(a->r, IV_AGENT_NETMGR_TICK_MS, on_nm_timer, a);
 }
 
-/* netmgr 切换事务的 reconnect 步：断旧 TCP → 用原址重开（队列数据保留） */
+/* netmgr 切换事务的 reconnect 步：按新出口换平台地址 → 断旧 TCP → 按新址重开
+ * （队列未确认数据全部保留，由取件泵补传）。 */
 static int agent_reconnect(void *arg, int new_ifindex)
 {
     iv_agent_t *a = arg;
+    const char *h;
+    uint16_t    port = 0u;
+    int         w    = IV_WAN_WIRELESS; /* 兜底：接口识别不出时按无线 */
+    int         i;
 
-    (void)new_ifindex; /* 按活动出口选平台地址待平台语义冻结后接入 */
+    if (a == NULL)
+        return IV_EINVAL;
+
+    /* 目标出口由 netmgr 传入的 new_ifindex **反推**，不依赖 active 的更新时机
+     * （本回调在切换事务内执行，active 何时翻转属 netmgr 内部实现）。 */
+    for (i = 0; i < IV_WAN_N; i++) {
+        if (a->wan_ifindex[i] != 0 && a->wan_ifindex[i] == new_ifindex) {
+            w = i;
+            break;
+        }
+    }
+
+    h = agent_pick_host(&a->cfg, w, &port);
+    if (iv_report_set_server(&a->rp, h, port) != IV_OK)
+        IV_LOG_W(AG_MOD, "server addr switch rejected, keep old (%s)",
+                 a->cfg.wan_name[w]);
+    else
+        IV_LOG_I(AG_MOD, "server addr -> %s:%u (wan=%s)",
+                 (h != NULL) ? h : "(none)", (unsigned)port, a->cfg.wan_name[w]);
+
     return iv_report_reconnect(&a->rp, a->now_ms);
 }
 

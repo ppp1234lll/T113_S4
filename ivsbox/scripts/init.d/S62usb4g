@@ -1,0 +1,177 @@
+#!/bin/sh
+#
+# S62usb4g —— 4G（Quectel EC200G）数据面自动拉起与运行期看护
+#
+# 背景与实测（架构 §18.3 ⚠②）：
+#   4G 这一路 WAN 走 CDC-ECM（内核 cdc_ether），"无线" WAN = usb0。
+#   * 开机：镜像自带的 udev 冷插拔链路（S10udev 的 `udevadm trigger --action=add`
+#     → /etc/udev/rules.d/11-usb-autodial.rules → /usr/bin/usb-EC200G-inserted.sh）
+#     通常会完成拨号；但该路径依赖"add 事件 + 模块已枚举"的时序，并非每次必成。
+#   * 运行期：**没有任何机制在掉线后重新拨号**。实测板上曾连续运行 4 天（自 10-08
+#     未重启），期间 4G PDP 掉线 ⇒ usb0 停在 DOWN，直到重启才恢复。
+#
+#   本脚本同时覆盖两端：开机做一次幂等拉起（udev 的兜底），之后常驻看护，
+#   发现 usb0 丢 carrier / 丢 IPv4 就自动重拨。
+#
+# 依赖：EC200G（USB 2c7c:0904）、AT 口可用的 /dev/ttyUSB*、busybox udhcpc、ip/stty/flock
+# 幂等：usb0 已 carrier ＋ 有 IPv4 ⇒ 该轮不做任何动作（不碰 AT）
+# 日志：/var/log/usb4g.log（tmpfs，重启即丢）；只在"状态变化/恢复动作"时写，不按轮次刷
+#
+# 编号 62：> 60（不打断 S60mount_udisk 的挂载时序），且晚于 S41dhcpcd（网络服务就绪）。
+#
+# 退出码恒为 0：4G 可后到，绝不因它未起来阻断 rcS 后续服务。
+
+LOG=/var/log/usb4g.log
+PIDFILE=/var/run/usb4g.pid
+LOCK=/var/lock/usb4g.lock
+WAN=usb0
+POLL=30          # 看护轮询周期（秒）
+DHCP_TRIES=3
+USBNET_WAIT=0.8
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG" 2>/dev/null; }
+
+usb0_exists()      { [ -d "/sys/class/net/$WAN" ]; }
+link_has_carrier() { ip -o link show "$WAN" 2>/dev/null | grep -q 'LOWER_UP'; }
+has_ipv4()         { ip -o -4 addr show "$WAN" 2>/dev/null | grep -q 'inet '; }
+cur_ip()           { ip -o -4 addr show "$WAN" 2>/dev/null | awk '{print $4}' | head -n1; }
+
+# at_run <port> <cmd> [wait_s] —— 在 AT 口执行一条命令，回显去 \r 的响应
+at_run() {
+    _port=$1; _cmd=$2; _wait=${3:-1.5}
+    stty -F "$_port" 115200 raw -echo 2>/dev/null
+    : > /tmp/usb4g.resp
+    # 子 shell 里起读线程、超时后杀掉；把子 shell 的 stderr 丢掉，
+    # 免得 busybox ash 打印 "Terminated" 作业通知污染日志。
+    ( cat "$_port" > /tmp/usb4g.resp 2>/dev/null & _p=$!
+      sleep 0.3
+      printf '%s\r' "$_cmd" > "$_port" 2>/dev/null
+      sleep "$_wait"
+      kill "$_p" 2>/dev/null ) 2>/dev/null
+    tr -d '\r' < /tmp/usb4g.resp
+    rm -f /tmp/usb4g.resp
+}
+
+# 在 /dev/ttyUSB* 中找出会回 "OK" 的 AT 口（端口号可能随枚举顺序变化，故不硬编码）
+find_at_port() {
+    for d in /dev/ttyUSB*; do
+        [ -c "$d" ] || continue
+        if at_run "$d" 'AT' 0.8 | grep -q '^OK'; then
+            echo "$d"; return 0
+        fi
+    done
+    return 1
+}
+
+# 恢复：把 usb0 重新拉起来（按需拨号 → 拉链路 → 取址）
+recover() {
+    # 1) 没 carrier 才需要碰 AT（PDP 未激活）
+    if ! link_has_carrier; then
+        AT=$(find_at_port)
+        if [ -z "$AT" ]; then
+            log "no AT-capable /dev/ttyUSB* found, will retry"
+            return
+        fi
+        if ! at_run "$AT" 'AT+QCFG="usbnet"' | grep -q '"usbnet",1'; then
+            log "usbnet != 1 -> set ECM + reset (module re-enumerates)"
+            at_run "$AT" 'AT+QCFG="usbnet",1' >/dev/null
+            at_run "$AT" 'AT+RESET' >/dev/null
+            return
+        fi
+        if ! at_run "$AT" 'AT+CPIN?' | grep -q 'READY'; then
+            log "$WAN SIM not ready, will retry"
+            return
+        fi
+        # PDP 未激活才拨（避免对已激活的数据呼叫重复下发）
+        if ! at_run "$AT" 'AT+QNETDEVCTL?' | grep -q '+QNETDEVCTL: 1'; then
+            log "PDP inactive -> AT+QNETDEVCTL=1,1,1 (AT port=$AT)"
+            at_run "$AT" 'AT+QNETDEVCTL=1,1,1' 2.5 >/dev/null
+        fi
+    fi
+
+    # 2) 拉链路并等 carrier
+    ip link set "$WAN" up 2>/dev/null
+    _i=0
+    while ! link_has_carrier; do
+        _i=$((_i + 1))
+        [ "$_i" -ge 15 ] && { log "$WAN no carrier after dial, will retry"; return; }
+        sleep 1
+    done
+
+    # 3) 取址（-n 失败即退、-q 拿到即退；失败重试若干次）
+    if ! has_ipv4; then
+        _n=0
+        while [ "$_n" -lt "$DHCP_TRIES" ]; do
+            udhcpc -i "$WAN" -n -q -t 6 -T 2 >> "$LOG" 2>&1 && break
+            _n=$((_n + 1))
+            log "udhcpc attempt $_n failed"
+            sleep 2
+        done
+    fi
+
+    if has_ipv4; then
+        log "$WAN up: $(cur_ip)"
+    else
+        log "$WAN still no IPv4, will retry"
+    fi
+}
+
+main() {
+    # 串行化：开机 rcS 与 udev 热插拔可能同时来，避免重复拨号
+    if command -v flock >/dev/null 2>&1 && [ -w /var/lock ]; then
+        exec 9>"$LOCK"
+        flock -n 9 || { log "another instance holds the lock, exit"; return 0; }
+    fi
+
+    # 等 usb0 出现（最多 30 s）；开机先让 udev 那条链路走完，再接管看护
+    _i=0
+    while ! usb0_exists; do
+        _i=$((_i + 1))
+        [ "$_i" -ge 30 ] && { log "$WAN not present, exit"; return 0; }
+        sleep 1
+    done
+    sleep 15
+    log "supervisor start (poll ${POLL}s)"
+
+    _prev=""
+    while :; do
+        if ! usb0_exists; then
+            _cur=absent
+        elif has_ipv4 && link_has_carrier; then
+            _cur=healthy
+        else
+            _cur=degraded
+        fi
+
+        [ "$_cur" != "$_prev" ] && { log "state: $_cur"; _prev="$_cur"; }
+        [ "$_cur" = degraded ] && recover
+
+        sleep "$POLL"
+    done
+}
+
+start() {
+    echo -n "Starting usb4g: "
+    # 后台常驻，避免拖慢 rcS（usb0 可后到，iv_netmgr 容忍晚起的链路）
+    main >> "$LOG" 2>&1 &
+    echo $! > "$PIDFILE"
+    echo "OK"
+}
+
+stop() {
+    # 不断开 4G（无线是主力 WAN）；只收尾看护进程
+    echo -n "Stopping usb4g: "
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null
+        rm -f "$PIDFILE"
+        log "supervisor stopped"
+    fi
+    echo "OK"
+}
+
+case "${1:-start}" in
+    start)   start ;;
+    stop)    stop ;;
+    restart|force-reload) stop; start ;;
+    *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

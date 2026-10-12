@@ -180,8 +180,8 @@ package-copy:
 	@mkdir -p packaging/bin packaging/scripts packaging/init.d
 	@cp $(BINS) packaging/bin/
 	@cp scripts/start_ivsbox.sh scripts/monitor.sh packaging/scripts/
-	@cp scripts/init.d/S65ivsboxd packaging/init.d/
-	@chmod +x packaging/scripts/start_ivsbox.sh packaging/scripts/monitor.sh packaging/init.d/S65ivsboxd
+	@cp scripts/init.d/S62usb4g scripts/init.d/S65ivsboxd packaging/init.d/
+	@chmod +x packaging/scripts/start_ivsbox.sh packaging/scripts/monitor.sh packaging/init.d/S62usb4g packaging/init.d/S65ivsboxd
 	@for bin in $(BINS); do \
 		LC_ALL=C $(CROSS)readelf -h "$$bin" | grep -q "Machine:.*ARM" || { \
 			echo "package: ERROR, not ARM ELF: $$bin"; exit 1; \

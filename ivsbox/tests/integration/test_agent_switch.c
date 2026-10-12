@@ -40,6 +40,20 @@
  * 在 ns 内造 usb0/eth0 两张 dummy 网卡。**unshare 不可用时优雅 SKIP（退出 0）**，
  * 绝不让 `make itest` 因环境受限而假红（与 test_e2e_report 的 pty SKIP 同口径）。
  *
+ * ============================ 两种模式：netns（默认）/ 真网卡 ============================
+ * 默认走上面的私有 netns —— 适合 VM，网卡是造的，对宿主零影响。
+ * 板端（TQ113）**没有 unshare、也没有 dummy/veth 模块**；但只要把环境变量
+ * `IV_AGENT_TEST_REALNIC=1` 置位，用例就改走「真网卡模式」：不建 ns、不造 dummy，
+ * 直接在**真实 usb0/eth0** 上跑同一条场景链（接口必须已存在，否则 SKIP）。
+ * 两处差异必须知道：
+ *   1) 真接口多半**已经 UP**，而内核只在**状态变化**时才发 RTM_NEWLINK；k02 因此
+ *      用一次「promisc 往返」把当前真实 flags 顶出来（见 k02 处注释）；
+ *   2) 用例的 switch_route 步会**真改板子的路由表**（留下两条 prio 100 的默认路由），
+ *      k06 掉/起 usb0 后还要 udhcpc 重取地址 —— 收尾（k07）会把这些痕迹清干净。
+ * 真网卡模式与 **4G 看护 `S62usb4g` 互斥**：看护每 30 s 会把 usb0 重新拨起来，与本
+ * 用例的「拔线」直接打架。检测到看护在跑时用例打印 SKIP 并退出 0。
+ * 真网卡模式会**真改板子路由、真断 4G 数据面**，务必在有人值守时跑。
+ *
  * ============================ 驱动方式：无 Reactor、注入时间轴 ============================
  * Reactor 只有阻塞式 `iv_reactor_run()`，没有可限时单步的接口；若用它就得把
  * 场景塞进定时器回调、按真实墙钟等待，用例会随宿主负载抖动。
@@ -67,6 +81,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h> /* kill()：探测 4G 看护是否在跑 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,6 +91,7 @@
 #include <unistd.h>
 
 #include "ivsbox/iv_agent.h"
+#include "ivsbox/iv_log.h"
 #include "ivsbox/iv_netlink.h"
 #include "ivsbox/iv_netmgr.h"
 #include "ivsbox/iv_probe.h"
@@ -88,12 +104,15 @@
 #define WAN_WD        "eth0"
 /* 「已进入私有 netns」的环境标记；未置位则自重启 */
 #define NS_ENV        "IV_AGENT_TEST_NETNS"
+/* 「真网卡模式」环境标记（板端无 unshare/dummy，直接跑真 usb0/eth0） */
+#define REALNIC_ENV   "IV_AGENT_TEST_REALNIC"
 /* 每拍注入的毫秒数（＝ iv_report 的 tick 节拍量级） */
 #define STEP_MS       200u
 
 /* iv_agent_t 约 35 KB（内含 iv_report 的队列/传输缓冲）—— 必须放静态区，勿放栈 */
 static iv_agent_t g_agent;
 static int        g_fail;
+static int        g_realnic; /* 1 = 真网卡模式（REALNIC_ENV 置位） */
 static uint64_t   g_now;
 
 static void chk(int cond, const char *what)
@@ -102,6 +121,19 @@ static void chk(int cond, const char *what)
         fprintf(stderr, "FAIL: %s\n", what);
         g_fail++;
     }
+}
+
+/* 让日志不走落盘：iv_log 的落盘出口是**进程级单例、懒打开**（第一次写日志时才建），
+ * 板端 /mnt/UDISK 可写时会在装配过程中多出一个 fd 并留到进程结束 —— 会把 k07 的
+ * 「不泄漏」断言打成假红（2026-10-12 板端实测：多的那个 fd 指向 /mnt/UDISK/log/...
+ * 的日志文件）。用日志模块自带的单测注入口关掉落盘，用例才与宿主的日志根目录可写
+ * 性无关（VM 上 /mnt/UDISK 不可写、板端可写，两条环境必须给出同一结论）。 */
+static void log_discard(int level, const char *module, const char *line, void *user)
+{
+    (void)level;
+    (void)module;
+    (void)line;
+    (void)user;
 }
 
 /* ---------------------------------------------------------------------------
@@ -124,6 +156,36 @@ static int count_open_fds(void)
     }
     (void)closedir(d);
     return n;
+}
+
+/* 泄漏时把每个句柄的指向打出来（只在断言失败时调）——没有它就只能靠猜。
+ * 条目名就是 fd 号，readlink 给出它指向什么（socket / 文件 / 管道）。 */
+static void dump_fds(void)
+{
+    DIR           *d;
+    struct dirent *e;
+
+    d = opendir("/proc/self/fd");
+    if (d == NULL) {
+        fprintf(stderr, "  (cannot open /proc/self/fd)\n");
+        return;
+    }
+    while ((e = readdir(d)) != NULL) {
+        char    p[256];
+        char    tgt[512];
+        ssize_t n;
+
+        if (e->d_name[0] == '.')
+            continue;
+        if (snprintf(p, sizeof p, "/proc/self/fd/%s", e->d_name) >= (int)sizeof p)
+            continue;
+        n = readlink(p, tgt, sizeof tgt - 1u);
+        if (n < 0)
+            continue;
+        tgt[n] = '\0';
+        fprintf(stderr, "  fd %s -> %s\n", e->d_name, tgt);
+    }
+    (void)closedir(d);
 }
 
 static int pty_pair(char *slave_path, size_t cap)
@@ -329,6 +391,55 @@ static int ip_set_state(const char *name, int up)
 }
 
 /* ---------------------------------------------------------------------------
+ * 真网卡模式（板端）专用助手
+ * ------------------------------------------------------------------------- */
+
+/* 接口在不在（/sys/class/net 有目录即有）。真网卡模式下 usb0/eth0 必须已存在。 */
+static int iface_present(const char *name)
+{
+    char p[128];
+
+    if (snprintf(p, sizeof p, "/sys/class/net/%s", name) >= (int)sizeof p)
+        return 0;
+    return access(p, F_OK) == 0;
+}
+
+static int ip_set_promisc(const char *name, int on)
+{
+    char *av[] = { (char *)"ip", (char *)"link", (char *)"set", (char *)name,
+                   (char *)"promisc", (char *)(on ? "on" : "off"), NULL };
+    return run_ip(av);
+}
+
+/* 「顶」出一条 RTM_NEWLINK：真接口多半已经 UP，而内核**只在状态变化时**才发
+ * RTM_NEWLINK ⇒ 已 UP 的接口不会再播事件，probe 的 LINK 项会停在 UNKNOWN。
+ * 用一次 promisc 往返制造一次 flags 变化：IFF_PROMISC 属于 dev->flags，改了必发
+ * RTM_NEWLINK；而 carrier 的判据只认 IFF_UP && IFF_LOWER_UP，所以首条事件报的
+ * 就是当前真实状态（iv_netlink 对「未见过」的接口必报）。还原时状态未变，被去重
+ * 吞掉。**不用 MTU**：板端 stmmac 的 eth0 在 UP 状态下改 MTU 直接 EBUSY
+ * （2026-10-12 板端实测，见当日记忆）。 */
+static void nudge_link(const char *name)
+{
+    (void)ip_set_promisc(name, 1);
+    (void)ip_set_promisc(name, 0);
+}
+
+/* 4G 看护（S62usb4g）是否在跑 —— 它会把 usb0 重新拨起来，与本用例的「拔线」互斥。
+ * 判据取脚本自己的 pidfile（/var/run/usb4g.pid），且进程必须还活着。 */
+static int usb4g_supervisor_running(void)
+{
+    FILE *f   = fopen("/var/run/usb4g.pid", "r");
+    int   pid = 0;
+
+    if (f == NULL)
+        return 0;
+    if (fscanf(f, "%d", &pid) != 1)
+        pid = 0;
+    (void)fclose(f);
+    return (pid > 1 && kill((pid_t)pid, 0) == 0) ? 1 : 0;
+}
+
+/* ---------------------------------------------------------------------------
  * 私有 netns：探测可用性 + 自重启
  * ------------------------------------------------------------------------- */
 
@@ -466,18 +577,31 @@ static int scenario(void)
     int             i;
     int             j;
 
+    /* 先把日志落盘出口摘掉（进程级单例、懒打开，理由见 log_discard），再取水位 ——
+     * 否则板端 /mnt/UDISK 可写会凭空多一个 fd，k07 必假红。 */
+    iv_log_set_sink(log_discard, NULL);
+
     /* 用例自建任何 fd（pty / listener）**之前**取水位：收尾把自建 fd 全关掉后
      * 应回到这里，k07 用它判装配层有没有漏关（取晚了会把测试自己的句柄算成泄漏）。 */
     fd_base = count_open_fds();
 
-    /* ---- netns 内先造网卡：接口必须先存在，iv_agent 才解析得到 ifindex ---- */
-    if (ip_add_dummy(WAN_WL) != 0 || ip_add_dummy(WAN_WD) != 0) {
-        printf("SKIP: cannot create dummy interfaces (iproute2 missing?)\n");
-        return 0;
-    }
-    if (ip_set_state("lo", 1) != 0) {
-        printf("SKIP: cannot bring lo up\n");
-        return 0;
+    /* ---- 网卡准备 ----
+     * 默认（netns）：造两张 dummy，状态留给 k02 拨动；
+     * 真网卡模式（板端）：沿用真实 usb0/eth0 —— 必须已存在，否则 SKIP。 */
+    if (g_realnic) {
+        if (!iface_present(WAN_WL) || !iface_present(WAN_WD)) {
+            printf("SKIP: real-NIC mode needs existing %s / %s\n", WAN_WL, WAN_WD);
+            return 0;
+        }
+    } else {
+        if (ip_add_dummy(WAN_WL) != 0 || ip_add_dummy(WAN_WD) != 0) {
+            printf("SKIP: cannot create dummy interfaces (iproute2 missing?)\n");
+            return 0;
+        }
+        if (ip_set_state("lo", 1) != 0) {
+            printf("SKIP: cannot bring lo up\n");
+            return 0;
+        }
     }
 
     master = pty_pair(slave_path, sizeof slave_path);
@@ -537,8 +661,14 @@ static int scenario(void)
         printf("SKIP: probe items missing, cannot continue\n");
         return 0;
     }
-    chk(ip_set_state(WAN_WL, 1) == 0, "k02 ip link set usb0 up");
-    chk(ip_set_state(WAN_WD, 1) == 0, "k02 ip link set eth0 up");
+    if (g_realnic) {
+        /* 真接口已经 UP、不会自己发事件 —— 顶一次（理由见 nudge_link 注释） */
+        nudge_link(WAN_WL);
+        nudge_link(WAN_WD);
+    } else {
+        chk(ip_set_state(WAN_WL, 1) == 0, "k02 ip link set usb0 up");
+        chk(ip_set_state(WAN_WD, 1) == 0, "k02 ip link set eth0 up");
+    }
     chk(wait_link(IV_WAN_WIRELESS, 1), "k02 wireless probe UP via real kernel link event");
     chk(wait_link(IV_WAN_WIRED, 1), "k02 wired probe UP via real kernel link event");
     pump_agent(master, 2);
@@ -644,7 +774,25 @@ static int scenario(void)
     ls = listen_port(port, &port2);
     chk(ls >= 0 && port2 == port, "k06 platform re-listened on the same port");
     chk(ip_set_state(WAN_WL, 1) == 0, "k06 ip link set usb0 up");
-    chk(wait_link(IV_WAN_WIRELESS, 1), "k06 wireless probe back UP");
+    {
+        int back = wait_link(IV_WAN_WIRELESS, 1);
+
+        chk(back, "k06 wireless probe back UP");
+        if (g_realnic) {
+            /* 真 usb0 掉/起之后地址要重取（板端没有自动重跑的 DHCP 客户端）—— 只补
+             * 地址，不动路由（默认出口归状态机管）。失败不单独断言：地址不是本用例的
+             * 目标，真要缺了会在下面的传输层 / 路由断言上炸出来。 */
+            char *av_dhcp[] = { (char *)"udhcpc", (char *)"-i", (char *)WAN_WL,
+                                (char *)"-n", (char *)"-q", (char *)"-t",
+                                (char *)"6", (char *)"-T", (char *)"2", NULL };
+
+            (void)run_ip(av_dhcp);
+            if (!back)
+                printf("NOTE: real %s did not return to carrier after link up — the "
+                       "EC200G PDP may need AT+QNETDEVCTL=1,1,1 (S62usb4g does that; "
+                       "it was stopped for this run)\n", WAN_WL);
+        }
+    }
     g_now += STEP_MS;
     (void)iv_agent_step(&g_agent, g_now);
     chk(iv_netmgr_wan_is_up(&g_agent.nm, IV_WAN_WIRELESS) == 1, "k06 wireless marked usable");
@@ -694,6 +842,21 @@ static int scenario(void)
     chk(iv_report_is_open(&g_agent.rp) == 0, "k07 report chain closed");
     chk(iv_netlink_fd(&g_agent.nl) == -1, "k07 netlink socket closed");
 
+    /* 真网卡模式：switch_route 的两条默认路由（prio 100）是**真建在板子上的**，且
+     * metric 比板子原有的 204/208 更小 ⇒ 会盖住默认出口。收尾删掉，不留痕（规则 6
+     * 口径；netns 模式不用管，ns 随进程回收）。 */
+    if (g_realnic) {
+        char *av_w[] = { (char *)"ip", (char *)"route", (char *)"del",
+                         (char *)"default", (char *)"dev", (char *)WAN_WL,
+                         (char *)"metric", (char *)"100", NULL };
+        char *av_d[] = { (char *)"ip", (char *)"route", (char *)"del",
+                         (char *)"default", (char *)"dev", (char *)WAN_WD,
+                         (char *)"metric", (char *)"100", NULL };
+
+        (void)run_ip(av_w);
+        (void)run_ip(av_d);
+    }
+
     /* 先收掉用例自建的 fd，再比对水位，否则会把自己的句柄算成"泄漏" */
     if (cs >= 0)
         (void)close(cs);
@@ -704,12 +867,19 @@ static int scenario(void)
     rm_tmpdir(qdir);
 
     /* 只断言"不增"而非"严格相等"：库内可能有惰性缓存；增长才说明装配层漏关。 */
-    chk(count_open_fds() <= fd_base, "k07 open/close did not leak fds");
+    {
+        int after = count_open_fds();
+
+        if (after > fd_base)
+            dump_fds(); /* 泄漏时把每个 fd 的指向打出来，省得回头猜 */
+        chk(after <= fd_base, "k07 open/close did not leak fds");
+    }
 
     if (g_fail == 0)
         printf("test_agent_switch passed "
-               "(netns: link up/down -> probe, wan switch, real route change, "
-               "tcp reconnect, queue backlog, hold_s switch-back, ordered replay)\n");
+               "(%s: link up/down -> probe, wan switch, real route change, "
+               "tcp reconnect, queue backlog, hold_s switch-back, ordered replay)\n",
+               g_realnic ? "real-NIC" : "netns");
     else
         printf("test_agent_switch FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;
@@ -718,6 +888,18 @@ static int scenario(void)
 int main(int argc, char *argv[])
 {
     (void)argc;
+
+    /* 真网卡模式（板端）：不建 ns、不造 dummy，直接在真 usb0/eth0 上跑。
+     * 与 4G 看护互斥（看护会把 usb0 重新拨起来）—— 检测到就 SKIP。 */
+    if (getenv(REALNIC_ENV) != NULL) {
+        g_realnic = 1;
+        if (usb4g_supervisor_running()) {
+            printf("SKIP: 4G supervisor (S62usb4g) is running; stop it before the "
+                   "real-NIC switch test to avoid interference\n");
+            return 0;
+        }
+        return scenario();
+    }
 
     /* 未进私有 netns：先确认 unshare 可用，再把用例整体重启进去 */
     if (getenv(NS_ENV) == NULL) {

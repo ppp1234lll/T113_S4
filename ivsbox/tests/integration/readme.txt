@@ -34,6 +34,11 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
                        `iv_report_reconnect` 真重建 TCP）、平台断→入队积压、
                        **跨过 hold_s 回切 → 按序补传**、收口无 fd 泄漏。
                        **无需外部服务**，但需 `unshare` 与 `iproute2`（见下）。
+                       **两种模式**：默认＝上面的私有 netns（VM 用，网卡是造的）；设
+                       `IV_AGENT_TEST_REALNIC=1` 则改走**真网卡模式** —— 跳过 netns 与
+                       造卡，直接在**真实 `usb0`/`eth0`** 上跑同一套 k01~k07（板端用；
+                       接口必须已存在，否则 SKIP；**须先 stop 4G 看护 `S62usb4g`**，它与
+                       "拔线"互斥；会真改板子默认路由，收尾自己删干净）。
 
 【运行方式】
   # 只跑自包含用例（无需先起任何服务）
@@ -41,6 +46,11 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
   ./build/host/tests/integration/test_e2e_report
   make TARGET=host build/host/tests/integration/test_agent_switch
   ./build/host/tests/integration/test_agent_switch
+
+  # 板端真链路（真网卡模式）：先停 4G 看护，跑完起回来并核对 ip route
+  /etc/init.d/S62usb4g stop
+  IV_AGENT_TEST_REALNIC=1 ./build/arm/tests/integration/test_agent_switch
+  /etc/init.d/S62usb4g start
 
   # 跑整个目录（前提：ivsboxd 必须先在跑，否则 test_ctl_snapshot 会报"没在跑"）
   build/host/ivsboxd &      # 宿主机：先起服务
@@ -63,8 +73,8 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
     它按架构 §18.3 的冻结名造 `usb0`/`eth0`，并在私有 netns 内**真改默认路由**
     （`iv_agent` 把 `switch_route` 接到了 `iv_netmgr_ops_default()`，不打桩 ——
     否则测的就不是装配层实际接的那条路）。**两者任一不可用时用例打印 `SKIP:` 并
-    返回 0**，不会让 `make itest` 假红；板端没有 `unshare`，该用例在板端一律 SKIP
-    （属预期，不影响"需外部服务"用例的板端执行）。
+    返回 0**，不会让 `make itest` 假红。板端没有 `unshare` ⇒ 默认模式在板端 SKIP；
+    要上板就置 `IV_AGENT_TEST_REALNIC=1` 走真网卡模式（见上），此时改用真接口。
   - 板端验证需先按 §S65ivsboxd 拉起服务，再运行"需外部服务"的用例。
 
 【相关文档】

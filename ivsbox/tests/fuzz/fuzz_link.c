@@ -75,7 +75,7 @@ int main(int argc, char **argv)
     double t0 = now_sec();
     static iv_link_t lk;
     static uint8_t chunk[2048];
-    static iv_link_cfg_t cfg = { 100, 1, 3 };
+    static iv_link_cfg_t cfg = { 100, 1, 3, 0u };
     unsigned long ev = 0;
     uint32_t clock_ms = 0;
 

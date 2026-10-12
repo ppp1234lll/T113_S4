@@ -12,6 +12,8 @@
  *   8) 链路状态：连续失败 DOWN、合法帧 UP（on_change 回调）；
  *   9) clear 以指定 rc 回调全部在飞；
  *  10) NULL / 非法入参；下行帧头不被上行解析器接受。
+ *  12) 帧超时（gap_ms>0）：半截帧超阈值复位，其后的完整帧仍被正常接收；
+ *      对照 gap_ms=0（旧行为）⇒ 半截帧永久卡住、后续完整帧被吃成 data。
  *
  * 期望帧字节由**独立手工组帧**生成（不经过被测代码），可抓住
  * "send 组帧被改坏"类回归。
@@ -154,7 +156,7 @@ int main(void)
 
     /* ---- 1) 正常收发：下行帧字节黄金校验 + 应答配对 ---- */
     {
-        iv_link_cfg_t cfg = { 1000, 2, 3 };
+        iv_link_cfg_t cfg = { 1000, 2, 3, 0u };
         size_t n;
 
         rec_reset();
@@ -177,7 +179,7 @@ int main(void)
 
     /* ---- 2) 丢应答触发重传：重传帧与首发一致 ---- */
     {
-        iv_link_cfg_t cfg = { 100, 2, 3 };
+        iv_link_cfg_t cfg = { 100, 2, 3, 0u };
         size_t n;
         uint8_t first[IV_FRAME_MAX];
         size_t first_len;
@@ -207,7 +209,7 @@ int main(void)
 
     /* ---- 3) 电源控制不重传，超时后槽释放 ---- */
     {
-        iv_link_cfg_t cfg = { 100, 2, 3 };
+        iv_link_cfg_t cfg = { 100, 2, 3, 0u };
 
         rec_reset();
         iv_link_init(&lk, &cfg, on_tx, on_up, on_chg, NULL);
@@ -229,7 +231,7 @@ int main(void)
 
     /* ---- 4) 同 cmd 并发 EBUSY / 表满 EFULL ---- */
     {
-        iv_link_cfg_t cfg = { 10000, 0, 3 };
+        iv_link_cfg_t cfg = { 10000, 0, 3, 0u };
 
         rec_reset();
         iv_link_init(&lk, &cfg, on_tx, on_up, on_chg, NULL);
@@ -249,7 +251,7 @@ int main(void)
 
     /* ---- 5) 上报帧无在飞 → on_upstream ---- */
     {
-        iv_link_cfg_t cfg = { 1000, 2, 3 };
+        iv_link_cfg_t cfg = { 1000, 2, 3, 0u };
         size_t n;
         uint8_t one = 0x01;
 
@@ -269,7 +271,7 @@ int main(void)
 
     /* ---- 6) 应答＋上报粘包一次 recv（交接区覆盖 bug 的回归用例） ---- */
     {
-        iv_link_cfg_t cfg = { 1000, 2, 3 };
+        iv_link_cfg_t cfg = { 1000, 2, 3, 0u };
         uint8_t two[2 * IV_FRAME_MAX];
         size_t n1, n2;
 
@@ -288,7 +290,7 @@ int main(void)
 
     /* ---- 7) on_done 内重入 send ---- */
     {
-        iv_link_cfg_t cfg = { 1000, 2, 3 };
+        iv_link_cfg_t cfg = { 1000, 2, 3, 0u };
         size_t n;
 
         rec_reset();
@@ -307,7 +309,7 @@ int main(void)
 
     /* ---- 8) 链路状态：连续失败 DOWN / 合法帧 UP ---- */
     {
-        iv_link_cfg_t cfg = { 100, 0, 3 }; /* 不重传，每次 tick 即失败 */
+        iv_link_cfg_t cfg = { 100, 0, 3, 0u }; /* 不重传，每次 tick 即失败 */
 
         rec_reset();
         iv_link_init(&lk, &cfg, on_tx, on_up, on_chg, NULL);
@@ -350,7 +352,7 @@ int main(void)
 
     /* ---- 9) clear 以指定 rc 回调全部在飞 ---- */
     {
-        iv_link_cfg_t cfg = { 10000, 0, 3 };
+        iv_link_cfg_t cfg = { 10000, 0, 3, 0u };
 
         rec_reset();
         iv_link_init(&lk, &cfg, on_tx, on_up, on_chg, NULL);
@@ -366,7 +368,7 @@ int main(void)
 
     /* ---- 10) 非法入参 / 下行帧头不被接受 ---- */
     {
-        iv_link_cfg_t cfg = { 1000, 2, 3 };
+        iv_link_cfg_t cfg = { 1000, 2, 3, 0u };
         static uint8_t big[IV_FRAME_DATA_MAX + 1];
         size_t n;
 
@@ -398,7 +400,7 @@ int main(void)
 
     /* ---- 11) 发送队列拒绝首发/重传时，错误可见且槽可复用 ---- */
     {
-        iv_link_cfg_t cfg = { 100, 2, 3 };
+        iv_link_cfg_t cfg = { 100, 2, 3, 0u };
         rec_reset();
         iv_link_init(&lk, &cfg, on_tx, on_up, on_chg, NULL);
         g_tx_rc = IV_EFULL;
@@ -417,8 +419,47 @@ int main(void)
             "slot reusable after retransmit queue failure");
     }
 
+    /* ---- 12) 帧超时（gap_ms>0）：半截帧按时复位，之后的完整帧仍被接收 ---- */
+    {
+        iv_link_cfg_t cfg = { 10000, 0, 3, IV_LINK_GAP_MS_DEFAULT };
+        size_t half;
+
+        /* 半截帧：帧头 + cmd + 长度域(data=4) + 只给 2/4 个 data 字节 */
+        rec_reset();
+        chk(iv_link_init(&lk, &cfg, on_tx, on_up, on_chg, NULL) == IV_OK, "gap init");
+        chk(iv_link_send(&lk, IV_FRAME_CMD_QUERY, req, 1, 0, on_done, NULL) == IV_OK,
+            "gap send");
+        half = mk(f, IV_FRAME_HEAD_UP, IV_FRAME_CMD_QUERY, json, 4);
+        iv_link_recv(&lk, f, half - 6, 1000);
+        chk(iv_framer_stats(&lk.framer)->resets == 0, "gap: no reset before threshold");
+        iv_link_tick(&lk, 1000 + (IV_LINK_GAP_MS_DEFAULT - 1));
+        chk(iv_framer_stats(&lk.framer)->resets == 0, "gap: no reset one ms early");
+        iv_link_tick(&lk, 1000 + IV_LINK_GAP_MS_DEFAULT);
+        chk(iv_framer_stats(&lk.framer)->resets == 1, "gap: half frame dropped at threshold");
+        /* 复位之后紧接着的完整帧必须被正常接收 —— 这正是 gap=0 做不到的 */
+        iv_link_recv(&lk, f, half, 1600);
+        chk(g_done.n == 1 && g_done.rc[0] == IV_OK &&
+                g_done.cmd[0] == IV_FRAME_CMD_QUERY && g_done.len[0] == 4,
+            "gap: valid frame accepted after reset");
+        chk(iv_framer_stats(&lk.framer)->resets == 1, "gap: reset counted once");
+        chk(iv_framer_stats(&lk.framer)->frames == 1, "gap: only the whole frame counted");
+
+        /* 对照：gap_ms=0（旧行为）⇒ 半截帧永久卡住，紧随的完整帧被吃成 data */
+        {
+            iv_link_cfg_t c0 = { 10000, 0, 3, 0u };
+            rec_reset();
+            iv_link_init(&lk, &c0, on_tx, on_up, on_chg, NULL);
+            iv_link_recv(&lk, f, half - 6, 1000);
+            iv_link_tick(&lk, 91000); /* 90 s 后仍不复位（机制关闭） */
+            chk(iv_framer_stats(&lk.framer)->resets == 0, "gap=0: never resets");
+            iv_link_recv(&lk, f, half, 91001);
+            chk(iv_framer_stats(&lk.framer)->frames == 0 && g_up.n == 0,
+                "gap=0: valid frame swallowed by the half frame");
+        }
+    }
+
     if (g_fail == 0)
         printf("test_link passed (send/pair/retransmit/exhaust/ebusy/efull/"
-               "upstream/sticky/reentry/linkstate/clear/null)\n");
+               "upstream/sticky/reentry/linkstate/clear/null/framegap)\n");
     return g_fail == 0 ? 0 : 1;
 }

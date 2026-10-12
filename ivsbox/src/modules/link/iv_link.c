@@ -11,7 +11,9 @@
  *     send()/clear() 不会复用正在处理的槽，也不会与遍历交叉；
  *   - 链路状态：事务最终失败 fail_streak++（达阈值判 DOWN）；
  *     成功/合法帧清零并置 UP（DOWN→UP 触发 on_change(1)）。
- *   - 超时比较用 (int32_t)(now - deadline) 差值语义（单调毫秒回绕安全）。
+ *   - 超时比较用 (int32_t)(now - deadline) 差值语义（单调毫秒回绕安全）；
+ *   - 成帧器帧超时（gap_ms）由 iv_link_tick() 驱动：半截帧超时复位丢弃，
+ *     防止状态机被半截帧永久卡死（详见 iv_link.h 文件头"帧超时"段）。
  */
 #include <string.h>
 
@@ -34,7 +36,7 @@ int iv_link_init(iv_link_t *lk, const iv_link_cfg_t *cfg,
     lk->on_upstream = on_upstream;
     lk->on_change = on_change;
     lk->arg = arg;
-    return iv_framer_init(&lk->framer, IV_FRAME_HEAD_UP, 0);
+    return iv_framer_init(&lk->framer, IV_FRAME_HEAD_UP, lk->cfg.gap_ms);
 }
 
 void iv_link_reset(iv_link_t *lk)
@@ -117,6 +119,11 @@ void iv_link_tick(iv_link_t *lk, uint32_t now_ms)
 
     if (lk == NULL)
         return;
+
+    /* 帧超时：半截帧（采集板发到一半掉电/复位）必须在这里丢掉，否则状态机
+     * 停在收 data，后面每一帧的正常字节都被吃成 data、链路永久失效。
+     * iv_framer_tick() 在 gap_ms==0 时自身 no-op，调用方无需判。 */
+    iv_framer_tick(&lk->framer, now_ms);
 
     for (i = 0; i < IV_LINK_INFLIGHT_MAX; i++) {
         uint8_t frame[IV_FRAME_MAX];

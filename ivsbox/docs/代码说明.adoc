@@ -28,6 +28,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | S3.8 装配层切出口端到端集成验收（§16.2 场景 1/2 等价自动化） | 已实现（VM 全量验证 ＋ 反向证伪 3 条；**板端真网卡模式已验收通过**，见文末 2026-10-12 14:05 节） | 2026-10-12 08:39 | 新增 `tests/integration/test_agent_switch.c`（约 700 行，`ITEST_SRCS` 通配自动纳入、不改构建脚本）＋重写 `tests/integration/readme.txt`（用例分三类）。*补 §S3.7 遗留的"§16.2 场景 1/2 待真机"缺口*：**私有 netns 自重启**（`unshare -rmn -- <self>`，无需 root；不可用则 SKIP 返回 0）＋ **`r=NULL` 注入时间轴**（`iv_netlink_poll()`＋`iv_agent_step(now_ms)`，绕开 Reactor 无单步接口），netlink/平台 TCP/采集板 pty 全真 I/O；七段场景 k01~k07（装配起步/摸底/基线上报/拔线切出口重连/平台断入库/回切补传/收口）。VM `make host/arm/analyze` 零告警、`make test` 26/26、`asan`/`tsan` 0 FAIL、本用例 RC=0、`test_e2e_report` 无回归、SKIP 路径 RC=0；**反向证伪 3 条**（7/1/12 行 FAIL）。板端一律 SKIP（无 `unshare`/`dummy`）。详见本文件 2026-10-12 08:39 节。
 | S3.9 4G 数据面自动拉起与运行期看护 | 已实现（板端实测：三次重启 ＋ `AT+RESET` 掉线自愈） | 2026-10-12 11:03 | 新增 `ivsbox/scripts/init.d/S62usb4g`（编号 62>60）＋ `Makefile` 的 `package-copy` 显式补入（该 target 是列举式非通配）。*先把 §18.3 ⚠② 查清、结论与原纪录不同*：**开机侧本就可用**（镜像 udev 冷插拔链路 `S10udev`→`11-usb-autodial.rules`→`usb-EC200G-inserted.sh` 会拨号，禁用本脚本后连跑两次重启 `usb0` 均自动 UP+IPv4）；**真正缺口在运行期**（PDP 掉线后无重拨；开工时板子自 10-08 连跑 4 天，`usb0` 停 DOWN、`QNETDEVCTL?=0,0,0,0`）。脚本＝**开机幂等兜底 ＋ 30 s 看护**：`healthy` 不碰 AT，`degraded` 才恢复（AT 口自动探测、`usbnet`/`CPIN` 校验、仅在 PDP 未激活时 `AT+QNETDEVCTL=1,1,1`）。实测三次 reboot 后 usb0 自动 UP+IP、看护常驻；`AT+RESET` 注入后约 10 s 自愈；`sh -n` 通过。详见本文件 2026-10-12 11:03 节。
 | S3.1 补同步链路查询 ＋ `iv_agent` 开局摸底 | 已实现（VM 全量验证 ＋ 反向证伪 2 条 ＋ 板端 ARM 验收通过） | 2026-10-12 15:00 | 新增 `iv_netlink_link_up()`（`SIOCGIFFLAGS`，零 netlink 请求、未 attach 可用、返回码加 `IV_ENOENT`）＋ `iv_agent_open()` 开局逐条 WAN 摸底；`test_agent_switch.c` 删掉真网卡模式的 promisc 顶事件补偿，`test_netlink.c` 新增 c13。*判据＝`IFF_UP && IFF_RUNNING` 而非 `UP && LOWER_UP`*：`ifreq.ifr_flags` 是 `short`，`IFF_LOWER_UP=0x10000` 装不下（板端实测 `ioctl=0x1043`、`ip` 同刻报 LOWER_UP；sysfs 亦无该位）⇒ 如实写"语义等价代理"。VM `make test` 26/26、`asan`/`tsan` 0 FAIL、netns 用例与 `test_e2e_report` RC=0；反向证伪 2 条（4 行／1 行 FAIL）；板端 ARM `test_netlink` ＋ 真网卡 `test_agent_switch` 均 RC=0、路由逐字还原。详见本文件文末 2026-10-12 15:00 节。 |
+| iv_link 帧超时（gap_ms）默认打开 —— 修"半截帧永久卡死状态机" | 已实现（VM 全量验证 ＋ 反向证伪 2 条 ＋ 板端 ARM 验收通过） | 2026-10-12 16:16 | `iv_link_cfg_t` 增 `gap_ms`（0＝关闭）＋ 新增 `IV_LINK_GAP_MS_DEFAULT=500u`；`iv_link_init()` 传 `cfg.gap_ms`（原写死 0）；`iv_link_tick()` 调 `iv_framer_tick()`（超时检查搭既有 200 ms 总线节拍，不新增定时器/fd/线程）。原状：全库无 `iv_framer_tick()` 调用点 ⇒ 半截帧（采集板发一半掉电）令状态机永久停在收 data、后续帧全被吃成 data、串口链路永久失效。取值硬约束：`gap_ms` 必须 > tick 周期（200 ms），否则被节拍切开的正常帧会被误判成半帧。既有单测/fuzz 的 cfg 位置初始化补第 4 字段 `0u`（语义逐字不变）＋ 新增第 12 组用例（半帧复位 ＋ gap=0 对照）。VM `test` **25/25**、`asan`/`tsan` 0 FAIL、host/arm/analyze 零告警、`test_e2e_report`/`test_agent_switch` RC=0；**反向证伪 2 条各 4 行 FAIL**；板端 ARM `test_link` RC=0、输出与 Host 逐字一致、md5 与 VM ARM 一致。详见本文件文末 2026-10-12 16:16 节。 |
 |===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
@@ -1335,3 +1336,39 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 * *引用清扫*：`grep -rn "iv_s2_uart" ivsbox/` 的命中项**只剩历史文档条目与本次新增的登记文字** —— *源码/头文件/构建脚本零引用*（`main.c`、`Makefile`、各 `*.c`·`*.h` 均无命中）。
 * *构建/回归（VM `tqt113`）*：`make host`/`make arm`/`make analyze` *RC=0 零告警*（ARM 出 ELF32 ARM EABI5）；`make test` *25/25、0 FAIL*（与摘除前 26 项相比只少 `test_s2_uart`，其余无回归）；`make asan`/`setarch -R make tsan` *0 FAIL*；`test_e2e_report` 与 `test_agent_switch`（netns）*RC=0*。
 * *未做（如实登记）*：板端未复跑（本改动不动任何 ARM 可见行为，且 `iv_s2_uart` 从未上板运行）；真实弱网、真平台地址、真采集板接 `ttySAC5` 仍待现场。
+
+
+== 2026-10-12 16:16 `iv_link` 帧超时（gap_ms）默认打开 —— 修"半截帧把成帧状态机永久卡死"
+
+=== 干了什么事
+
+* `include/ivsbox/iv_link.h`：`iv_link_cfg_t` 末尾新增 `uint32_t gap_ms`（`0` ＝ 关闭）；新增宏 `IV_LINK_GAP_MS_DEFAULT 500u`；`IV_LINK_CFG_DEFAULT` 由 `{ 2000u, 2u, 3u }` 变为 `{ 2000u, 2u, 3u, IV_LINK_GAP_MS_DEFAULT }`；文件头新增"帧超时（gap_ms）"设计段（机制必要性、取值硬约束、复位语义），`iv_link_tick()` 的接口注释同步补上"① 成帧器帧超时检查"。
+* `src/modules/link/iv_link.c`：`iv_link_init()` 把 `lk->cfg.gap_ms` 传给 `iv_framer_init()`（原为写死的 `0`）；`iv_link_tick()` 开头新增 `iv_framer_tick(&lk->framer, now_ms)`。
+* `tests/unit/test_link.c`：既有 11 处 `iv_link_cfg_t cfg = { ... }` 位置初始化补第 4 字段 `0u`；新增第 12 组用例（半截帧 → 未到阈值不复位 → 到阈值复位 → 紧随其后的完整帧仍被正常接收 → 复位计数只加一次 → `gap_ms=0` 对照组证明"完整帧被半截帧吞掉"）。
+* `tests/fuzz/fuzz_link.c`：cfg 位置初始化补 `0u`（fuzz 语义不变）。
+* `src/modules/link/readme.txt`、`include/ivsbox/readme.txt`：帧超时口径同步（原"`gap_ms = 0` 关闭帧超时机制"已改为"默认 500 ms 打开"）。
+
+=== 解决什么问题
+
+* 改动前：`iv_link_init()` 把成帧器初始化为 `gap_ms = 0`，而 `iv_framer_tick()` 在**全库没有任何调用点**（只有单元测试与 fuzz 自己调）⇒ 帧超时机制在**产品里从未生效**。
+* 后果：串口是**字节流、没有消息边界**。采集板若发到一半掉电/复位（帧头与长度域已收到、data 没收全），状态机就停在 `ST_DATA`；此后每一帧的正常字节 —— 连同步字 `0F0F` 也算 —— 都被当成上一帧的 data 吃掉（data 满 1024 字节后判 `too_long` 回搜索态，但那时已经吞掉约 1 KB 的有效数据/多帧），**串口链路实际上永久失效，只能重启进程**。计划 §0.1 自 2026-10-10 起把这条登记为遗留。
+* 改动后：`iv_link_tick()` 每次被调用（装配层 200 ms 总线节拍）都顺手做一次帧超时检查；半截帧超过 `gap_ms` 即复位回同步搜索态，**紧随其后的完整帧恢复正常接收**。复位只丢残帧、不回调上层，在飞事务照原样由 `timeout_ms` 重传兜底 ⇒ 与既有的"命令级确认 ＋ 超时重传"语义正交、不冲突。
+
+=== 关键取值与硬约束（写进头文件，避免后人改坏）
+
+* **`gap_ms` 必须 > `iv_link_tick()` 的调用周期**。装配层 `iv_report_step()` 由 `IV_AGENT_PROBE_TICK_MS = 200 ms` 定时器驱动；串口一次 `read` 可能只取到半帧，剩余字节要等下一次节拍才喂进来 —— `gap` 若小于节拍，"被节拍切开的正常帧"会被误判成半截帧丢掉。
+* 默认 **500 ms**：单帧线上时间 @115200 约 23 ms（`IV_FRAME_MAX` = 8 ＋ 1024 B），余量充足；帧间长空闲（0xE1 轮询 30 s、上报 300 s）**不受影响** —— 复位判据要求状态机不在同步字搜索态，帧间的搜索态不会被判超时。
+* 可观测性：复位次数经 `iv_framer_stats()->resets` 读取，是现场判断"采集板是否在发半帧"的唯一指标（真采集板接 `ttySAC5` 时可用它直接观察）。
+
+=== 影响范围
+
+* **产品默认行为变化**：帧超时由关变开。但只影响**异常半帧** —— 正常帧在字节收齐瞬间即交付并回到搜索态，不受影响；E2E（假采集板 pty）与板端真串口路径均无变化。
+* `gap_ms` **未接配置键**：走编译期默认 500 ms。配置化属于"装配层配置接线"的范畴（`iv_link` 在模块层，不读配置），本轮刻意不做。
+* 既有单测/fuzz 的语义**逐字不变**（它们的 cfg 位置初始化补 `0u` ＝ 关闭，与改动前一致）；新增覆盖只在第 12 组用例。
+
+=== 验证方式与结果
+
+* *构建/回归（VM `tqt113`，gcc 11.4.0）*：`make host`/`make arm`/`make analyze` **RC=0 且 `grep -E "warning:|error:"` 命中 0**（ARM 出 ELF32 ARM EABI5）；`make test` **25/25 · 0 FAIL**（`test_link passed (... /framegap)`）；`make asan` / `setarch -R make tsan` 各 **0 FAIL**；集成用例 `test_e2e_report` 与 `test_agent_switch`（netns 私有网络，真路由改动）各 **RC=0**。
+* *反向证伪 2 条（机制级）*：① `iv_link_init()` 把 gap 传回 `0` ⇒ 第 12 组用例 **4** 行 FAIL；② 删掉 `iv_link_tick()` 里的 `iv_framer_tick()` 调用 ⇒ 同样 **4** 行 FAIL。**基线 0 行 FAIL、两条还原后复验 0 行 FAIL、源文件与备份 diff 一致** ⇒ "传参"与"节拍驱动"两个环节都被钉住（只改一处同样会红）。
+* *板端（2026-10-12 16:1x，TQ113 `armv7l`）*：ARM 版 `test_link` md5 `4674c7bab7db472b0047c17d99d70cc5`（与 VM ARM 产物一致）、输出与 Host **逐字一致**（含 `/framegap`）、**RC=0**；跑完 `rm -f /tmp/test_link_fg` 清理。
+* *未做（如实登记）*：真采集板半帧现场注入（待 `ttySAC5` 现场）；`gap_ms` 配置化；板端长稳观察 `resets` 计数。

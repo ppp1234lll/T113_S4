@@ -19,7 +19,7 @@ include/ivsbox  ——  全部公共头文件（跨层接口声明）
   iv_frame.h            采集板 UART 成帧/编码（上行头 0x0F0F、下行头 0xF0F0，CRC-8）
   iv_gps.h              GPS/NMEA 定位与时间源（vendored minmea，含上报策略判断）
   iv_health.h           健康线程 + 看门狗门控（判主循环/慢任务池是否活着，决定喂狗/停喂）
-  iv_link.h             采集板 UART 命令级可靠收发（应答超时重传、链路状态维护）
+  iv_link.h             采集板 UART 命令级可靠收发（应答超时重传、链路状态维护、成帧帧超时默认 500 ms）
   iv_log.h              统一日志门面（日期目录+小时文件落盘、级别过滤、故障码风暴抑制）
   iv_proto.h            云平台私有协议（二进制 ACK 帧 + ## 字符串数据帧，只做协议不做传输）
   iv_reactor.h          epoll 事件循环 Reactor（所有 fd 事件的唯一分发中心）

@@ -1274,3 +1274,64 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 * *板端（TQ113，ARM）*：`test_netlink` **RC=0**、`passed (args, attach/groups, garbage, link updown/dedupe, dellink, addr, route, multi-msg, ENOBUFS, reset, trunc, link query)` 且**无 SKIP 行**（说明 c13 的 DOWN 分支真在真接口上跑了 —— 板端 `/sys` 的 `IFF_UP` 位挑出 down 接口并断言回 0）；`IV_AGENT_TEST_REALNIC=1 ./test_agent_switch` **RC=0**、`passed (real-NIC: …)`（k01"播种"断言在真 `usb0`/`eth0` 上成立）。跑完路由/地址**逐字还原**（`usb0 10.179.169.249/24`、`default via 192.168.2.1 dev eth0 … metric 204`、`default via 10.179.169.1 dev usb0 … metric 208`）。
 * *遗留（本轮操作面）*：板端跑完用例后 `start` 4G 看护时撞上未释放的 `flock`（`another instance holds the lock, exit`）⇒ 看护当场未起，需人工 `start` 一次；`usb0` 数据面本身完好（`UP,LOWER_UP` ＋ IPv4 ＋ `metric 208`）。
 * *未做（如实登记）*：真实弱网（netem）；真平台地址；真采集板接 `ttySAC5`。
+
+== 2026-10-12 15:57 平台事实登记：`usb0` 默认路由 metric 漂移（*只登记，不改产品*）
+
+=== 背景
+
+本节跟进 S3.9（`S62usb4g`）与 2026-10-12 15:00 的板端收尾：*同一块板对 `usb0` 默认路由 metric 的观察不一致* —— 既有 `default via 10.179.169.1 dev usb0 … metric 208`，也有 `default via 10.179.169.1 dev usb0`（无 metric），且 4G 会压过有线。开工前的原假设"208 是本工程手工加的、被别的东西抹掉"必须查清，否则容易做*会被下一次租约覆盖的假修复*。
+
+=== 定性链条（板端只读实测）
+
+* 取址方＝BSP 的常驻 `/sbin/dhcpcd -f /etc/dhcpcd.conf`（`S41dhcpcd` 起，pid 1916）。它的路由口径是 *`metric = 200 + ifindex`*：`eth0`（ifindex 4）⇒ *204*、`usb0`（ifindex 8）⇒ *208*。
+* *抹掉 metric 的是另一个客户端*：BSP udev 脚本 `/usr/bin/usb-EC200G-inserted.sh`（第 172 行起）拉起的*常驻 `udhcpc -i usb0`*（pid 1686），用 BusyBox 的 `/usr/share/udhcpc/default.script`，在 `renew`/`bound` 分支执行 `route del default gw 0.0.0.0 dev $interface` ＋ `route add default gw $i dev $interface` —— *不带 metric* ⇒ 每次租约事件都重装一次。
+* 旁证：`/usr/share/udhcpc/default.script.d/` *为空*、`/etc/udhcpc/` *不存在*、全盘 `grep -rln metric` 只命中无关文件。
+* 共犯（次要）：本工程 `ivsbox/scripts/init.d/S62usb4g` 第 105 行的 `udhcpc -i "$WAN" -n -q -t 6 -T 2` 同样不带 metric，但*仅在 PDP 恢复路径*下执行。
+
+=== 影响评估与处置
+
+* *影响＝无（本产品不依赖该优先级）*：`iv_netmgr` 切换默认出口时用 *`metric 100`*，恒小于 204/208 ⇒ 管理面/业务面不受影响；未被接管时 4G 压过有线，恰与 `AUTO` 模式的"无线优先"一致 ⇒ 属*一致性问题、非功能缺陷*。
+* *处置（用户 2026-10-12 拍板 ③）＝只登记为平台事实/风险，产品代码与板端脚本零改动。* 备选修法 ① 加 metric 校正看护、② 拨号后 `dhcpcd -n usb0` 交还路由，均已评估为功能改动且现值不值得，本轮不采纳；若日后重开，*板端验收判据*＝"连续两次租约事件后 `metric` 仍为 208（或 `iv_netmgr` 的 `metric 100` 仍在）"。
+* *风险提示*：任何"`usb0` 恒为 `metric 208`、有线天然优先"的假设都是错的 —— 该 metric 由 BSP 的常驻 `udhcpc` 决定，随租约事件漂移。
+
+=== 验证方式与结果
+
+* 板端*只读*核对（未改板端任何文件）：`ps` 见 `dhcpcd` 与常驻 `udhcpc -i usb0` 并存；`ip route` 见 `default via 10.179.169.1 dev usb0`（无 metric）＋ `default via 192.168.2.1 dev eth0 … metric 204`；`/usr/share/udhcpc/default.script` 的 `renew`/`bound` 分支逐行核对。
+* 本轮*无代码/脚本改动，未跑构建* —— 规则 4 意义上本无代码产出，本节按用户批准的登记范围（③ 写进 `代码说明.adoc` ＋ `修改记录.md`）补入，便于日后查 `usb0` 路由时不再重复踩。
+
+== 2026-10-12 15:58 S2 串口装配 `iv_s2_uart` 整段摘除（收口 2026-10-10 08:45 的"未接主入口"）
+
+=== 干了什么事
+
+* *删除三个文件*：`ivsbox/include/ivsbox/iv_s2_uart.h`、`ivsbox/src/modules/link/iv_s2_uart.c`、`ivsbox/tests/unit/test_s2_uart.c`。
+* *清理引用*：`ivsbox/include/ivsbox/readme.txt` 去掉头文件行；`ivsbox/src/modules/link/readme.txt` 去掉 `iv_s2_uart.c` 行并在【实现状态】注明摘除原因；`ivsbox/docs/功能开发计划.md` §0.1 追加收口行、§S2 追加"2026-10-12 15:58 收口"补记。
+* *未改任何其它代码与构建脚本*：`Makefile` 一字未改（`TEST_SRCS := $(wildcard tests/unit/*.c)` 通配自动生效；`package-copy` 虽为显式列举，但只列脚本与二进制、不含本模块）。
+
+=== 解决什么问题
+
+* 2026-10-10 08:45 起，计划 §0.1 一直挂着一行「S2 流程审查修复 …… *部分实现（未接主入口，未硬件联调）*」，其中"未接主入口"指的就是 `iv_s2_uart`。
+* 本次查明：`iv_s2_uart` 与*已接线*的 `iv_report`（`src/modules/report/`，S3.6）是*同一组原语*（`iv_serial`/`iv_frame`/`iv_link`/`iv_status`）之上的*两套并行装配*。逐项比对（依据＝两处源码）：
+
+|===
+| 能力 | `iv_s2_uart` | `iv_report`（S3.6，已接线）
+| E1 查询轮询 | 有（30 s） | 有（30 s）
+| 部分写 | 有（4 槽 tx 队列 ＋ 偏移续写） | 有（单槽 `txbuf/txlen` ＋ `memmove` 留残余、`EAGAIN` 留待下次冲）
+| 断线清镜像 | 有 | 有（`serial_drop()`）
+| 断线重开重试 | 有（1 s tick 重连） | 有（`IV_REPORT_SERIAL_RETRY_MS`）
+| 上行/事件分发 | 有 | 有
+| 上报队列 / 平台传输 / 心跳 / 查询应答 | *无* | *有*
+|===
+
+* ⇒ `iv_report` 是 `iv_s2_uart` 的*超集*；后者独有的只有"4 槽 tx 队列 ＋ `query_pending` 门"，与 `iv_report` 的单槽冲写*功能等价*。而主入口只能有一个 `/dev/ttySAC5` 持有者 ⇒ 留着它就是"二选一"的隐患。（该判断已于 2026-10-12 写入项目记忆的待拍板项，本轮由用户拍板"整段摘除"。）
+
+=== 影响范围
+
+* *产品行为不变*：`iv_s2_uart` 从未被 `main.c` 或任何其它编译单元引用（`main.c`/`Makefile`/各 `*.c`·`*.h` 全库**零引用**）⇒ 摘除不影响运行中的 `ivsboxd`。
+* *测试*：`make test` 由 *26 项减为 25 项*（少的正是 `test_s2_uart`）；S2.2/S2.3/S2.6 的单测（`test_frame`/`test_link`/`test_status`）全在，覆盖不受影响。
+* *文档口径*：计划 §0.1 那行的"未接主入口"就此闭合为"能力已由 `iv_report` 覆盖"；但 *M2 退出条件里的"真实硬件联调"仍未满足*（真采集板接 `ttySAC5` 待现场），摘除不等于 M2 完成。
+
+=== 验证方式与结果
+
+* *引用清扫*：`grep -rn "iv_s2_uart" ivsbox/` 的命中项**只剩历史文档条目与本次新增的登记文字** —— *源码/头文件/构建脚本零引用*（`main.c`、`Makefile`、各 `*.c`·`*.h` 均无命中）。
+* *构建/回归（VM `tqt113`）*：`make host`/`make arm`/`make analyze` *RC=0 零告警*（ARM 出 ELF32 ARM EABI5）；`make test` *25/25、0 FAIL*（与摘除前 26 项相比只少 `test_s2_uart`，其余无回归）；`make asan`/`setarch -R make tsan` *0 FAIL*；`test_e2e_report` 与 `test_agent_switch`（netns）*RC=0*。
+* *未做（如实登记）*：板端未复跑（本改动不动任何 ARM 可见行为，且 `iv_s2_uart` 从未上板运行）；真实弱网、真平台地址、真采集板接 `ttySAC5` 仍待现场。

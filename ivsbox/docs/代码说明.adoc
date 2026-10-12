@@ -25,6 +25,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | S2 流程审查修复 | 部分实现（未接主入口） | 2026-10-10 08:47 | 协议帧尾校验与发送失败传播、UART 控制动作禁自动重发、E1 全量镜像刷新、新增 Reactor 串口装配；本机四个相关单测及静态分析通过，未硬件联调。
 | S2 与 S3.6 合并适配 | 已实现（模块与上报装配层；主入口待接） | 2026-10-10 15:23 | 保留 S3.6 新平台协议，发送拒绝传至平台/串口回调；串口掉线清镜像并重连；本机单测、Linux VM 25 项单测、host/ARM 构建及相关 E2E 均通过。
 | M3 收口·装配层 iv_agent（S3.1~S3.6 接入 ivsboxd） | 已实现 | 2026-10-10 17:41 | 新增 `iv_agent.h`/`iv_agent.c`（libivmodules）把 netlink/probe/netmgr/report 四链装配成一个可运行整体，`main.c` 从配置读参后 `iv_agent_open`；`iv_report` 增 `iv_report_reconnect()` 接 netmgr 切换钩子（切出口后重建平台 TCP、队列未确认数据保留）。VM host/arm/analyze 零告警、test/asan/tsan 各 26/26；VM netns 建 dummy 接口冒烟：`agent up: wan0=usb0(if3) wan1=eth0(if2) mode=4`、拔插网卡无崩溃、SIGTERM 优雅退出。详见本文件 2026-10-10 17:41 节。
+| S3.8 装配层切出口端到端集成验收（§16.2 场景 1/2 等价自动化） | 已实现（VM 全量验证 ＋ 反向证伪 3 条；板端 SKIP） | 2026-10-12 08:39 | 新增 `tests/integration/test_agent_switch.c`（约 700 行，`ITEST_SRCS` 通配自动纳入、不改构建脚本）＋重写 `tests/integration/readme.txt`（用例分三类）。*补 §S3.7 遗留的"§16.2 场景 1/2 待真机"缺口*：**私有 netns 自重启**（`unshare -rmn -- <self>`，无需 root；不可用则 SKIP 返回 0）＋ **`r=NULL` 注入时间轴**（`iv_netlink_poll()`＋`iv_agent_step(now_ms)`，绕开 Reactor 无单步接口），netlink/平台 TCP/采集板 pty 全真 I/O；七段场景 k01~k07（装配起步/摸底/基线上报/拔线切出口重连/平台断入库/回切补传/收口）。VM `make host/arm/analyze` 零告警、`make test` 26/26、`asan`/`tsan` 0 FAIL、本用例 RC=0、`test_e2e_report` 无回归、SKIP 路径 RC=0；**反向证伪 3 条**（7/1/12 行 FAIL）。板端一律 SKIP（无 `unshare`/`dummy`）。详见本文件 2026-10-12 08:39 节。
 |===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
@@ -1116,3 +1117,41 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
   `agent up: wan0=usb0(if3) wan1=eth0(if2) mode=4 server=(none):0`
   `ivsboxd initialized, entering reactor`；`ip link set usb0 down` / `up` 事件被消化、进程无崩溃；`kill -TERM` 后 `signal 15 received, stopping` → `shutting down ivsboxd` → `taskpool destroyed`（优雅退出）。VM 上串口 `/dev/ttySAC5`、UDS 目录、平台地址缺失均为按设计降级（各有 WARN/ERR 日志，不阻断启动）。
 * **未做（如实登记）**：① §16.2 场景 1/2（拔线/弱网/回切/补传）验收 —— 用户 2026-10-10 定为"仅编译＋既有回归"，待真平台地址/真机；② **反向证伪**：本轮无新增单测，故无"FAIL 行"式证伪对象；③ 平台地址"按活动出口选 wired/wireless"语义未冻结，暂按"有线优先、空则无线"；④ `devid`（TID）/`mod`（型号）无配置键来源，分别取 0 / NULL；⑤ probe 的 TCP fd 每次 tick 动态创建，未逐个挂 Reactor，改在 200 ms 定时器内统一驱动。
+
+== 2026-10-12 08:39 S3.8 装配层切出口端到端集成验收（§16.2 场景 1/2 的等价自动化）
+
+=== 干了什么事
+
+* 新增 *`tests/integration/test_agent_switch.c`*（约 700 行，自包含集成用例，零 mock）：把"真内核链路事件 → 探活 → 双 WAN 状态机 → **真改默认出口** → 平台 TCP 重建 → 上报入队积压 → 回切后按序补传"整条装配链做成**可在 VM 上重复运行、结果确定**的端到端用例。
+* 重写 *`tests/integration/readme.txt`*：用例由两类扩为三类（连外部服务 / 自包含 / **自包含＋私有 netns**），登记本用例的覆盖范围、对 `unshare`＋iproute2 的依赖、不可用时 SKIP 的口径、运行命令与注意事项。
+* *未改任何产品代码与构建脚本*：`Makefile` 的 `ITEST_SRCS := $(wildcard tests/integration/*.c)` 通配自动纳入；`iv_agent.*`/`main.c`/`iv_report.*` 一行未动。
+
+=== 解决什么问题
+
+* §S3.7 明示遗留"§16.2 场景 1/2（拔线/弱网/回切/补传）验收留待真平台地址/真机" —— 即"切出口"这条最关键的装配链此前**从未被端到端跑过**，S3.3 的切换事务与 `iv_report_reconnect()` 只在单测/冒烟层面验证。本用例把该场景变成可回归的自动化，把"待真机"降级为"待真机现场确认"，而非"逻辑未验"。
+* 该场景没法用普通单测覆盖：要造"接口名固定、链路可拨、默认路由可改"，且**不能打桩 `switch_route`**（否则验的就是假货）——只有真实内核 ＋ 私有 netns 同时满足。
+
+=== 影响范围
+
+* 仅新增测试文件与文档；**产品行为、接口、构建脚本均无改动**（新增文件经通配自动进 `build/host/tests/integration/`）。
+* 该用例**不进 `make test`**（可能需外部条件），由 `make itest` 单独跑；`itest` 会对每个用例 `"$t" || exit 1`，故用例必须能自我 SKIP 并返回 0。板端（TQ113 无 `unshare`/`dummy` 模块）**一律 SKIP**。
+
+=== 验证方式与结果
+
+* *形态*：**私有 netns 自重启** —— `main()` 未置 `IV_AGENT_TEST_NETNS` 时先 `unshare -rmn -- true` 探测，可用则 `execlp("unshare","unshare","-rmn","--",argv[0])` 重启自身（`WEXITSTATUS==127` ⇒ 打印 SKIP 返回 0）；不可用立即 SKIP。`unshare -rmn` 建私有 user+net+mount ns，**无需 root**。**驱动**：Reactor 只有阻塞式 `iv_reactor_run()`、无可限时单步接口 ⇒ 用 `r=NULL` 打开 agent（不注册 netlink fd/定时器），调用方按节拍自行 `iv_netlink_poll()` ＋ `iv_agent_step(a, now_ms)`，`now_ms` 由测试推进（迟滞 `hold_s`/上报节拍全在掌控）。**真实 I/O 全保留**：netlink 事件来自真内核、平台用 127.0.0.1 回环真 TCP、采集板用真 pty；iproute2 经 `fork`+`exec` 直传 argv。
+* *七段场景*：k01 装配起步（`ifindex>0`、`wan_probe_idx>=0`、初始 `WIRELESS_UP` 且 fd 有增长）→ k02 摸底（`ip link set usb0/eth0 up`，等真 LINK_UP，`iv_netmgr_wan_is_up()==1`）→ k03 基线上报（平台 accept、`wait_transport_up`，trigger 上报后校验 `##` 帧 `CSQ==9`）→ k04 拔线（`ip link set usb0 down` ⇒ `switches==1`、`active_wan==WIRED`、`state==WIRED_UP`，平台侧 accept 到**新** TCP 且旧连接被拆）→ k05 平台断（trigger×2 ⇒ `queue_count==2`、`queue_full==0`）→ k06 回切＋补传（平台复听同端口、`usb0 up`，先断言 `hold_s` 未到**不切**、推时间过 `hold_s` 后 `switches==2`、`active_wan==WIRELESS`，再等重连、`wait_queue_empty`，校验两帧 `CSQ=11,12` 且无尾随字节）→ k07 收口（`is_open==0`、`netlink_fd==-1`、关自建 fd 后 `count_open_fds()<=fd_base`）。
+* *构建/回归（VM `tqt113`）*：`make host`/`make arm`/`make analyze` 全 **RC=0 零告警**（ARM 出 **ELF32 ARM EABI5**）；`make test` **26/26**、`make asan`/`setarch -R make tsan` **0 FAIL**（与既有 26 项无回归）；本用例 **RC=0**，输出 `test_agent_switch passed (netns: link up/down -> probe, wan switch, real route change, tcp reconnect, queue backlog, hold_s switch-back, ordered replay)`；`test_e2e_report` 仍通过（**无回归**）；SKIP 降级路径（`PATH=/nonexistent`）打印 `SKIP: private netns unavailable (unshare -rmn)` 且 **RC=0**。
+* *反向证伪 3 条*（每条：`cp` 备份 → `python3` 锚定单点替换（`assert n==1`）→ 只重编该用例 → `grep -c '^FAIL:'` → 恢复；基线 0、恢复后源码 md5 一致、基线复跑 RC=0）：
+
+|===
+| 变异点 | FAIL 行数 | 命中的断言
+| `netmgr_feed` 恒把探活结论当成功 | 7 | k04 切换未发生、k06 提前回切
+| `agent_reconnect` 不调 `iv_report_reconnect` | 1 | 平台侧未收到新 TCP
+| `on_nl_evt` 不把 LINK 事件转给 `iv_probe_set_link` | 12 | k02 摸底即塌
+|===
+
+* *实现期修正（教训，写死）*：
+  **① k04 判据不能用 `iv_transport_connects`**：`iv_transport_open()` 会复位会话统计（`connects` 归零）⇒ 重连后只可能是 1，`>=2` 恒 FAIL；改为**平台侧证据**（新 TCP 被 `accept` ＋ 旧连接 `read()<=0` 被拆）。
+  **② fd 水位基准取点**：必须在**自建任何 fd 之前**取 `fd_base`、并在 k07 **先关自建 fd** 再比对，否则会把测试自己的句柄算成"泄漏"。
+* **未做（如实登记）**：① 板端一律 **SKIP**（无 `unshare`/`dummy` 模块）；② 真实弱网（netem 高延迟/丢包）未覆盖；③ 真机现场（真平台地址＋真采集板）仍待 —— 本用例是其**等价自动化**而非替代。
+* *清理*：VM `/tmp/wb_agent`（源码副本）、`/tmp/r_*.log`、`/tmp/f_build.log`、`/tmp/iv_agent.c.bak` 用毕删除；本机无临时残留。

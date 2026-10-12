@@ -46,8 +46,10 @@
  * `IV_AGENT_TEST_REALNIC=1` 置位，用例就改走「真网卡模式」：不建 ns、不造 dummy，
  * 直接在**真实 usb0/eth0** 上跑同一条场景链（接口必须已存在，否则 SKIP）。
  * 两处差异必须知道：
- *   1) 真接口多半**已经 UP**，而内核只在**状态变化**时才发 RTM_NEWLINK；k02 因此
- *      用一次「promisc 往返」把当前真实 flags 顶出来（见 k02 处注释）；
+ *   1) 真接口多半**已经 UP**，而内核只在**状态变化**时才发 RTM_NEWLINK —— 靠的是
+ *      **装配层的开局摸底**（`iv_agent_open()` 同步读一次 carrier 播进 probe）把
+ *      当前真实状态播出来；k02 因此直接断言"真接口开局就被播成 UP"，不再自己顶
+ *      一条事件（那是在补偿装配层"开局不摸底"的缺口，缺口已修）；
  *   2) 用例的 switch_route 步会**真改板子的路由表**（留下两条 prio 100 的默认路由），
  *      k06 掉/起 usb0 后还要 udhcpc 重取地址 —— 收尾（k07）会把这些痕迹清干净。
  * 真网卡模式与 **4G 看护 `S62usb4g` 互斥**：看护每 30 s 会把 usb0 重新拨起来，与本
@@ -404,25 +406,10 @@ static int iface_present(const char *name)
     return access(p, F_OK) == 0;
 }
 
-static int ip_set_promisc(const char *name, int on)
-{
-    char *av[] = { (char *)"ip", (char *)"link", (char *)"set", (char *)name,
-                   (char *)"promisc", (char *)(on ? "on" : "off"), NULL };
-    return run_ip(av);
-}
-
-/* 「顶」出一条 RTM_NEWLINK：真接口多半已经 UP，而内核**只在状态变化时**才发
- * RTM_NEWLINK ⇒ 已 UP 的接口不会再播事件，probe 的 LINK 项会停在 UNKNOWN。
- * 用一次 promisc 往返制造一次 flags 变化：IFF_PROMISC 属于 dev->flags，改了必发
- * RTM_NEWLINK；而 carrier 的判据只认 IFF_UP && IFF_LOWER_UP，所以首条事件报的
- * 就是当前真实状态（iv_netlink 对「未见过」的接口必报）。还原时状态未变，被去重
- * 吞掉。**不用 MTU**：板端 stmmac 的 eth0 在 UP 状态下改 MTU 直接 EBUSY
- * （2026-10-12 板端实测，见当日记忆）。 */
-static void nudge_link(const char *name)
-{
-    (void)ip_set_promisc(name, 1);
-    (void)ip_set_promisc(name, 0);
-}
+/* 注：真网卡模式**不再自己"顶"一条 RTM_NEWLINK**。早期版本靠一次 promisc 往返
+ * 把当前状态顶出来（MTU 往返在板端 eth0/stmmac 上直接 EBUSY），但那是在补偿装配
+ * 层"开局不摸底"的缺口（2026-10-12 板端真链路验收查出）。缺口已在 `iv_agent_open()`
+ * 里修掉（open 时同步探一次链路可用性播进 probe），故此处只需断言，无需造事件。 */
 
 /* 4G 看护（S62usb4g）是否在跑 —— 它会把 usb0 重新拨起来，与本用例的「拔线」互斥。
  * 判据取脚本自己的 pidfile（/var/run/usb4g.pid），且进程必须还活着。 */
@@ -655,6 +642,19 @@ static int scenario(void)
     chk(g_agent.wan_probe_idx[IV_WAN_WIRED] >= 0, "k01 wired probe item created");
     chk(iv_report_serial_fd(&g_agent.rp) >= 0, "k01 serial opened (pty)");
 
+    /* 开局摸底：装配完成时两路 WAN 的 LINK 项就该是**当前真实状态**，而不是
+     * UNKNOWN —— netlink 不回放现状，装配层不自己读一次的话，"接口早就 UP" 的
+     * 场景（板端开机就是如此）会一直等不到事件。真网卡模式＝真接口本来就 UP
+     * ⇒ 应播成 UP；netns 模式＝dummy 刚建出来是 DOWN ⇒ 应播成 DOWN。 */
+    {
+        iv_probe_state_t want = g_realnic ? IV_PROBE_UP : IV_PROBE_DOWN;
+
+        chk(iv_probe_state(&g_agent.pb, g_agent.wan_probe_idx[IV_WAN_WIRELESS]) == want,
+            "k01 wireless link seeded from current kernel state");
+        chk(iv_probe_state(&g_agent.pb, g_agent.wan_probe_idx[IV_WAN_WIRED]) == want,
+            "k01 wired link seeded from current kernel state");
+    }
+
     /* ---- k02 摸底：真内核 LINK_UP → probe UP → netmgr 标记两路可用 ---- */
     if (g_agent.wan_probe_idx[IV_WAN_WIRELESS] < 0 ||
         g_agent.wan_probe_idx[IV_WAN_WIRED] < 0) {
@@ -662,15 +662,20 @@ static int scenario(void)
         return 0;
     }
     if (g_realnic) {
-        /* 真接口已经 UP、不会自己发事件 —— 顶一次（理由见 nudge_link 注释） */
-        nudge_link(WAN_WL);
-        nudge_link(WAN_WD);
+        /* 真接口本来就 UP ⇒ 开局摸底应已把它们播成 UP（k01 已钉死）。这里只把
+         * 结论交给状态机，**不需要任何"造事件"的手段**。 */
+        chk(wait_link(IV_WAN_WIRELESS, 1), "k02 wireless UP (seeded at open)");
+        chk(wait_link(IV_WAN_WIRED, 1), "k02 wired UP (seeded at open)");
     } else {
+        /* netns：dummy 建出来就是 DOWN（摸底应播成 DOWN），再靠**真内核 LINK_UP
+         * 事件**转 UP —— 这一段验的是 netlink → probe 的事件转接。 */
+        chk(wait_link(IV_WAN_WIRELESS, 0), "k02 wireless starts DOWN (seeded at open)");
+        chk(wait_link(IV_WAN_WIRED, 0), "k02 wired starts DOWN (seeded at open)");
         chk(ip_set_state(WAN_WL, 1) == 0, "k02 ip link set usb0 up");
         chk(ip_set_state(WAN_WD, 1) == 0, "k02 ip link set eth0 up");
+        chk(wait_link(IV_WAN_WIRELESS, 1), "k02 wireless probe UP via real kernel link event");
+        chk(wait_link(IV_WAN_WIRED, 1), "k02 wired probe UP via real kernel link event");
     }
-    chk(wait_link(IV_WAN_WIRELESS, 1), "k02 wireless probe UP via real kernel link event");
-    chk(wait_link(IV_WAN_WIRED, 1), "k02 wired probe UP via real kernel link event");
     pump_agent(master, 2);
     chk(iv_netmgr_wan_is_up(&g_agent.nm, IV_WAN_WIRELESS) == 1, "k02 netmgr: wireless usable");
     chk(iv_netmgr_wan_is_up(&g_agent.nm, IV_WAN_WIRED) == 1, "k02 netmgr: wired usable");

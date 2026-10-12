@@ -22,6 +22,7 @@
  */
 #include <errno.h>
 #include <string.h>
+#include <sys/ioctl.h> /* SIOCGIFFLAGS：同步查接口 flags */
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -39,8 +40,16 @@
  *   （2026-10-09 实测：VM gcc11/glibc2.35 即使 -D_GNU_SOURCE 也没有定义，
  *   兜底值一旦写错，单测自洽、真实内核事件全丢 —— 本轮联调抓到的真缺陷）。
  *   自持常量是唯一不依赖工具链的写法。
+ *
+ * 两条路径用的位**不同源**，各自都有实测依据：
+ *   - 事件路径（handle_link）：判 carrier 用 `UP && LOWER_UP`，值来自 netlink
+ *     的 32 位 ifi_flags，LOWER_UP 拿得到；
+ *   - 同步查询（iv_netlink_link_up）：走 SIOCGIFFLAGS，而 ifreq.ifr_flags 是
+ *     short（2 B），IFF_LOWER_UP=0x10000 物理上装不下（2026-10-12 板端实测），
+ *     只能用 `UP && RUNNING`。二者在全部已测场景逐一致，详见该函数注释。
  * ------------------------------------------------------------------------- */
 #define IVNL_KF_UP       ((uint32_t)0x00000001u) /* = IFF_UP */
+#define IVNL_KF_RUNNING  ((uint32_t)0x00000040u) /* = IFF_RUNNING */
 #define IVNL_KF_LOWER_UP ((uint32_t)0x00010000u) /* = IFF_LOWER_UP */
 
 /* ---------------------------------------------------------------------------
@@ -376,6 +385,60 @@ int iv_netlink_feed(iv_netlink_t *nl, const void *buf, size_t len)
     if (overflow)
         return IV_EFULL;
     return nl->evt_count;
+}
+
+int iv_netlink_link_up(const char *ifname, int *up_out)
+{
+    struct ifreq ifr;
+    unsigned     flags;
+    int          fd;
+    int          e;
+
+    if (ifname == NULL || up_out == NULL)
+        return IV_EINVAL;
+    *up_out = 0;
+
+    /* 空名 / 超 IFNAMSIZ 的名字不可能对应任何接口（内核也只会回 ENODEV） */
+    if (ifname[0] == '\0' || strlen(ifname) >= sizeof(ifr.ifr_name))
+        return IV_ENOENT;
+
+    fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return socket_err_map(errno);
+
+    memset(&ifr, 0, sizeof(ifr));
+    (void)memcpy(ifr.ifr_name, ifname, strlen(ifname));
+    if (ioctl(fd, SIOCGIFFLAGS, &ifr) != 0) {
+        e = errno;
+        (void)close(fd);
+        errno = e;
+        if (e == ENODEV || e == ENXIO || e == ENOENT)
+            return IV_ENOENT;
+        return socket_err_map(e);
+    }
+    (void)close(fd);
+
+    /* 判据 = IFF_UP && IFF_RUNNING（**不是**事件路径那对 UP && LOWER_UP）。
+     *
+     * 为什么不同源：`struct ifreq.ifr_flags` 是 `short`（2 B），而 IFF_LOWER_UP
+     * 是 0x10000 —— SIOCGIFFLAGS 结构上就装不下那一位。2026-10-12 实测（板端
+     * TQ113 内核 5.4.61-rt37 ＋ VM netns dummy）：eth0/usb0 有载波时 ioctl 回
+     * 0x1043（UP|BROADCAST|MULTICAST|RUNNING），LOWER_UP 恒为 0；而同一时刻
+     * `ip` 报 `<...UP,LOWER_UP>`（那一位只有 32 位的 netlink ifi_flags 才有）。
+     * `/sys/class/net/<if>/flags` 也不能当替代：板端回 0x1003（无 LOWER_UP），
+     * netns 里该文件干脆不存在。
+     *
+     * IFF_RUNNING 是内核 dev_get_flags() 按 RFC2863 合成的"操作态 up"
+     * （= netif_running && netif_oper_up），与 LOWER_UP 在已测全部场景逐一致：
+     * 板端 eth0/usb0 → 1（与事件路径同）；VM netns dummy `ip link set up`
+     * → 0xc3 → 1、`set down` → 0x82 → 0（`ip` 也分别报 LOWER_UP / 无）。
+     * 故此为**语义等价代理**而非常量级同源，头文件已如实声明。
+     * ifr_flags 是有符号 short，先取 16 位无符号再掩码，免得符号扩展生噪音。 */
+    flags   = (unsigned)(uint16_t)ifr.ifr_flags;
+    *up_out = (((flags & IVNL_KF_UP) != 0u) && ((flags & IVNL_KF_RUNNING) != 0u))
+                  ? 1
+                  : 0;
+    return IV_OK;
 }
 
 int iv_netlink_poll(iv_netlink_t *nl)

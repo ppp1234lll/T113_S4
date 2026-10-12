@@ -27,6 +27,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M3 收口·装配层 iv_agent（S3.1~S3.6 接入 ivsboxd） | 已实现 | 2026-10-10 17:41 | 新增 `iv_agent.h`/`iv_agent.c`（libivmodules）把 netlink/probe/netmgr/report 四链装配成一个可运行整体，`main.c` 从配置读参后 `iv_agent_open`；`iv_report` 增 `iv_report_reconnect()` 接 netmgr 切换钩子（切出口后重建平台 TCP、队列未确认数据保留）。VM host/arm/analyze 零告警、test/asan/tsan 各 26/26；VM netns 建 dummy 接口冒烟：`agent up: wan0=usb0(if3) wan1=eth0(if2) mode=4`、拔插网卡无崩溃、SIGTERM 优雅退出。详见本文件 2026-10-10 17:41 节。
 | S3.8 装配层切出口端到端集成验收（§16.2 场景 1/2 等价自动化） | 已实现（VM 全量验证 ＋ 反向证伪 3 条；**板端真网卡模式已验收通过**，见文末 2026-10-12 14:05 节） | 2026-10-12 08:39 | 新增 `tests/integration/test_agent_switch.c`（约 700 行，`ITEST_SRCS` 通配自动纳入、不改构建脚本）＋重写 `tests/integration/readme.txt`（用例分三类）。*补 §S3.7 遗留的"§16.2 场景 1/2 待真机"缺口*：**私有 netns 自重启**（`unshare -rmn -- <self>`，无需 root；不可用则 SKIP 返回 0）＋ **`r=NULL` 注入时间轴**（`iv_netlink_poll()`＋`iv_agent_step(now_ms)`，绕开 Reactor 无单步接口），netlink/平台 TCP/采集板 pty 全真 I/O；七段场景 k01~k07（装配起步/摸底/基线上报/拔线切出口重连/平台断入库/回切补传/收口）。VM `make host/arm/analyze` 零告警、`make test` 26/26、`asan`/`tsan` 0 FAIL、本用例 RC=0、`test_e2e_report` 无回归、SKIP 路径 RC=0；**反向证伪 3 条**（7/1/12 行 FAIL）。板端一律 SKIP（无 `unshare`/`dummy`）。详见本文件 2026-10-12 08:39 节。
 | S3.9 4G 数据面自动拉起与运行期看护 | 已实现（板端实测：三次重启 ＋ `AT+RESET` 掉线自愈） | 2026-10-12 11:03 | 新增 `ivsbox/scripts/init.d/S62usb4g`（编号 62>60）＋ `Makefile` 的 `package-copy` 显式补入（该 target 是列举式非通配）。*先把 §18.3 ⚠② 查清、结论与原纪录不同*：**开机侧本就可用**（镜像 udev 冷插拔链路 `S10udev`→`11-usb-autodial.rules`→`usb-EC200G-inserted.sh` 会拨号，禁用本脚本后连跑两次重启 `usb0` 均自动 UP+IPv4）；**真正缺口在运行期**（PDP 掉线后无重拨；开工时板子自 10-08 连跑 4 天，`usb0` 停 DOWN、`QNETDEVCTL?=0,0,0,0`）。脚本＝**开机幂等兜底 ＋ 30 s 看护**：`healthy` 不碰 AT，`degraded` 才恢复（AT 口自动探测、`usbnet`/`CPIN` 校验、仅在 PDP 未激活时 `AT+QNETDEVCTL=1,1,1`）。实测三次 reboot 后 usb0 自动 UP+IP、看护常驻；`AT+RESET` 注入后约 10 s 自愈；`sh -n` 通过。详见本文件 2026-10-12 11:03 节。
+| S3.1 补同步链路查询 ＋ `iv_agent` 开局摸底 | 已实现（VM 全量验证 ＋ 反向证伪 2 条 ＋ 板端 ARM 验收通过） | 2026-10-12 15:00 | 新增 `iv_netlink_link_up()`（`SIOCGIFFLAGS`，零 netlink 请求、未 attach 可用、返回码加 `IV_ENOENT`）＋ `iv_agent_open()` 开局逐条 WAN 摸底；`test_agent_switch.c` 删掉真网卡模式的 promisc 顶事件补偿，`test_netlink.c` 新增 c13。*判据＝`IFF_UP && IFF_RUNNING` 而非 `UP && LOWER_UP`*：`ifreq.ifr_flags` 是 `short`，`IFF_LOWER_UP=0x10000` 装不下（板端实测 `ioctl=0x1043`、`ip` 同刻报 LOWER_UP；sysfs 亦无该位）⇒ 如实写"语义等价代理"。VM `make test` 26/26、`asan`/`tsan` 0 FAIL、netns 用例与 `test_e2e_report` RC=0；反向证伪 2 条（4 行／1 行 FAIL）；板端 ARM `test_netlink` ＋ 真网卡 `test_agent_switch` 均 RC=0、路由逐字还原。详见本文件文末 2026-10-12 15:00 节。 |
 |===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
@@ -1230,9 +1231,46 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 * *板端还原核对*：`usb0 UP 10.179.169.249/24`、`default via 10.179.169.1 dev usb0 proto dhcp metric 208`、`default via 192.168.2.1 dev eth0 proto dhcp metric 204`、看护 `pid` 常驻 `state: healthy` —— **与开工前逐字一致**。
 * *未做（如实登记）*：真实弱网（netem）；真平台地址；真采集板接 `ttySAC5`。
 
-=== 登记的产品缺口（待拍板，未修）
+=== 登记的产品缺口（**已于 2026-10-12 15:00 修掉**，实现见文末本节）
 
 * `iv_agent_open()` **不读开局链路状态**：netlink 只报「变化」（`iv_netlink.h` 明写「订阅不回放现状、初见即报充当初始状态同步」），而 `iv_agent.c` 的 `netmgr_feed()` 对 `IV_PROBE_UNKNOWN` 直接 `continue`（不喂）。
 * ⇒ **daemon 启动时若两条 WAN 已经 UP**（板端真实开机就是如此：udev 拨 4G、`eth0` 早已 UP），probe 的 LINK 项**不会**有事件、一直停在 `UNKNOWN`，netmgr 便「看不见」任何可用 WAN —— 此时 4G 掉线，`wired` 仍是 `UNKNOWN` ⇒ **切不过去**（本该切）。
 * **真网卡模式 k02 的「顶一次事件」正是这个缺口的临时补偿**；VM netns 用例因为网卡是「先建 DOWN 再 `up`」（必然有事件）而**天然覆盖不到**。
-* **未修**：属产品语义变更（给 `iv_netlink` 加一个同步查询接口，或在 `iv_agent_open` 里做一次开局摸底），待拍板。
+* **已修（2026-10-12 15:00）**：`iv_netlink` 新增同步查询 `iv_netlink_link_up()`，`iv_agent_open()` 在装配完成时逐条 WAN 摸底一次；随之本用例真网卡模式的"promisc 顶事件"补偿**已删除**（缺口从根上修掉，k01 改为直接断言"开局即播成当前真实状态"）。判据、依据与验证见文末 2026-10-12 15:00 节。
+
+== 2026-10-12 15:00 S3.1 补同步链路查询 ＋ `iv_agent` 开局摸底（修 14:05 登记的产品缺口）
+
+=== 干了什么事
+
+- *新增 `iv_netlink_link_up(ifname, up_out)`*（`ivsbox/include/ivsbox/iv_netlink.h` ＋ `ivsbox/src/hardware/iv_netlink.c`）：开一个临时 `AF_INET/SOCK_DGRAM` socket → `ioctl(SIOCGIFFLAGS)` → 立即 `close`；**不发任何 netlink 请求**（"无 dump、无 set" 的既有契约不破）、不持有状态、**未 attach 也能用**；返回码段新增 `IV_ENOENT`（无此接口，含名字为空或超长）。
+- *`iv_agent_open()` 新增"开局摸底"段*：`iv_probe_start()` 之后、`netmgr` 初始化之前，逐条 WAN 调一次 `iv_netlink_link_up()`；成功即 `iv_probe_set_link(&a->pb, a->wan_ifindex[w], up, now_ms)` 并打一行 `link seed: <if> up|down`，失败只 `IV_LOG_W` 告警、不致命。放在 `netmgr` 拿结论**之前**，状态机开局就能"看见"可用 WAN。
+- *`test_agent_switch.c` 删掉真网卡模式的"顶一次事件"补偿*（`ip_set_promisc`/`nudge_link`）：k01 改为直接断言"开局即被播成当前真实状态"（真模式期望 `UP`、netns 期望 `DOWN`），k02 真模式只 `wait_link(...,1)`、netns 模式保留 `ip link set ... up` → 真内核 LINK 事件这条断言链。
+- *`test_netlink.c` 新增 c13*：断言 `NULL`（两个参数）/空名/超长名/不存在接口的返回码；对 `lo`（必 UP）断言回 1；再用 `/sys/class/net/*/flags` 的 **bit0（`IFF_UP`）** 挑一个真 down 接口断言回 0（挑不到就 SKIP，不算失败）。
+
+=== 关键：判据是 `UP && RUNNING`，不是 `UP && LOWER_UP`（被实测逼出来的）
+
+- *`struct ifreq.ifr_flags` 是 `short`（2 B）*，而 `IFF_LOWER_UP = 0x10000` —— `SIOCGIFFLAGS` **结构上装不下那一位**。原方案（本日 A 项拍板）写的是"与事件路径完全同源 ＝ `IFF_UP && IFF_LOWER_UP`"，实测证明**做不到**。
+- *板端证据（TQ113，内核 5.4.61-rt37）*：`eth0`/`usb0` 有载波时 `ioctl` 回 `0x1043`（UP｜BROADCAST｜MULTICAST｜**RUNNING**，`LOWER_UP` 恒 0），而**同一时刻** `ip` 报 `<BROADCAST,MULTICAST,UP,LOWER_UP>`（该位只有 32 位的 netlink `ifi_flags` 才有）。
+- *`/sys/class/net/<if>/flags` 同样不能替代*：板端回 `0x1003`（UP｜BROADCAST｜MULTICAST，既无 `LOWER_UP` 也无 `RUNNING`）；VM 私有 netns 里该文件**根本不存在**。
+- *`IFF_RUNNING` 是等价代理*：它是内核 `dev_get_flags()` 按 RFC2863 合成的"操作态 up"（`netif_running && netif_oper_up`），在**已测全部场景**与 `LOWER_UP` 逐一致：板端 `eth0`/`usb0` → 1（与事件路径同）；VM netns dummy `ip link set up` → `0xc3` → 1、`set down` → `0x82` → 0（`ip` 也分别报 `LOWER_UP` / 无）。
+- *⇒ 如实写明"语义等价代理"而**非**"完全同源"*：`iv_netlink.c` 新增 `IVNL_KF_RUNNING` 常量并在 `iv_netlink_link_up()` 上方写清"两条路径为什么用的位不同源"，`iv_netlink.h` 的 API 注释同步；`test_netlink.c` 的 c13 注释与 oracle 取位（只用 `IFF_UP`）也照这一事实改写。**不假装同源是本轮刻意保留的诚实性。**
+
+=== 解决什么问题
+
+* 修掉 2026-10-12 15:00 登记的 14:05 节缺口：`iv_agent_open()` **不读开局链路状态**。`iv_netlink` 是事件源（只报"变化"、订阅不回放现状），而 `netmgr_feed()` 对 `IV_PROBE_UNKNOWN` 是 `continue`（不喂）⇒ **daemon 启动时若两条 WAN 已经 UP**（板端开机就是如此：udev 拨 4G、`eth0` 早已 UP），probe 的 LINK 项永远停在 `UNKNOWN`，netmgr "看不见"任何可用 WAN —— 此时 4G 掉线，本可用的 `eth0` 也切不过去。VM netns 用例因"先建 DOWN 再 up"而**天然覆盖不到**。
+
+=== 影响范围
+
+* `libivhal`（`iv_netlink`）与 `libivmodules`（`iv_agent`）各加一段；**链接序、外部库、构建脚本一字未改**（无新依赖，只多一个 `<sys/ioctl.h>`）。
+* 事件路径（`handle_link()` 的 `UP && LOWER_UP`）**一行未动** —— 那条路径拿的是 32 位 `ifi_flags`，本就没有这个问题。
+
+=== 验证方式与结果
+
+* *VM 全量回归（最终文件）*：`make host`/`arm`/`analyze` **RC=0 零告警**（ARM 出 ELF32 ARM EABI5）；`make test` **26/26**；`make asan`/`setarch -R make tsan` **0 FAIL**；netns 路径 `test_agent_switch` **RC=0**；`test_e2e_report` **RC=0**。
+* *反向证伪 2 条（判据＝真出现 FAIL 行，基线 0）*：
+  - ① `iv_agent.c` 摸底循环里的 `iv_probe_set_link(...)` 换成 `(void)0;` ⇒ netns 用例 **4 行 FAIL**（`k01 wireless/wired link seeded from current kernel state`、`k02 wireless/wired starts DOWN (seeded at open)`）。
+  - ② `iv_netlink.c` 掩码回退成 `IFF_UP && IFF_LOWER_UP` ⇒ `test_netlink` **1 行 FAIL**（`c13 lo up == 1`）—— 正好证明 c13 能抓住本轮板端实测出的那个缺陷。
+  - *踩坑（流程，写死）*：还原源文件时若用 `os.replace` 把备份换回来，**mtime 会保住备份的时间戳、可能比变异后编出的 `.o` 还旧** ⇒ `make` 判定"无需重编"，跑出来还是**变异版目标文件**，会误判成"还原后仍红"。**还原后必须 `touch` 源文件（或删 `.o`／强制重建）再复验**；本轮 `touch` 后两条都回到 **0 FAIL**，`grep` 变异标记 = 0。
+* *板端（TQ113，ARM）*：`test_netlink` **RC=0**、`passed (args, attach/groups, garbage, link updown/dedupe, dellink, addr, route, multi-msg, ENOBUFS, reset, trunc, link query)` 且**无 SKIP 行**（说明 c13 的 DOWN 分支真在真接口上跑了 —— 板端 `/sys` 的 `IFF_UP` 位挑出 down 接口并断言回 0）；`IV_AGENT_TEST_REALNIC=1 ./test_agent_switch` **RC=0**、`passed (real-NIC: …)`（k01"播种"断言在真 `usb0`/`eth0` 上成立）。跑完路由/地址**逐字还原**（`usb0 10.179.169.249/24`、`default via 192.168.2.1 dev eth0 … metric 204`、`default via 10.179.169.1 dev usb0 … metric 208`）。
+* *遗留（本轮操作面）*：板端跑完用例后 `start` 4G 看护时撞上未释放的 `flock`（`another instance holds the lock, exit`）⇒ 看护当场未起，需人工 `start` 一次；`usb0` 数据面本身完好（`UP,LOWER_UP` ＋ IPv4 ＋ `metric 208`）。
+* *未做（如实登记）*：真实弱网（netem）；真平台地址；真采集板接 `ttySAC5`。

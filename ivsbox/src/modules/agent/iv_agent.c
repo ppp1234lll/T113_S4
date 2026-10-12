@@ -150,6 +150,27 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     if (iv_probe_start(&a->pb, now_ms) != IV_OK)
         IV_LOG_W(AG_MOD, "probe start failed (icmp may be unavailable)");
 
+    /* ---- 3b. 开局摸底（必须）----
+     * netlink 只报"变化"、不回放现状（见 iv_netlink.h 取舍 2），而 netmgr_feed()
+     * 对 IV_PROBE_UNKNOWN 是"不喂"。若本进程启动时两条 WAN 已经 UP（板端开机就是
+     * 如此：udev 拨 4G、eth0 早已 UP），probe 的 LINK 项会一直停在 UNKNOWN，状态机
+     * 便"看不见"任何可用 WAN —— 4G 掉线时切不到本来可用的 eth0（2026-10-12 板端
+     * 真链路验收查出）。这里在装配完成时同步探一次链路可用性播进去
+     * （判据 IFF_UP && IFF_RUNNING；为何不是事件路径的 LOWER_UP，见
+     * iv_netlink.h 里 iv_netlink_link_up() 的说明）。 */
+    for (w = 0; w < IV_WAN_N; w++) {
+        int up = 0;
+
+        if (a->wan_probe_idx[w] < 0)
+            continue;
+        if (iv_netlink_link_up(cfg->wan_name[w], &up) != IV_OK) {
+            IV_LOG_W(AG_MOD, "link seed failed for wan %s", cfg->wan_name[w]);
+            continue;
+        }
+        (void)iv_probe_set_link(&a->pb, a->wan_ifindex[w], up, now_ms);
+        IV_LOG_I(AG_MOD, "link seed: %s %s", cfg->wan_name[w], up ? "up" : "down");
+    }
+
     /* ---- 4. netmgr（switch_route 复用默认；reconnect 接上报链）---- */
     iv_netmgr_cfg_default(&mc);
     mc.mode = (cfg->mode != 0) ? cfg->mode : IV_NETMGR_MODE_AUTO;

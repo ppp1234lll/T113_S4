@@ -17,7 +17,9 @@
  *   c06 DELLINK 只在"曾见过且为 UP"时补发 DOWN —— 去掉 seen 查找会多报幽灵 DOWN；
  *   c07 地址不去重 —— 若误用 LINK 的去重表处理地址，同接口第二地址会丢；
  *   c08 非 UNICAST/非默认路由被过滤 —— 放行会灌进网段路由风暴；
- *   c10 -ENOBUFS 必须升级 IV_EFULL —— 吞掉它上层永远不知道丢过消息。
+ *   c10 -ENOBUFS 必须升级 IV_EFULL —— 吞掉它上层永远不知道丢过消息；
+ *   c13 查询判据必须是 UP && RUNNING —— 若照抄事件路径的 LOWER_UP，ioctl 的
+ *        short 装不下 0x10000，lo 会回 0 直接红（2026-10-12 板端实测暴露）。
  *
  * 临时产物：无（全部内存内构造，无文件、无 fork）。AGENTS.md 规则 6。
  */
@@ -635,6 +637,91 @@ static void c12_ifname_truncation(void)
 
 }
 
+/* c13：同步查询 iv_netlink_link_up()。
+ *
+ * 判据是 `IFF_UP && IFF_RUNNING`，**不是**事件路径那对 `UP && LOWER_UP`
+ * （ifreq.ifr_flags 是 short，装不下 0x10000；依据见 iv_netlink.h 的说明）。
+ * 所以不能再用 /sys flags 的 LOWER_UP 位当 oracle —— 板端 sysfs 回 0x1003
+ * （无 LOWER_UP），VM netns 里那文件干脆不存在。改成两条**可移植**断言：
+ *   1) UP 方向：`lo` 在可用环境必然 up ⇒ 必回 1。若实现误抄 LOWER_UP 判据，
+ *      ioctl 拿不到那一位，这里必为 0 —— 正是 2026-10-12 板端暴露的缺陷。
+ *   2) DOWN 方向：用 /sys 的 **bit0(IFF_UP)** 挑一个真 down 的接口（板端有
+ *      sit0/tunl0/can0）⇒ 必回 0。bit0 两端实测可靠，RUNNING/LOWER_UP 才不可靠。
+ * 挑不到 down 接口（如 VM 宿主只有 lo/ens33）就 SKIP，不算失败。 */
+static int sys_up_flag(const char *ifname, unsigned *out)
+{
+    char     p[128];
+    FILE    *f;
+    unsigned fl = 0u;
+
+    if (snprintf(p, sizeof p, "/sys/class/net/%s/flags", ifname) >= (int)sizeof p)
+        return -1;
+    f = fopen(p, "r");
+    if (f == NULL)
+        return -1;
+    if (fscanf(f, "%x", &fl) != 1) {
+        (void)fclose(f);
+        return -1;
+    }
+    (void)fclose(f);
+    *out = (fl & 0x1u); /* 只信 bit0：板端 sysfs 的 RUNNING/LOWER_UP 与内核不一致 */
+    return 0;
+}
+
+static void c13_link_query(void)
+{
+    unsigned       fl  = 0u;
+    int            up  = -1;
+    int            hit = 0;
+    DIR           *d;
+    struct dirent *de;
+
+    chk(iv_netlink_link_up(NULL, &up) == IV_EINVAL, "c13 NULL ifname");
+    chk(iv_netlink_link_up("lo", NULL) == IV_EINVAL, "c13 NULL out");
+    chk(iv_netlink_link_up("", &up) == IV_ENOENT, "c13 empty ifname");
+    chk(iv_netlink_link_up("ivsbox-no-such-if", &up) == IV_ENOENT,
+        "c13 non-existent iface");
+    chk(iv_netlink_link_up("averyveryverylongiface", &up) == IV_ENOENT,
+        "c13 over-long ifname");
+
+    /* (1) UP 方向：lo 在可用环境必然 up */
+    if (sys_up_flag("lo", &fl) == 0 && fl != 0u) {
+        up = -1;
+        chk(iv_netlink_link_up("lo", &up) == IV_OK, "c13 lo query returns IV_OK");
+        chk(up == 1,
+            "c13 lo up == 1 (LOWER_UP-based mask would fail: short cannot hold 0x10000)");
+    } else {
+        printf("SKIP: lo is not IFF_UP in this environment\n");
+    }
+
+    /* (2) DOWN 方向：拿 /sys 的 bit0 挑一个真 down 的接口 */
+    d = opendir("/sys/class/net");
+    if (d == NULL) {
+        printf("SKIP: /sys/class/net unavailable\n");
+        return;
+    }
+    while (hit == 0 && (de = readdir(d)) != NULL) {
+        unsigned f2 = 1u;
+        char     m[96];
+
+        if (de->d_name[0] == '.')
+            continue;
+        if (sys_up_flag(de->d_name, &f2) != 0 || f2 != 0u)
+            continue; /* 只挑 IFF_UP 未置位的 */
+        up = -1;
+        /* `%.63s` 限宽：d_name 理论上可到 255 字节，直接 %s 会被
+         * -Wformat-truncation 判成可能截断（-Werror 直接挂）。接口名实际 ≤ 15。 */
+        (void)snprintf(m, sizeof m, "c13 down iface %.63s -> IV_OK", de->d_name);
+        chk(iv_netlink_link_up(de->d_name, &up) == IV_OK, m);
+        (void)snprintf(m, sizeof m, "c13 down iface %.63s -> 0", de->d_name);
+        chk(up == 0, m);
+        hit = 1;
+    }
+    (void)closedir(d);
+    if (hit == 0)
+        printf("SKIP: no IFF_UP-clear iface to probe\n");
+}
+
 int main(void)
 {
     c01_args_and_guards();
@@ -649,12 +736,14 @@ int main(void)
     c10_nlmsg_error_enobufs();
     c11_reset_resync();
     c12_ifname_truncation();
+    c13_link_query();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_netlink FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_netlink passed (args, attach/groups, garbage, link updown/"
-           "dedupe, dellink, addr, route, multi-msg, ENOBUFS, reset, trunc)\n");
+           "dedupe, dellink, addr, route, multi-msg, ENOBUFS, reset, trunc, "
+           "link query)\n");
     return 0;
 }

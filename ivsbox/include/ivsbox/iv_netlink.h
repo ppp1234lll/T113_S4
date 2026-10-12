@@ -72,6 +72,7 @@
  *   IV_EAUTH   socket 被拒（EACCES/EPERM，理论上 NETLINK_ROUTE 不需要特权）
  *   IV_ENOMEM  socket 资源不足（EMFILE/ENFILE/ENOMEM）
  *   IV_EFULL   内核事件队列溢出，必须全量重同步（见上）
+ *   IV_ENOENT  没有这个接口（仅 iv_netlink_link_up() 会返回）
  *   IV_EIO     其它系统调用失败；**errno 保留原值**便于诊断
  *   poll/feed 的成功返回值 = 本次交付的事件数（>= 0）。
  */
@@ -167,6 +168,28 @@ int iv_netlink_fd(const iv_netlink_t *nl);
  * 返回 = 交付的事件数（>= 0）；IV_EFULL = 溢出须重同步（事件可能已部分
  * 交付）；IV_ESTATE = 未 attach；其余 IV_* 见文件头。 */
 int iv_netlink_poll(iv_netlink_t *nl);
+
+/* 同步查一次接口**当前**是否可用（链路 up 且带载波）。up_out 回填 1/0。
+ *
+ * 为什么需要它：本模块是**事件源**，只报"变化"——订阅时内核不回放现状
+ * （见文件头取舍 2：attach 后的第一条 NEWLINK 才算初次同步）。若上层在接口
+ * "早就 UP" 之后才启动，就可能永远等不到那条初次事件。所以把"现状"做成一个
+ * 显式同步查询，让调用方在装配完成时自己播一次种子（`iv_agent` 就这么用）。
+ *
+ * 判据：`IFF_UP && IFF_RUNNING`。**不是**事件路径那对 `UP && LOWER_UP`
+ * —— 此处如实声明，不假装同源：本查询走 `ioctl(SIOCGIFFLAGS)`，而
+ * `struct ifreq.ifr_flags` 是 `short`（2 B），IFF_LOWER_UP（0x10000）物理上
+ * 装不下（2026-10-12 板端实测：eth0/usb0 有载波时回 0x1043，LOWER_UP 恒 0，
+ * 而同一时刻 `ip` 报 LOWER_UP；`/sys/class/net/<if>/flags` 同样拿不到该位，
+ * 板端回 0x1003、VM netns 里连文件都没有）。`IFF_RUNNING` 是内核按 RFC2863
+ * 合成的操作态 up，在上述全部已测场景与 `LOWER_UP` 逐一致（板端 eth0/usb0
+ * 两端同值；VM netns dummy up/down 双向）。
+ *
+ * 实现只开一个临时 AF_INET socket、查完即关，**不发任何 netlink 请求**
+ * （"无 dump、无 set" 的边界不破），不持有状态，未 attach 也能用。
+ * 返回：IV_OK / IV_EINVAL（NULL 参数）/ IV_ENOENT（无此接口，含名字为空
+ * 或过长）/ IV_EIO（其它系统调用失败，errno 保留原值）。 */
+int iv_netlink_link_up(const char *ifname, int *up_out);
 
 /* 字节级注入：把一段原始 rtnetlink 报文（可含多条消息）喂进解析器。
  * 与 poll() 同一条解析路径；返回 = 交付的事件数，IV_EFULL = 见上。

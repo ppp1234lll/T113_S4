@@ -93,6 +93,7 @@
 #include <unistd.h>
 
 #include "ivsbox/iv_agent.h"
+#include "ivsbox/iv_frame.h" /* S4.5：造 0xC1 上行帧喂给 pty 假采集板 */
 #include "ivsbox/iv_log.h"
 #include "ivsbox/iv_netlink.h"
 #include "ivsbox/iv_netmgr.h"
@@ -694,6 +695,35 @@ static int scenario(void)
     chk(iv_netmgr_wan_is_up(&g_agent.nm, IV_WAN_WIRED) == 1, "k02 netmgr: wired usable");
     chk(iv_agent_netmgr_state(&g_agent) == IV_NETMGR_WIRELESS_UP, "k02 still wireless-first");
 
+    /* ---- k02c M4-S4.5：0xC1 箱门开启 → agent 门开钩子（**端到端**） ----
+     * 为什么必须在这里测：`iv_agent` 把 `on_door_open` 挂进 report cfg 的那两行
+     * （`rc.on_door` / `rc.on_door_arg`）**没有任何单测能覆盖** —— 单测是直接调
+     * `iv_status`、或直接给 `iv_report_cfg_t` 填钩子；只有真的经 agent 开局、
+     * 真的从 pty 喂一帧 0xC1 上来，才能证明"钩子挂上了"（**回调没挂上测不出**）。
+     * ⚠ **故意放在 k02 之后**：多跑两拍 iv_agent_step 会驱动 netmgr；若放在联路拔起
+     * 之前，netmgr 会提前计数 ⇒ k04/k06 的切换与回切时序假红（实测）。 */
+    {
+        uint8_t up[IV_FRAME_MAX];
+        int     un;
+
+        chk(iv_agent_door_events(&g_agent) == 0u, "k02c no door event before 0xC1");
+        un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_DOOR, "\x01", 1u,
+                            up, sizeof up);
+        chk(un > 0, "k02c upstream 0xC1 frame built");
+        chk(write(master, up, (size_t)un) == un, "k02c feed 0xC1 door-open");
+        /* 推两拍但**不推进 g_now**：k02 之后的 k03/k04/k06 依赖精确的时间模型
+         * （netmgr 迟滞计数、hold_s 回切），多走 400 ms 会把它们带歪；而纯喂一帧不需要时间前进 ——
+         * iv_report_step() 每次都会把串口抽干。（**实测结论**：用 pump_agent 推两拍会让 k04 早一次
+         * 完成切换事务、k06 提前回切 ⇒ 三条断言假红。） */
+        (void)iv_agent_step(&g_agent, g_now);
+        (void)iv_agent_step(&g_agent, g_now);
+        chk(iv_agent_door_events(&g_agent) == 1u, "k02c agent door hook fired once");
+        chk(g_agent.rp.st.valid.DS == 1u && g_agent.rp.st.data.DS == 2,
+            "k02c mirror DS=2 after 0xC1");
+        chk(iv_agent_door_events(NULL) == 0u, "k02c NULL handle -> 0");
+    }
+
+
     /* ---- k03 基线上报：平台建连 + 一件上报走通 ---- */
     for (j = 0; j < 20 && cs < 0; j++) {
         g_now += STEP_MS;
@@ -903,8 +933,8 @@ static int scenario(void)
 
     if (g_fail == 0)
         printf("test_agent_switch passed "
-               "(%s: link up/down -> probe, wan switch, real route change, "
-               "tcp reconnect, queue backlog, hold_s switch-back, ordered replay)\n",
+               "(%s: link up/down -> probe, door-event, wan switch, real route "
+               "change, tcp reconnect, queue backlog, hold_s switch-back, ordered replay)\n",
                g_realnic ? "real-NIC" : "netns");
     else
         printf("test_agent_switch FAILED (%d)\n", g_fail);

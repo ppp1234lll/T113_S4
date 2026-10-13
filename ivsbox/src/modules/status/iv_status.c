@@ -141,13 +141,28 @@ static int json_flat_complete(const char *json)
 void iv_status_init(iv_status_t *st)
 {
     if (st == NULL) return;
-    memset(st, 0, sizeof(*st));
+    memset(st, 0, sizeof(*st)); /* 整表复位（含 on_door 钩子）⇒ 持有者须重新挂 */
 }
+
+void iv_status_set_door_cb(iv_status_t *st, iv_status_door_cb cb, void *arg)
+{
+    if (st == NULL) return;
+    st->on_door     = cb;
+    st->on_door_arg = arg;
+}
+
+/* 全量刷新的临时镜像：**只含 data/valid**。
+ * 不能直接用 `iv_status_t`：尾部的整表赋值（旧句 `*st = next;`）会把挂在
+ * `iv_status_t` 上的 `on_door`/`on_door_arg` 一起清掉 —— 而 0xE1 轮询每 30 s 就走一次。 */
+typedef struct {
+    iv_status_data_t  data;
+    iv_status_valid_t valid;
+} iv_status_mirror_t;
 
 void iv_status_handle_query(iv_status_t *st, const uint8_t *json, uint16_t len)
 {
     char buf[1024];
-    iv_status_t next;
+    iv_status_mirror_t next;
     unsigned relay_seen = 0, chv_seen = 0, cha_seen = 0;
     unsigned power_seen = 0, elec_seen = 0;
     double d;
@@ -216,7 +231,9 @@ void iv_status_handle_query(iv_status_t *st, const uint8_t *json, uint16_t len)
           next.data.AKW[0] || relay_seen || chv_seen || cha_seen ||
           power_seen || elec_seen))
         return;
-    *st = next;
+    /* 只把镜像本体换上去，不碰 `on_door`/`on_door_arg`。 */
+    st->data  = next.data;
+    st->valid = next.valid;
 }
 
 void iv_status_handle_upstream(uint8_t cmd, const uint8_t *data, uint16_t len, void *arg)
@@ -226,9 +243,12 @@ void iv_status_handle_upstream(uint8_t cmd, const uint8_t *data, uint16_t len, v
 
     if (st == NULL) return;
     if (cmd == IV_FRAME_CMD_DOOR) {
-        /* data = 0x01；门状态统一映射 DS=2（开） */
+        /* data = 0x01；门状态统一映射 DS=2（开，架构 §18.2 口径） */
         st->data.DS = 2;
         st->valid.DS = 1;
+        /* S4.5：门开事件 → 同步触发钩子。**放在镜像更新之后**，回调里读到的是新值。 */
+        if (st->on_door != NULL)
+            st->on_door((int)st->data.DS, st->on_door_arg);
         return;
     }
     if (cmd != IV_FRAME_CMD_EVENT || data == NULL || len == 0) return;

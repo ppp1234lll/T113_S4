@@ -14,6 +14,8 @@
  *  10) iv_status_init 清零全部状态
  *  11) NULL 入参不炸
  *  12) on_done_query_only 适配：IV_OK + cmd=0xE1 → 全量刷新；其他 cmd → 忽略；IV_!=OK → 忽略
+ *  13) S4.5 门开钩子：0xC1 触发回调（且回调里读到的镜像已是新值）、回调拿到透明 arg、
+ *      0xC2 的 DS TAG **不**触发、0xE1 全量刷新**不丢**钩子、摘钩子后不触发、无钩子也不影响镜像
  */
 #include <stdio.h>
 #include <string.h>
@@ -45,6 +47,23 @@ static void on_done(int rc, uint8_t cmd, const uint8_t *data, uint16_t len, void
     if (st == NULL) return;
     if (rc == IV_OK && cmd == IV_FRAME_CMD_QUERY && data != NULL && len != 0)
         iv_status_handle_query(st, data, len);
+}
+
+/* ---- S4.5 门开钩子的记录器（文件作用域，回调无用户参数传输通道以外的状态）---- */
+static int   g_door_hits;
+static int   g_door_last;
+static void *g_door_arg;
+static int   g_door_mirror_ds;
+
+static void door_cb(int ds, void *arg)
+{
+    iv_status_t *st = (iv_status_t *)arg;
+
+    g_door_hits++;
+    g_door_last = ds;
+    g_door_arg  = arg;
+    /* 回调里读镜像：若回调跑在镜像更新**之前**，这里会拿到旧值 ⇒ 被撞出来 */
+    g_door_mirror_ds = (st != NULL && st->valid.DS) ? (int)st->data.DS : -1;
 }
 
 int main(void)
@@ -236,8 +255,52 @@ int main(void)
         chk(!st.valid.V, "on_done failed rc ignored");
     }
 
+    /* ---- 13) S4.5 门开事件钩子 ---- */
+    {
+        iv_status_init(&st);
+        iv_status_set_door_cb(&st, door_cb, &st);
+        g_door_hits = 0; g_door_last = -1; g_door_arg = NULL; g_door_mirror_ds = -1;
+
+        iv_status_handle_upstream(IV_FRAME_CMD_DOOR, (const uint8_t *)"\x01", 1, &st);
+        chk(g_door_hits == 1, "S4.5 door cb fired once on 0xC1");
+        chk(g_door_last == 2, "S4.5 door cb sees DS=2 (\u5f00, \u67b6\u6784 \u00a718.2)");
+        chk(g_door_arg == &st, "S4.5 door cb got user arg");
+        chk(st.valid.DS && st.data.DS == 2, "S4.5 0xC1 -> mirror DS=2");
+        chk(g_door_mirror_ds == 2, "S4.5 cb observes updated mirror (callback after update)");
+
+        /* 0xC2 的 DS TAG 只刷镜像，**不**触发门开钩子（本步以 0xC1 为唯一门开信号） */
+        {
+            const char *ev = "{\"key\":\"mcuEvent\",\"DS\":1}";
+            iv_status_handle_upstream(IV_FRAME_CMD_EVENT, (const uint8_t *)ev,
+                                      (uint16_t)strlen(ev), &st);
+            chk(g_door_hits == 1, "S4.5 0xC2 DS tag does NOT fire door cb");
+            chk(st.valid.DS && st.data.DS == 1, "S4.5 0xC2 DS tag still updates mirror");
+        }
+
+        /* ★ 0xE1 全量刷新（每 30 s 一次）不得清掉钩子 —— 旧句式 `*st = next;` 会清 */
+        {
+            const char *json = "{\"V\":220.0,\"DS\":2}";
+            g_door_hits = 0;
+            iv_status_handle_query(&st, (const uint8_t *)json, (uint16_t)strlen(json));
+            chk(st.valid.V && st.data.V == 220.0f, "S4.5 full refresh applied");
+            iv_status_handle_upstream(IV_FRAME_CMD_DOOR, (const uint8_t *)"\x01", 1, &st);
+            chk(g_door_hits == 1, "S4.5 door cb survives 0xE1 full refresh");
+        }
+
+        /* 摘钩子（cb=NULL）后不再触发 */
+        iv_status_set_door_cb(&st, NULL, NULL);
+        g_door_hits = 0;
+        iv_status_handle_upstream(IV_FRAME_CMD_DOOR, (const uint8_t *)"\x01", 1, &st);
+        chk(g_door_hits == 0, "S4.5 door cb removed -> no fire");
+
+        /* 从未挂钩子：不炸，且镜像照样更新 */
+        iv_status_init(&st);
+        iv_status_handle_upstream(IV_FRAME_CMD_DOOR, (const uint8_t *)"\x01", 1, &st);
+        chk(st.valid.DS && st.data.DS == 2, "S4.5 no cb -> mirror still updated");
+    }
+
     if (g_fail == 0)
         printf("test_status passed (query/partial/robust/badjson/door/event/nomcuEvent/"
-               "snapshot/format/init/null/done_adapter)\n");
+               "snapshot/format/init/null/done_adapter/door_cb)\n");
     return g_fail == 0 ? 0 : 1;
 }

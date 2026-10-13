@@ -47,6 +47,19 @@
 static int      g_fail;
 static uint64_t g_now;
 
+/* S4.5 门开钩子记录器。**为什么要在集成里再测一遍**：单测是直接调
+ * `iv_status_set_door_cb()` 挂的，覆盖不到"装配层到底有没有把钩子挂上去"——
+ * 正是"回调没挂上测不出"的教训。这里钩子只经 `iv_report_cfg_t` 传入。 */
+static int g_door_hits;
+static int g_door_last;
+
+static void e2e_door_cb(int ds, void *arg)
+{
+    (void)arg;
+    g_door_hits++;
+    g_door_last = ds;
+}
+
 static void chk(int cond, const char *what)
 {
     if (!cond) {
@@ -305,6 +318,8 @@ int main(void)
     cfg.report_ms    = 3600u * 1000u; /* 关周期上报：用 trigger 精确催报 */
     cfg.heartbeat_ms = 3600u * 1000u; /* 关心跳：会污染收包断言 */
     cfg.poll_ms      = 3600u * 1000u; /* 关轮询：喂应答的时点由测试掌握 */
+    cfg.on_door      = e2e_door_cb; /* S4.5：端到端证明钩子经 cfg 挂进了 iv_report */
+    cfg.on_door_arg  = NULL;
 
     iv_report_init(&rp);
     chk(iv_report_open(&rp, &cfg, NULL, 0u) == IV_OK, "c00 open");
@@ -484,6 +499,29 @@ int main(void)
         }
     }
 
+    /* ---- c02c M4-S4.5：0xC1 箱门开启 → 镜像 DS=2 ＋ 门开钩子触发（端到端） ----
+     * 覆盖 plan §S4.5「怎么验证」单元项在**装配链**上的等价物：这里的钩子不是测试
+     * 直接调 `iv_status` 挂的，而是经 `iv_report_cfg_t` 在 `iv_report_open()` 时落下的。
+     * 帧字节也顺带验一次：0xC1 的 data = 0x01（**非 JSON**，架构 §18.2）。
+     * ⚠ **故意放在 c04 之后**：本块会把镜像 DS 从 1 改成 2，而 c04 的数据段黄金里
+     * 写死了 （不能为了让新用例方便就去改旁边已有的黄金断言）。 */
+    {
+        uint8_t up[IV_FRAME_MAX];
+        int     un;
+
+        g_door_hits = 0;
+        g_door_last = -1;
+        un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_DOOR, "\x01", 1u,
+                            up, sizeof up);
+        chk(un > 0, "c02c upstream 0xC1 frame built");
+        chk(write(master, up, (size_t)un) == un, "c02c feed 0xC1 door-open event");
+        pump(&rp, master, 2);
+        chk(rp.st.valid.DS == 1u && rp.st.data.DS == 2,
+            "c02c mirror DS=2 after 0xC1");
+        chk(g_door_hits == 1, "c02c door hook fired once via cfg wiring");
+        chk(g_door_last == 2, "c02c door hook got DS=2");
+    }
+
     /* ---- c05 平台断开 → 上报入队积压（不丢） ---- */
     {
         int j;
@@ -630,6 +668,20 @@ int main(void)
         rn = drain(master, rx, sizeof rx, 500);
         chk(iv_report_serial_fd(&rp) >= 0 && rn >= 8u,
             "c09 reconnect sent fresh E1");
+
+        /* S4.5：串口断开走 `serial_drop()` → `iv_status_init()` 会清掉门开钩子
+         * ⇒ 装配层必须重挂。这里重新喂一次 0xC1，钩子仍必须触发；
+         * 否则现场表现就是"串口断一次以后，再开门就不抓拍了"。 */
+        g_door_hits = 0;
+        {
+            uint8_t up[IV_FRAME_MAX];
+            int     un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_DOOR,
+                                        "\x01", 1u, up, sizeof up);
+            chk(un > 0, "c09 upstream 0xC1 frame built");
+            chk(write(master, up, (size_t)un) == un, "c09 feed 0xC1 after reconnect");
+            pump(&rp, master, 2);
+        }
+        chk(g_door_hits == 1, "c09 door hook re-armed after serial reconnect");
     }
 
     /* ---- c10 收口 ---- */
@@ -645,7 +697,8 @@ int main(void)
 
     if (g_fail == 0)
         printf("test_e2e_report passed "
-               "(poll/mirror/power-0xD1/report/queue/replay/query/ack/serial-reconnect)\n");
+               "(poll/mirror/power-0xD1/door-event/report/queue/replay/query/ack/"
+               "serial-reconnect)\n");
     else
         printf("test_e2e_report FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

@@ -16,6 +16,10 @@
  *
  * **不读不写串口**：字节流由 `iv_link` 处理，本模块只见 `iv_link_cb` 回调。
  *
+ * **S4.5 门开事件钩子**：`0xC1`（箱门开启）到达时，除把镜像 `DS` 置为"开"外，
+ * 还会**同步**触发一次 `iv_status_door_cb`（见 `iv_status_set_door_cb`）——装配层用它做
+ * "门开触发抓拍"（抓图本体属 M6-S6.2）。**无鉴权 / 无审计 / 无去重表**（S4.5 口径）。
+ *
  * ============================ JSON 提取 ============================
  * 字段名按架构 §18.2（2026-10-08 单片机源码核对）的口径取，不做模糊匹配。
  * 提取走**自研极简解析**（strstr + atof/atoi），不引 json-c：
@@ -123,9 +127,27 @@ typedef struct {
     uint32_t ELEC : 1;
 } iv_status_valid_t;
 
+/* 箱门开启事件回调（S4.5）：`0xC1` 到达时、**镜像的 `DS` 已更新为"开"之后**触发。
+ *
+ * `ds` = 更新后的门状态镜像值（**原值直传口径**：采集板语义 1=关 / 2=开，
+ * 见架构 §18.2；平台侧语义未定义，本模块不映射 —— 与 `iv_report` 的出报口径一致）。
+ * `arg` = `iv_status_set_door_cb()` 传入的透明指针。
+ *
+ * 回调在**调用者线程**（装配层单线程）内同步执行：**禁止在其中做阻塞 IO**，
+ * 抓图 / 上报等重活须转异步（架构 §4.2 单次回调约束）。
+ * 回调里可安全读 `iv_status_t`（镜像已更新）。 */
+typedef void (*iv_status_door_cb)(int ds, void *arg);
+
 typedef struct {
     iv_status_data_t  data;
     iv_status_valid_t valid;
+
+    /* 门开事件钩子（S4.5，**不参与镜像刷新**）。NULL = 不通知。
+     * 由 `iv_status_set_door_cb()` 设置；`iv_status_init()` 会清零它（整表复位）、
+     * 而 `iv_status_handle_query()` 的全量刷新**不会**（故意）。
+     * ⇒ 持有者必须在**每次 `iv_status_init()` 之后**重新挂（`iv_report` 已这么做）。 */
+    iv_status_door_cb on_door;
+    void             *on_door_arg;
 } iv_status_t;
 
 /* 单条事件（0xC2）的解析结果——本结构只用于在快照里说明"最近一次事件"
@@ -164,6 +186,10 @@ void iv_status_handle_query(iv_status_t *st,
  */
 void iv_status_handle_upstream(uint8_t cmd, const uint8_t *data,
                                 uint16_t len, void *arg);
+
+/* 挂 / 摘箱门开启事件回调（S4.5）。`cb == NULL` 表示摘除；`arg` 原样随回调返回。
+ * ⚠ **必须在每次 `iv_status_init()` 之后重新调用**（init 会清零钩子）。 */
+void iv_status_set_door_cb(iv_status_t *st, iv_status_door_cb cb, void *arg);
 
 /*
  * 输出快照为可打印摘要（人读，调试用）：

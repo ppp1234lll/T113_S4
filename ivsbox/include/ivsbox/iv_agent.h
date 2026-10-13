@@ -53,6 +53,10 @@
  *     **netmgr 传入的 new_ifindex** 反推目标出口再取址，并交给
  *     `iv_report_set_server()` 生效。**本口没配则回退另一口**；两口都空 ⇒
  *     不启平台链路（`iv_report_reconnect` 返回 `IV_ESTATE` 空转）。
+ *   - **箱门事件（S4.5）**：本层把 `on_door_open` 挂到 `iv_report_cfg_t::on_door`，
+ *     `iv_status` 解到 `0xC1`（箱门开启）时同步回调。**M4 阶段＝空实现 ＋ 日志 ＋ 计数**，
+ *     抓图本体属 M6-S6.2（到时把 `on_door_open` 换成本地通道 `snapshot.take` 派发即可）；
+ *     无鉴权 / 无审计 / 无去重表。
  *   - **devid（TID）/ mod（型号）无配置键来源**：按架构 §10.2「身份不进配置」，
  *     devid 应由工厂身份分区（`/dev/by-name/private`，S5.5）读取 ⇒ **不设配置键**；
  *     mod（硬件型号串）与 `sv` 同类，属**编译期事实**，待用户给型号串后定为默认值。
@@ -158,6 +162,7 @@ typedef struct {
     int          wan_ifindex[IV_WAN_N];   /* 启动时按名字解析；0=未绑定 */
     int          wan_probe_idx[IV_WAN_N]; /* 绑该 WAN 的 probe 项下标；-1=无 */
     uint8_t      wan_link_up[IV_WAN_N];   /* 最近一次 netlink carrier 状态 */
+    uint64_t     door_events;             /* S4.5 累计门开事件次数（M4 阶段可观测用） */
 
     uint64_t     now_ms;
     uint8_t      opened;
@@ -203,6 +208,7 @@ iv_netmgr_state_t iv_agent_netmgr_state(const iv_agent_t *a);
 iv_wan_t          iv_agent_active_wan(const iv_agent_t *a);
 int               iv_agent_active_ifindex(const iv_agent_t *a);
 iv_report_t      *iv_agent_report(iv_agent_t *a); /* 读上报链统计/状态用 */
+uint64_t          iv_agent_door_events(const iv_agent_t *a); /* S4.5 门开事件计数 */
 
 #ifdef __cplusplus
 }

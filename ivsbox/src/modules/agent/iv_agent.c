@@ -33,6 +33,7 @@ static void on_cfg_search_mode(const iv_proto_frame_t *f, void *arg);
 static int  agent_send_power(const void *data, uint16_t len, void *arg);
 static void on_camdet_change(int ch, iv_camdet_status_t old_st,
                              iv_camdet_status_t new_st, void *arg);
+static void on_door_open(int ds, void *arg);
 
 /* 接口名 → 内核 ifindex；未解析到返回 0（该 WAN 视为未绑定） */
 static int wan_ifindex_of(const char *name)
@@ -142,6 +143,8 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     rc.report_ms    = cfg->report_ms;
     rc.heartbeat_ms = cfg->heartbeat_ms;
     rc.poll_ms      = cfg->poll_ms;
+    rc.on_door      = on_door_open; /* S4.5：门开 → 抓拍钩子（M4 阶段空实现） */
+    rc.on_door_arg  = a;
     arc = iv_report_open(&a->rp, &rc, r, now_ms);
     if (arc != IV_OK) {
         IV_LOG_E(AG_MOD, "report open failed: %d", arc);
@@ -388,6 +391,23 @@ static void on_camdet_change(int ch, iv_camdet_status_t old_st,
                                  a->now_ms);
 }
 
+/* S4.5 门开事件出口：`0xC1`（箱门开启）到达时由 iv_status 同步触发。
+ * **M4 阶段 ＝ 空实现 ＋ 日志 ＋ 计数**：抓图本体在 M6-S6.2（经本地通道
+ * `snapshot.take` 交 `ivsbox-media` 抠图），到时把这里换成派发即可；
+ * 无鉴权 / 无审计 / 无去重表（S4.5 口径）。
+ * 回调在装配层单线程内同步执行 ⇒ 这里**只允许无阻塞动作**（架构 §4.2）。 */
+static void on_door_open(int ds, void *arg)
+{
+    iv_agent_t *a = arg;
+
+    if (a == NULL)
+        return;
+    a->door_events++;
+    IV_LOG_I(AG_MOD,
+             "door open event #%llu (DS=%d): snapshot hook not wired (M6-S6.2)",
+             (unsigned long long)a->door_events, ds);
+}
+
 /* 把摄像机五态编码注入上报层的 CNS 字段（闭合 S3.6 的"CNS 恒 0"遗留）：
  * 只改 cns[]，其余外部事实（CSQ/定位/故障码）原样保留。 */
 static void camdet_feed(iv_agent_t *a)
@@ -610,4 +630,9 @@ int iv_agent_active_ifindex(const iv_agent_t *a)
 iv_report_t *iv_agent_report(iv_agent_t *a)
 {
     return (a != NULL) ? &a->rp : NULL;
+}
+
+uint64_t iv_agent_door_events(const iv_agent_t *a)
+{
+    return (a != NULL) ? a->door_events : 0u;
 }

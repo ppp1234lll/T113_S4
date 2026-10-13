@@ -65,6 +65,10 @@
  *     `IV_REPORT_TICK_MS`（200 ms）即收发节拍。代价是补传吞吐 ≈ 5 件/s；
  *     现场若嫌慢，后续把 `iv_transport_fd()` 注册进 Reactor 即可（登记为遗留）。
  *   - `CNS`（6 路摄像机网络状态）当前由调用方注入，本步**恒为 0**（摄像机探测属 M4）。
+ *   - **箱门事件钩子（S4.5）**：`iv_report_cfg_t::on_door` 由装配层挂；本层在
+ *     `iv_status` 把 `0xC1` 解析成门开之后同步触发。⚠ `iv_status_init()` 会清零钩子，
+ *     故本层在**每一处** `iv_status_init(&rp->st)` 之后都用本层自持的 cfg 副本
+ *     重新挂（含 `serial_drop()` 的串口重连路径）；配置里没挂则保持 NULL。
  */
 #ifndef IVSBOX_IV_REPORT_H
 #define IVSBOX_IV_REPORT_H
@@ -139,6 +143,11 @@ typedef struct {
     uint32_t    poll_ms;      /* 0 → IV_REPORT_POLL_MS */
     const char *mod;          /* 硬件型号串（E3 应答 `mod`）；NULL → "" */
     const char *sv;           /* 软件版本串（E3 应答 `sv`）；NULL → iv_version_string() */
+
+    /* 箱门开启事件（S4.5）：`0xC1` 到达时回调（M4 阶段装配层只记日志；
+     * 抓图本体属 M6-S6.2）。NULL = 不通知。详见文件头"已知取舍"。 */
+    iv_status_door_cb on_door;
+    void             *on_door_arg;
 } iv_report_cfg_t;
 
 typedef struct {

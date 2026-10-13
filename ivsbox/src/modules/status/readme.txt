@@ -5,17 +5,19 @@ src/modules/status  ——  采集板全部 IO / 阈值 / 继电器状态的内�
 【目录作用】
   采集板全部 IO / 阈值 / 继电器状态在 `ivsboxd` 内存中的**权威镜像**。
   来源＝与 `iv_link` 的三条回调对接：`on_done`（0xE1 查询应答→全量刷新）、
-  `on_upstream`（0xC2 事件上报→按 TAG 增量；0xC1 箱门→门状态）。
+  `on_upstream`（0xC2 事件上报→按 TAG 增量；0xC1 箱门→门状态＋**门开事件钩子**）。
   出口＝`iv_status_snapshot_json()`，供本地通道 `system.snapshot`、平台周期上报、
   Web 展示。属模块层（`libivmodules.a`），依赖 `libiv_link`（回调签名）、
   `libivcore`（iv_ret）。**不读也不写串口**，只见 `iv_link_cb` 回调。
 
 【文件说明】
-  iv_status.c   镜像实现（全量/增量/门状态刷新、快照序列化）＋自研极简 JSON 提取
+  iv_status.c   镜像实现（全量/增量/门状态刷新、快照序列化、门开事件钩子）＋自研极简 JSON 提取
   .gitkeep      目录占位
 
 【实现状态】
-  已实现（功能开发计划 M2-S2.6）。
+  已实现（功能开发计划 M2-S2.6）；**M4-S4.5 增"门开事件钩子"**（2026-10-13）：
+  `0xC1` 到达 → 先更新镜像 `DS=2`、**再同步触发** `on_door` 回调（钩子**不参与镜像刷新**，
+  只是装配层的抓拍事件出口；M4 阶段由 `iv_agent` 挂空实现＋日志＋计数，抓图本体在 M6-S6.2）。
 
 【约定与注意事项】
   - **单写者、零锁**：所有入口只在装配层（Reactor 单线程）调用；读出口快照也在
@@ -29,9 +31,14 @@ src/modules/status  ——  采集板全部 IO / 阈值 / 继电器状态的内�
   - 已知局限（与协议一致）：协议无请求号，重复帧由镜像的内容比较天然幂等；
     0xC2 每帧只管一个 TAG；0xFF/0xE2 不在协议内（2026-10-08 确认无心跳/周期上报），
     本工程不处理。
+  - **门开钩子的生存期（S4.5，易踩）**：`on_door`/`on_door_arg` 挂在 `iv_status_t` 上，而
+    `iv_status_init()` 是**整表 memset** ⇒ 每次 init 都会把钩子清零，持有者**必须在每次 init
+    之后重挂**（`iv_report` 用 `status_apply_hooks()` 在 init / serial_drop / open 三处统一重挂）。
+    相反，`iv_status_handle_query()` 的全量刷新**故意不碰钩子**（用私有 `iv_status_mirror_t`
+    只换 `data`/`valid`）—— 否则 `0xE1` 每 30 s 一次轮询就会把钩子悄悄清掉。
   - 返回码（iv_ret.h）：`iv_status_*` 全为 void/简单状态，零 I/O、不失败；
     `iv_status_snapshot_json()` 缓冲不足时返回 `IV_ERANGE`。
 
 【相关文档】
-  ivsbox/docs/功能开发计划.md：§S2.6
+  ivsbox/docs/功能开发计划.md：§S2.6、§S4.5（门开事件钩子，2026-10-13）
   T113运维终端-系统架构设计.md：§18.2（状态键表，2026-10-08 核对）

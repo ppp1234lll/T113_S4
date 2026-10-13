@@ -44,6 +44,14 @@ void iv_report_cfg_default(iv_report_cfg_t *cfg)
     cfg->poll_ms      = IV_REPORT_POLL_MS;
 }
 
+/* iv_status_init() 会清零镜像上的钩子 ⇒ 每处 init 之后都从本层自持的
+ * cfg 副本重挂一遍（init / serial_drop / open 三处）。
+ * init 时 rp->cfg 尚为零（memset）⇒ 这里就是"挂 NULL"，真值在 open 里落。 */
+static void status_apply_hooks(iv_report_t *rp)
+{
+    iv_status_set_door_cb(&rp->st, rp->cfg.on_door, rp->cfg.on_door_arg);
+}
+
 void iv_report_init(iv_report_t *rp)
 {
     if (rp == NULL)
@@ -52,6 +60,7 @@ void iv_report_init(iv_report_t *rp)
     rp->serial_fd = -1;
     rp->env.csq   = -1; /* 未知：默认不上传 CSQ */
     iv_status_init(&rp->st);
+    status_apply_hooks(rp);
     iv_queue_init(&rp->q);
     iv_transport_init(&rp->tr);
 }
@@ -73,6 +82,7 @@ static void serial_drop(iv_report_t *rp)
     iv_link_clear(&rp->lk, IV_ECONN);
     iv_link_reset(&rp->lk);
     iv_status_init(&rp->st);
+    status_apply_hooks(rp); /* 串口重连后把门开钩子重挂回去 */
     rp->next_serial_retry = rp->now_ms + IV_REPORT_SERIAL_RETRY_MS;
 }
 
@@ -531,11 +541,14 @@ int iv_report_open(iv_report_t *rp, const iv_report_cfg_t *cfg,
     c.poll_ms     = cfg->poll_ms ? cfg->poll_ms : IV_REPORT_POLL_MS;
     c.mod         = cfg->mod;
     c.sv          = cfg->sv;
+    c.on_door     = cfg->on_door;
+    c.on_door_arg = cfg->on_door_arg;
 
     rp->cfg    = c;
     rp->r      = r;
     rp->now_ms = now_ms;
     rp->env.csq = -1;
+    status_apply_hooks(rp); /* cfg 已就位，把箱门事件钩子挂上 */
 
     /* 平台目标地址：拷进本层自持副本（运行期可经 iv_report_set_server 改写） */
     if (c.server_host != NULL)

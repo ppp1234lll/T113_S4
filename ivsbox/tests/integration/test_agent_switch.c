@@ -24,6 +24,7 @@
  *   k04 拔线：无线 carrier 掉 → 状态机切有线，**事务真的成功**（= 路由真改成功
  *       + 重连真发生：传输层建连计数 +1、平台侧收到第二条 TCP）；
  *   k05 平台断：链路事件之外再断平台 → 上报入队积压、不丢；
+ *   k04b M4-S4.4：无线掉线的那条沿 ⇒ MN 变 2 ⇒ 继电器 1 断电重启（pty 上的 0xD1）；
  *   k06 回切 + 补传：无线恢复、跨过 hold_s 自动切回无线，欠包按序补发、队列清空；
  *   k07 收口：资源全释放，不留 fd（规则 6 之外的兜底）。
  *
@@ -71,7 +72,10 @@
  *   k04 重连必须真发生 —— `agent_reconnect` 若不调 `iv_report_reconnect`
  *        （直接 return IV_OK），TCP 永远绑在旧出口，此处必红；
  *   k04 链路事件必须被消费 —— `on_nl_evt` 若不再把 LINK_UP/DOWN 转给
- *        `iv_probe_set_link`，probe 状态永不变化，此处必红。
+ *        `iv_probe_set_link`，probe 状态永不变化，此处必红；
+ *   k04b 主网故障沿（M4-S4.4）—— `env_feed` 若改回裸 `iv_probe_state()`（单次
+ *        超时即判死）、或干脆不喂 MN、或不把沿接给 `iv_recovery`，
+ *        k04b 的"MN 变 2 ＋ 继电器 1 收到 0xD1"必红。
  *
  * ============================ 临时产物 ============================
  * 仅 $TMPDIR 下一个临时目录（持久队列），用例结束前删除；私有 netns 随进程
@@ -122,6 +126,11 @@ static iv_agent_t g_agent;
 static int        g_fail;
 static int        g_realnic; /* 1 = 真网卡模式（REALNIC_ENV 置位） */
 static uint64_t   g_now;
+
+/* 串口下行字节的**留存副本**：pump_agent 原先是"读了就扔"，M4-S4.4 要证明
+ * 主网故障沿真的变成了 pty 上的 0xD1 报文，就得把字节留下。 */
+static uint8_t    g_cap[65536];
+static size_t     g_capn;
 
 static void chk(int cond, const char *what)
 {
@@ -492,15 +501,44 @@ static int reexec_in_netns(const char *self)
  * 驱动助手
  * ------------------------------------------------------------------------- */
 
+/* 读干 pty master 并把字节追加进 g_cap（溢出即截断：本用例只关心"有没有"）。 */
+static void cap_suck(int master)
+{
+    char   b[1024];
+    size_t dn;
+
+    if (master < 0)
+        return;
+    dn = drain(master, b, sizeof b, 0);
+    if (dn == 0u)
+        return;
+    if (dn > sizeof g_cap - g_capn)
+        dn = sizeof g_cap - g_capn;
+    memcpy(g_cap + g_capn, b, dn);
+    g_capn += dn;
+}
+
+/* 自 from 起，g_cap 里是否出现过一条 `F0 F0 <cmd>` 开头的下行帧。 */
+static int cap_has_frame_from(size_t from, uint8_t cmd)
+{
+    size_t i;
+
+    if (from > g_capn)
+        from = g_capn;
+    for (i = from; i + 2u < g_capn; i++) {
+        if (g_cap[i] == 0xF0u && g_cap[i + 1u] == 0xF0u && g_cap[i + 2u] == cmd)
+            return 1;
+    }
+    return 0;
+}
+
 /* 推进 n 拍；每拍把 pty master 上的下行字节抽掉（防 pty 缓冲写满） */
 static void pump_agent(int master, int n)
 {
     int i;
 
     for (i = 0; i < n; i++) {
-        char scratch[512];
-
-        (void)drain(master, scratch, sizeof scratch, 0);
+        cap_suck(master);
         g_now += STEP_MS;
         (void)iv_agent_step(&g_agent, g_now);
     }
@@ -571,6 +609,7 @@ static int scenario(void)
     int             fd_base;
     int             i;
     int             j;
+    size_t          cap_mark = 0u;
 
     /* 先把日志落盘出口摘掉（进程级单例、懒打开，理由见 log_discard），再取水位 ——
      * 否则板端 /mnt/UDISK 可写会凭空多一个 fd，k07 必假红。 */
@@ -633,6 +672,10 @@ static int scenario(void)
     cfg.nm_ok_n    = 1u;
     cfg.nm_hold_s  = 1u; /* 回切稳定期 1 s（时间轴由用例注入，瞬间可跨） */
     cfg.nm_stable_s = 0u; /* 立即恢复媒体；本用例不驱动媒体步 */
+    /* M4-S4.4：出厂默认 reboot_max=0（禁用自愈）—— 那条路径已经在
+     * test_recovery 单测里钉死；本用例要验的是**接线**，故打开它。 */
+    cfg.netthr_reboot_max = 2u;
+    cfg.netthr_reboot_interval_s = 60u;
 
     /* ---- k01 装配起步 ---- */
     fd_before = count_open_fds();
@@ -694,6 +737,9 @@ static int scenario(void)
     chk(iv_netmgr_wan_is_up(&g_agent.nm, IV_WAN_WIRELESS) == 1, "k02 netmgr: wireless usable");
     chk(iv_netmgr_wan_is_up(&g_agent.nm, IV_WAN_WIRED) == 1, "k02 netmgr: wired usable");
     chk(iv_agent_netmgr_state(&g_agent) == IV_NETMGR_WIRELESS_UP, "k02 still wireless-first");
+    /* k02b M4-S4.4：两路都可用 ⇒ MN 两路都是 1（上报字段的生产者已在装配层点火） */
+    chk(iv_agent_mn(&g_agent, IV_WAN_WIRELESS) == 1u, "k02b wireless MN == 1 (normal)");
+    chk(iv_agent_mn(&g_agent, IV_WAN_WIRED) == 1u, "k02b wired MN == 1 (normal)");
 
     /* ---- k02c M4-S4.5：0xC1 箱门开启 → agent 门开钩子（**端到端**） ----
      * 为什么必须在这里测：`iv_agent` 把 `on_door_open` 挂进 report cfg 的那两行
@@ -762,6 +808,7 @@ static int scenario(void)
     }
 
     /* ---- k04 拔线：真内核 LINK_DOWN → 切有线（事务 = 真改路由 + 真重连） ---- */
+    cap_mark = g_capn; /* M4-S4.4 的 0xD1 只可能在这之后出现 */
     chk(ip_set_state(WAN_WL, 0) == 0, "k04 ip link set usb0 down");
     chk(wait_link(IV_WAN_WIRELESS, 0), "k04 wireless probe DOWN via real kernel link event");
     pump_agent(master, 4);
@@ -775,6 +822,21 @@ static int scenario(void)
     chk(iv_agent_netmgr_state(&g_agent) == IV_NETMGR_WIRED_UP, "k04 state WIRED_UP");
     chk(iv_agent_active_ifindex(&g_agent) == g_agent.wan_ifindex[IV_WAN_WIRED],
         "k04 active ifindex == resolved eth0 ifindex");
+
+    /* ---- k04b M4-S4.4：主网「正常 → 故障」沿 → 继电器 1 断电重启 ----
+     * 装配层的 MN 生产者用 netmgr 的**迟滞结论**（`iv_netmgr_wan_is_up()`），
+     * 并在 1→2 沿上调 `iv_recovery_on_master_change()`；动作经 iv_report_send_cmd
+     * 落到本层自持的 iv_link ⇒ **pty 上应当真的看见一条 0xD1**。 */
+    cap_suck(master); /* 把最后一步写进 pty 的字节也捞回来（pump 是先抽后推） */
+    chk(iv_agent_mn(&g_agent, IV_WAN_WIRELESS) == 2u,
+        "k04b wireless MN -> 2 (hysteresis verdict reached the report env)");
+    chk(iv_agent_mn(&g_agent, IV_WAN_WIRED) == 1u,
+        "k04b wired MN stays 1 (only the failed path goes to 2)");
+    chk(cap_has_frame_from(cap_mark, IV_FRAME_CMD_POWER),
+        "k04b master-net fault edge -> 0xD1 on the serial (relay 1 power cycle)");
+    chk(iv_recovery_port_credit(&g_agent.rec, IV_RECOVERY_PORT_MASTER) == 1,
+        "k04b relay 1 consumed exactly one action (2 -> 1)");
+    chk(g_agent.rec.disabled == 0u, "k04b recovery was enabled, not denied");
 
     chk(wait_transport_up(30), "k04 transport back UP after reconnect");
     {
@@ -854,6 +916,8 @@ static int scenario(void)
     pump_agent(master, 3);
     chk(iv_netmgr_switches(&g_agent.nm) == 2u, "k06 switched back to wireless after hold_s");
     chk(iv_agent_active_wan(&g_agent) == IV_WAN_WIRELESS, "k06 active WAN -> wireless");
+    chk(iv_agent_mn(&g_agent, IV_WAN_WIRELESS) == 1u,
+        "k06b wireless MN back to 1 after recovery (edge detector re-armed)");
     chk(strcmp(iv_agent_report(&g_agent)->srv_host, SRV_WL) == 0,
         "k06 platform addr back to the wireless one");
     chk(iv_agent_netmgr_state(&g_agent) == IV_NETMGR_WIRELESS_UP, "k06 state WIRELESS_UP");
@@ -934,7 +998,8 @@ static int scenario(void)
     if (g_fail == 0)
         printf("test_agent_switch passed "
                "(%s: link up/down -> probe, door-event, wan switch, real route "
-               "change, tcp reconnect, queue backlog, hold_s switch-back, ordered replay)\n",
+               "change, tcp reconnect, queue backlog, hold_s switch-back, ordered replay, "
+               "MN fault edge -> relay 0xD1)\n",
                g_realnic ? "real-NIC" : "netns");
     else
         printf("test_agent_switch FAILED (%d)\n", g_fail);

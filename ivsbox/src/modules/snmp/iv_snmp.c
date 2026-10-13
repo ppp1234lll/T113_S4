@@ -17,6 +17,22 @@
 #include "ivsbox/iv_clock.h"
 
 /* ---------------------------------------------------------------------------
+ * 槽位名规范表（OID 蓝本，见 iv_snmp.h 与功能开发计划 §S4.3）
+ * 顺序即 `camera.snmp.oid.<槽位>` / `switch.snmp.oid.<槽位>` 在配置默认值表里的
+ * 出现顺序，二者必须一致（装配层按本表顺序读键、也按本表顺序回报槽位名）。
+ * ------------------------------------------------------------------------- */
+const char *const iv_snmp_cam_slots[IV_SNMP_CAM_SLOT_N] = {
+    "sysDescr", "sysUpTime",    "sysName",      "deviceType", "softVersion",
+    "serialNumber", "cpuPercent", "memUsed",    "devStatus",
+};
+
+const char *const iv_snmp_sw_slots[IV_SNMP_SW_SLOT_N] = {
+    "sysDescr",     "sysUpTime",     "ifDescr",       "ifSpeed",
+    "ifAdminStatus","ifOperStatus",  "ifInOctets",    "ifInDiscards",
+    "ifOutOctets",  "ifOutDiscards", "lldpRemSysName","lldpRemPortId",
+};
+
+/* ---------------------------------------------------------------------------
  * 默认注入点
  * ------------------------------------------------------------------------- */
 static const iv_snmp_iops_t g_default_iops = {

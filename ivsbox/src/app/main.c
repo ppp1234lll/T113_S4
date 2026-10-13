@@ -12,6 +12,8 @@
  */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <ifaddrs.h>
+#include <netpacket/packet.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -327,6 +329,92 @@ static uint16_t cfg_port(const char *key)
     return (uint16_t)v;
 }
 
+/* ---------------------------------------------------------------------------
+ * M4-S4.2：本机网口的 IPv4 与 MAC（SADP Inquiry 字段）
+ * 取不到就保持 0 / 全 0（iv_device 会填占位值，不影响其余三路发现）。
+ * ------------------------------------------------------------------------- */
+static void local_link_info(const char *ifname, uint32_t *ip_be, uint8_t mac[6])
+{
+    struct ifaddrs *head = NULL;
+    struct ifaddrs *ifa;
+
+    *ip_be = 0u;
+    memset(mac, 0, 6u);
+    if (ifname == NULL || ifname[0] == '\0')
+        return;
+    if (getifaddrs(&head) != 0)
+        return;
+    for (ifa = head; ifa != NULL; ifa = ifa->ifa_next) {
+        const struct sockaddr *sa = ifa->ifa_addr;
+
+        if (sa == NULL || strcmp(ifa->ifa_name, ifname) != 0)
+            continue;
+        if (sa->sa_family == AF_INET && *ip_be == 0u) {
+            *ip_be = ((const struct sockaddr_in *)(const void *)sa)
+                         ->sin_addr.s_addr;
+        } else if (sa->sa_family == AF_PACKET) {
+            const struct sockaddr_ll *sll =
+                (const struct sockaddr_ll *)(const void *)sa;
+
+            if (sll->sll_halen == 6u)
+                memcpy(mac, sll->sll_addr, 6u);
+        }
+    }
+    freeifaddrs(head);
+}
+
+/* ---------------------------------------------------------------------------
+ * M4-S4.3：读一个 SNMP 目标的配置（**不新增配置键**，全部复用 S4.3 已冻结的
+ * `camera.snmp.*` / `switch.snmp.*`）。
+ * OID 槽位按 `slots[]`（规范表 `iv_snmp_cam_slots` / `iv_snmp_sw_slots`）顺序读；
+ * **位置保持一一对应**：中间某槽没配就留空串、不压缩下标，否则
+ * `iv_agent_snmp_get()` 回报的槽位名会错位。n_oid 取"最后一个非空槽 + 1"。
+ * ------------------------------------------------------------------------- */
+static void cfg_snmp_target(iv_agent_snmp_cfg_t *sc, const char *pfx,
+                            const char *const *slots, int n_slot,
+                            uint32_t ip_be)
+{
+    char    key[96];
+    int64_t v = 0;
+    int     b = 0;
+    int     i;
+
+    memset(sc, 0, sizeof(*sc));
+    sc->ip_be = ip_be;
+
+    if (snprintf(key, sizeof(key), "%s.enable", pfx) < (int)sizeof(key) &&
+        iv_config_get_bool(g_cfg, key, &b) == IV_OK)
+        sc->enable = b;
+    if (snprintf(key, sizeof(key), "%s.community", pfx) < (int)sizeof(key)) {
+        const char *s = NULL;
+
+        if (iv_config_get_str(g_cfg, key, &s) == IV_OK && s != NULL)
+            (void)snprintf(sc->community, sizeof(sc->community), "%.*s",
+                           (int)sizeof(sc->community) - 1, s);
+    }
+    if (snprintf(key, sizeof(key), "%s.timeout_ms", pfx) < (int)sizeof(key) &&
+        iv_config_get_int(g_cfg, key, &v) == IV_OK && v > 0)
+        sc->timeout_ms = (uint32_t)v;
+    if (snprintf(key, sizeof(key), "%s.retries", pfx) < (int)sizeof(key) &&
+        iv_config_get_int(g_cfg, key, &v) == IV_OK && v >= 0)
+        sc->retries = (uint32_t)v;
+
+    for (i = 0; i < n_slot && i < (int)IV_AGENT_SNMP_SLOT_MAX; i++) {
+        const char *s = NULL;
+
+        sc->oid[i][0] = '\0';
+        if (snprintf(key, sizeof(key), "%s.oid.%s", pfx, slots[i]) >=
+            (int)sizeof(key))
+            continue;
+        if (iv_config_get_str(g_cfg, key, &s) != IV_OK || s == NULL)
+            continue;
+        (void)snprintf(sc->oid[i], IV_SNMP_OID_STR_MAX, "%.*s",
+                       (int)IV_SNMP_OID_STR_MAX - 1, s);
+        if (sc->oid[i][0] != '\0')
+            sc->n_oid = i + 1; /* 位置语义：下标＝规范槽位表下标 */
+    }
+}
+
 static int agent_setup(void)
 {
     iv_agent_cfg_t ac;
@@ -378,6 +466,24 @@ static int agent_setup(void)
         ac.netthr_reboot_max = (uint32_t)v;
     if (iv_config_get_int(g_cfg, "netthr.reboot_interval_s", &v) == IV_OK && v > 0)
         ac.netthr_reboot_interval_s = (uint32_t)v;
+
+    /* 摄像机信息探测（S4.2）：开机一次自动搜索；SADP 走有线网口，报文字段取本机
+     * 网口的 IPv4/MAC（取不到就留空，其余三路发现不受影响）。 */
+    ac.dev_enable = 1;
+    ac.dev_ifname[0] = '\0'; /* 空 ⇒ iv_agent 用 wan_name[IV_WAN_WIRED] */
+    local_link_info(ac.wan_name[IV_WAN_WIRED], &ac.dev_local_ip_be,
+                    ac.dev_local_mac);
+
+    /* SNMP 采集（S4.3）：**收发必须落在慢任务池**（iv_snmp 是阻塞式）。
+     * 目标 IP 复用既有键：摄像机＝`camera.ch.0.ip`（现网"查摄像机1"），
+     * 交换机＝`switch.ip`；OID 槽位键名即语义（见 iv_snmp.h 规范表）。 */
+    ac.pool = g_pool;
+    cfg_snmp_target(&ac.snmp[IV_AGENT_SNMP_CAM], "camera.snmp",
+                    iv_snmp_cam_slots, (int)IV_SNMP_CAM_SLOT_N,
+                    cfg_ip_be("camera.ch.0.ip"));
+    cfg_snmp_target(&ac.snmp[IV_AGENT_SNMP_SW], "switch.snmp",
+                    iv_snmp_sw_slots, (int)IV_SNMP_SW_SLOT_N,
+                    cfg_ip_be("switch.ip"));
 
     ac.devid = 0u;
 

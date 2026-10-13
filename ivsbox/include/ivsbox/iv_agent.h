@@ -64,6 +64,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "ivsbox/iv_camdet.h"
 #include "ivsbox/iv_netlink.h"
 #include "ivsbox/iv_netmgr.h"
 #include "ivsbox/iv_probe.h"
@@ -116,6 +117,11 @@ typedef struct {
     uint32_t    nm_ok_n;            /* 0 → 默认 2 */
     uint32_t    nm_hold_s;          /* 0 → 默认 30 */
     uint32_t    nm_stable_s;        /* 0 → 默认 10 */
+
+    /* ---- M4 摄像机网络状态检测（S4.1）---- */
+    uint32_t    camera_ip_be[IV_CAMDET_CH_N]; /* 0=该路未配置 */
+    uint32_t    camera_detect_mode;   /* 0 → 默认 PING(1)；对应现网 search_mode */
+    uint32_t    camera_detect_rtt_ms; /* 0 → 默认 200 ms */
 } iv_agent_cfg_t;
 
 /* ---------------------------------------------------------------------------
@@ -128,6 +134,7 @@ typedef struct {
     iv_netlink_t nl;  /* S3.1 */
     iv_probe_t   pb;  /* S3.2 */
     iv_netmgr_t  nm;  /* S3.3 */
+    iv_camdet_t  cd;  /* S4.1 摄像机网络状态探测（内嵌第二个 iv_probe 实例） */
 
     /* netmgr 的事务执行点：switch_route 复用默认（netlink 改路由），reconnect
      * 接本层 → iv_report_reconnect。ops.arg 指向本结构，故不能是静态常量。 */

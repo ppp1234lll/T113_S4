@@ -30,6 +30,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | S3.1 补同步链路查询 ＋ `iv_agent` 开局摸底 | 已实现（VM 全量验证 ＋ 反向证伪 2 条 ＋ 板端 ARM 验收通过） | 2026-10-12 15:00 | 新增 `iv_netlink_link_up()`（`SIOCGIFFLAGS`，零 netlink 请求、未 attach 可用、返回码加 `IV_ENOENT`）＋ `iv_agent_open()` 开局逐条 WAN 摸底；`test_agent_switch.c` 删掉真网卡模式的 promisc 顶事件补偿，`test_netlink.c` 新增 c13。*判据＝`IFF_UP && IFF_RUNNING` 而非 `UP && LOWER_UP`*：`ifreq.ifr_flags` 是 `short`，`IFF_LOWER_UP=0x10000` 装不下（板端实测 `ioctl=0x1043`、`ip` 同刻报 LOWER_UP；sysfs 亦无该位）⇒ 如实写"语义等价代理"。VM `make test` 26/26、`asan`/`tsan` 0 FAIL、netns 用例与 `test_e2e_report` RC=0；反向证伪 2 条（4 行／1 行 FAIL）；板端 ARM `test_netlink` ＋ 真网卡 `test_agent_switch` 均 RC=0、路由逐字还原。详见本文件文末 2026-10-12 15:00 节。 |
 | iv_link 帧超时（gap_ms）默认打开 —— 修"半截帧永久卡死状态机" | 已实现（VM 全量验证 ＋ 反向证伪 2 条 ＋ 板端 ARM 验收通过） | 2026-10-12 16:16 | `iv_link_cfg_t` 增 `gap_ms`（0＝关闭）＋ 新增 `IV_LINK_GAP_MS_DEFAULT=500u`；`iv_link_init()` 传 `cfg.gap_ms`（原写死 0）；`iv_link_tick()` 调 `iv_framer_tick()`（超时检查搭既有 200 ms 总线节拍，不新增定时器/fd/线程）。原状：全库无 `iv_framer_tick()` 调用点 ⇒ 半截帧（采集板发一半掉电）令状态机永久停在收 data、后续帧全被吃成 data、串口链路永久失效。取值硬约束：`gap_ms` 必须 > tick 周期（200 ms），否则被节拍切开的正常帧会被误判成半帧。既有单测/fuzz 的 cfg 位置初始化补第 4 字段 `0u`（语义逐字不变）＋ 新增第 12 组用例（半帧复位 ＋ gap=0 对照）。VM `test` **25/25**、`asan`/`tsan` 0 FAIL、host/arm/analyze 零告警、`test_e2e_report`/`test_agent_switch` RC=0；**反向证伪 2 条各 4 行 FAIL**；板端 ARM `test_link` RC=0、输出与 Host 逐字一致、md5 与 VM ARM 一致。详见本文件文末 2026-10-12 16:16 节。 |
 | A1 装配层配置接线：平台地址"按活动出口选"（＋ 三项口径纠正） | 已实现（VM 全量验证 ＋ 反向证伪 2 条 ＋ 板端 ARM 验收通过） | 2026-10-12 16:50 | `iv_report` 增**自持目标地址** `srv_host`/`srv_port` ＋ `iv_report_set_server()`（只改副本、不主动断连）；`reconnect()` 一律按副本重连。`iv_agent_cfg_t` 的单一 `server_host/port` 改为 `srv_host[IV_WAN_N]`/`srv_port[IV_WAN_N]`（下标＝`iv_wan_t`）；`agent_initial_wan()` 定初始活动口（只有 `WIRED_ONLY` 从有线起步），`agent_reconnect()` 按 **netmgr 传入的 `new_ifindex` 反推**出口换址后重连，`agent_pick_host()` 实现"本口没配回退另一口"。`main.c` 读 `net.server.{wireless,wired}.{host,port}` 四条键。**口径纠正（按架构 §10.2，与上一轮口头建议不同）**：① 身份不进配置 ⇒ `devid` 不设键（待 S5.5 读 `private`）；② 网口由 `sys.transport.mode` 隐含、原 `net.wan.*` 六项已删 ⇒ 网卡名与 netmgr 阈值不新增键；③ 切换门限正源是 `netthr.loss_count`（现状由 `probe.max_fail` 同源喂，本轮未动，登记待办）。**行为变更**：初启选址由"有线优先"变"按初始活动出口（默认无线优先）"。验证：VM `test` **25/25**、`asan`/`tsan` 0 FAIL、host/arm/analyze 零告警、`test_e2e_report` 与 `test_agent_switch`(netns) **RC=0 · 0 FAIL**（后者 6 条新地址断言在真 TCP 上证实"无线→有线→无线"换址）；**反向证伪 2 条各 3 行 FAIL**（出口反推失效／`set_server` 变空操作）；板端 ARM `test_report` RC=0、md5 `c3619640…`、输出与 Host 逐字一致，`test_agent_switch` 板端 SKIP（无 `unshare`）RC=0。**未做**：`netthr.loss_count` 接线、`ok_n`/`hold_s`/`stable_s` （架构缺键）、`devid`/`mod` 来源。详见本文件文末 2026-10-12 16:50 节。 |
+| M4-S4.1 摄像机网络状态探测（三方式可选） | 已实现（VM 全量验证 ＋ 反向证伪 4 条；**netns/板端实测待补**） | 2026-10-13 11:48 | 新增 `include/ivsbox/iv_camdet.h`（328 行）＋ `src/modules/probe/iv_camdet.c`（908 行，零 malloc）＋ `tests/unit/test_camdet.c`（710 行，12 组 c01~c12）；装配进 `iv_agent`（camdet 起停、200 ms 节拍驱动、netlink 链路事件转接、平台命令 `0xA5` 路由）、`main.c` 读 6 路 `camera.ch.N.ip`、`iv_config.c` 新增 `camera.detect.mode`/`camera.detect.rtt_ms` 两键、`test_config.c` 黄金计数 39→41/38→40/47→49。**五态编码** `0/1/2/4/5`（现网 `NET_STATUS_E`）；三方式互斥可切换（PING 4 包均值判延时 / 端口扫描 7 端口表 / RTSP OPTIONS）。**关键实现**：PING 复用**独立 `iv_probe` 实例**（非往 WAN 项表加项）；"包间隔≫tick 周期"使 sent/lost 增量恒 ≤1 ⇒ 逐包采样；端口/RTSP 用 tick 推进的非阻塞串行状态机（*偏离*计划"用慢任务池(S5)"，已登记）。VM `test` **26/26**、`build`/`asan`/`analyze`/`arm`/`tsan` 全 RC=0 零告警、`arm` 出 ELF32 ARM EABI5；**反向证伪 4 条全部抓出**（1/1/3/1 行 FAIL）。`CNS` 段与 `iv_report_build_seg` 已对上。*未做：VM netns veth、板端对实验室摄像机实测*。详见本文件文末 2026-10-13 11:48 节。 |
 |===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
@@ -1413,3 +1414,33 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 * *反向证伪 2 条（机制级）*：① `agent_reconnect()` 的出口反推失效（`w = i;` ⇒ 恒 `IV_WAN_WIRELESS`）⇒ **3** 行 FAIL（`k04 platform addr switched…`、`k04 transport really re-dials…`、`test_agent_switch FAILED (2)`）；② `iv_report_set_server()` 变空操作（删掉副本写入两行）⇒ 同样 **3** 行 FAIL。基线 0 FAIL、两条还原后复验 0 FAIL、源文件与备份 diff 一致 ⇒ "装配层选址"与"report 层改址"两个环节都被钉住。
 * *板端（2026-10-12 16:4x，TQ113 `armv7l`）*：ARM 版 `test_report` md5 `c3619640e875d9afa7f4a3931bd9b91a`（与 VM ARM 产物一致）、输出与 Host **逐字一致**、**RC=0**；`test_agent_switch` 板端 **SKIP**（镜像无 `unshare`，用例自降级为 SKIP 并返回 0）、**RC=0**；两个产物跑完 `rm -f` 清理。
 * *未做（如实登记）*：真机现场（真平台地址＋真采集板 `ttySAC5`）；`REALNIC` 模式未跑（本轮不涉真网卡语义，且板端 4G 看护在跑，避免再动管理链路）。
+
+== 2026-10-13 11:48 M4-S4.1 摄像机网络状态探测（三方式可选）
+
+=== 干了什么事
+
+* *新增 `ivsbox/include/ivsbox/iv_camdet.h`（328 行，公开接口）*：`iv_camdet_t` 句柄（内嵌**独立** `iv_probe_t pb`、`ch_idx[]`、`ch_ip_be[]`、探测结论 `vd[]` 与对外状态 `st[]`、4 包取样环 `pk_ok`/`pk_rtt`/`pk_pos`/`pk_n`、引擎增量基准 `pv_sent`/`pv_lost`、端口/RTSP 串行状态机 `sc_*`、`fd`/`fd_deadline_ms`、统计）；`iv_camdet_cfg_t`（mode/rtt_thr_ms/round_ms/两个注入点/状态沿回调）；`iv_camdet_iops_t`（socket/connect/getsockopt/send/recv/close/now_ms 七点注入）；两个枚举（五态 `IV_CAMDET_NO_IP/NORMAL/FAULT/DELAY/LOSS`＝0/1/2/4/5，方式 `PING=1/PORT=2/RTSP=3`）；常量（`CH_N=6`、包间隔 5000、单包超时 5000、样本数 4、RTT 阈值默认 200、轮间隔 30000、端口表 7 项）；API＝`init/open/close/is_open/set_channels/set_mode/set_link/tick/status/verdict/ip/cns/mode/last_change_ms/samples/rounds/status_name/mode_name/port_table/default_iops/cfg_default`。头文件内嵌两张表：五态编码表 ＋ "与现网口径逐条对齐"表（并明写唯一形态差异与两处落点偏离）。
+* *新增 `ivsbox/src/modules/probe/iv_camdet.c`（908 行，零 malloc）*：`pb_rebuild()`（按 `ch_ip_be[]` 重建引擎项、记 `ch_idx`）、`refresh()`（先算探测结论，再叠加"网线断开"覆盖，最后按需回调 `on_change`）、`sample_ping()`（按 `sent`/`lost` 增量取"刚完成的单包"填环、集满 4 个结算）、`ping_verdict()`（全应答→均值 < 阈值 ? 正常 : 延时；部分应答→丢包；零应答→故障）、`port_tick()`（7 端口串行 connect，位图记已连通）、`rtsp_tick()`（connect→发 `OPTIONS`→收到 >0 字节即正常）。
+* *新增 `ivsbox/tests/unit/test_camdet.c`（710 行，12 组）*：c01 生命周期/非法参数、c02 PING 五态、c03 RTT 阈值边界（`==` 判延时）、c04 4 包环取样、c05 方式切换、c06 端口表连接、c07 端口扫描状态机、c08 RTSP 状态机、c09 链路覆盖、c10 通道热更新、c11 回调沿、c12 `CNS` 与 `iv_report_build_seg` 同步。mock PING 注入点**从实发字节里解析真实 echo seq** 来回应答；mock camdet 注入点驱动端口/RTSP 状态机（每步推进足够 tick）。
+* *装配改动*：`iv_agent.h`（含 `iv_camdet.h`、cfg 增 `camera_ip_be[6]`/`camera_detect_mode`/`camera_detect_rtt_ms`、句柄增 `cd`）；`iv_agent.c`（`iv_agent_open()` 起 camdet ＋ 用 `iv_netlink_link_up()` 播种链路状态 ＋ 注册 `0xA5` 路由；step 驱动 `iv_camdet_tick()` ＋ 200 ms 定时器；close 停飞；netlink 链路事件转 `iv_camdet_set_link()`；新增 `camdet_feed()`/`on_cfg_search_mode()`）；`main.c`（读 `camera.ch.N.ip` 六路 ＋ `camera.detect.mode`/`rtt_ms`）；`iv_config.c`（`camera.search` 后追加两键）；`test_config.c`（黄金计数 39→41、38→40、47→49）。
+
+=== 解决什么问题
+
+* *闭合"CNS 恒 0"遗留的软件面*：`iv_report_env_t.cns[6]` 此前恒 0。S4.1 产出五态编码并由装配层喂入，`iv_report_build_seg()` 的 `CNS=%01d,…;` 六路字段即真实探测结果。c12 用例直接把它与 `iv_report_build_seg()` 对接验证。
+* *给 S4.4 断电重启提供触发源*：本模块只给"正常→故障"的状态沿（`on_change`），不动作；S4.4 消费该沿做继电器断电（M4 后续步）。
+* *三方式口径对齐现网*：过去 S4.1 计划是"三层探测"演绎，与现网不符；本轮按现网参考实现重写为三方式互斥、运行时可切换，判定阈值/端口表/RTSP 串/五态编码逐条照线上口径。
+
+=== 影响范围
+
+* *新增独立模块，对既有模块零破坏*：`iv_camdet` 不修改任何既有模块的私有数据；`iv_agent.h` 的 cfg 结构体**新增字段**（在结构体尾部），调用方 `main.c` 同步填充；`iv_config` 默认值表 +2 条（39→41），容量距 `IV_CFG_ITEMS_MAX=128` 仍有余量。
+* *资源占用*：`iv_camdet_t` 约 2 KB（含内嵌 `iv_probe_t`），放静态区（`iv_agent_t` 成员）非栈；PING 方式额外持有一个 raw socket（与 WAN 实例各一）；端口/RTSP 方式同时最多 1 个进行中 socket。
+* *权能*：PING 需 `CAP_NET_RAW`（与 S3.2 同级，`ivsboxd` 以 root 运行本就具备）；无该权能时引擎自降级（`icmp_disabled`），本模块对应返回 `IV_ENOTSUP`。
+* *未覆盖 / 登记待办*：① **VM netns veth 模拟通/断/限速未做**；② **板端对实验室摄像机断电/断网/拔线三方式实测未做**（M4 退出条件"实验室摄像机实测"仍欠）；③ 端口扫描/RTSP 未放慢任务池（已登记偏离，理由见头文件）；④ PING 为均匀 20 s 采样而非现网 4 s 突发（已登记形态差异）。
+
+=== 验证方式与结果
+
+* *构建/回归（VM `tqt113`，gcc 11.4.0，工作目录 `/tmp/wbm4`，`LC_ALL=C`）*：`make test` **26/26 · 0 FAIL**（含新增 `test_camdet`）；`make build`/`make arm`/`make analyze` **RC=0 且 `grep -E "warning:|error:"` 命中 0**（ARM 出 ELF32 ARM EABI5）；`make asan` 与 `setarch -R make tsan` 各 **0 FAIL**。
+* *反向证伪 4 条（机制级）*：① `ping_verdict()` 把"均值 == 阈值"改判正常（应判延时）⇒ **1** 行 FAIL；② "部分应答"改判正常（应判丢包）⇒ **1** 行 FAIL；③ 4 包取样环语义变异 ⇒ **3** 行 FAIL；④ 链路 down 覆盖失效 ⇒ **1** 行 FAIL。四条还原后基线复跑 **RC=0 · 0 FAIL**。
+* *CNS 同步*：c12 断言 `iv_camdet_cns()` 六路输出与 `iv_report_build_seg()` 生成的 `CNS=%01d,…;` 段逐位一致。
+* *未做（如实登记）*：VM netns veth（真链路通/断/限速）；板端三方式对实验室摄像机实测（海康 192.168.1.200、大华 .106/.108）；真平台地址／真采集板。
+

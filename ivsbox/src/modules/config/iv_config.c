@@ -164,6 +164,10 @@ static const cfg_default_t s_defaults[] = {
 
     /* ---- camera. 摄像机配置（架构 §10.2；ch[] 是真数组，元素＝1 条目） ---- */
     D_STR(IV_CFG_CLS_CAMERA, "camera.search", "搜索模式（off/onvif/scan）", "off", "off,onvif,scan"),
+    /* M4-S4.1 摄像机网络状态检测：方式与延时阈值（现网 search_mode /
+     * DEFALUT_NETWORK_DELAY 口径） */
+    D_INT(IV_CFG_CLS_CAMERA, "camera.detect.mode", "摄像机检测方式：1=PING 2=端口扫描 3=RTSP", 1, 1, 3),
+    D_INT(IV_CFG_CLS_CAMERA, "camera.detect.rtt_ms", "PING 方式延时判定阈值（毫秒，平均 RTT >= 此值即判延时）", 200, 10, 10000),
     /* 6 路 × 8 字段——逐路铺出（数组按元素存，这里给足 0..5 的默认槽）。
      * ⚠ 密码字段**存 SM4 密文**（架构 §10.2），出厂默认空串＝未配置。*/
     D_STR(IV_CFG_CLS_CAMERA, "camera.ch.0.vendor", "第 1 路厂商", "", NULL),

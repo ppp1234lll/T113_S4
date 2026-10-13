@@ -34,6 +34,12 @@
 #include "ivsbox/iv_watchdog.h"
 
 #define APP_MOD "app"
+
+/* 摄像机 6 路 IP 配置键（S4.1；空串＝未配置） */
+static const char *const CAM_IP_KEY[IV_CAMDET_CH_N] = {
+    "camera.ch.0.ip", "camera.ch.1.ip", "camera.ch.2.ip",
+    "camera.ch.3.ip", "camera.ch.4.ip", "camera.ch.5.ip"
+};
 #define CHAN_SNAPSHOT "system.snapshot"
 
 /* 运行期全局句柄 */
@@ -325,6 +331,7 @@ static int agent_setup(void)
 {
     iv_agent_cfg_t ac;
     int64_t        v;
+    int            i;
 
     iv_agent_cfg_default(&ac);
 
@@ -357,6 +364,14 @@ static int agent_setup(void)
     }
 
     /* devid（TID）暂无配置键来源：待工厂身份分区（/dev/by-name/private）读取落地 */
+    /* 摄像机网络状态检测（S4.1）：6 路 IP 与检测方式 */
+    for (i = 0; i < IV_CAMDET_CH_N; i++)
+        ac.camera_ip_be[i] = cfg_ip_be(CAM_IP_KEY[i]);
+    if (iv_config_get_int(g_cfg, "camera.detect.mode", &v) == IV_OK && v > 0)
+        ac.camera_detect_mode = (uint32_t)v;
+    if (iv_config_get_int(g_cfg, "camera.detect.rtt_ms", &v) == IV_OK && v > 0)
+        ac.camera_detect_rtt_ms = (uint32_t)v;
+
     ac.devid = 0u;
 
     if (iv_agent_open(&g_agent, &ac, g_reactor, iv_clock_monotonic_ms()) != IV_OK) {

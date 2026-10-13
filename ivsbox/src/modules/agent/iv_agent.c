@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "ivsbox/iv_agent.h"
+#include "ivsbox/iv_proto.h"
 #include "ivsbox/iv_clock.h"
 #include "ivsbox/iv_log.h"
 #include "ivsbox/iv_version.h"
@@ -27,6 +28,8 @@ static int  agent_reconnect(void *arg, int new_ifindex);
 
 static void probe_drive(iv_agent_t *a, uint64_t now_ms);
 static void netmgr_feed(iv_agent_t *a, uint64_t now_ms);
+static void camdet_feed(iv_agent_t *a);
+static void on_cfg_search_mode(const iv_proto_frame_t *f, void *arg);
 
 /* 接口名 → 内核 ifindex；未解析到返回 0（该 WAN 视为未绑定） */
 static int wan_ifindex_of(const char *name)
@@ -232,6 +235,38 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
 
     /* ---- 5. 本层定时器 ---- */
     if (r != NULL) {
+        /* ---- 摄像机网络状态探测（S4.1）---- */
+        {
+            iv_camdet_cfg_t ccfg;
+
+            iv_camdet_cfg_default(&ccfg);
+            if (cfg->camera_detect_mode != 0u)
+                ccfg.mode = (int)cfg->camera_detect_mode;
+            if (cfg->camera_detect_rtt_ms != 0u)
+                ccfg.rtt_thr_ms = cfg->camera_detect_rtt_ms;
+            iv_camdet_init(&a->cd, &ccfg);
+            if (iv_camdet_open(&a->cd, NULL, now_ms) != IV_OK) {
+                IV_LOG_W(AG_MOD, "camdet open failed");
+            } else if (iv_camdet_set_channels(&a->cd, cfg->camera_ip_be,
+                                              now_ms) < 0) {
+                IV_LOG_W(AG_MOD, "camdet channel table rejected");
+            }
+            /* 摄像机在有线侧：开局同步一次 carrier（现网：网线断开 ⇒ 已配 IP 的一律报 2） */
+            {
+                int cup = 0;
+
+                if (cfg->wan_name[IV_WAN_WIRED][0] != 0 &&
+                    iv_netlink_link_up(cfg->wan_name[IV_WAN_WIRED], &cup) == IV_OK) {
+                    (void)iv_camdet_set_link(&a->cd, cup, now_ms);
+                    IV_LOG_I(AG_MOD, "camdet link seed: %s %s",
+                             cfg->wan_name[IV_WAN_WIRED], cup ? "up" : "down");
+                }
+            }
+            /* 平台命令 0xA5（CONFIGURE_SEARCH_MODE）切换检测方式 */
+            (void)iv_proto_route(&a->rp.pf, IV_PROTO_CMD_CFG_SEARCH,
+                                 on_cfg_search_mode, a);
+        }
+
         a->pb_timer = iv_timer_add(r, IV_AGENT_PROBE_TICK_MS, on_pb_timer, a);
         a->nm_timer = iv_timer_add(r, IV_AGENT_NETMGR_TICK_MS, on_nm_timer, a);
         if (a->pb_timer == NULL || a->nm_timer == NULL)
@@ -259,6 +294,9 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
     probe_drive(a, now_ms);
     netmgr_feed(a, now_ms);
     (void)iv_netmgr_tick(&a->nm, now_ms);
+    if (iv_camdet_is_open(&a->cd))
+        (void)iv_camdet_tick(&a->cd, now_ms);
+    camdet_feed(a);
     (void)iv_report_step(&a->rp, now_ms);
     return IV_OK;
 }
@@ -283,7 +321,8 @@ void iv_agent_close(iv_agent_t *a)
         }
     }
 
-    iv_report_close(&a->rp); /* 摘 serial/tick 事件、关传输与队列 */
+        iv_camdet_close(&a->cd);  /* 停在飞 socket + 关引擎 */
+iv_report_close(&a->rp); /* 摘 serial/tick 事件、关传输与队列 */
     iv_netmgr_init(&a->nm);  /* netmgr 无 close：init 复位 */
     if (a->pb.started)
         (void)iv_probe_stop(&a->pb);
@@ -297,6 +336,44 @@ void iv_agent_close(iv_agent_t *a)
 /* ---------------------------------------------------------------------------
  * 驱动：probe（发探/收结果/超时）与 netmgr（喂结论 + 状态推进）
  * ------------------------------------------------------------------------- */
+/* 把摄像机五态编码注入上报层的 CNS 字段（闭合 S3.6 的"CNS 恒 0"遗留）：
+ * 只改 cns[]，其余外部事实（CSQ/定位/故障码）原样保留。 */
+static void camdet_feed(iv_agent_t *a)
+{
+    iv_report_env_t env;
+    int             cns[IV_CAMDET_CH_N];
+    int             i;
+
+    if (!iv_camdet_is_open(&a->cd))
+        return;
+    if (iv_camdet_cns(&a->cd, cns) != IV_OK)
+        return;
+    env = a->rp.env;
+    for (i = 0; i < IV_REPORT_CNS_N && i < IV_CAMDET_CH_N; i++)
+        env.cns[i] = cns[i];
+    iv_report_set_env(&a->rp, &env);
+}
+
+/* 平台 0xA5（配置搜索方式）：DATA[0] = 1/2/3，非法回 0x74。
+ * 与现网 com_set_carema_search_mode_function() 同口径（那儿也是取 buff[0]）。 */
+static void on_cfg_search_mode(const iv_proto_frame_t *f, void *arg)
+{
+    iv_agent_t *a = (iv_agent_t *)arg;
+    int         rc;
+
+    if (f == NULL || a == NULL)
+        return;
+    if (f->data == NULL || f->len < 1u) {
+        (void)iv_proto_ack(&a->rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    rc = iv_camdet_set_mode(&a->cd, (int)f->data[0], a->now_ms);
+    (void)iv_proto_ack(&a->rp.pf, f->cmd,
+                       (rc >= 0) ? IV_PROTO_ACK_OK : IV_PROTO_ERR_EXEC);
+    IV_LOG_I(AG_MOD, "platform set detect mode %u -> rc=%d",
+             (unsigned)f->data[0], rc);
+}
+
 static void probe_drive(iv_agent_t *a, uint64_t now_ms)
 {
     int n;
@@ -370,6 +447,10 @@ static void on_nl_evt(const iv_netlink_evt_t *e, void *arg)
                 a->wan_link_up[w] = (uint8_t)up;
         }
         /* 即时重判绑定该接口的 probe 项（拔线要秒级可见） */
+        /* 网线状态直接覆盖摄像机结论（现网口径） */
+        if (a->wan_ifindex[IV_WAN_WIRED] != 0 &&
+            a->wan_ifindex[IV_WAN_WIRED] == e->ifindex)
+            (void)iv_camdet_set_link(&a->cd, up, a->now_ms);
         (void)iv_probe_set_link(&a->pb, e->ifindex, up, a->now_ms);
         break;
     }
@@ -398,6 +479,9 @@ static void on_pb_timer(void *arg)
 
     a->now_ms = now;
     probe_drive(a, now);
+    if (iv_camdet_is_open(&a->cd))
+        (void)iv_camdet_tick(&a->cd, now);
+    camdet_feed(a);
     if (a->r != NULL)
         a->pb_timer = iv_timer_add(a->r, IV_AGENT_PROBE_TICK_MS, on_pb_timer, a);
 }

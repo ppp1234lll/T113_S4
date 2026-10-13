@@ -175,7 +175,10 @@ static iv_config_t *reopen_cfg(void)
 /* ===========================================================================
  * §S8.1 ① + F1/F4：文件根本不存在 ⇒ 用内置默认值照常启动
  * 新口径：单文件、八分类、128 容量上限。变长 camera.ch 不预建槽位，
- * 无相机时默认项共 5+11+5+3+3+5+4+5 = 41 项。
+ * 无相机时默认项共 5+11+5+16+20+5+4+5 = 71 项。
+ * （camera 16 = camera.search/detect.mode/detect.rtt_ms 共 3 ＋ SNMP 目标参数 4 ＋
+ *   SNMP OID 槽位 9；switch 20 = switch.ip/vendor/model 共 3 ＋ SNMP 目标参数 5 ＋
+ *   SNMP OID 槽位 12。camera.ch 是变长数组，此处不计。）
  * 反向证伪：若默认值表被清空 / 补齐逻辑不跑，items 与各默认值断言立刻失败。
  * ========================================================================= */
 static void case_defaults_startup(void)
@@ -199,9 +202,9 @@ static void case_defaults_startup(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c1: stat");
     chk(st.loaded == 0, "c1: loaded == 0 (started from built-in defaults)");
-    chk(st.items == 41u, "c1: 41 non-array defaults materialised");
+    chk(st.items == 71u, "c1: 71 non-array defaults materialised");
     chk(st.from_file == 0u, "c1: nothing came from the file");
-    chk(st.from_default == 41u, "c1: everything came from defaults");
+    chk(st.from_default == 71u, "c1: everything came from defaults");
     chk(st.invalid == 0u, "c1: a missing file is NOT an invalid value");
     chk(st.version == 0u, "c1: version is 0 when there is no file");
     chk(st.dirty == 0, "c1: not dirty right after open");
@@ -512,9 +515,9 @@ static void case_fill_and_origin(void)
         return;
 
     chk(iv_config_stat(c, &st) == IV_OK, "c5: stat");
-    chk(st.items == 41u, "c5: all non-array defaults are materialised");
+    chk(st.items == 71u, "c5: all non-array defaults are materialised");
     chk(st.from_file == 1u, "c5: exactly one key came from the file");
-    chk(st.from_default == 40u, "c5: forty were filled from defaults");
+    chk(st.from_default == 70u, "c5: seventy were filled from defaults");
     chk(st.invalid == 0u, "c5: a MISSING key is not an INVALID key");
     chk(st.loaded == 1, "c5: the file itself loaded fine");
 
@@ -535,7 +538,7 @@ static void case_fill_and_origin(void)
  * F4：文件把子树写成标量（`"net": 5`）必须判非法并剔除，不能让它把整棵
  *     net.* 默认子树挡在门外。
  * 反向证伪：去掉 item_check() 里的 is_default_parent 分支后，invalid 会退回 0，
- *           而 items 也不再是 41 —— 这正是 F6 静默清空运行中配置的那条路。
+ *           而 items 也不再是 71 —— 这正是 F6 静默清空运行中配置的那条路。
  * ========================================================================= */
 static void case_parent_scalar_rejected(void)
 {
@@ -555,7 +558,7 @@ static void case_parent_scalar_rejected(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c6: stat");
     chk(st.invalid == 1u, "c6: the scalar that shadows a subtree is counted as invalid");
-    chk(st.items == 41u, "c6: the whole non-array default set is still there");
+    chk(st.items == 71u, "c6: the whole non-array default set is still there");
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && s[0] == '\0',
         "c6: net.* is usable again (defaulted empty)");
     chk(iv_config_get_int(c, "net", &iv) == IV_ENOENT, "c6: the offending key itself is gone");
@@ -960,7 +963,7 @@ static void case_comment_roundtrip(void)
     chk(iv_config_stat(c, &st) == IV_OK, "c11: stat after round-trip");
     chk(st.loaded == 1, "c11: the rendered file parses back cleanly");
     chk(st.invalid == 0u, "c11: no value was rejected on the round-trip");
-    chk(st.items == 49u, "c11: 41 base keys plus one 8-field camera survived");
+    chk(st.items == 79u, "c11: 71 base keys plus one 8-field camera survived");
 
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "172.16.0.9") == 0,
         "c11: the string survived");
@@ -1464,6 +1467,150 @@ static void cleanup(void)
     (void)rmdir(g_dir);
 }
 
+/* 造一个**恰好 len 字符**的点分 OID 文本（形如 1.3.6.1.4.1.1.1…），用于长度边界用例。 */
+static void build_oid_text(char *out, size_t len)
+{
+    static const char base[] = "1.3.6.1.4.1";
+    size_t            i      = sizeof(base) - 1u; /* 11 */
+
+    memcpy(out, base, i);
+    while (i < len) {
+        out[i++] = '.';
+        if (i < len)
+            out[i++] = '1';
+    }
+    out[len] = '\0';
+}
+
+/* ===========================================================================
+ * §S4.3：SNMP OID 槽位＝"键名即语义、值即 OID 字符串"的 **4 段键**
+ *   （`camera.snmp.oid.<槽位>` / `switch.snmp.oid.<槽位>`）。
+ * ① 出厂默认（海康套）逐条取回，与计划 §S4.3「OID 蓝本」表一致；
+ * ② 自定义值写盘→重开一致，含两个边界：**31 字符槽位名**、**159 字符 OID 值**；
+ * ③ 越界被拒：**32 字符槽位名**（段长上限 `IV_CFG_SEG_MAX-1`）与 **160 字符 OID 值**
+ *    （`IV_CFG_STR_MAX` 上限）⇒ 计入 `invalid` 且**不落进句柄**。
+ * 反向证伪：删掉 `key_ok()` 的段长检查 或 `flatten_leaf()` 的字符串长度检查，
+ *           ③ 的两条断言立刻失败（非法值被静默接受）。
+ * ========================================================================= */
+static void case_snmp_oid_keys(void)
+{
+    char            pf[200];
+    char            json[1024];
+    char            good[160]; /* 159 字符 + NUL */
+    char            bad[161];  /* 160 字符 + NUL */
+    char            slot31[32];
+    char            slot32[33];
+    char            key[IV_CFG_KEY_MAX];
+    iv_config_t    *c;
+    iv_cfg_stat_t   st;
+    iv_cfg_origin_t org;
+    const char     *s = NULL;
+
+    build_oid_text(good, 159u);
+    build_oid_text(bad, 160u);
+    memset(slot31, 'a', 31u);
+    slot31[31] = '\0';
+    memset(slot32, 'b', 32u);
+    slot32[32] = '\0';
+    cfg_path(pf, sizeof(pf));
+
+    /* ---- ① 出厂默认（海康套）---- */
+    (void)unlink(pf);
+    c = reopen_cfg();
+    chk(c != NULL, "c17: open (built-in SNMP OID defaults)");
+    if (c == NULL)
+        return;
+    chk(iv_config_get_str(c, "camera.snmp.oid.sysDescr", &s) == IV_OK &&
+            strcmp(s, "1.3.6.1.2.1.1.1.0") == 0,
+        "c17: camera sysDescr default = MIB-II sysDescr");
+    chk(iv_config_get_str(c, "camera.snmp.oid.cpuPercent", &s) == IV_OK &&
+            strcmp(s, "1.3.6.1.4.1.39165.1.7.0") == 0,
+        "c17: camera cpuPercent default = Hikvision private OID");
+    chk(iv_config_get_str(c, "camera.snmp.oid.devStatus", &s) == IV_OK && s[0] == '\0',
+        "c17: camera devStatus default empty (no Hik node => not collected)");
+    chk(iv_config_get_str(c, "switch.snmp.oid.ifOperStatus", &s) == IV_OK &&
+            strcmp(s, "1.3.6.1.2.1.2.2.1.8") == 0,
+        "c17: switch ifOperStatus default = IF-MIB column (no trailing .0)");
+    chk(iv_config_get_str(c, "switch.snmp.oid.lldpRemPortId", &s) == IV_OK &&
+            strcmp(s, "1.0.8802.1.1.2.1.4.1.1.7") == 0,
+        "c17: switch lldpRemPortId default = LLDP-MIB column");
+    chk(iv_config_get_str(c, "switch.snmp.community", &s) == IV_OK &&
+            strcmp(s, "public") == 0,
+        "c17: switch.snmp.community default public");
+    {
+        int64_t iv = 0;
+
+        chk(iv_config_get_int(c, "switch.snmp.port", &iv) == IV_OK && iv == 161,
+            "c17: switch.snmp.port default 161");
+        chk(iv_config_get_int(c, "camera.snmp.timeout_ms", &iv) == IV_OK && iv == 1500,
+            "c17: camera.snmp.timeout_ms default 1500");
+        chk(iv_config_get_int(c, "camera.snmp.retries", &iv) == IV_OK && iv == 1,
+            "c17: camera.snmp.retries default 1");
+    }
+    iv_config_close(c);
+
+    /* ---- ② 自定义值 + 长度边界：写盘 → 重开一致 ---- */
+    (void)snprintf(json, sizeof(json),
+                   "{\n"
+                   "  \"camera\": { \"snmp\": { \"oid\": {\n"
+                   "      \"cpuPercent\": \"1.3.6.1.4.1.1004849.1.1.3.0\",\n"
+                   "      \"%s\": \"%s\"\n"
+                   "  } } }\n"
+                   "}\n",
+                   slot31, good);
+    chk(write_file(pf, json, 0644u) == 0, "c17: seed a custom OID table");
+    c = reopen_cfg();
+    chk(c != NULL, "c17: open (custom OID table)");
+    if (c == NULL)
+        return;
+    chk(iv_config_get_str(c, "camera.snmp.oid.cpuPercent", &s) == IV_OK &&
+            strcmp(s, "1.3.6.1.4.1.1004849.1.1.3.0") == 0,
+        "c17: a swapped-in (Dahua) OID wins over the built-in default");
+    chk(iv_config_origin(c, "camera.snmp.oid.cpuPercent", &org) == IV_OK &&
+            org == IV_CFG_FROM_FILE,
+        "c17: origin FILE for the supplied OID");
+    (void)snprintf(key, sizeof(key), "camera.snmp.oid.%s", slot31);
+    chk(iv_config_get_str(c, key, &s) == IV_OK && strcmp(s, good) == 0,
+        "c17: 31-char slot name + 159-char OID value round-trip from the file");
+    chk(iv_config_save(c, NULL, 0u) == IV_OK, "c17: save the custom table");
+    iv_config_close(c);
+
+    c = reopen_cfg();
+    chk(c != NULL, "c17: reopen after save");
+    if (c == NULL)
+        return;
+    chk(iv_config_get_str(c, key, &s) == IV_OK && strcmp(s, good) == 0,
+        "c17: the 4-deep OID key survives a save/reload round-trip");
+    iv_config_close(c);
+
+    /* ---- ③ 越界被拒（不静默接受）---- */
+    (void)snprintf(json, sizeof(json),
+                   "{\n"
+                   "  \"camera\": { \"snmp\": { \"oid\": {\n"
+                   "      \"%s\": \"1.3.6.1.2.1.1.1.0\",\n"
+                   "      \"memUsed\": \"%s\"\n"
+                   "  } } }\n"
+                   "}\n",
+                   slot32, bad);
+    chk(write_file(pf, json, 0644u) == 0, "c17: seed out-of-range OID keys");
+    c = reopen_cfg();
+    chk(c != NULL, "c17: open (out-of-range OID keys)");
+    if (c == NULL)
+        return;
+    chk(iv_config_stat(c, &st) == IV_OK, "c17: stat");
+    chk(st.invalid == 2u,
+        "c17: both the 32-char slot and the 160-char OID count as invalid");
+    (void)snprintf(key, sizeof(key), "camera.snmp.oid.%s", slot32);
+    chk(iv_config_get_str(c, key, &s) == IV_ENOENT,
+        "c17: a 32-char slot name (>= IV_CFG_SEG_MAX) is rejected");
+    chk(iv_config_get_str(c, "camera.snmp.oid.memUsed", &s) != IV_OK ||
+            strcmp(s, bad) != 0,
+        "c17: a 160-char OID value (>= IV_CFG_STR_MAX) is never stored");
+    iv_config_close(c);
+
+    (void)unlink(pf);
+}
+
 int main(void)
 {
     char   tmpl[] = "/tmp/ivcfg_XXXXXX";
@@ -1504,6 +1651,7 @@ int main(void)
     case_pool_and_misc();
     case_dir_autocreate();
     case_dir_recursive_create();
+    case_snmp_oid_keys();
 
     cleanup();
 
@@ -1512,6 +1660,7 @@ int main(void)
         return 1;
     }
     printf("test_config passed (S8 F1-F7 + S8.1 single-file/8-class/array/double/"
-           "comment-roundtrip/per-class transaction + G20 dir-recursive-create)\n");
+           "comment-roundtrip/per-class transaction + G20 dir-recursive-create + "
+           "S4.3 snmp-oid-slots)\n");
     return 0;
 }

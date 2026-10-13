@@ -168,6 +168,42 @@ static const cfg_default_t s_defaults[] = {
      * DEFALUT_NETWORK_DELAY 口径） */
     D_INT(IV_CFG_CLS_CAMERA, "camera.detect.mode", "摄像机检测方式：1=PING 2=端口扫描 3=RTSP", 1, 1, 3),
     D_INT(IV_CFG_CLS_CAMERA, "camera.detect.rtt_ms", "PING 方式延时判定阈值（毫秒，平均 RTT >= 此值即判延时）", 200, 10, 10000),
+    /* M4-S4.3 SNMP 采集：目标参数 4 条 ＋ OID 槽位 9 条。
+     * OID 表**唯一来源＝配置**：代码内不内置任何品牌特化表，换机型只改这里、不改固件。
+     * ⚠ 槽位名必须**厂家中立**（同一槽位只能存一个 OID：海康/大华同指标 OID 不同，
+     *   不能两套并存）；name 由键名承担，type 由本行的 desc 登记（键深 4 段＝
+     *   IV_CFG_DEPTH_MAX 极限，**不能再加第 5 段 name/type 字段**）。
+     * 出厂默认填**海康**那一套（主流机型）；大华套由 Web（S5.1）一键切，
+     *   摄像机为其它品牌时本组私有 OID 无应答属预期（**报"无应答"、不乱填值**）。
+     * ⚠ `community` 属口令类，架构 §10 本应走 `secure/`；F8 密钥分离未实现，
+     *   首版暂落普通配置——**已知欠账**（与 `camera.ch.N.pass` 同类）。 */
+    D_BOOL(IV_CFG_CLS_CAMERA, "camera.snmp.enable", "摄像机 SNMP 采集开关", "false"),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.community",
+          "摄像机 SNMP 团体字（读团体；⚠ 口令类，F8 未实现前暂落普通配置）", "public", NULL),
+    D_INT(IV_CFG_CLS_CAMERA, "camera.snmp.timeout_ms", "摄像机 SNMP 单次事务超时（毫秒）",
+          1500, 100, 60000),
+    D_INT(IV_CFG_CLS_CAMERA, "camera.snmp.retries", "摄像机 SNMP 重试次数（0=只发一次）",
+          1, 0, 10),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.sysDescr",
+          "SNMP 槽位 sysDescr＝系统描述（string）", "1.3.6.1.2.1.1.1.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.sysUpTime",
+          "SNMP 槽位 sysUpTime＝运行时长（TimeTicks/counter）", "1.3.6.1.2.1.1.3.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.sysName",
+          "SNMP 槽位 sysName＝设备名称（string）", "1.3.6.1.2.1.1.5.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.deviceType",
+          "SNMP 槽位 deviceType＝设备型号/类型（string）", "1.3.6.1.4.1.39165.1.1.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.softVersion",
+          "SNMP 槽位 softVersion＝软件版本（string）", "1.3.6.1.4.1.39165.1.3.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.serialNumber",
+          "SNMP 槽位 serialNumber＝序列号（string；海康无独立 SN 节点，用 deviceID）",
+          "1.3.6.1.4.1.39165.1.5.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.cpuPercent",
+          "SNMP 槽位 cpuPercent＝CPU 使用率（integer, %）", "1.3.6.1.4.1.39165.1.7.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.memUsed",
+          "SNMP 槽位 memUsed＝内存已用（gauge；大华为使用率 %）", "1.3.6.1.4.1.39165.1.11.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.devStatus",
+          "SNMP 槽位 devStatus＝设备状态（integer 0=bad/1=good；海康 MIB 无此节点⇒留空＝不采）",
+          "", NULL),
     /* 6 路 × 8 字段——逐路铺出（数组按元素存，这里给足 0..5 的默认槽）。
      * ⚠ 密码字段**存 SM4 密文**（架构 §10.2），出厂默认空串＝未配置。*/
     D_STR(IV_CFG_CLS_CAMERA, "camera.ch.0.vendor", "第 1 路厂商", "", NULL),
@@ -223,6 +259,45 @@ static const cfg_default_t s_defaults[] = {
     D_STR(IV_CFG_CLS_SWITCH, "switch.ip", "交换机 IP", "", NULL),
     D_STR(IV_CFG_CLS_SWITCH, "switch.vendor", "交换机品牌", "", NULL),
     D_STR(IV_CFG_CLS_SWITCH, "switch.model", "交换机型号", "", NULL),
+    /* M4-S4.3 SNMP 采集：目标参数 5 条 ＋ OID 槽位 12 条。
+     * 槽位名沿用标准 MIB 对象名（IF-MIB / LLDP-MIB），便于对照厂家文档。
+     * **值里不带末尾 `.0` 的即"表列"**⇒按端口号 GETNEXT 遍历展开（第 3 条起）。
+     * ⚠ 团体字同 camera.snmp.community：F8 未实现，暂落普通配置（已知欠账）。 */
+    D_BOOL(IV_CFG_CLS_SWITCH, "switch.snmp.enable", "交换机 SNMP 采集开关", "false"),
+    D_INT(IV_CFG_CLS_SWITCH, "switch.snmp.port", "交换机 SNMP 端口", 161, 1, 65535),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.community",
+          "交换机 SNMP 团体字（读团体；⚠ 口令类，F8 未实现前暂落普通配置）", "public", NULL),
+    D_INT(IV_CFG_CLS_SWITCH, "switch.snmp.timeout_ms", "交换机 SNMP 单次事务超时（毫秒）",
+          1500, 100, 60000),
+    D_INT(IV_CFG_CLS_SWITCH, "switch.snmp.retries", "交换机 SNMP 重试次数（0=只发一次）",
+          1, 0, 10),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.sysDescr",
+          "SNMP 槽位 sysDescr＝系统描述（string，标量）", "1.3.6.1.2.1.1.1.0", NULL),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.sysUpTime",
+          "SNMP 槽位 sysUpTime＝运行时长（TimeTicks/counter，标量）", "1.3.6.1.2.1.1.3.0", NULL),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.ifDescr",
+          "SNMP 槽位 ifDescr＝端口描述（string，表列⇒GETNEXT）", "1.3.6.1.2.1.2.2.1.2", NULL),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.ifSpeed",
+          "SNMP 槽位 ifSpeed＝端口速率（gauge，表列⇒GETNEXT）", "1.3.6.1.2.1.2.2.1.5", NULL),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.ifAdminStatus",
+          "SNMP 槽位 ifAdminStatus＝端口管理态（integer 1=up/2=down，表列；MIB 可写，本步不 SET）",
+          "1.3.6.1.2.1.2.2.1.7", NULL),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.ifOperStatus",
+          "SNMP 槽位 ifOperStatus＝端口物理态（integer 1=up/2=down，表列）", "1.3.6.1.2.1.2.2.1.8", NULL),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.ifInOctets",
+          "SNMP 槽位 ifInOctets＝端口入字节（counter，表列）", "1.3.6.1.2.1.2.2.1.10", NULL),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.ifInDiscards",
+          "SNMP 槽位 ifInDiscards＝端口入丢弃（counter，表列）", "1.3.6.1.2.1.2.2.1.13", NULL),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.ifOutOctets",
+          "SNMP 槽位 ifOutOctets＝端口出字节（counter，表列）", "1.3.6.1.2.1.2.2.1.16", NULL),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.ifOutDiscards",
+          "SNMP 槽位 ifOutDiscards＝端口出丢弃（counter，表列）", "1.3.6.1.2.1.2.2.1.19", NULL),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.lldpRemSysName",
+          "SNMP 槽位 lldpRemSysName＝LLDP 邻居系统名（string，表列）",
+          "1.0.8802.1.1.2.1.4.1.1.9", NULL),
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.lldpRemPortId",
+          "SNMP 槽位 lldpRemPortId＝LLDP 邻居端口 ID（string，表列）",
+          "1.0.8802.1.1.2.1.4.1.1.7", NULL),
 
     /* ---- elec. 电阈值（小数；数值待产品参数冻结，暂给 0.0＝未配置） ---- */
     D_DBL(IV_CFG_CLS_ELEC, "elec.volt_high", "电压上限（V）", 0.0, 0.0, 1.0e6),

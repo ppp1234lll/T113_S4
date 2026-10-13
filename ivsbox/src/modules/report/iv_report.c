@@ -165,6 +165,18 @@ static void on_link_done(int rc, uint8_t cmd, const uint8_t *data, uint16_t len,
         iv_status_handle_query(&rp->st, data, len);
 }
 
+int iv_report_send_cmd(iv_report_t *rp, uint8_t cmd, const void *data,
+                       uint16_t len, uint64_t now_ms)
+{
+    if (rp == NULL)
+        return IV_EINVAL;
+    if (!rp->opened)
+        return IV_ESTATE;
+    /* 控制命令不登记 on_done：它的应答语义归应用层（本层不消费）。
+     * 传 NULL 的代价是"应答被静默丢弃"，对 0xD1 无害——见 iv_link.h。 */
+    return iv_link_send(&rp->lk, cmd, data, len, (uint32_t)now_ms, NULL, NULL);
+}
+
 static void on_link_upstream(uint8_t cmd, const uint8_t *data, uint16_t len,
                              void *arg)
 {

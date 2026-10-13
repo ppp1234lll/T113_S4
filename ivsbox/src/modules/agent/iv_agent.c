@@ -30,6 +30,9 @@ static void probe_drive(iv_agent_t *a, uint64_t now_ms);
 static void netmgr_feed(iv_agent_t *a, uint64_t now_ms);
 static void camdet_feed(iv_agent_t *a);
 static void on_cfg_search_mode(const iv_proto_frame_t *f, void *arg);
+static int  agent_send_power(const void *data, uint16_t len, void *arg);
+static void on_camdet_change(int ch, iv_camdet_status_t old_st,
+                             iv_camdet_status_t new_st, void *arg);
 
 /* 接口名 → 内核 ifindex；未解析到返回 0（该 WAN 视为未绑定） */
 static int wan_ifindex_of(const char *name)
@@ -244,6 +247,11 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
                 ccfg.mode = (int)cfg->camera_detect_mode;
             if (cfg->camera_detect_rtt_ms != 0u)
                 ccfg.rtt_thr_ms = cfg->camera_detect_rtt_ms;
+            /* S4.4：把 "正常 → 故障" 的沿直接接进自愈模块。回调里只做
+             * "判断 ＋ 入队"，不做任何 I/O；真正的 0xD1 由下面 step/timer
+             * 里的 iv_recovery_tick 每拍最多发 1 条（同 cmd 在飞唯一）。 */
+            ccfg.on_change = on_camdet_change;
+            ccfg.cb_arg    = a;
             iv_camdet_init(&a->cd, &ccfg);
             if (iv_camdet_open(&a->cd, NULL, now_ms) != IV_OK) {
                 IV_LOG_W(AG_MOD, "camdet open failed");
@@ -262,6 +270,26 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
                              cfg->wan_name[IV_WAN_WIRED], cup ? "up" : "down");
                 }
             }
+            /* S4.4 自愈：出厂默认**禁用**（reboot_max=0 ⇒ 对齐现网
+             * net_reload=0）；打开需配 `netthr.reboot_max` >= 1。动作经
+             * iv_report_send_cmd 走本层自持的 iv_link（0xD1 属控制命令，
+             * iv_link 只发一次、不重传）。 */
+            {
+                iv_recovery_cfg_t rcfg;
+
+                iv_recovery_cfg_default(&rcfg);
+                rcfg.reboot_max  = (int)cfg->netthr_reboot_max;
+                rcfg.cooldown_ms = (cfg->netthr_reboot_interval_s != 0u)
+                                       ? cfg->netthr_reboot_interval_s * 1000u
+                                       : 0u;
+                rcfg.tx     = agent_send_power;
+                rcfg.tx_arg = a;
+                iv_recovery_init(&a->rec, &rcfg);
+                IV_LOG_I(AG_MOD, "recovery: reboot_max=%d cooldown=%us",
+                         (int)cfg->netthr_reboot_max,
+                         (unsigned)cfg->netthr_reboot_interval_s);
+            }
+
             /* 平台命令 0xA5（CONFIGURE_SEARCH_MODE）切换检测方式 */
             (void)iv_proto_route(&a->rp.pf, IV_PROTO_CMD_CFG_SEARCH,
                                  on_cfg_search_mode, a);
@@ -297,6 +325,7 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
     if (iv_camdet_is_open(&a->cd))
         (void)iv_camdet_tick(&a->cd, now_ms);
     camdet_feed(a);
+    (void)iv_recovery_tick(&a->rec, now_ms);
     (void)iv_report_step(&a->rp, now_ms);
     return IV_OK;
 }
@@ -322,6 +351,7 @@ void iv_agent_close(iv_agent_t *a)
     }
 
         iv_camdet_close(&a->cd);  /* 停在飞 socket + 关引擎 */
+    iv_recovery_close(&a->rec);
 iv_report_close(&a->rp); /* 摘 serial/tick 事件、关传输与队列 */
     iv_netmgr_init(&a->nm);  /* netmgr 无 close：init 复位 */
     if (a->pb.started)
@@ -336,6 +366,28 @@ iv_report_close(&a->rp); /* 摘 serial/tick 事件、关传输与队列 */
 /* ---------------------------------------------------------------------------
  * 驱动：probe（发探/收结果/超时）与 netmgr（喂结论 + 状态推进）
  * ------------------------------------------------------------------------- */
+/* S4.4 动作出口：把 iv_recovery 造好的 0xD1 载荷交给本层自持的 iv_link。
+ * IV_EBUSY（同 cmd 在飞）原样上抛 —— iv_recovery 会保留队头、下一拍再试。 */
+static int agent_send_power(const void *data, uint16_t len, void *arg)
+{
+    iv_agent_t *a = arg;
+
+    return iv_report_send_cmd(&a->rp, IV_FRAME_CMD_POWER, data, len, a->now_ms);
+}
+
+/* S4.1 状态沿 → S4.4：把该路摄像机的 old/new 原样交下去；"是否动作"
+ * （单沿/冷却/限次/禁用）由 iv_recovery 一处判定，这里不长第二套策略。 */
+static void on_camdet_change(int ch, iv_camdet_status_t old_st,
+                             iv_camdet_status_t new_st, void *arg)
+{
+    iv_agent_t *a = arg;
+
+    if (a == NULL)
+        return;
+    iv_recovery_on_camera_change(&a->rec, ch, (int)old_st, (int)new_st,
+                                 a->now_ms);
+}
+
 /* 把摄像机五态编码注入上报层的 CNS 字段（闭合 S3.6 的"CNS 恒 0"遗留）：
  * 只改 cns[]，其余外部事实（CSQ/定位/故障码）原样保留。 */
 static void camdet_feed(iv_agent_t *a)
@@ -482,6 +534,7 @@ static void on_pb_timer(void *arg)
     if (iv_camdet_is_open(&a->cd))
         (void)iv_camdet_tick(&a->cd, now);
     camdet_feed(a);
+    (void)iv_recovery_tick(&a->rec, now);
     if (a->r != NULL)
         a->pb_timer = iv_timer_add(a->r, IV_AGENT_PROBE_TICK_MS, on_pb_timer, a);
 }

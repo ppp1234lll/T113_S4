@@ -705,6 +705,25 @@ static void case_reject_writes_nothing(void)
     chk(iv_config_save(c, detail, sizeof(detail)) == IV_OK,
         "c8: two unset (0.0) thresholds are NOT an inversion");
 
+    /* ---- M4-S4.4：netthr.reboot_max 的下限由 1 放宽到 **0** ----
+     * 0 ＝ 禁用自愈（对齐现网出厂 net_reload=0）；-1 仍须被拒。 */
+    detail[0] = '\0';
+    chk(iv_config_set_int(c, "netthr.reboot_max", 0) == IV_OK,
+        "c8: reboot_max=0 accepted (self-heal disabled)");
+    chk(iv_config_save(c, detail, sizeof(detail)) == IV_OK,
+        "c8: save accepts reboot_max=0");
+    chk(iv_config_get_int(c, "netthr.reboot_max", &iv) == IV_OK && iv == 0,
+        "c8: reboot_max reads back 0");
+    chk(iv_config_set_int(c, "netthr.reboot_max", -1) == IV_OK,
+        "c8: -1 is stored in memory (range is checked at save)");
+    detail[0] = '\0';
+    chk(iv_config_save(c, detail, sizeof(detail)) == IV_EINVAL,
+        "c8: save still refuses reboot_max=-1");
+    chk(contains(detail, "netthr.reboot_max"),
+        "c8: detail names reboot_max");
+    chk(iv_config_set_int(c, "netthr.reboot_max", 3) == IV_OK,
+        "c8: restore reboot_max");
+
     chk(iv_config_get_int(c, "probe.timeout_ms", &iv) == IV_OK && iv == 500,
         "c8: the accepted values are live");
 

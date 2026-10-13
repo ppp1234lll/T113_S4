@@ -69,6 +69,7 @@
 #include "ivsbox/iv_netmgr.h"
 #include "ivsbox/iv_probe.h"
 #include "ivsbox/iv_reactor.h"
+#include "ivsbox/iv_recovery.h"
 #include "ivsbox/iv_report.h"
 #include "ivsbox/iv_ret.h"
 
@@ -122,6 +123,14 @@ typedef struct {
     uint32_t    camera_ip_be[IV_CAMDET_CH_N]; /* 0=该路未配置 */
     uint32_t    camera_detect_mode;   /* 0 → 默认 PING(1)；对应现网 search_mode */
     uint32_t    camera_detect_rtt_ms; /* 0 → 默认 200 ms */
+
+    /* ---- M4 自愈（S4.4）：故障沿 → 电源通道断电重启 ----
+     * `netthr.reboot_max`：每通道最多动作次数，**0 ＝ 禁用自愈**
+     *   （现网出厂 net_reload=0；本工程该键出厂默认 3，见修改记录）。
+     * `netthr.reboot_interval_s`：动作后冷却秒数（现网 NETWAOK_RELOAD_TIME
+     *   = 60）。0 → 由 iv_recovery 取默认（60 s）。 */
+    uint32_t    netthr_reboot_max;
+    uint32_t    netthr_reboot_interval_s;
 } iv_agent_cfg_t;
 
 /* ---------------------------------------------------------------------------
@@ -135,6 +144,7 @@ typedef struct {
     iv_probe_t   pb;  /* S3.2 */
     iv_netmgr_t  nm;  /* S3.3 */
     iv_camdet_t  cd;  /* S4.1 摄像机网络状态探测（内嵌第二个 iv_probe 实例） */
+    iv_recovery_t rec; /* S4.4 自愈：消费 cd 的"正常→故障"沿，发 0xD1 断电重启 */
 
     /* netmgr 的事务执行点：switch_route 复用默认（netlink 改路由），reconnect
      * 接本层 → iv_report_reconnect。ops.arg 指向本结构，故不能是静态常量。 */

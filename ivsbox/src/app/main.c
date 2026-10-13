@@ -372,6 +372,13 @@ static int agent_setup(void)
     if (iv_config_get_int(g_cfg, "camera.detect.rtt_ms", &v) == IV_OK && v > 0)
         ac.camera_detect_rtt_ms = (uint32_t)v;
 
+    /* 自愈（S4.4）：netthr.reboot_max（**0 = 禁用自愈**，对齐现网 net_reload=0）
+     * 与 netthr.reboot_interval_s（动作后冷却秒数，现网 NETWAOK_RELOAD_TIME=60）。 */
+    if (iv_config_get_int(g_cfg, "netthr.reboot_max", &v) == IV_OK && v >= 0)
+        ac.netthr_reboot_max = (uint32_t)v;
+    if (iv_config_get_int(g_cfg, "netthr.reboot_interval_s", &v) == IV_OK && v > 0)
+        ac.netthr_reboot_interval_s = (uint32_t)v;
+
     ac.devid = 0u;
 
     if (iv_agent_open(&g_agent, &ac, g_reactor, iv_clock_monotonic_ms()) != IV_OK) {

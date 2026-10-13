@@ -231,6 +231,28 @@ int iv_report_trigger(iv_report_t *rp, uint64_t now_ms);
 int iv_report_reconnect(iv_report_t *rp, uint64_t now_ms);
 
 /*
+ * 下发任意采集板命令（下行帧）：`0xD1` 电源控制 / `0xD2` 重启等**控制类**
+ * 命令走这里。本层自持 `iv_link`，装配层不得另行持有第二份 —— 否则同 cmd
+ * 在飞唯一（`IV_EBUSY`）的约束会被绕过。
+ *
+ *   调用方**必须在慢任务池之外、且在调用后自行按需 resolve**：
+ *   0xD1/0xD2 属控制命令（`iv_link` 只发一次、不重传），`iv_link_send` 返回
+ *   `IV_OK` 只表示**已交发送队列入队**，不代表对端已执行（协议无事务号，见
+ *   iv_link.h 与 §S2.3）。`on_done` 本层不登记（控制命令的应答语义归应用层）。
+ *
+ *   返回 `iv_link_send` 的返回码：
+ *     IV_OK      已入队（含"同 cmd 上一笔还在飞"以外的正常情形）
+ *     IV_EBUSY   **同 cmd 在飞**：调用方应保留待发项、稍后重试（S4.4 的待发
+ *                FIFO 就是这么串行化整排 7 条 0xD1 的）
+ *     IV_EINVAL  参数非法（rp/data 为 NULL 而 len 非 0）
+ *     IV_ERANGE  len > IV_FRAME_DATA_MAX
+ *     IV_EFULL   在飞表满
+ *     IV_ESTATE  未 open（本层不检查，交给 iv_link 的入队路径）
+ */
+int iv_report_send_cmd(iv_report_t *rp, uint8_t cmd, const void *data,
+                       uint16_t len, uint64_t now_ms);
+
+/*
  * 设置**下一次建连**使用的平台地址（**不主动断连**：在用连接原样保留，
  * 由 `iv_report_reconnect()` 关闭并按新址重开）。`host` 为空 / `port` 为 0
  * ⇒ 清空目标地址（此后 `iv_report_reconnect()` 返回 IV_ESTATE）。

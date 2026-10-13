@@ -363,6 +363,55 @@ int main(void)
         chk(strcmp(rp.st.data.APOWER, "0.00") == 0, "c02 mirror APOWER");
     }
 
+    /* ---- c02b M4-S4.4：0xD1 电源控制下行（**假采集板 = pty**，字节级黄金校验） ----
+     * 覆盖 plan §S4.4「怎么验证」的集成项：动作帧真的按 §18.2 落到串口上；
+     * 并端到端复现"同 cmd 在飞唯一" ⇒ 证明 S4.4 的待发队列不是过度设计。 */
+    {
+        static const char pl[]  = "{\"port\":3,\"status\":0}";
+        static const char ack[] = "{\"result\":1}";
+        uint8_t           want[IV_FRAME_MAX];
+        uint8_t           up[IV_FRAME_MAX];
+        char              got[64];
+        size_t            wn;
+        size_t            gn;
+        uint16_t          pln = (uint16_t)(sizeof pl - 1u);
+        int               un;
+
+        chk(iv_report_send_cmd(NULL, IV_FRAME_CMD_POWER, pl, pln, g_now) == IV_EINVAL,
+            "c02b NULL handle -> IV_EINVAL");
+
+        chk(iv_report_send_cmd(&rp, IV_FRAME_CMD_POWER, pl, pln, g_now) == IV_OK,
+            "c02b 0xD1 accepted");
+        gn = drain(master, got, sizeof got, 500);
+        wn = (size_t)iv_frame_build(IV_FRAME_HEAD_DOWN, IV_FRAME_CMD_POWER, pl, pln,
+                                    want, sizeof want);
+        chk(wn > 0u, "c02b expected 0xD1 frame built");
+        chk(gn == wn, "c02b 0xD1 frame length");
+        chk(gn == wn && memcmp(got, want, wn) == 0, "c02b 0xD1 frame bytes golden");
+        chk(gn >= 9u && (uint8_t)got[0] == 0xF0u && (uint8_t)got[1] == 0xF0u &&
+            (uint8_t)got[2] == IV_FRAME_CMD_POWER &&
+            /* §18.2：长度域**小端**（21 → 15 00） */
+            (uint8_t)got[3] == (uint8_t)pln && (uint8_t)got[4] == 0x00u &&
+            (uint8_t)got[wn - 2u] == 0xFFu && (uint8_t)got[wn - 1u] == 0xFFu,
+            "c02b 0xD1 head/cmd/len(LE)/tail");
+
+        /* 同 cmd 在飞唯一：第二笔必被拒 */
+        chk(iv_report_send_cmd(&rp, IV_FRAME_CMD_POWER, pl, pln, g_now) == IV_EBUSY,
+            "c02b second 0xD1 while in flight -> IV_EBUSY");
+
+        /* 采集板回 0xD1 应答 ⇒ 事务完成、槽位释放、可再发 */
+        un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_POWER, ack,
+                            (uint16_t)(sizeof ack - 1u), up, sizeof up);
+        chk(un > 0, "c02b upstream 0xD1 ack built");
+        chk(write(master, up, (size_t)un) == un, "c02b feed the 0xD1 ack");
+        pump(&rp, master, 2);
+        chk(iv_report_send_cmd(&rp, IV_FRAME_CMD_POWER, pl, pln, g_now) == IV_OK,
+            "c02b after the ack the slot is reusable");
+
+        /* 收干净：别把这一笔的字节留给 c03 */
+        (void)drain(master, got, sizeof got, 500);
+    }
+
     /* ---- c03 平台链路 UP ---- */
     {
         int j;
@@ -596,7 +645,7 @@ int main(void)
 
     if (g_fail == 0)
         printf("test_e2e_report passed "
-               "(poll/mirror/report/queue/replay/query/ack/serial-reconnect)\n");
+               "(poll/mirror/power-0xD1/report/queue/replay/query/ack/serial-reconnect)\n");
     else
         printf("test_e2e_report FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

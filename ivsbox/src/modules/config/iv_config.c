@@ -309,7 +309,8 @@ static const cfg_default_t s_defaults[] = {
     /* ---- netthr. 网络阈值（架构 §10.2；丢包＝**次数**；承担原 wan.* 的切换门限） ---- */
     D_INT(IV_CFG_CLS_NETTHR, "netthr.timeout_ms", "网络超时时间（毫秒）", 2000, 100, 60000),
     D_INT(IV_CFG_CLS_NETTHR, "netthr.loss_count", "丢包次数上限", 3, 1, 100),
-    D_INT(IV_CFG_CLS_NETTHR, "netthr.reboot_max", "自愈重启次数上限", 3, 1, 100),
+    D_INT(IV_CFG_CLS_NETTHR, "netthr.reboot_max", "自愈重启次数上限（**0 = 禁用自愈**）",
+          3, 0, 100),
     D_INT(IV_CFG_CLS_NETTHR, "netthr.reboot_interval_s", "重启时间（秒，两次重启之间的最短间隔）",
           60, 1, 3600),
 

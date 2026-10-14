@@ -3,10 +3,11 @@ scripts  ——  部署与运行时脚本目录（拉起链路 + sysvinit 服务
 ============================================================
 
 【目录作用】
-  本目录存放 IVSBox 在板端运行所需的启动/守护脚本。板上有两条**互相独立**的拉起链路
-  （2026-10-13 M5-S5.1 起）：
+  本目录存放 IVSBox 在板端运行所需的启动/守护脚本。板上有三条**互相独立**的拉起链路
+  （2026-10-14 M6-S6.1 起）：
     · ivsboxd（主控）：init.d/S65ivsboxd → start_ivsbox.sh → monitor.sh
     · ivsbox-web（Web）：init.d/S66ivsboxweb → monitor-web.sh
+    · ivsbox-media（媒体）：init.d/S67ivsboxmedia → monitor-media.sh
   各自 monitor 是各自进程的**唯一拉起方**，并内含熔断：窗口内重拉超限则进 failsafe
   停止拉起。脚本随程序落 rootfs 的 /opt/ivsbox/scripts，不落 UDISK。
 
@@ -15,6 +16,9 @@ scripts  ——  部署与运行时脚本目录（拉起链路 + sysvinit 服务
   monitor.sh          ivsboxd 的唯一拉起方：5s 轮询守护 + 熔断（failsafe）熔断状态落 UDISK
   monitor-web.sh      ivsbox-web 的唯一拉起方：5s 轮询守护 + 熔断，状态独立落 UDISK
                       （.monitor-web.state，与主控互不干扰）；**不碰看门狗**
+  monitor-media.sh    ivsbox-media 的唯一拉起方：同 monitor-web.sh 模式
+                      （.monitor-media.state）；**不碰看门狗**（媒体崩溃只停抓拍/录像，
+                      控制面不受牵连；计划 S6.1"崩溃只重启自身"）
   init.d/             sysvinit 开机服务脚本子目录（见 init.d/readme.txt）
   ci/                 CI 辅助脚本子目录（当前为空占位）
 

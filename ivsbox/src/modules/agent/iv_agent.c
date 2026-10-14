@@ -40,6 +40,9 @@ static void on_dev_found(const iv_dev_desc_t *d, void *arg);
 static int  snmp_task_fn(iv_task_ctx_t *ctx);
 static void on_snmp_done(uint64_t id, int rc, const void *result,
                          size_t result_len, void *arg);
+static void rec_drive(iv_agent_t *a, uint64_t now);
+static int  rec_media_start(int id, const char *url, void *arg);
+static int  rec_media_stop(int id, void *arg);
 
 /* 接口名 → 内核 ifindex；未解析到返回 0（该 WAN 视为未绑定） */
 static int wan_ifindex_of(const char *name)
@@ -382,6 +385,41 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
                              on_cfg_search_mode, a);
     }
 
+    /* ---- 5b. M6 媒体桥接＋断网录像状态机（**不依赖 Reactor**，两种模式同装）----
+     * media 起自带 worker 线程（抓拍异步化）；失败只降级（抓拍/录像不可用），
+     * 不影响控制面。recm 的 URL 表生产来源待 §18.5（见 iv_recctl.h 文件头），
+     * n_url=0 时状态机自然旁路。media 起不来就不装配 recm 的 URL（避免每拍
+     * 对一个不存在的对端重试刷日志）。 */
+    {
+        iv_media_cfg_t  mcfg;
+        iv_recctl_cfg_t rcfg;
+
+        iv_media_cfg_default(&mcfg);
+        if (cfg->media_snap_dir[0] != '\0')
+            mcfg.snap_dir = cfg->media_snap_dir;
+        if (iv_media_init(&a->media, &mcfg) != IV_OK) {
+            IV_LOG_W(AG_MOD, "media bridge init failed, capture/record disabled");
+        } else {
+            int n;
+
+            iv_recctl_cfg_default(&rcfg);
+            if (cfg->rec_hold_ms != 0u)
+                rcfg.hold_ms = cfg->rec_hold_ms;
+            if (cfg->rec_debounce_ms != 0u)
+                rcfg.debounce_ms = cfg->rec_debounce_ms;
+            rcfg.n_url = (cfg->rec_n_url > 0) ? cfg->rec_n_url : 0;
+            if (rcfg.n_url > IV_RECCTL_CH_N)
+                rcfg.n_url = IV_RECCTL_CH_N;
+            for (n = 0; n < rcfg.n_url; n++)
+                (void)snprintf(rcfg.url[n], sizeof(rcfg.url[n]), "%s",
+                               cfg->rec_url[n]);
+            (void)iv_recctl_init(&a->recm, &rcfg);
+            IV_LOG_I(AG_MOD, "media bridge up, rec urls=%d hold=%ums debounce=%ums",
+                     rcfg.n_url, (unsigned)rcfg.hold_ms,
+                     (unsigned)rcfg.debounce_ms);
+        }
+    }
+
     /* ---- 6. 本层定时器（仅 Reactor 模式；r == NULL 时由调用方按节拍推进）---- */
     if (r != NULL) {
         a->pb_timer = iv_timer_add(r, IV_AGENT_PROBE_TICK_MS, on_pb_timer, a);
@@ -419,6 +457,7 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
         (void)iv_device_tick(&a->dev, now_ms);
     env_feed(a, now_ms);
     (void)iv_recovery_tick(&a->rec, now_ms);
+    rec_drive(a, now_ms); /* M6-S6.3：断网录像状态机（每拍喂判据） */
     (void)iv_report_step(&a->rp, now_ms);
     return IV_OK;
 }
@@ -446,6 +485,16 @@ void iv_agent_close(iv_agent_t *a)
     iv_camdet_close(&a->cd);  /* 停在飞 socket + 关引擎（未开时幂等） */
     iv_device_close(&a->dev); /* 关 UDP / AF_PACKET 两个 socket（未开时幂等） */
     iv_recovery_close(&a->rec);
+    /* M6：先停录像（优雅收尾，防对端等保活超时）再停桥接线程（join） */
+    if (a->media.inited) {
+        iv_recctl_ops_t ops;
+
+        ops.start = rec_media_start;
+        ops.stop  = rec_media_stop;
+        ops.arg   = a;
+        (void)iv_recctl_stop_all(&a->recm, &ops);
+        iv_media_fini(&a->media);
+    }
     iv_report_close(&a->rp); /* 摘 serial/tick 事件、关传输与队列 */
     iv_netmgr_init(&a->nm);  /* netmgr 无 close：init 复位 */
     if (a->pb.started)
@@ -483,20 +532,65 @@ static void on_camdet_change(int ch, iv_camdet_status_t old_st,
 }
 
 /* S4.5 门开事件出口：`0xC1`（箱门开启）到达时由 iv_status 同步触发。
- * **M4 阶段 ＝ 空实现 ＋ 日志 ＋ 计数**：抓图本体在 M6-S6.2（经本地通道
- * `snapshot.take` 交 `ivsbox-media` 抠图），到时把这里换成派发即可；
- * 无鉴权 / 无审计 / 无去重表（S4.5 口径）。
- * 回调在装配层单线程内同步执行 ⇒ 这里**只允许无阻塞动作**（架构 §4.2）。 */
+ * **M6-S6.2 起接真抓拍**：入队 iv_media（异步、有界队列、满丢最旧），本回调
+ * 只做"判断＋入队"，绝不阻塞（回调在装配层单线程内同步执行，架构 §4.2）。
+ * 抓拍成败走桥接统计（iv_media_stats）与媒体进程日志。无鉴权/无审计/无去重表。 */
 static void on_door_open(int ds, void *arg)
 {
     iv_agent_t *a = arg;
+    char        path[IV_MEDIA_URL_MAX];
+    int         rc;
 
     if (a == NULL)
         return;
     a->door_events++;
-    IV_LOG_I(AG_MOD,
-             "door open event #%llu (DS=%d): snapshot hook not wired (M6-S6.2)",
-             (unsigned long long)a->door_events, ds);
+    if (!a->media.inited) {
+        IV_LOG_W(AG_MOD,
+                 "door open event #%llu (DS=%d): media bridge down, no capture",
+                 (unsigned long long)a->door_events, ds);
+        return;
+    }
+    rc = iv_media_capture_async(&a->media, NULL, path, sizeof(path));
+    if (rc == IV_OK)
+        IV_LOG_I(AG_MOD, "door open event #%llu (DS=%d): capture -> %s",
+                 (unsigned long long)a->door_events, ds, path);
+    else
+        IV_LOG_W(AG_MOD, "door open event #%llu (DS=%d): capture rejected (%d)",
+                 (unsigned long long)a->door_events, ds, rc);
+}
+
+/* ---------------------------------------------------------------------------
+ * M6-S6.3 断网录像驱动（判据口径见 iv_recctl.h 文件头）
+ * ------------------------------------------------------------------------- */
+static int rec_media_start(int id, const char *url, void *arg)
+{
+    iv_agent_t *a = arg;
+
+    return iv_media_record_start(&a->media, id, url);
+}
+
+static int rec_media_stop(int id, void *arg)
+{
+    iv_agent_t *a = arg;
+
+    return iv_media_record_stop(&a->media, id);
+}
+
+static void rec_drive(iv_agent_t *a, uint64_t now)
+{
+    iv_recctl_ops_t ops;
+    int wan_up;
+    int plat_up;
+
+    if (!a->media.inited)
+        return; /* 桥接不可用：状态机根本没装配（open 里 gate 过），双保险 */
+    wan_up  = iv_netmgr_wan_is_up(&a->nm, IV_WAN_WIRELESS) ||
+              iv_netmgr_wan_is_up(&a->nm, IV_WAN_WIRED);
+    plat_up = (iv_transport_state(&a->rp.tr) == IV_TRANSPORT_UP);
+    ops.start = rec_media_start;
+    ops.stop  = rec_media_stop;
+    ops.arg   = a;
+    (void)iv_recctl_step(&a->recm, wan_up, plat_up, now, &ops);
 }
 
 /* 把本层掌握的"非采集板事实"注入上报层：CNS（六路摄像机网络状态）＋ MN（主网两路）。
@@ -823,6 +917,7 @@ static void on_nm_timer(void *arg)
     netmgr_feed(a, now);
     (void)iv_netmgr_tick(&a->nm, now);
     env_feed(a, now); /* 主网 MN 更新 ＋ 故障沿（1 s 粒度足够） */
+    rec_drive(a, now); /* M6-S6.3：与 iv_agent_step（r==NULL 模式）同装同驱动 */
     if (a->r != NULL)
         a->nm_timer = iv_timer_add(a->r, IV_AGENT_NETMGR_TICK_MS, on_nm_timer, a);
 }
@@ -894,6 +989,16 @@ iv_report_t *iv_agent_report(iv_agent_t *a)
 const iv_camdet_t *iv_agent_camdet(const iv_agent_t *a)
 {
     return (a != NULL) ? &a->cd : NULL;
+}
+
+iv_media_t *iv_agent_media(iv_agent_t *a)
+{
+    return (a != NULL) ? &a->media : NULL;
+}
+
+iv_recctl_t *iv_agent_recctl(iv_agent_t *a)
+{
+    return (a != NULL) ? &a->recm : NULL;
 }
 
 uint64_t iv_agent_door_events(const iv_agent_t *a)

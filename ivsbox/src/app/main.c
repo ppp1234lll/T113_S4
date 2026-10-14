@@ -376,6 +376,42 @@ static int ctl_do_settime(int64_t wall_sec, void *arg)
 }
 
 /* ---------------------------------------------------------------------------
+ * M6 媒体方法的 ctl 绑定（S6.1）：四个 ops 全部转发到 agent 内嵌的 iv_media
+ * 桥接实例。arg＝&g_agent（iv_agent_t），经 iv_agent_media() 取桥接句柄。
+ * 语义与失败码由 iv_media 定义（capture 异步入队、record 同步回环 HTTP）。
+ * ------------------------------------------------------------------------- */
+static int media_op_capture(const char *path, char *out_path, size_t cap,
+                            void *arg)
+{
+    return iv_media_capture_async(iv_agent_media((iv_agent_t *)arg), path,
+                                  out_path, cap);
+}
+
+static int media_op_record_start(int id, const char *url, void *arg)
+{
+    return iv_media_record_start(iv_agent_media((iv_agent_t *)arg), id, url);
+}
+
+static int media_op_record_stop(int id, void *arg)
+{
+    return iv_media_record_stop(iv_agent_media((iv_agent_t *)arg), id);
+}
+
+static int media_op_record_status(int id, int *recording, void *arg)
+{
+    return iv_media_record_status(iv_agent_media((iv_agent_t *)arg), id,
+                                  recording);
+}
+
+static const iv_ctl_media_ops_t s_media_ops = {
+    media_op_capture,
+    media_op_record_start,
+    media_op_record_stop,
+    media_op_record_status,
+    NULL /* arg 在 app_init 里回填为 &g_agent（agent 此时才存在） */
+};
+
+/* ---------------------------------------------------------------------------
  * M3 业务装配：从配置读取参数，拉起网络侧与上报链
  * ------------------------------------------------------------------------- */
 /* 配置里的点分十进制 IPv4 → 网络序；空串/非法返回 0（＝未配） */
@@ -684,8 +720,12 @@ static int app_init(void)
 
     /* 9b. agent 就绪后再回填路由上下文的 agent 指针：
      * iv_ctl 的 sys.overview / device.list / snmp.* / camera.search 都读它，
-     * 而第 5 步建通道时 agent 还没装配。 */
-    g_ctl_ctx.agent = &g_agent;
+     * 而第 5 步建通道时 agent 还没装配。M6：媒体方法经 ops 表绑到 agent 内嵌
+     * 的 iv_media 实例（agent_open 已起桥接线程；失败时 inited=0，方法按
+     * IV_ENOTSUP/IV_ECONN 应答，不致命）。 */
+    g_ctl_ctx.agent     = &g_agent;
+    g_ctl_ctx.media     = &s_media_ops;
+    g_ctl_ctx.media_arg = &g_agent;
 
     /* 10. 健康线程（必须在 reactor 创建之后、run 之前） */
     g_health = iv_health_start_default(g_reactor, g_pool, g_wd_fd);

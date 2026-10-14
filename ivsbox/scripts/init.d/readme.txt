@@ -19,6 +19,10 @@ scripts/init.d  ——  sysvinit 开机服务脚本目录
   S66ivsboxweb     ivsbox-web sysvinit 脚本（M5-S5.1）：start 只拉起 monitor-web.sh；
                    stop 先停守护再停 Web；restart 清 .monitor-web.state。编号 66 > 65，
                    让主控先建好本地通道 socket（/var/run/ivsbox/ctl）
+  S67ivsboxmedia   ivsbox-media sysvinit 脚本（M6-S6.1）：start 只拉起 monitor-media.sh；
+                   stop 先停守护再停媒体进程；restart 清 .monitor-media.state。
+                   编号 67 > 66；媒体进程不依赖本地通道（自带 127.0.0.1:18000 HTTP），
+                   晚起只让桥接接口暂时按业务失败应答
   .gitkeep         目录占位文件（保留本目录入 git）
 
 【约定与注意事项】

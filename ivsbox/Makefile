@@ -59,10 +59,31 @@ THIRD_PARTY_SRCS := $(wildcard third_party/*/*.c)
 MODULES_SRCS     += $(THIRD_PARTY_SRCS)
 APP_SRCS      := $(wildcard src/app/*.c)
 
-MEDIA_SRCS    := $(wildcard media/src/*.c)
+# 媒体进程（M6-S6.0，收编自姊妹工程 bird_media，见 media/README.ivsbox.md）：
+# main.c 在 media/ 根，业务源在 media/src/<media|http|utils>/*.c。
+MEDIA_SRCS    := media/main.c $(wildcard media/src/*/*.c)
 WEB_SRCS      := $(wildcard web/src/*.c)
 UPDATER_SRCS  := $(wildcard updater/src/*.c)
 PROVISION_SRCS:= $(wildcard tools/provision/src/*.c)
+
+# bird_media 头文件路径（只给媒体对象用，见下面专属模式规则；不进全局 CFLAGS，
+# 避免 ffmpeg/mongoose 的头名泄漏给主工程源码）。
+MEDIA_INC := -Imedia/include -Imedia/src -Imedia/src/media -Imedia/src/http \
+             -Imedia/third_party/ffmpeg/include
+
+# ffmpeg 预编译静态库（随 bird_media 携带，已验架构：lib_arm=ARM EABI5 soft-float、
+# lib_x86=x86-64；与 VM 交叉/宿主 gcc 匹配）。
+ifeq ($(TARGET),arm)
+FFMPEG_LIB_DIR := media/third_party/ffmpeg/lib_arm
+else
+FFMPEG_LIB_DIR := media/third_party/ffmpeg/lib_x86
+endif
+# 链接顺序与 bird_media 的 CMakeLists 一致（avformat 依赖 avcodec…）
+FFMPEG_LIBS := $(FFMPEG_LIB_DIR)/libavformat.a \
+               $(FFMPEG_LIB_DIR)/libavcodec.a \
+               $(FFMPEG_LIB_DIR)/libavutil.a \
+               $(FFMPEG_LIB_DIR)/libavdevice.a
+# -lz（avformat 的 gzip 头）/ -ldl（avutil 可能 dlopen）：上游 CMake 同款
 
 TEST_SRCS     := $(wildcard tests/unit/*.c)
 FUZZ_SRCS     := $(wildcard tests/fuzz/*.c)
@@ -179,13 +200,13 @@ package: arm
 package-copy:
 	@mkdir -p packaging/bin packaging/scripts packaging/init.d
 	@cp $(BINS) packaging/bin/
-	@cp scripts/start_ivsbox.sh scripts/monitor.sh scripts/monitor-web.sh packaging/scripts/
-	@cp scripts/init.d/S62usb4g scripts/init.d/S65ivsboxd scripts/init.d/S66ivsboxweb packaging/init.d/
+	@cp scripts/start_ivsbox.sh scripts/monitor.sh scripts/monitor-web.sh scripts/monitor-media.sh packaging/scripts/
+	@cp scripts/init.d/S62usb4g scripts/init.d/S65ivsboxd scripts/init.d/S66ivsboxweb scripts/init.d/S67ivsboxmedia packaging/init.d/
 	# Web 静态资源（M5-S5.3）：模板与数据分离，页面改版不必重编固件。
 	@rm -rf packaging/web
 	@mkdir -p packaging/web/static
 	@cp -r web/static/. packaging/web/static/ 2>/dev/null || true
-	@chmod +x packaging/scripts/start_ivsbox.sh packaging/scripts/monitor.sh packaging/scripts/monitor-web.sh packaging/init.d/S62usb4g packaging/init.d/S65ivsboxd packaging/init.d/S66ivsboxweb
+	@chmod +x packaging/scripts/start_ivsbox.sh packaging/scripts/monitor.sh packaging/scripts/monitor-web.sh packaging/scripts/monitor-media.sh packaging/init.d/S62usb4g packaging/init.d/S65ivsboxd packaging/init.d/S66ivsboxweb packaging/init.d/S67ivsboxmedia
 	@for bin in $(BINS); do \
 		LC_ALL=C $(CROSS)readelf -h "$$bin" | grep -q "Machine:.*ARM" || { \
 			echo "package: ERROR, not ARM ELF: $$bin"; exit 1; \
@@ -254,6 +275,12 @@ $(BUILD_DIR)/third_party/%.o: third_party/%.c $(VER_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS_THIRD_PARTY) -MMD -MP -c -o $@ $<
 
+# 媒体进程对象（M6-S6.0）：bird_media 收编源码**按上游原样编译**（同 third_party
+# 纪律：去 -Werror 保留 -Wall -Wextra），加 MEDIA_INC；stem 比 %.o 更短，优先匹配。
+$(BUILD_DIR)/media/%.o: media/%.c $(VER_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS_THIRD_PARTY) $(MEDIA_INC) -MMD -MP -c -o $@ $<
+
 $(LIBCORE): $(CORE_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
@@ -270,9 +297,13 @@ $(APP_BINS): $(APP_OBJS) $(LIBMODULES) $(LIBHAL) $(LIBCORE)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $(APP_OBJS) -L$(BUILD_DIR) -livmodules -livhal -livcore $(LDLIBS)
 
+# 媒体进程（M6-S6.0）：ffmpeg 静态库链在 LDLIBS 之前（静态库依赖动态库的位置
+# 纪律）；-lz -ldl 是 avformat/avutil 的伴随依赖（上游 CMake 同款）。
+# 注意前置只放 $(MEDIA_OBJS)——$^ 会全部喂给链接行，版本戳等辅助文件不可挂这里
+# （否则 ld 把 .gitver 当输入文件报 syntax error）。
 $(MEDIA_BIN): $(MEDIA_OBJS)
 	@mkdir -p $(dir $@)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(FFMPEG_LIBS) $(LDLIBS) -lz -ldl
 
 # Web 进程要用 libivcore 的本地通道客户端（iv_chan）与日志（iv_log），故必须链
 # libivcore。**刻意不链 libivmodules**：Web 不直接碰配置 / 数据库，一切数据都发本地

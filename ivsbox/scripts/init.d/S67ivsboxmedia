@@ -1,0 +1,72 @@
+#!/bin/sh
+# IVSBox 媒体进程 sysvinit 脚本（M6-S6.1）
+# 与 S66ivsboxweb 同口径：不用 procd（板端无 procd），start-stop-daemon 后台拉起；
+# **start() 只拉起 monitor-media.sh，ivsbox-media 由 monitor-media 唯一拉起**。
+#
+# 编号 67 > 66：晚于 S65ivsboxd（先有本地通道）与 S66ivsboxweb（编排上让附属
+# 服务先起）。ivsbox-media 不依赖本地通道（走自己的 127.0.0.1:18000 HTTP），晚起
+# 只影响"桥接接口暂时 IV_ECONN"，ivsboxd 侧按业务失败应答，不阻塞不退出。
+
+IVSBOX_USER=${IVSBOX_USER:-root}
+IVSBOX_GROUP=${IVSBOX_GROUP:-root}
+
+# 程序（bin/scripts）落 rootfs；数据落 UDISK（S60mount_udisk 挂载，编号必须 > 60）。
+IVSBOX_APP=/opt/ivsbox
+IVSBOX_HOME=/mnt/UDISK/ivsbox
+# monitor-media 的熔断状态文件在数据侧。restart 时清掉它 = 人工解除熔断。
+MONITOR_STATE=$IVSBOX_HOME/.monitor-media.state
+PIDFILE=/var/run/ivsbox-media.pid
+MONITOR_PIDFILE=/var/run/ivsboxmedia_monitor.pid
+
+start() {
+    echo -n "Starting ivsbox-media: "
+
+    mkdir -p /mnt/UDISK/log
+
+    chown -R "$IVSBOX_USER:$IVSBOX_GROUP" "$IVSBOX_APP" 2>/dev/null || true
+
+    # 只拉起守护循环，由它拉起 / 看护 ivsbox-media。
+    /sbin/start-stop-daemon --start --background --make-pidfile \
+        --pidfile "$MONITOR_PIDFILE" --exec "$IVSBOX_APP/scripts/monitor-media.sh" \
+        --chuid "$IVSBOX_USER:$IVSBOX_GROUP" || {
+        echo "FAIL"
+        return 1
+    }
+
+    echo "OK"
+}
+
+stop() {
+    echo -n "Stopping ivsbox-media: "
+
+    # 先停守护方，再停被守护方（与 S66ivsboxweb 同次序，理由同）。
+    /sbin/start-stop-daemon --stop --pidfile "$MONITOR_PIDFILE" --signal TERM --retry 5 2>/dev/null || true
+    # ivsbox-media 对 SIGTERM 走 mongoose 的信号退出（http_server_start 捕获），
+    # media_fini 停 worker，普通 TERM 即可正常退出。
+    /sbin/start-stop-daemon --stop --pidfile "$PIDFILE" --signal TERM --retry 20 2>/dev/null || true
+
+    echo "OK"
+}
+
+restart() {
+    # 人工解除 monitor-media 的熔断：rcS 开机只调 start，故在 restart 清是安全的。
+    rm -f "$MONITOR_STATE"
+    stop
+    start
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart|force-reload)
+        restart
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

@@ -42,6 +42,16 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
                        **开局链路状态两种模式都由 `iv_agent_open()` 的"开局摸底"播出**
                        （同步查一次真实状态；真接口本来就 UP、内核不会自播事件）；
                        netns 模式 k02 另用 `ip link set ... up` 造一条真内核 LINK 事件。
+  test_web_http.c      ivsbox-web HTTP 服务端到端（M5，自包含）：自己 fork+execl 拉
+                       起静态服务，裸 socket 分段发送复现"头体分两次到达"，验静态页/
+                       鉴权/目录穿越/400/413/fd 稳定性。无需 ivsboxd。
+  test_media_e2e.c     ivsbox-media（收编 bird_media）× iv_media 桥接端到端（M6-S6.1，
+                       **自包含**）：自己 fork+execl 拉起 build/host/ivsbox-media（固定
+                       端口 18000，二进制缺失或端口被占 ⇒ SKIP 退出 0），经桥接模块打
+                       真实接口：status 往返、无效 RTSP 受理→对端自动停→保活把会话表
+                       清掉（桥接↔对端状态同步的端到端证据）、capture 结论与磁盘一致
+                       （VM 无 /dev/video0 ⇒ 判 fail，环境有摄像头 ⇒ 判 ok，两种环境
+                       都不假红）。无需 ivsboxd。**并行跑两份会因端口冲突假红**。
 
 【运行方式】
   # 只跑自包含用例（无需先起任何服务）

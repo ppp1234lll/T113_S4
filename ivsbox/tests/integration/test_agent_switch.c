@@ -767,6 +767,17 @@ static int scenario(void)
         chk(g_agent.rp.st.valid.DS == 1u && g_agent.rp.st.data.DS == 2,
             "k02c mirror DS=2 after 0xC1");
         chk(iv_agent_door_events(NULL) == 0u, "k02c NULL handle -> 0");
+        /* ---- k02c-2 M6-S6.2：门开钩子接到 iv_media 桥接（**端到端**） ----
+         * "on_door_open 里换成入队抓拍"同样没有任何单测能覆盖 —— 只有真 agent
+         * 开局＋真 pty 喂 0xC1 才能证明接线成立。这里只断言"入队这一步发生了"
+         * （snap_req +1，同步计数）；对端 media 进程不在 ⇒ worker 会计 snap_fail，
+         * 属预期，不参与断言。 */
+        {
+            iv_media_stats_t mst;
+
+            iv_media_stats(iv_agent_media(&g_agent), &mst);
+            chk(mst.snap_req == 1u, "k02c door hook enqueued one capture (M6 wired)");
+        }
     }
 
 

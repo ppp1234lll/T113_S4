@@ -48,6 +48,11 @@
  *   camera.search      —                   触发一轮设备发现（S4.2）
  *   system.time        {"ts":<秒>}         设系统墙钟（运维页"同步时间"）
  *   system.reboot      —                   请求重启（运维页"重启"）
+ *   snapshot.take      {"path":"..."}      抓拍（M6-S6.2，入队即回；path 省略
+ *                                          则按媒体桥接默认目录自动命名）
+ *   record.start       {"id":N,"url":"rtsp://..."}  开始录第 N 路（M6-S6.3）
+ *   record.stop        {"id":N}            停第 N 路
+ *   record.status      {"id":N}            第 N 路在录状态（兼对端保活）
  *
  * ============================ 依赖与并发 ============================
  *   - 依赖方向：本模块在 libivmodules，允许依赖 libivcore/libivhal 与外部库；
@@ -85,11 +90,27 @@ extern "C" {
 #define IV_CTL_APPLY_ITEMS_MAX 64
 
 /*
+ * 媒体动作表（M6-S6.1）：本模块**不直接依赖** iv_media（便于单测注入假实现），
+ * 装配层把绑定 iv_media 的表挂进 ctx。media 为 NULL 时四个媒体方法一律
+ * IV_ENOTSUP（"能调但没接"与"不许调"要能区分，同 do_reboot 口径）。
+ * 语义与 iv_media 对应函数一致：capture 为**入队即回**（异步抓拍，成败走
+ * 统计与日志）；record 三接口同步（毫秒级回环 HTTP）。
+ */
+typedef struct {
+    int (*capture)(const char *path, char *out_path, size_t cap, void *arg);
+    int (*record_start)(int id, const char *url, void *arg);
+    int (*record_stop)(int id, void *arg);
+    int (*record_status)(int id, int *recording, void *arg);
+    void *arg;
+} iv_ctl_media_ops_t;
+
+/*
  * 上下文：本模块**不持有**这些句柄，只在调用瞬间借用。
  *   cfg   —— 必需，NULL 则除 system.snapshot 外的方法都返回 IV_ESTATE。
  *   agent —— 可空；为空时 sys.overview / device.* / snmp.* / camera.search 降级。
  *   db    —— 可空；审计落盘（`control.db` 表结构属 S9 交付物，当前不建表，
  *            写操作只在这里留一个明确的接缝，不虚构表）。
+ *   media —— 可空（M6）；为空时 snapshot.take / record.* 返回 IV_ENOTSUP。
  *   do_reboot / do_settime —— 可空；为空时对应方法返回 IV_ENOTSUP
  *            （**"能调但没接"与"不许调"要能区分**，故不静默假装成功）。
  */
@@ -97,6 +118,9 @@ typedef struct {
     iv_config_t *cfg;
     iv_agent_t  *agent;
     iv_db_t     *db;
+
+    const iv_ctl_media_ops_t *media;
+    void                     *media_arg;
 
     int (*do_reboot)(void *arg);
     void *reboot_arg;

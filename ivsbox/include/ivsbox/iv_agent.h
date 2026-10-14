@@ -88,10 +88,12 @@
 
 #include "ivsbox/iv_camdet.h"
 #include "ivsbox/iv_device.h"
+#include "ivsbox/iv_media.h"
 #include "ivsbox/iv_netlink.h"
 #include "ivsbox/iv_netmgr.h"
 #include "ivsbox/iv_probe.h"
 #include "ivsbox/iv_reactor.h"
+#include "ivsbox/iv_recctl.h"
 #include "ivsbox/iv_recovery.h"
 #include "ivsbox/iv_report.h"
 #include "ivsbox/iv_ret.h"
@@ -228,6 +230,21 @@ typedef struct {
      * 卡住整个事件循环，属架构 §4.2 明令禁止）。下标见 IV_AGENT_SNMP_*。 */
     iv_taskpool_t *pool;
     iv_agent_snmp_cfg_t snmp[IV_AGENT_SNMP_TARGET_N];
+
+    /* ---- M6 媒体（S6.1/S6.2/S6.3）----
+     * `media_snap_dir`：门开/ctl 自动命名的抓拍落盘目录；空串 →
+     *   IV_MEDIA_SNAP_DIR_DEFAULT（板端 SD 挂载点确认前按 bird_media 的
+     *   /mnt/sdcard 根系走，登记为待板端事实）。
+     * `rec_*`：断网录像（S6.3）。判据＝出口全断（迟滞结论）＋平台 TCP 断，
+     *   保持 rec_hold_ms 才开录；恢复 rec_debounce_ms 才停录。
+     *   **URL 表暂无生产来源**（配置无 RTSP 地址键、发现档案无 URL 字段，
+     *   见 iv_recctl.h 文件头）⇒ app 层暂填 0 路，状态机自然旁路；
+     *   §18.5 冻结录像来源后填 rec_url 即活。 */
+    char     media_snap_dir[64];
+    uint32_t rec_hold_ms;     /* 0 → IV_RECCTL_HOLD_MS_DEFAULT */
+    uint32_t rec_debounce_ms; /* 0 → IV_RECCTL_DEBOUNCE_MS_DEFAULT */
+    int      rec_n_url;       /* 0..IV_RECCTL_CH_N */
+    char     rec_url[IV_RECCTL_CH_N][IV_RECCTL_URL_MAX];
 } iv_agent_cfg_t;
 
 /* ---------------------------------------------------------------------------
@@ -244,6 +261,12 @@ typedef struct {
     iv_recovery_t rec; /* S4.4 自愈：消费 cd 的"正常→故障"沿，发 0xD1 断电重启 */
     iv_device_t  dev;  /* S4.2 多品牌设备发现（开机一次 ＋ 0xE4 手动触发） */
     iv_agent_snmp_job_t snmp_job[IV_AGENT_SNMP_TARGET_N]; /* S4.3 采集作业与结果 */
+
+    /* M6 媒体（S6.1~S6.3）：media＝回环 HTTP 桥接（自带 worker 线程）；
+     * recm＝断网录像状态机（纯逻辑，动作回调绑本实例的 media）。名字避开
+     * 上面的 rec（iv_recovery）。 */
+    iv_media_t   media;
+    iv_recctl_t  recm;
 
     /* netmgr 的事务执行点：switch_route 复用默认（netlink 改路由），reconnect
      * 接本层 → iv_report_reconnect。ops.arg 指向本结构，故不能是静态常量。 */
@@ -326,6 +349,12 @@ uint64_t          iv_agent_door_events(const iv_agent_t *a); /* S4.5 门开事�
 /* S4.1 摄像机探测句柄只读出口（M5-S5.1 新增：Web 总览要读 CNS 六路与检测方式）。
  * 返回内部句柄，调用方只读；a 为 NULL 返回 NULL。 */
 const iv_camdet_t *iv_agent_camdet(const iv_agent_t *a);
+
+/* M6 媒体出口：media＝iv_ctl_media_ops_t 绑定用（装配层经 iv_agent_media()
+ * 拿实例指针）；recm＝app 层填/读录像 URL 表用（open 后直接改 recm.cfg 也行）。
+ * 未 open 时 media.inited=0，绑给 ctl 的方法会按 IV_ENOTSUP 应答。 */
+iv_media_t  *iv_agent_media(iv_agent_t *a);
+iv_recctl_t *iv_agent_recctl(iv_agent_t *a);
 
 /* S4.4 主网第 w 路（0/1）的 MN 状态：1=正常 / 2=断开（迟滞判定后；0=尚未判定）。
  * 就是上报数据段 `MN=` 字段的生产者（见 iv_report.h 的 env.mn[]）。 */

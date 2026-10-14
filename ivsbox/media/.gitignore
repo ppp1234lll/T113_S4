@@ -1,0 +1,15 @@
+# 忽略整个 build 目录
+build/*
+
+# 排除（即：不忽略）以下特定的脚本和配置文件
+!build/arm.cmake
+!build/build.sh
+!build/build_x86.sh
+!build/clean.sh
+
+# ---- ivsbox 收编追加（2026-10-14） ----
+# lib_x86 静态库（33 MB）不入库：宿主构建需要时从姊妹工程 bird_media 同路径拷
+# （见 README.ivsbox.md）；make test/asan/tsan 不受影响。
+third_party/ffmpeg/lib_x86/*.a
+# lib_arm 是板端交付必需（约 3 MB），强制入库（抵消 ivsbox/.gitignore 的 *.a）
+!third_party/ffmpeg/lib_arm/*.a

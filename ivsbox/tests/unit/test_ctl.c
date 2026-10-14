@@ -22,6 +22,7 @@
 #include "ivsbox/iv_config.h"
 #include "ivsbox/iv_ctl.h"
 #include "ivsbox/iv_log.h"
+#include "ivsbox/iv_media.h" /* IV_MEDIA_CH_N（c16 媒体方法的 id 上限） */
 #include "ivsbox/iv_ret.h"
 
 static int  g_fail;
@@ -89,6 +90,43 @@ static json_object *jodata(json_object *j)
     if (!json_object_object_get_ex(j, "d", &v))
         return NULL;
     return v;
+}
+
+/* ---- c16 媒体假 ops（M6-S6.1）：只计数与回显，不做任何 I/O ---- */
+static int g_n_cap, g_n_start, g_n_stop, g_n_status;
+
+static int media_fake_capture(const char *path, char *out_path, size_t cap,
+                              void *arg)
+{
+    (void)arg;
+    g_n_cap++;
+    (void)snprintf(out_path, cap, "%s", (path != NULL) ? path : "snap_auto.jpg");
+    return IV_OK;
+}
+
+static int media_fake_start(int id, const char *url, void *arg)
+{
+    (void)arg;
+    (void)url;
+    g_n_start++;
+    return (id >= 0 && id < IV_MEDIA_CH_N) ? IV_OK : IV_EINVAL;
+}
+
+static int media_fake_stop(int id, void *arg)
+{
+    (void)arg;
+    (void)id;
+    g_n_stop++;
+    return IV_OK;
+}
+
+static int media_fake_status(int id, int *recording, void *arg)
+{
+    (void)arg;
+    (void)id;
+    g_n_status++;
+    *recording = 1;
+    return IV_OK;
 }
 
 int main(void)
@@ -332,6 +370,98 @@ int main(void)
 
         chk(iv_ctl_handle(&ctx, "x", big, raw, sizeof(raw), &len) == IV_EINVAL,
             "c15: oversized request rejected");
+    }
+
+    /* ==================== c16 媒体方法（M6-S6.1，假 ops 注入） ====================
+     * f1 若 media==NULL 未按 IV_ENOTSUP 应答（写出了别的东西），c16a 会红；
+     * f2 若 ops 假实现没被调到（路由漏接），c16b 的计数器不会动；
+     * f3 若 record.status 的布尔应答写反，c16c 会红。 */
+    {
+        static const iv_ctl_media_ops_t ops = {
+            media_fake_capture, media_fake_start, media_fake_stop,
+            media_fake_status,  NULL
+        };
+
+        /* c16a 未挂 ops：四个方法一律 IV_ENOTSUP（"能调但没接"可辨） */
+        j = call(&ctx, "{\"m\":\"snapshot.take\"}", &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && j != NULL && joerr(j) == IV_ENOTSUP,
+            "c16a: snapshot.take without ops -> ENOTSUP (f1)");
+        if (j != NULL)
+            json_object_put(j);
+        j = call(&ctx, "{\"m\":\"record.start\",\"p\":{\"id\":0,\"url\":\"rtsp://x\"}}",
+                 &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && j != NULL && joerr(j) == IV_ENOTSUP,
+            "c16a: record.start without ops -> ENOTSUP");
+        if (j != NULL)
+            json_object_put(j);
+
+        /* c16b 挂上假 ops：capture 入队应答带自动命名路径 */
+        ctx.media     = &ops;
+        ctx.media_arg = NULL;
+        j = call(&ctx, "{\"m\":\"snapshot.take\"}", &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c16b: capture accepted");
+        {
+            json_object *d = jodata(j);
+            json_object *v = NULL;
+
+            if (d != NULL && json_object_object_get_ex(d, "path", &v))
+                chk(strcmp(json_object_get_string(v), "snap_auto.jpg") == 0,
+                    "c16b: auto path echoed");
+            else
+                chk(0, "c16b: path missing");
+        }
+        if (j != NULL)
+            json_object_put(j);
+        chk(g_n_cap == 1, "c16b: fake capture called once (f2)");
+        /* 显式 path 透传 */
+        j = call(&ctx, "{\"m\":\"snapshot.take\",\"p\":{\"path\":\"/tmp/x.jpg\"}}",
+                 &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c16b: explicit path accepted");
+        if (j != NULL)
+            json_object_put(j);
+        chk(g_n_cap == 2, "c16b: fake capture called twice");
+
+        /* c16c record.start：合法 id 受理；非法 id 拒 */
+        j = call(&ctx, "{\"m\":\"record.start\",\"p\":{\"id\":1,\"url\":\"rtsp://10.0.0.5/ch1\"}}",
+                 &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c16c: start accepted");
+        if (j != NULL)
+            json_object_put(j);
+        chk(g_n_start == 1, "c16c: fake start called");
+        j = call(&ctx, "{\"m\":\"record.start\",\"p\":{\"id\":99,\"url\":\"rtsp://x\"}}",
+                 &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && j != NULL && joerr(j) == IV_EINVAL,
+            "c16c: bad id rejected before reaching ops");
+        if (j != NULL)
+            json_object_put(j);
+        chk(g_n_start == 1, "c16c: ops NOT called for bad id");
+        j = call(&ctx, "{\"m\":\"record.start\",\"p\":{\"id\":0}}",
+                 &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && j != NULL && joerr(j) == IV_EINVAL,
+            "c16c: missing url rejected");
+        if (j != NULL)
+            json_object_put(j);
+
+        /* c16d record.stop / record.status */
+        j = call(&ctx, "{\"m\":\"record.stop\",\"p\":{\"id\":1}}", &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c16d: stop accepted");
+        if (j != NULL)
+            json_object_put(j);
+        chk(g_n_stop == 1, "c16d: fake stop called");
+        j = call(&ctx, "{\"m\":\"record.status\",\"p\":{\"id\":2}}", &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c16d: status answered");
+        {
+            json_object *d = jodata(j);
+            json_object *v = NULL;
+
+            if (d != NULL && json_object_object_get_ex(d, "recording", &v))
+                chk(json_object_get_boolean(v) == 1, "c16d: recording flag true (f3)");
+            else
+                chk(0, "c16d: recording field missing");
+        }
+        if (j != NULL)
+            json_object_put(j);
+        chk(g_n_status == 1, "c16d: fake status called");
     }
 
     /* ---------------- 收尾（规则 6） ---------------- */

@@ -39,7 +39,10 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M5-S5.1/S5.3 Web 服务与八页面（自研最小 HTTP/1.1，弃 SSI/CGI） | 已实现（VM 全量验证 ＋ 新增集成用例 ＋ 反向证伪 2 条；`ab` 真压测、板端走查、审计落盘待补） | 2026-10-14 09:10 | `web/src/` 五件（iv_web.h/iv_web_chan.c/iv_web_api.c/iv_web_static.c/main.c）＋ `web/static/` 三件；`monitor-web.sh` ＋ `S66ivsboxweb`；`WEB_BIN` 只链 `libivcore`。**统一测试修掉 3 个真缺陷**（parse_req 就地改写缓冲／响应头终止空行缺失／400 快路径写错缓冲区）。详见本文件文末 2026-10-14 09:10 节 |
 | M5-S5.2/S5.4 本地通道方法路由 iv_ctl ＋ 配置事务（版本门） | 已实现（VM 全量验证 ＋ 反向证伪 2 条；审计落 control.db、事务通知接线待补） | 2026-10-14 09:10 | `iv_ctl.h`/`iv_ctl.c` 13 方法；`system.snapshot` 老格式与"未知方法静默"两条老契约保住；`config.apply` 版本门＋失败回滚；`main.c` 多客户端＋reboot/settime 钩子；单测 `test_ctl.c` 15 组 |
 | M5-S5.5 ivsbox-provision 组播出厂工装 | 已实现（VM 全量验证 ＋ 反向证伪 1 条；组播默认值与报文格式待用户冻结） | 2026-10-14 09:10 | `iv_provision.h`/`iv_provision.c` ＋ `tools/provision`；56 B 身份记录＋XOR 混淆＋裸分区直写（无 `O_CREAT`）；`IVPR` 报文四道校验；工厂标记闸门；单测 `test_prov.c` |
+| M6-S6.0~S6.3 视频链路（收编 bird_media ＋ 回环桥接 ＋ 断网录像） | 已实现（VM 全量验证 ＋ 集成 ＋ 反向证伪 5 条；S6.4/S6.5/S6.6 与 URL 表生产来源待补） | 2026-10-14 11:01 | `ivsbox/media/` 收编 bird_media（零改动）＋ `iv_media`/`iv_recctl` 新模块 ＋ `iv_ctl` 4 方法 ＋ agent/main 装配 ＋ `monitor-media.sh`/`S67ivsboxmedia`；test 33/33、集成 6/6、反向证伪 5/5。详见本文件文末 2026-10-14 11:01 节
 |===
+
+== 2026-10-09 11:38|===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
 
@@ -1648,3 +1651,21 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 * **快路径响应也必须落在发送缓冲**：`on_writable` 只认 `c->wbuf`，任何"顺手写进另一个缓冲"的快路径都是在发垃圾。
 * **需要 `/mnt/UDISK` 的集成用例可用 `unshare -rm` 在非 root 的编译机上跑绿**：`mount -t tmpfs none /mnt` ＋ `none /var/run` 即可造出 ivsboxd 需要的全部路径；注意命名空间退出**不会**杀掉里面起的进程，端口残留要用 `pkill -x`（不能用 `pkill -f`，会误杀 ssh 自身命令行）。
 * **用户级命名空间内的进程残留会冒充"修复无效"**：本轮曾因端口 18081 被上一轮的旧二进制占着，误判"分段请求仍然超时"；清理残留后同一份代码立即全绿。复现失败前先 `pkill -x` 清场。
+
+== 2026-10-14 11:01 M6 视频链路（bird_media 收编 ＋ 回环桥接 ＋ 断网录像）
+
+=== 干了什么事
+
+- *收编*：`ivsbox/media/`＝bird_media 整目录原样（零改动）；`ivsbox-media` 独立进程（mongoose :18000，capture/record 三接口）；ffmpeg 静态库 lib_arm 入库/lib_x86 忽略。
+- *新模块*：`iv_media`（回环 HTTP 桥接：队列＋worker＋stat 判成败＋保活续命）、`iv_recctl`（断网录像状态机：hold 10 s／debounce 60 s，出口全断＋平台 DOWN）。
+- *通道*：`iv_ctl` 增 snapshot.take/record.start·stop·status（13→17 方法）；`main.c` 转发钩子；`iv_agent` 门开沿真入队抓拍（闭合 S4.5）＋ rec_drive 装配。
+- *守护*：`scripts/monitor-media.sh` ＋ `S67ivsboxmedia`（独立守护、不碰看门狗）。
+
+=== 验证
+
+- VM：`make test` 33/33；asan/tsan 零报告（tsan 修测试 3 处 race）；analyze/arm rc=0；集成 6/6（test_media_e2e 真拉起进程）；反向证伪 5/5；package 完整（ELF32 ARM EABI5）。
+
+=== 未做（登记）
+
+- S6.4 视频读取（卡平台文件服务协议）、S6.5 SD 卡策略、S6.6 音频（卡 §18.6）、RTSP URL 表生产来源（卡 §18.5＋各路地址/账号）、bird_media 无鉴权（M8）、板端实测（未覆盖事实）。
+

@@ -36,6 +36,7 @@
 #include "ivsbox/iv_camdet.h"
 #include "ivsbox/iv_clock.h"
 #include "ivsbox/iv_ctl.h"
+#include "ivsbox/iv_media.h"
 #include "ivsbox/iv_report.h"
 #include "ivsbox/iv_status.h"
 #include "ivsbox/iv_version.h"
@@ -55,7 +56,11 @@ static const char *const k_methods[] = {
     "snmp.run",
     "camera.search",
     "system.time",
-    "system.reboot"
+    "system.reboot",
+    "snapshot.take",
+    "record.start",
+    "record.stop",
+    "record.status"
 };
 
 int iv_ctl_method_count(void)
@@ -922,6 +927,110 @@ static int m_system_reboot(const iv_ctl_ctx_t *ctx, json_object *p,
     return rsp_data(d, out, cap, out_len);
 }
 
+/* ============================ 媒体（M6-S6.1） ============================ */
+
+/* 四个媒体方法共同的门口：未挂 ops 一律 IV_ENOTSUP（同 do_reboot 口径）。 */
+static int m_media_capture(const iv_ctl_ctx_t *ctx, json_object *p,
+                           char *out, size_t cap, size_t *out_len)
+{
+    const char  *path = NULL;
+    char         out_path[IV_MEDIA_URL_MAX];
+    json_object *d;
+    int          rc;
+
+    if (ctx->media == NULL || ctx->media->capture == NULL)
+        return rsp_err(IV_ENOTSUP, "media not wired", out, cap, out_len);
+    if (p != NULL)
+        path = param_str(p, "path");
+    rc = ctx->media->capture(path, out_path, sizeof(out_path), ctx->media_arg);
+    if (rc == IV_EINVAL)
+        return rsp_err(IV_EINVAL, "bad path", out, cap, out_len);
+    if (rc == IV_EBUSY)
+        return rsp_err(IV_EBUSY, "capture queue full", out, cap, out_len);
+    if (rc != IV_OK)
+        return rsp_err(rc, "capture not accepted", out, cap, out_len);
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "queued", json_object_new_boolean(1));
+    json_object_object_add(d, "path", json_object_new_string(out_path));
+    return rsp_data(d, out, cap, out_len);
+}
+
+static int m_media_record_start(const iv_ctl_ctx_t *ctx, json_object *p,
+                                char *out, size_t cap, size_t *out_len)
+{
+    int64_t     id = -1;
+    const char *url;
+    int         rc;
+
+    if (ctx->media == NULL || ctx->media->record_start == NULL)
+        return rsp_err(IV_ENOTSUP, "media not wired", out, cap, out_len);
+    if (param_i64(p, "id", &id) != IV_OK || id < 0 || id >= IV_MEDIA_CH_N)
+        return rsp_err(IV_EINVAL, "bad id", out, cap, out_len);
+    url = param_str(p, "url");
+    if (url == NULL || url[0] == '\0')
+        return rsp_err(IV_EINVAL, "missing url", out, cap, out_len);
+    rc = ctx->media->record_start((int)id, url, ctx->media_arg);
+    if (rc != IV_OK)
+        return rsp_err(rc, "record start failed", out, cap, out_len);
+    {
+        json_object *d = json_object_new_object();
+        if (d == NULL)
+            return IV_ENOMEM;
+        json_object_object_add(d, "id", json_object_new_int((int)id));
+        json_object_object_add(d, "started", json_object_new_boolean(1));
+        return rsp_data(d, out, cap, out_len);
+    }
+}
+
+static int m_media_record_stop(const iv_ctl_ctx_t *ctx, json_object *p,
+                               char *out, size_t cap, size_t *out_len)
+{
+    int64_t id = -1;
+    int     rc;
+
+    if (ctx->media == NULL || ctx->media->record_stop == NULL)
+        return rsp_err(IV_ENOTSUP, "media not wired", out, cap, out_len);
+    if (param_i64(p, "id", &id) != IV_OK || id < 0 || id >= IV_MEDIA_CH_N)
+        return rsp_err(IV_EINVAL, "bad id", out, cap, out_len);
+    rc = ctx->media->record_stop((int)id, ctx->media_arg);
+    if (rc != IV_OK)
+        return rsp_err(rc, "record stop failed", out, cap, out_len);
+    {
+        json_object *d = json_object_new_object();
+        if (d == NULL)
+            return IV_ENOMEM;
+        json_object_object_add(d, "id", json_object_new_int((int)id));
+        json_object_object_add(d, "stopped", json_object_new_boolean(1));
+        return rsp_data(d, out, cap, out_len);
+    }
+}
+
+static int m_media_record_status(const iv_ctl_ctx_t *ctx, json_object *p,
+                                 char *out, size_t cap, size_t *out_len)
+{
+    int64_t id = -1;
+    int     rec = 0;
+    int     rc;
+    json_object *d;
+
+    if (ctx->media == NULL || ctx->media->record_status == NULL)
+        return rsp_err(IV_ENOTSUP, "media not wired", out, cap, out_len);
+    if (param_i64(p, "id", &id) != IV_OK || id < 0 || id >= IV_MEDIA_CH_N)
+        return rsp_err(IV_EINVAL, "bad id", out, cap, out_len);
+    rc = ctx->media->record_status((int)id, &rec, ctx->media_arg);
+    if (rc != IV_OK)
+        return rsp_err(rc, "record status failed", out, cap, out_len);
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "id", json_object_new_int((int)id));
+    json_object_object_add(d, "recording", json_object_new_boolean(rec));
+    return rsp_data(d, out, cap, out_len);
+}
+
 /* ============================ 入口 ============================ */
 
 int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
@@ -1002,6 +1111,14 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_system_time(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "system.reboot") == 0)
         rc = m_system_reboot(ctx, params, out, out_cap, out_len);
+    else if (strcmp(method, "snapshot.take") == 0)
+        rc = m_media_capture(ctx, params, out, out_cap, out_len);
+    else if (strcmp(method, "record.start") == 0)
+        rc = m_media_record_start(ctx, params, out, out_cap, out_len);
+    else if (strcmp(method, "record.stop") == 0)
+        rc = m_media_record_stop(ctx, params, out, out_cap, out_len);
+    else if (strcmp(method, "record.status") == 0)
+        rc = m_media_record_status(ctx, params, out, out_cap, out_len);
     else
         rc = IV_ENOTSUP; /* **不写 out**，由调用方静默丢弃 */
 

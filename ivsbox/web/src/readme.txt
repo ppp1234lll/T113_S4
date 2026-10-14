@@ -17,6 +17,10 @@ web/src  ——  ivsbox-web 进程源码目录（自研最小 HTTP/1.1 服务）
                    S6.4 起增加媒体文件的**流式发送**（pread→send，正文不进 wbuf）
                    与**限速**（1 s 窗口配额；配额用尽把等待折进 poll 超时，
                    **不是 sleep**，否则会连累其它连接）。
+                   M7-S7.4 起主循环每拍调 `heartbeat_tick()` 刷**心跳文件**：
+                   monitor-web.sh 用它判"主循环是不是卡死了"（`kill -STOP`/死锁的
+                   进程在 /proc 里照样存在，只看 pid 接不住）。心跳**必须由主循环
+                   推进**——改成独立线程刷，则卡死时线程照常前进，等于没有检测。
   iv_web_api.c     REST 路由 + 会话 Cookie + 本地通道转发（M5-S5.2/S5.4）。
   iv_web_static.c  静态资源（直接从 web/static 读盘 —— 改页面不必重编固件）。
   iv_web_media.c   S6.4 媒体下载：`/media/...` → media_root 下的普通文件。路径围栏
@@ -28,8 +32,12 @@ web/src  ——  ivsbox-web 进程源码目录（自研最小 HTTP/1.1 服务）
   make host / make arm    分别产出 build/host/ivsbox-web、build/arm/ivsbox-web
   运行：ivsbox-web [--port N] [--root DIR] [--chan PATH] [--pass PW]
                    [--media-root DIR] [--media-bps N]
+                   [--heartbeat PATH] [--heartbeat-ms N]
   口令也可用环境变量 IVSBOX_WEB_PASS；媒体根/限速可用 IVSBOX_WEB_MEDIA_ROOT /
   IVSBOX_WEB_MEDIA_BPS 覆盖（产线走命令行，环境变量留给开发/测试）。
+  心跳路径/周期可用 IVSBOX_WEB_HEARTBEAT / IVSBOX_WEB_HEARTBEAT_MS 覆盖，**须与
+  monitor-web.sh 的同名变量指同一个文件**（两边不一致 ⇒ 健康进程会被判成卡死）；
+  `--heartbeat-ms 0` 关闭心跳，仅用于验证。
 
 【约定与注意事项】
   - 支持的 HTTP 子集：GET / POST，`Connection: close`（不做 keep-alive / pipeline /

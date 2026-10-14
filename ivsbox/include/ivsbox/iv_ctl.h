@@ -53,6 +53,11 @@
  *   record.start       {"id":N,"url":"rtsp://..."}  开始录第 N 路（M6-S6.3）
  *   record.stop        {"id":N}            停第 N 路
  *   record.status      {"id":N}            第 N 路在录状态（兼对端保活）
+ *   ota.status         —                   升级状态（pending/版本/bootcount/回滚次数；M7-S7.2）
+ *   ota.request        {"path":"/...","restart":true}
+ *                                          落一个"请装这个包"请求（M7-S7.2）。
+ *                                          **不做安装**：包须已落在 `<data_root>/ota/` 下，
+ *                                          真正改盘的安装由 monitor.sh 拉起 ivsbox-updater 完成。
  *
  * ============================ 依赖与并发 ============================
  *   - 依赖方向：本模块在 libivmodules，允许依赖 libivcore/libivhal 与外部库；
@@ -128,6 +133,13 @@ typedef struct {
     /* 设系统墙钟；wall_sec 为 Unix 秒。返回 IV_OK 表示已生效。 */
     int (*do_settime)(int64_t wall_sec, void *arg);
     void *settime_arg;
+
+    /* OTA 落点（M7-S7.2）：只给 ota.status / ota.request 用。可空 → iv_upd 的
+     * 编译期默认（/opt/ivsbox ＋ /mnt/UDISK/ivsbox，见 iv_upd.h）。
+     * **本模块绝不写 pending.json 或 current/previous 链接** —— 改版本的唯一写者
+     * 是 ivsbox-updater，这里只读状态、只落一个请求文件（单写者原则，架构 §10.4）。 */
+    const char *ota_app_root;
+    const char *ota_data_root;
 } iv_ctl_ctx_t;
 
 /*

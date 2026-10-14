@@ -40,10 +40,23 @@
 /* 响应头预留区：所有响应头都很短（固定 4 行 + 可选 Set-Cookie），512 绰绰有余。 */
 #define RSP_HEAD_OFF    512u
 
+/* ---- 主循环心跳（M7-S7.4，架构 §16.2 场景 7）----
+ * 主循环每 WEB_HB_MS_DEF 把**单调毫秒数**写进该文件；monitor-web.sh 用「内容有没有变」
+ * 判主循环是否卡死（`kill -STOP`/死锁的进程在 /proc 里照样存在，只看 pid 接不住）。
+ * 落 /tmp（tmpfs）：复位即清，不会把上一轮的旧值当成本轮的心跳。
+ * 用 `--heartbeat-ms 0`（或 IVSBOX_WEB_HEARTBEAT_MS=0）可显式关闭，仅用于验证。 */
+#define WEB_HB_PATH_DEF "/tmp/ivsbox-web.heartbeat"
+#define WEB_HB_MS_DEF   5000u
+
 static iv_web_ctx_t  g_ctx;
 static iv_web_conn_t g_conn[IV_WEB_MAX_CONN];
 static int           g_listen_fd = -1;
 static volatile sig_atomic_t g_stop = 0;
+
+static const char *g_hb_path   = WEB_HB_PATH_DEF;
+static uint32_t    g_hb_ms     = WEB_HB_MS_DEF;
+static uint64_t    g_hb_next   = 0u; /* 下一次允许写心的时刻（0＝立刻写第一拍） */
+static int         g_hb_warned = 0;  /* 写失败只告警一次，不刷屏 */
 
 /* --------------------------------------------------------------------------
  * 公共小工具
@@ -55,6 +68,46 @@ uint64_t iv_web_now_ms(void)
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
         return 0u;
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* --------------------------------------------------------------------------
+ * 主循环心跳（M7-S7.4）
+ * -------------------------------------------------------------------------- */
+/* 频率刻意不高：心跳只须在守护侧超时（默认 30 s，见 monitor-web.sh）内到达即可；
+ * 5 s 一条对 tmpfs 是噪声级开销，又比超时小一个量级 ⇒ 偶发一次写失败不会被误判卡死。
+ *
+ * **必须由主循环调用**：换成独立线程来刷，则 poll/业务卡死时线程照常前进、心跳一直新鲜
+ * —— 那等于没有卡死检测。这是「判活」与「判卡死」的分水岭，别为了「解耦」把它挪走。 */
+static void heartbeat_tick(void)
+{
+    uint64_t now;
+    char     buf[32];
+    int      fd;
+    int      len;
+
+    if (g_hb_path == NULL || g_hb_path[0] == '\0' || g_hb_ms == 0u)
+        return;                       /* 显式关闭（验证/无 tmpfs 场景） */
+    now = iv_web_now_ms();
+    if (g_hb_next != 0u && now < g_hb_next)
+        return;
+    g_hb_next = now + (uint64_t)g_hb_ms;
+
+    fd = open(g_hb_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        /* 写不进去（目录不存在/只读）不是致命错误：告警一次，主业务照跑。
+         * 代价是守护侧会把本进程判成「卡死」并重拉一次 —— 这个方向是安全的：
+         * 误重启一个健康进程，好过「该重启时永远不重启」。 */
+        if (g_hb_warned == 0) {
+            g_hb_warned = 1;
+            IV_LOG_W(WEB_MOD, "heartbeat write failed: %s (%s)", g_hb_path,
+                     strerror(errno));
+        }
+        return;
+    }
+    len = snprintf(buf, sizeof buf, "%llu\n", (unsigned long long)now);
+    if (len > 0)
+        (void)write(fd, buf, (size_t)len);
+    (void)close(fd);
 }
 
 /* xorshift32：只用来生成会话 token。**不用于安全关键用途**（token 的强度还
@@ -595,7 +648,8 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [--port N] [--root DIR] [--chan PATH] [--pass PW]\n"
-            "          [--media-root DIR] [--media-bps N] [--version]\n"
+            "          [--media-root DIR] [--media-bps N]\n"
+            "          [--heartbeat PATH] [--heartbeat-ms N] [--version]\n"
             "  defaults: port %d, root %s, chan %s\n"
             "            media-root %s, media-bps %u (0 = unlimited)\n",
             argv0, WEB_PORT_DEF, WEB_ROOT_DEF, IV_CHAN_PATH_DEFAULT,
@@ -639,6 +693,10 @@ int main(int argc, char *argv[])
                            (int)sizeof(g_ctx.media_root) - 1, argv[++i]);
         } else if (strcmp(argv[i], "--media-bps") == 0 && i + 1 < argc) {
             g_ctx.media_bps = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--heartbeat") == 0 && i + 1 < argc) {
+            g_hb_path = argv[++i];
+        } else if (strcmp(argv[i], "--heartbeat-ms") == 0 && i + 1 < argc) {
+            g_hb_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else {
             usage(argv[0]);
             return 1;
@@ -660,6 +718,13 @@ int main(int argc, char *argv[])
         env = getenv("IVSBOX_WEB_MEDIA_BPS");
         if (env != NULL && env[0] != '\0')
             g_ctx.media_bps = (uint32_t)strtoul(env, NULL, 10);
+        /* 心跳路径/周期（S7.4）：monitor-web.sh 用同名变量，两边必须指同一个文件。 */
+        env = getenv("IVSBOX_WEB_HEARTBEAT");
+        if (env != NULL && env[0] != '\0')
+            g_hb_path = env;
+        env = getenv("IVSBOX_WEB_HEARTBEAT_MS");
+        if (env != NULL && env[0] != '\0')
+            g_hb_ms = (uint32_t)strtoul(env, NULL, 10);
     }
 
     /* 日志失败不致命：host 上没有 /mnt/UDISK/log 是常态，Web 照样要能跑。 */
@@ -687,6 +752,10 @@ int main(int argc, char *argv[])
         int           nfds = 0;
         int           timeout = 1000;
         uint64_t      now;
+
+        /* 主循环心跳（S7.4）：放在本圈最前面 —— 无论本圈是立刻返回还是等满
+         * timeout（上限 1000 ms），心跳都随循环前进；循环一停，心跳即停。 */
+        heartbeat_tick();
 
         pf[0].fd      = g_listen_fd;
         pf[0].events  = POLLIN;

@@ -201,12 +201,13 @@ package-copy:
 	@mkdir -p packaging/bin packaging/scripts packaging/init.d
 	@cp $(BINS) packaging/bin/
 	@cp scripts/start_ivsbox.sh scripts/monitor.sh scripts/monitor-web.sh scripts/monitor-media.sh packaging/scripts/
+	@cp scripts/ivsbox-run.sh packaging/scripts/
 	@cp scripts/init.d/S62usb4g scripts/init.d/S65ivsboxd scripts/init.d/S66ivsboxweb scripts/init.d/S67ivsboxmedia packaging/init.d/
 	# Web 静态资源（M5-S5.3）：模板与数据分离，页面改版不必重编固件。
 	@rm -rf packaging/web
 	@mkdir -p packaging/web/static
 	@cp -r web/static/. packaging/web/static/ 2>/dev/null || true
-	@chmod +x packaging/scripts/start_ivsbox.sh packaging/scripts/monitor.sh packaging/scripts/monitor-web.sh packaging/scripts/monitor-media.sh packaging/init.d/S62usb4g packaging/init.d/S65ivsboxd packaging/init.d/S66ivsboxweb packaging/init.d/S67ivsboxmedia
+	@chmod +x packaging/scripts/start_ivsbox.sh packaging/scripts/monitor.sh packaging/scripts/monitor-web.sh packaging/scripts/monitor-media.sh packaging/scripts/ivsbox-run.sh packaging/init.d/S62usb4g packaging/init.d/S65ivsboxd packaging/init.d/S66ivsboxweb packaging/init.d/S67ivsboxmedia
 	@for bin in $(BINS); do \
 		LC_ALL=C $(CROSS)readelf -h "$$bin" | grep -q "Machine:.*ARM" || { \
 			echo "package: ERROR, not ARM ELF: $$bin"; exit 1; \
@@ -313,9 +314,13 @@ $(WEB_BIN): $(WEB_OBJS) $(LIBCORE)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $(WEB_OBJS) -L$(BUILD_DIR) -livcore $(LDLIBS)
 
-$(UPDATER_BIN): $(UPDATER_OBJS)
+# 升级器要调 libivmodules 里的 iv_upd（安装/双版本/回滚）与 iv_ota（验签），
+# 故链三层库；`--gc-sections` 会把没用到的部分丢掉，不会把整个 modules 拖进产物。
+# 注意：链了 modules 就意味着 libivsboxd-updater 的运行期依赖里多了 libcrypto
+# （iv_ota 用它做 Ed25519），与 ivsboxd 自身是否用 OTA 无关。
+$(UPDATER_BIN): $(UPDATER_OBJS) $(LIBMODULES) $(LIBHAL) $(LIBCORE)
 	@mkdir -p $(dir $@)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $(UPDATER_OBJS) -L$(BUILD_DIR) -livmodules -livhal -livcore $(LDLIBS)
 
 # 出厂工装要用 libivmodules 里的身份编解码 / 裸分区读写（iv_provision），故链整个
 # modules 静态库；`--gc-sections` 会把没用到的部分丢掉，不会把 sqlite3/json-c 的

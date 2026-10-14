@@ -1844,3 +1844,80 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 * **装配层接线**：`ivsboxd` 收升级命令 / 下载 / 上报进度 —— 属 M7-S7.2（本模块已就绪，等着被调）。
 * **量产发布公钥**：`iv_ota_builtin_pubkey()` 是占位（`IV_ENOTSUP` ＋ 全零输出）；公钥由发布侧密钥工程产出后写入 `src/modules/ota/`，**私钥绝不入库**（规则 3 第 6 条）。
 * **板端真机实测**（板子不在线，未覆盖事实）。
+
+== M7-S7.2~S7.5 安装器与双版本切换、回滚与启动包装、故障注入、长稳
+
+=== 干了什么事
+
+* **S7.2 装盘与切版本**：新增 `include/ivsbox/iv_upd.h` ＋ `src/modules/upd/iv_upd.c`（进 `libivmodules`）与 `updater/`
+  （root 按需运行的 CLI）。落点按 §0 口径**分家**：程序（`bin/`＋`scripts/`）落 rootfs `/opt/ivsbox/`（`releases/<ver>/`
+  ＋ `current`/`previous` 链接），数据、暂存、事件、请求留 UDISK `/mnt/UDISK/ivsbox/ota/`。装配接线只做两件事：
+  本地通道新增 `ota.status`/`ota.request`（主控**只收命令＋落一个请求文件**，绝不改盘），`monitor.sh` 消费请求并
+  拉起独立进程执行安装。
+* **S7.3 启动包装与回滚**：新增 `scripts/ivsbox-run.sh`，链路 `S65ivsboxd → monitor.sh → ivsbox-run.sh → exec ./bin/ivsboxd`；
+  `src/app/main.c` 在装配完成、进 reactor 前落就绪标记；monitor 按标记确认、超时回滚并停掉实例。
+* **S7.4 故障注入加固**：新增 `tests/fault-inject.sh`（三态清单）与 `tests/integration/test_fault_db_power.c`；
+  并给 `ivsbox-web` 加主循环心跳、给 `ivsbox-media` 加外部 HTTP 探针，补齐"卡死 vs 崩溃"的区分。
+* **S7.5 长稳**：新增 `tests/soak.sh`（周期扰动 ＋ 资源斜率）。
+* 新增装配层端到端用例 `tests/upgrade-boot.sh`（6 个用例），把上面那条**接线**钉住。
+
+=== 解决什么问题
+
+* S7.1 只做到"验签、只验不改"，装盘与切版本完全空缺 ⇒ 升级链路整体不可用，§16.2 场景 7/8 无法验收。
+* **旧判活看不见卡死**：只看"进程还在"时，`kill -STOP` 或死锁的主控/Web/媒体都算"活着"，重拉被永久压住 ⇒
+  §16.2 场景 7「只重启对应服务」落不了地。本轮把判活拆成两层（进程层 ＋ **循环层**）。
+* **陈旧就绪标记会被误当成战绩**：monitor 拉起后在同一圈轮询就读标记，而"清标记"发生在被 fork 的子进程里 ——
+  上一实例"落下标记后立刻崩溃"时，新版本会被**瞬时误确认**（`state=confirmed` 是终点，此后连回滚都判不动）。
+* **落点变量名两边不一致**：monitor 用 `IVSBOX_APP_DIR`、包装脚本读 `IVSBOX_APP_ROOT`，两者默认值恰好相同所以
+  在板端"看起来正常"；一旦现场改落点，就变成"守一个目录、起另一个目录"（用例首轮即抓到）。
+
+=== 影响范围
+
+* `libivmodules` 新增 `iv_upd`；`ivsboxd`/`ivsbox-updater`/单测都会链到它。**既有功能行为零变化**（本地通道只多两个方法）。
+* 新增可执行 `ivsbox-updater`（`make` 已出、`package-copy` 已归集）与脚本 `scripts/ivsbox-run.sh`；
+  monitor / monitor-web / monitor-media 三份守护脚本的行为按上表变化；`ivsbox-web` 新增 CLI 与两个环境变量。
+* 磁盘契约新增：`<app_root>/releases/<ver>/`、`<app_root>/current|previous`、`<data_root>/ota/{pending.json,events.log,staging/<ver>/,request}`。
+  `pending.json` 是**手写扁平 JSON**（不引 json-c：json-c 只允许落在 `src/modules/config/`），字段＝
+  `fmt/state/version/previous/app_dir/bootcount/max_boot/reason`。
+* **未覆盖 / TODO**：真机注入与 72h 长稳（现场）；量产公钥；平台侧"版本回退事件"上报（无跨端码值）。
+
+=== 怎么验证
+
+* VM（编译机 `192.168.2.115`）全量：`make test` / `make host` / `make analyze` / `make asan` / `setarch -R make tsan` /
+  `make arm` **六项全 rc=0**；日志内 7 条告警**全部来自 `media/src/` 上游代码**，本工程文件零告警；
+  `make analyze` 本轮**先删 `build/analyze` 再跑**（目录已存在时 make 会认为无需编译，"rc=0" 是空证明；本轮编译 55 个 `.o`）；
+  `test_upd: all passed (0 skip)` 在三遍 sanitizer 下一致；ARM 产物 `readelf` ＝ EABI5 soft-float、`NEEDED` 含 `libcrypto.so.1.1`；
+  新文件单独 `-fanalyzer` rc=0。
+* **装配层端到端 `tests/upgrade-boot.sh` 23 PASS / 0 FAIL**：真跑 host 升级器 ＋ 包装脚本 ＋ monitor，盘面在 `/tmp` 现造；
+  u4 对应计划 §S7.3 的验证条「bootcount 超限注入 → 回滚」。**假主控必须是编译出来的 ELF** —— monitor 用 `ps -o comm`
+  判活，shell 脚本的 comm 是解释器名，拿脚本假装主控会让守护逻辑根本进不去（"什么都没测"却报绿）。
+* **故障注入宿主项 13 PASS / 0 FAIL / 0 SKIPPED / 8 NOT-RUN**（真机项只印方法与判据，**不计入通过**）；
+  `test_fault_db_power` 通过（写库中 SIGKILL：已提交批次恰好存活、未提交永不出现、`integrity_check` 过、零长库被重建）。
+* **反向证伪 10 条全部抓出并还原复绿**（每条：编译干净 → 指定用例变红 → 还原 → 复绿）：
+  C 侧 7 条 —— `u64_at` 小端分支取反（**73 条断言同时变红**）／`bc > maxb` 边界／pending 与 install 相位次序／
+  回读判据取反／落点 PROG↔DATA 互换／去掉 `rm_rf` 前的 current·previous 护栏（**为此补了 t15**）／`is_prog_rel` 恒假；
+  shell 侧 3 条 —— 拿掉"拉起前清就绪标记"（u5/u6 **同时报红**且告警日志打出 `upgrade confirmed`，正是"没跑起来的新版被误确认"）／
+  拿掉 TERM→KILL／不把落点传给包装（首轮真实缺陷）。
+* **未验证（如实登记）**：真机项（72h 长稳、断电回滚、录像中掉电、串口拔出、SD 满/拔卡、弱网/双网断开、卡死复位）；
+  板端 rootfs 是否真有 `libcrypto.so.1.1`；平台侧版本回退事件上报。
+
+=== 沉淀的纪律
+
+* **装配层的东西只能用"真拉起进程"的用例抓**：C 单测里根本不存在 `monitor → 包装 → boot-begin → 换目录 exec` 这条接线；
+  本轮两个真缺陷（落点变量名不一致、陈旧标记被误确认）**都是**它抓的，单测与变异都抓不到。
+* **"能编译"不是证伪**：变异必须编译干净（`-Werror` 一挂，红的是编译器）、必须让**指定的**用例变红、必须还原复绿；
+  shell 侧同理先用 `busybox sh -n` 过一遍语法。
+* **无法用单文件变异证明的性质，就补独立用例**：`rm_rf` 前那道护栏在正常版本号递增下不可达，去掉它任何用例都不红 ⇒
+  补 t15（回滚把 current 退回旧版本后，"比 current 新、却等于 previous"的版本号重新可装）才把它变成可证的。
+* **测试自身也会错**：`test_fault_db_power` 起初在 `close` 之后断言 `-wal` 存在 —— 而正常关闭会 checkpoint 并删掉它，
+  于是 5 轮全红；**红的是判据位置，不是被测代码**。判据要放在"能被观察的那一刻"（句柄仍打开时）。
+* **SKIP / NOT-RUN 不能当通过**：DELEGATE 项输出含 `SKIP` 一律记 SKIPPED，真机项记 NOT-RUN 并写明"不计入通过"；
+  长稳的斜率判据只在运行时长够（≥ `--slope-min-hours`）时才生效，短跑不宣称"平稳"。
+
+=== 未做（如实登记）
+
+* **真机项**：72h 长稳（S7.5 的验收本体）、断电回滚、录像中掉电、串口拔出、SD 满/拔卡、弱网/双网断开、卡死 ⇒ 看门狗复位。
+* **量产发布公钥未部署**：`iv_ota_builtin_pubkey()` 仍 `IV_ENOTSUP` ＋ 全零（fail-closed 拒一切包），私钥不入库。
+* **平台侧"版本回退事件"上报**：`iv_err.h` 只有 ELEC/NET/SENSOR 三类、无 OTA/版本码值，类型段 `0x4~0xF` 是否冻结
+  须与单片机侧协商（与 SD 告警同一卡点）⇒ 本轮只落 `ota/events.log`。
+* **板端真机实测**（板子仍不在线，未覆盖事实）。

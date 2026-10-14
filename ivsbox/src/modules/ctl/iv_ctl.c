@@ -39,6 +39,7 @@
 #include "ivsbox/iv_media.h"
 #include "ivsbox/iv_report.h"
 #include "ivsbox/iv_status.h"
+#include "ivsbox/iv_upd.h"
 #include "ivsbox/iv_version.h"
 
 /* ============================ 方法表 ============================ */
@@ -60,7 +61,9 @@ static const char *const k_methods[] = {
     "snapshot.take",
     "record.start",
     "record.stop",
-    "record.status"
+    "record.status",
+    "ota.status",
+    "ota.request"
 };
 
 int iv_ctl_method_count(void)
@@ -1085,6 +1088,87 @@ static int m_media_record_status(const iv_ctl_ctx_t *ctx, json_object *p,
     return rsp_data(d, out, cap, out_len);
 }
 
+/* ============================ ota.status / ota.request（M7-S7.2） ============================ */
+
+/* OTA 落点：本模块不持有配置，只在调用瞬间借用（与 cfg/agent 同一口径）。 */
+static void ota_cfg_of(const iv_ctl_ctx_t *ctx, iv_upd_cfg_t *c)
+{
+    iv_upd_cfg_default(c);
+    if (ctx->ota_app_root != NULL)
+        c->app_root = ctx->ota_app_root;
+    if (ctx->ota_data_root != NULL)
+        c->data_root = ctx->ota_data_root;
+}
+
+/* 升级状态。**只读**：读 pending.json / events.log / current 链接，一个字节都不写。 */
+static int m_ota_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_t *out_len)
+{
+    iv_upd_cfg_t    c;
+    iv_upd_status_t st;
+    json_object    *d;
+    char            ver[IV_UPD_VER_MAX];
+    char            prev[IV_UPD_VER_MAX];
+
+    ota_cfg_of(ctx, &c);
+    iv_upd_status(&c, &st);
+    iv_ota_ver_format(st.version, ver, sizeof ver);
+    iv_ota_ver_format(st.previous, prev, sizeof prev);
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "pending", json_object_new_boolean(st.pending != 0 ? 1 : 0));
+    json_object_object_add(d, "active", json_object_new_boolean(st.active != 0 ? 1 : 0));
+    json_object_object_add(d, "state",
+                           json_object_new_string(st.state[0] != '\0' ? st.state : "-"));
+    json_object_object_add(d, "version", json_object_new_string(ver));
+    json_object_object_add(d, "previous", json_object_new_string(prev));
+    json_object_object_add(d, "bootcount", json_object_new_int((int)st.bootcount));
+    json_object_object_add(d, "max_boot", json_object_new_int((int)st.max_boot));
+    json_object_object_add(d, "rollbacks", json_object_new_int((int)st.rollbacks));
+    json_object_object_add(d, "last_event",
+                           json_object_new_string(st.last_event[0] != '\0' ? st.last_event : "-"));
+    json_object_object_add(d, "last_reason",
+                           json_object_new_string(st.last_reason[0] != '\0' ? st.last_reason : "-"));
+    json_object_object_add(d, "current",
+                           json_object_new_string(st.current_dir[0] != '\0' ? st.current_dir : "-"));
+    return rsp_data(d, out, cap, out_len);
+}
+
+/* 落一个"请装这个包"的请求。**本方法不做安装**：包必须已经落在 <data_root>/ota/ 下，
+ * 真正改盘的安装由 monitor.sh 拉起 ivsbox-updater 完成（理由见 iv_upd.h 里
+ * iv_upd_request_write 的注释：危险动作要有自己的进程生命周期）。 */
+static int m_ota_request(const iv_ctl_ctx_t *ctx, json_object *p, char *out, size_t cap,
+                         size_t *out_len)
+{
+    iv_upd_cfg_t    c;
+    iv_upd_reason_t why = IV_UPD_OK;
+    const char     *path = param_str(p, "path");
+    json_object    *v = NULL;
+    json_object    *d;
+    int             restart = 0;
+    int             rc;
+
+    if (path == NULL)
+        return rsp_err(IV_EINVAL, "missing path", out, cap, out_len);
+    if (p != NULL && json_object_object_get_ex(p, "restart", &v) && v != NULL)
+        restart = json_object_get_boolean(v) ? 1 : 0;
+
+    ota_cfg_of(ctx, &c);
+    rc = iv_upd_request_write(&c, path, restart, &why);
+    if (rc != IV_OK)
+        return rsp_err(rc, iv_upd_reason_name(why), out, cap, out_len);
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "accepted", json_object_new_boolean(1));
+    json_object_object_add(d, "restart", json_object_new_boolean(restart != 0 ? 1 : 0));
+    json_object_object_add(d, "note", json_object_new_string(
+                                          "install 由 monitor.sh 拉起 ivsbox-updater 执行；进度查 ota.status"));
+    return rsp_data(d, out, cap, out_len);
+}
+
 /* ============================ 入口 ============================ */
 
 int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
@@ -1173,6 +1257,10 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_media_record_stop(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "record.status") == 0)
         rc = m_media_record_status(ctx, params, out, out_cap, out_len);
+    else if (strcmp(method, "ota.status") == 0)
+        rc = m_ota_status(ctx, out, out_cap, out_len);
+    else if (strcmp(method, "ota.request") == 0)
+        rc = m_ota_request(ctx, params, out, out_cap, out_len);
     else
         rc = IV_ENOTSUP; /* **不写 out**，由调用方静默丢弃 */
 

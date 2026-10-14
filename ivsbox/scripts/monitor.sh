@@ -64,12 +64,29 @@ WINDOW_S=${IVSBOX_RESTART_WINDOW:-300}
 COOLDOWN_S=${IVSBOX_FAILSAFE_COOLDOWN:-1800}
 POLL_S=${IVSBOX_POLL_S:-5}
 
+# ---- OTA / 升级自检（M7-S7.2 ＋ S7.3）----
+# 升级器与就绪标记的路径与 scripts/ivsbox-run.sh、src/app/main.c 保持一致。
+IVSBOX_UPD=${IVSBOX_UPD:-$IVSBOX_APP_DIR/bin/ivsbox-updater}
+IVSBOX_READY_MARK=${IVSBOX_READY_MARK:-/tmp/ivsbox-ready}
+# 升级自检窗口：新版拉起后多久还没落下就绪标记，就判定失败并回滚。
+# 必须显著大于"装配完成所需时间"（配置/DB/通道/agent/健康线程），也不能大到让
+# 现场干等；120 s 是"慢速存储 + 冷启动"的宽松上界。
+IVSBOX_UPGRADE_TIMEOUT=${IVSBOX_UPGRADE_TIMEOUT:-120}
+# 自检判失败后停止当前实例的宽容期：先 TERM，等这么久再不退就 KILL。
+# 为什么不能只 TERM：卡死的实例（T 态 / 死循环不响应信号）TERM 不动它，而"停不掉"
+# 会让回滚**只在下次开机才生效** —— 与 S7.3"尽快把业务拉回旧版本"的意图正好相反。
+IVSBOX_BOOT_KILL_GRACE_S=${IVSBOX_BOOT_KILL_GRACE_S:-5}
+# ivsboxd 落下的"请装这个包"请求（由本地通道的 ota.request 方法写）。
+OTA_REQUEST=$IVSBOX_HOME/ota/request
+
 # 状态文件是单行三列：`<window_start_mono> <restarts> <failsafe_until_mono>`，
 # 全部是 /proc/uptime 的整数秒（见文件头"时间基准"）。读入后逐列做"是不是纯数字"
 # 的兜底：状态文件被写坏/复位打断写半截时按"零历史"处理，绝不让坏文件卡死守护循环。
 WS=0
 RC=0
 FS=0
+# 本实例的启动时刻（单调秒），用于升级自检超时判定；0 表示"还没拉起过"。
+BOOT_T0=0
 
 mono_now() {
     cut -d. -f1 /proc/uptime 2>/dev/null
@@ -151,19 +168,92 @@ while true; do
         else
             RC=$((RC + 1))
             state_write "$WS" "$RC" "$FS"
-            # 用 `( ... ) &` + `exec`：子 shell 被 exec 成 ivsboxd 本体，$! 即 ivsboxd 的真实 pid。
-            # 不能写 `cd "$IVSBOX_APP_DIR" && ./bin/ivsboxd ... &` —— `&` 作用于整条 AND 列表，
-            # 会多留一个常驻的 monitor.sh 空壳进程，且 $! 拿到的是空壳而不是 ivsboxd 的 pid。
-            ( cd "$IVSBOX_APP_DIR" && exec ./bin/ivsboxd >/dev/null 2>&1 ) &
+            # 用 `( ... ) &` + `exec`：子 shell 被 exec 成**启动包装脚本**，包装脚本再
+            # exec 成 ivsboxd 本体 —— `$!` 始终是同一个 pid（M7-S7.3 起改走包装脚本：
+            # 由它按 bootcount 决定这一次该起哪个版本目录，见 scripts/ivsbox-run.sh）。
+            # 不能写 `cd "$IVSBOX_APP_DIR" && ./scripts/ivsbox-run.sh &` —— `&` 作用于
+            # 整条 AND 列表，会多留一个常驻的 monitor.sh 空壳进程，且 $! 拿到的是空壳。
+            # 拉起前**同步**清掉就绪标记 —— 不能只靠包装脚本自己删。包装脚本的删除
+            # 发生在被 fork 出来的子进程里，本圈轮询读标记时它可能还没被调度；若上一
+            # 实例恰好"落下标记后立刻崩溃"，本圈就会把**它的**标记当成新版的战绩，给
+            # 一个反复崩溃的新版盖上"已确认" —— bootcount 归零，回滚保护整个失效。
+            rm -f "$IVSBOX_READY_MARK" 2>/dev/null || true
+            # 把本脚本解析出来的落点**显式传给**包装脚本。包装脚本的同名变量默认值与这里
+            # 恰好一致，但"恰好一致"不是契约：一旦现场用 IVSBOX_APP_DIR 改掉落点，包装
+            # 脚本会继续读它自己的默认值 /opt/ivsbox —— monitor 守着一个目录、启动包装去起
+            # 另一个目录（tests/upgrade-boot.sh u5 抓到的就是这条）。IVSBOX_READY_MARK 必须
+            # 一起传：否则上面那行 rm 删的是 A 文件、包装脚本删的是 B 文件。
+            # 变量赋值写在子 shell 里 —— 赋值进子 shell 环境、被 exec 出的进程继承，
+            # `$!` 仍与 exec 出来的主控是同一个 pid（pidfile 语义不变）。
+            ( IVSBOX_APP_ROOT="$IVSBOX_APP_DIR" \
+              IVSBOX_DATA_ROOT="$IVSBOX_HOME" \
+              IVSBOX_LOG_ROOT="$IVSBOX_LOG_ROOT" \
+              IVSBOX_READY_MARK="$IVSBOX_READY_MARK" \
+              exec "$IVSBOX_APP_DIR/scripts/ivsbox-run.sh" ) &
             # 回写 pidfile：monitor 是唯一拉起方，必须让 pidfile 始终指向真实进程。
             # 不写这一步，崩溃重启后 pidfile 仍是旧 pid，init 脚本的 stop 会打空、停不掉服务。
             echo $! > "$IVSBOX_PIDFILE" 2>/dev/null || true
+            # 升级自检从这一刻开始计时。每次重拉都**重新计时**：新版崩溃后被重拉，应该
+            # 按"这一次"算，而不是把上一实例已经等掉的时间累进来。
+            BOOT_T0=$now
         fi
     fi
 
-    if [ -f /tmp/ivsbox-upgrade.ready ]; then
-        # OTA 触发点：后续由 OTA 模块实现，当前保留占位
-        :
+    # ---- OTA 请求消费（M7-S7.2）----
+    # 分工：ivsboxd 只负责"收命令 + 落一个请求文件"（本地通道 ota.request，路径必须是
+    # 已经落在设备上的包）；**真正改盘的安装动作由本脚本拉起独立进程**完成。
+    # 为什么放在 monitor 而不是 ivsboxd 里：安装要停/换正在运行的程序，这段危险动作
+    # 需要它自己的生命周期 —— 不该继承主控的看门狗 fd，也不该在跑 reactor 的进程里阻塞。
+    if [ -f "$OTA_REQUEST" ] && [ -x "$IVSBOX_UPD" ]; then
+        req_pkg=""
+        req_restart=""
+        read -r req_pkg req_restart < "$OTA_REQUEST" 2>/dev/null || true
+        rm -f "$OTA_REQUEST"
+        case "$req_pkg" in
+        /*)
+            alert "OTA: 开始安装 $req_pkg (restart=${req_restart:-0})"
+            if [ "$req_restart" = "1" ]; then
+                "$IVSBOX_UPD" install "$req_pkg" --restart >> "$ALERT" 2>&1
+            else
+                "$IVSBOX_UPD" install "$req_pkg" >> "$ALERT" 2>&1
+            fi
+            alert "OTA: 安装结束 rc=$?"
+            ;;
+        *)
+            alert "OTA: 请求里的路径不是绝对路径，已丢弃：$req_pkg"
+            ;;
+        esac
+    fi
+
+    # ---- 升级自检确认（M7-S7.3）----
+    # 只在"存在待确认升级"时才判（status --pending）。判据用**就绪标记**而不是
+    # "进程还活着"：活着不等于自检通过 —— 配置/DB/通道/agent/健康线程任何一路没起来
+    # 都不该被确认；而"什么时候算真的起来了"只有 ivsboxd 自己知道（见 src/app/main.c）。
+    if [ "$BOOT_T0" -ne 0 ] && [ -x "$IVSBOX_UPD" ] && \
+       "$IVSBOX_UPD" status --pending --app-root "$IVSBOX_APP_DIR" --data-root "$IVSBOX_HOME" >/dev/null 2>&1; then
+        if [ -f "$IVSBOX_READY_MARK" ]; then
+            "$IVSBOX_UPD" boot-ok --app-root "$IVSBOX_APP_DIR" --data-root "$IVSBOX_HOME" >/dev/null 2>&1
+            rm -f "$IVSBOX_READY_MARK"
+            alert "upgrade confirmed: 就绪标记已出现，pending -> confirmed"
+        elif [ $((now - BOOT_T0)) -ge "$IVSBOX_UPGRADE_TIMEOUT" ]; then
+            alert "upgrade self-test TIMEOUT (${IVSBOX_UPGRADE_TIMEOUT}s) -- 回滚到 previous"
+            "$IVSBOX_UPD" boot-fail --app-root "$IVSBOX_APP_DIR" --data-root "$IVSBOX_HOME" >> "$ALERT" 2>&1
+            "$IVSBOX_UPD" status --app-root "$IVSBOX_APP_DIR" --data-root "$IVSBOX_HOME" >> "$ALERT" 2>&1
+            rm -f "$IVSBOX_READY_MARK"
+            # 停掉当前实例：下一圈轮询就会发现它没了，用回滚后的 current 重新拉起旧版本。
+            inst_pid=$(cat "$IVSBOX_PIDFILE" 2>/dev/null)
+            kill -TERM "$inst_pid" 2>/dev/null || true
+            # TERM 不退就 KILL（宽容期见 IVSBOX_BOOT_KILL_GRACE_S）。只 TERM 的话，一个
+            # "活着但永远不落标记"的半截实例会一直占着位子：monitor 看它还在就不再重拉，
+            # 于是回滚后的旧版本**永远起不来**。
+            sleep "$IVSBOX_BOOT_KILL_GRACE_S"
+            if [ -n "$inst_pid" ] && [ -r "/proc/$inst_pid/stat" ] && \
+               [ "$(cut -d' ' -f3 "/proc/$inst_pid/stat" 2>/dev/null)" != "Z" ]; then
+                alert "self-test TIMEOUT: 实例 pid=$inst_pid 未响应 TERM，升级为 KILL"
+                kill -KILL "$inst_pid" 2>/dev/null || true
+            fi
+            BOOT_T0=0
+        fi
     fi
 
     sleep "$POLL_S"

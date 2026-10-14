@@ -12,6 +12,7 @@
  */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <netpacket/packet.h>
 #include <signal.h>
@@ -35,6 +36,7 @@
 #include "ivsbox/iv_log.h"
 #include "ivsbox/iv_reactor.h"
 #include "ivsbox/iv_taskpool.h"
+#include "ivsbox/iv_upd.h"
 #include "ivsbox/iv_version.h"
 #include "ivsbox/iv_watchdog.h"
 
@@ -793,6 +795,41 @@ static int app_init(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * 就绪标记（M7-S7.3：升级自检的判据）
+ * ------------------------------------------------------------------------- */
+/* 装配全部走完之后落一个标记，启动包装脚本与 monitor 据此判定"这次启动真的起来了"：
+ * 有标记 ⇒ boot-ok（pending → confirmed）；超过自检窗口仍没标记 ⇒ boot-fail（回滚）。
+ *
+ * 口径（写清楚，不夸大）：判据覆盖 **ivsboxd 自身**的装配 —— 日志 / 配置 / SQLite /
+ * 慢任务池 / reactor / 本地通道 / 看门狗 / M3 业务装配 / 健康线程，即 app_init()
+ * 走到 `return 0` 的那一刻。**不含**独立的 ivsbox-media、ivsbox-web 进程（它们由各自
+ * 的 init 脚本守护，生命周期与主控无关），也不代表平台侧链路真的通 —— 那些属于
+ * §16.2 的联调场景，不该由一个开机标记冒充。
+ *
+ * 路径可用环境变量 IVSBOX_READY_MARK 覆盖（验证时指到临时目录）。写失败**不算致命**：
+ * 不写标记的后果是升级自检超时后回滚，那比"带病确认"安全。 */
+static void ready_mark_write(void)
+{
+    const char *path = getenv("IVSBOX_READY_MARK");
+    int         fd;
+
+    if (path == NULL || path[0] == '\0')
+        path = IV_UPD_READY_MARK_DEFAULT;
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        IV_LOG_W(APP_MOD, "ready mark create failed: %s (%s)", path, strerror(errno));
+        return;
+    }
+    if (write(fd, "1\n", 2u) != 2) {
+        IV_LOG_W(APP_MOD, "ready mark write failed: %s (%s)", path, strerror(errno));
+    } else {
+        (void)fsync(fd);
+        IV_LOG_I(APP_MOD, "ready mark written: %s", path);
+    }
+    (void)close(fd);
+}
+
+/* ---------------------------------------------------------------------------
  * 入口
  * ------------------------------------------------------------------------- */
 int main(int argc, char *argv[])
@@ -811,6 +848,9 @@ int main(int argc, char *argv[])
         fprintf(stderr, "ivsboxd init failed\n");
         return 1;
     }
+
+    /* 装配完成 ⇒ 落就绪标记（M7-S7.3 升级自检的判据，见函数注释） */
+    ready_mark_write();
 
     (void)iv_reactor_run(g_reactor);
 

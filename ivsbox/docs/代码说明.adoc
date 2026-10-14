@@ -43,6 +43,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M6-S5.5 收口 组播协议定稿：设备搜索 ＋ 设备 ID/MAC 配置 | 已实现（协议层重写 ＋ 工装双角色 ＋ 单测重写 ＋ 集成 7/7 ＋ 反向证伪 5/5） | 2026-10-14 12:28 | 按《蜂鸟物联打印软件协议20250220.xlsx》把自定义 `IVPR` 帧换成 **JSON over 组播**（`239.255.255.252:37200`），只实现 `search` 与 `update_mac`，其余 6 条静默；手写容错扫描器不用 json-c；`iv_prov_decide()` 纯决策；工具双角色 `--search`/`--set-id`。详见本文件文末 2026-10-14 12:28 节
 | M6-S6.5 前置 配置键接线：录像路数与 URL 表来源落地 | 已实现（`IV_CFG_ITEMS_MAX` 192 ＋ `camera.ch` 8 路 ＋ `camera.rec.*` ＋ `reboot_max` 0 ＋ `cfg_rec_sources()` 接线 ＋ 集成 8/8 ＋ 反向证伪 4/4） | 2026-10-14 14:50 | 纠正旧说法：`camera.ch.N.url`/`.record` **本就存在**，缺的是**没人读** ⇒ 新增 `cfg_rec_sources()`（url＋record **AND** 才进表）；**录像 8／探测 6／`CNS` 6** 三域独立不得一起抬。详见本文件文末 2026-10-14 14:50 节
 | M6-S6.4/S6.5 视频读取（HTTP Range 下载）＋ SD 卡策略 | 已实现（新增 `iv_storage` ＋ core `iv_sha256` ＋ `iv_web_media`；test/asan/tsan 35/35；集成 8/8＋1 SKIP；反向证伪 9/9；**方式一平台上传按协议未定不做**） | 2026-10-14 16:10 | S6.5＝`statfs` 巡检 ＋ 水位 85/90/95/70（升档即时、降档到 70% 才解除）＋ REC→ALARM→SNAP 删序 ＋ 有界 64 候选窗 ＋ 最近 120 s 切片不删；S6.4＝`/media` Range（206/416/ETag/If-Range/`?sha=1` 校验值/1 s 窗口限速/取消）。容量闸门 `iv_recctl_gate()` 由 agent 每拍喂。详见本文件文末 2026-10-14 16:10 节 |
+| M6 退出条件收口（§16.2 场景 6 ＋ SD 告警出口） | 已实现（VM 全量验证 ＋ 反向证伪 3 条；平台侧 `ERR` 上报卡跨端协商） | 2026-10-14 16:40 | 核实出**真缺口**：`iv_storage` 的 `fault/alarm` 此前**除单测无任何生产调用者**，`sys.overview`（架构 §9.1 总览页"SD 卡"＋媒体页"存储水位"的数据源）里没有 storage 段 ⇒ §16.2 场景 6 要求的"产生明确告警"落不了地。本轮把 `storage` 段接进 `sys.overview`（`build_storage()`）＋ 新增 `iv_storage_enabled()` 把"未启用"与"巡检过且正常"分开（未启用只给 `enabled:false`，不给零值字段冒充健康）。新增 `tests/integration/test_sd_fault_e2e.c`：私有 user+mount ns ＋ tmpfs，用 `IVSBOX_SD_ROOT` 把存储根指到"存在／不存在(拔卡)／`size=1M` tmpfs 灌满(写满)"三种受控位置，每种真拉起一次 `ivsboxd`，从本地通道验 `fault/alarm/level/allow_new/stop_rec` ＋ 告警日志行，并**三种情形都断言 `system.snapshot` 仍应答**（控制业务不受影响）。VM `test`/`asan`/`tsan` 各 35/35、`arm`/`package` rc=0、集成 **9 passed ＋ 1 SKIP**、**反向证伪 3/3 抓出**。*未做：平台 `ERR` 故障码上报 SD（`iv_err.h` 无 SD 码值、类型段 `0x4~0xF` 归属未冻结，卡跨端协商）；板端真机实测*。详见本文件文末 2026-10-14 16:40 节。 |
 |===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
@@ -1761,3 +1762,40 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 - **SD 挂载点**（板端事实）：默认 `/mnt/sdcard`（与 bird_media `defs.h` 同源），待 COM28 串口核对。
 - **`ivsbox-media` 的 host 版**因宿主机缺 `lib_x86` 静态库无法链接 —— `.gitignore` 忽略 `*.a`、工作目录只带 `lib_arm`（**既有基线**，非本轮引入）。
 - 板端真机实测（未覆盖事实）。
+
+
+== 2026-10-14 16:40 M6 退出条件收口（§16.2 场景 6 验收 ＋ SD 告警出口）
+
+=== 干了什么事
+
+* **补了一个真缺口**：`iv_storage` 的 `fault/alarm` 此前**除单测没有任何生产调用者**（`iv_storage_alarm()` 只被 `test_storage.c` 读），而 `sys.overview` —— 架构 §9.1 总览页"SD 卡"、媒体页"存储水位"的**唯一数据源** —— 里根本没有 storage 段。后果：§16.2 场景 6 要求的"**产生明确告警**"落不了地，SD 异常只留一行本地日志，Web/平台都看不到。
+* **出口**：`iv_ctl.c` 新增 `build_storage()`，把 `storage` 段挂进 `sys.overview`（`enabled/level/level_name/used_pct/fault/alarm/allow_new/stop_rec/rounds/deletes/del_bytes/faults`）。**恒给一个对象**：未启用时**只给** `enabled:false` —— 零值 `level/fault` 只是"没巡检过"，与"巡检过且正常"不是一回事，混在一起会让人把"没启用"读成"磁盘一切正常"。
+* **新增 `iv_storage_enabled()`**：把"已 init（本机启用了存储策略）"从一堆 NULL 安全的零值读数里显式分出来。
+* **场景 6 端到端验收**（`tests/integration/test_sd_fault_e2e.c`，自包含）：私有 user+mount ns ＋ tmpfs 造 `/mnt`、`/var/run`；`IVSBOX_SD_ROOT`（`iv_storage_root_resolve()` 的**开发/测试口子**，产线不设）把存储根指到三种受控位置；每种**真拉起一次 `build/host/ivsboxd`**，再从**本地通道**问 `sys.overview` / `system.snapshot`：
+** 根存在（空目录）⇒ `enabled=true / fault=0 / alarm=0 / level=0`
+** 根**不存在**（＝拔卡）⇒ `fault=1 / alarm=1 / allow_new=0 / stop_rec=1`，日志出现 `storage fault: mounted=0 ... (recording gated)`
+** 根挂 `size=1M` tmpfs 并**灌满**（＝写满）⇒ `level=3`(stop) / `alarm=1`，日志出现 `storage level ok -> stop`
+* **三种情形都断言 `system.snapshot` 仍应答 `"status":"ok"`** —— 这是"控制和平台业务继续运行"（场景 6 的前半句）在本地控制面上的**可观测证据**。
+* **不必等 30 s**：`iv_storage_step()` 见 `last_run_ms == 0` 就真跑一轮（主控起来第一拍即巡检），故每种情形几秒内即可断言。
+
+=== 怎么验证
+
+* VM `make test` / `asan` / `tsan` 各 **35/35**（0 FAIL，**0 sanitizer 报告**）；`make arm` rc=0 **零告警**，`build/arm/ivsboxd`、`ivsbox-web`、`ivsbox-media` 均为 ELF32 / `e_machine=0x28`(ARM)；`make package` rc=0。
+* **集成 9 passed ＋ 1 SKIP**（SKIP＝`test_media_e2e`：宿主机缺 `lib_x86` 静态库，`ivsbox-media` 的 host 版链不出来 —— **既有基线**，非本轮引入）。
+* **反向证伪 3/3 全部抓出**，每条**编译干净 → 用例变红 → 还原 → 复绿 → md5 对账一致**：
+** f1 `build_storage()` 不再输出 storage 段 ⇒ 单测 1 处 ＋ e2e 6 处 FAIL（三种情形 × "报出状态"与"enabled 为真"两断言）
+** f2 `fault`/`alarm` 恒 0 ⇒ e2e `sd gone` FAIL（且**只**命中 `sd gone` —— 写满情形断言的是 `level=3`，与 `fault/alarm` 无关，说明三条断言各盯不同判据）
+** f3 去掉"未启用提前返回"（零值字段冒充健康）⇒ 单测 FAIL
+
+=== 沉淀的纪律
+
+* **"没巡检过"与"巡检过且正常"必须在接口上分开**：零值读数看起来像健康。凡"未启用"状态，接口只报"未启用"，**不要**把一堆零值字段一起发出去。
+* **SKIP 不能当通过**：本轮验证脚本漏建 `ivsbox-web` 时，两条 Web 集成用例静默 SKIP 且退出 0，`make itest` 照样 rc=0 ⇒ 报数前必须**核对 SKIP 的条数与原因**。
+* **单测天然测不到的接线类缺陷，只有"真拉起进程"的集成用例抓得到**（本轮 `sys.overview` 的 storage 段属 `src/modules/`，单测能测协议外形，但"真 `ivsboxd` 在 SD 坏掉时是否仍应答"只有 e2e 能答）。
+
+=== 未做（如实登记）
+
+* **平台侧 `ERR` 故障码上报 SD**：`ivsbox/include/ivsbox/iv_err.h` 只有 ELEC/NET/SENSOR 三类，**SD/存储没有码值**，且该文件明确写明"类型段 `0x4~0xF` 归属**尚未冻结**、新增或调整前须与单片机侧对齐后同步" ⇒ **卡跨端协商**，不由本侧单方面定码值。
+* **S6.4 方式一**（设备主动向平台文件服务分片上传）—— 卡平台文件服务协议。
+* **场景 5 的真机部分**：真摄像机 RTSP 片段可被 `ffprobe` 解析且时间连续 —— 属真机现场（与 M4 退出条件同性质），只登记不推进。
+* 板端真机实测（未覆盖事实）。

@@ -263,6 +263,11 @@ int              iv_storage_fault(const iv_storage_t *s);     /* 1 = 未挂载/�
 int              iv_storage_used_pct(const iv_storage_t *s);
 void             iv_storage_stats(const iv_storage_t *s, iv_storage_stats_t *out);
 
+/* 1 = 已 init（本机启用了存储策略）。
+ * **必须与读数区分**：未 init 时 level=OK/fault=0/allow_new=1 看起来"健康"，
+ * 那只是零值，不是"巡检过且没问题"。上层的"SD 卡"视图靠这一位把两者分开。 */
+int              iv_storage_enabled(const iv_storage_t *s);
+
 /* 水位档位/故障的中文名（日志用；永不 NULL） */
 const char *iv_storage_level_name(int level);
 

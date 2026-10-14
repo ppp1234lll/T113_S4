@@ -88,6 +88,26 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
                        攻击面 —— 符号链接文件名完全合法，第一道逐段检查拦不住它）、缺失
                        404、限速用墙钟证明（去掉限速会立刻变红）、中途 cancel 后服务仍可用、
                        反复下载无 fd 泄漏。**不需要 ivsboxd**。
+  test_sd_fault_e2e.c  M6 退出条件 §16.2 场景 6 端到端（**自包含 ＋ 私有 user+mount ns**）：
+                       "SD 卡拔出或写满时，控制和平台业务继续运行并产生明确告警"。
+                       自己 `unshare -rm` 进私有 user+mount ns，把 `/mnt` 与 `/var/run`
+                       挂成 tmpfs，用 `IVSBOX_SD_ROOT`（`iv_storage_root_resolve()` 的
+                       开发/测试口子）把存储根指到三种受控位置，每种位置**真拉起一次
+                       `build/host/ivsboxd`**，再从**本地通道**问 `sys.overview` /
+                       `system.snapshot`：① 根存在（空目录）⇒ `enabled=true/fault=0/
+                       alarm=0/level=0`；② 根**不存在**（＝拔卡）⇒ `fault=1/alarm=1/
+                       allow_new=0/stop_rec=1`，日志出现 `storage fault: mounted=0`
+                       （带 `(recording gated)`）；③ 根挂在 `size=1M` 的 tmpfs 上并
+                       **灌满**（＝写满）⇒ `level=3`(stop)/`alarm=1`，日志出现
+                       `storage level ok -> stop`。**三种情形都断言 `system.snapshot`
+                       仍然应答 `"status":"ok"`** —— 这是"控制业务不受影响"的可观测
+                       证据。首轮巡检不必等 30 s（`iv_storage_step()` 见 `last_run_ms==0`
+                       即真跑一轮）。这条同时是**存储告警对外出口的回归网**：本次改动前
+                       `iv_storage_alarm()` 除单测无任何调用者、`sys.overview` 也没有
+                       `storage` 段，SD 异常只有本地日志、上层看不到。需
+                       `build/host/ivsboxd`（缺 ⇒ SKIP）；`unshare -rm` 不可用 ⇒ SKIP。
+                       平台侧 `ERR` 故障码上报**未接**（SD 码值在 `iv_err.h` 无槽位，
+                       类型段 `0x4~0xF` 归属待与单片机侧协商）⇒ 属真机/协议现场。
 
 【运行方式】
   # 只跑自包含用例（无需先起任何服务）

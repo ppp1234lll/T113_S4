@@ -193,6 +193,12 @@ int main(void)
     chk(rc == IV_OK && j != NULL, "c04: overview answered");
     chk(jobool(j, "ok", 0) == 1, "c04: ok true");
     chk(jodata(j) != NULL, "c04: has data object");
+    /* S6.5：总览里**恒有** storage 段；未挂 agent 时它**恰好**是 `{"enabled":false}`。
+     * 三个一起守住：① 出口没被删掉；② 未启用**不**被当成"体检通过"（`storage` 是
+     * build_overview 最后追加的成员，故它以 `}}` 收尾 —— 零值字段一旦被塞进来，
+     * 这个收尾就不再成立）；③ 键顺序未被无意改动。 */
+    chk(strstr(raw, "\"storage\":{\"enabled\":false}}") != NULL,
+        "c04: overview carries storage={enabled:false} and nothing else when no agent is attached");
     if (j != NULL)
         json_object_put(j);
 

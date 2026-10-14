@@ -322,6 +322,52 @@ static void add_status_view(json_object *d, const iv_report_t *rp)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * S6.5 存储视图（架构 §9.1：总览页列"SD 卡"，媒体页列"存储水位"）
+ *
+ * **它是 SD 异常唯一的对外出口**：在本次改动之前，`iv_storage` 的故障/告警
+ * 只落本地日志（`iv_storage_alarm()` 除了单测没有任何生产调用者），上层
+ * 完全看不到 ⇒ §16.2 场景 6 要求的"产生明确告警"无从体现。这里把档位、
+ * 故障、水位与统计一并交出去，Web 据此在总览页亮灯。
+ *
+ * **恒返回一个对象**（哪怕没启用）：`enabled=0` ＝ 本机未启用存储策略。
+ * 未启用时**不再给** level/used_pct 等零值字段 —— 那些零值是"没巡检"，
+ * 不是"巡检过且正常"，混在一起会让人把"没启用"读成"磁盘一切正常"。
+ *
+ * 平台侧 `ERR` 故障码上报**未接**：SD 故障码在 `iv_err.h` 里没有槽位
+ * （类型段 `0x4~0xF` 归属未冻结，须与单片机侧协商）⇒ 如实登记为卡点。
+ * ------------------------------------------------------------------------- */
+static json_object *build_storage(const iv_ctl_ctx_t *ctx)
+{
+    json_object       *s  = json_object_new_object();
+    iv_storage_t      *st = (ctx->agent != NULL) ? iv_agent_storage(ctx->agent) : NULL;
+    iv_storage_stats_t ss;
+
+    if (s == NULL)
+        return NULL;
+
+    json_object_object_add(s, "enabled", json_object_new_boolean(iv_storage_enabled(st)));
+    if (!iv_storage_enabled(st))
+        return s;
+
+    memset(&ss, 0, sizeof ss);
+    iv_storage_stats(st, &ss);
+
+    json_object_object_add(s, "level", json_object_new_int((int)iv_storage_level(st)));
+    json_object_object_add(s, "level_name",
+                           json_object_new_string(iv_storage_level_name(iv_storage_level(st))));
+    json_object_object_add(s, "used_pct", json_object_new_int(iv_storage_used_pct(st)));
+    json_object_object_add(s, "fault", json_object_new_int(iv_storage_fault(st)));
+    json_object_object_add(s, "alarm", json_object_new_int(iv_storage_alarm(st)));
+    json_object_object_add(s, "allow_new", json_object_new_int(iv_storage_allow_new(st)));
+    json_object_object_add(s, "stop_rec", json_object_new_int(iv_storage_stop_rec(st)));
+    json_object_object_add(s, "rounds", json_object_new_int64((int64_t)ss.rounds));
+    json_object_object_add(s, "deletes", json_object_new_int64((int64_t)ss.deletes));
+    json_object_object_add(s, "del_bytes", json_object_new_int64((int64_t)ss.del_bytes));
+    json_object_object_add(s, "faults", json_object_new_int64((int64_t)ss.faults));
+    return s;
+}
+
 static json_object *build_overview(const iv_ctl_ctx_t *ctx)
 {
     json_object *d   = json_object_new_object();
@@ -401,6 +447,14 @@ static json_object *build_overview(const iv_ctl_ctx_t *ctx)
     if (ctx->cfg != NULL)
         json_object_object_add(d, "config_version",
                                json_object_new_int64((int64_t)iv_config_version(ctx->cfg)));
+
+    /* S6.5：SD 卡 / 存储水位（架构 §9.1 总览页）。恒给一个对象，见 build_storage()。 */
+    {
+        json_object *sv = build_storage(ctx);
+
+        if (sv != NULL)
+            json_object_object_add(d, "storage", sv);
+    }
     return d;
 }
 

@@ -417,6 +417,11 @@ void iv_storage_stats(const iv_storage_t *s, iv_storage_stats_t *out)
     *out = s->st;
 }
 
+int iv_storage_enabled(const iv_storage_t *s)
+{
+    return (s != NULL && s->inited) ? 1 : 0;
+}
+
 const char *iv_storage_level_name(int level)
 {
     switch (level) {

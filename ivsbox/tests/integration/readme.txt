@@ -52,6 +52,14 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
                        清掉（桥接↔对端状态同步的端到端证据）、capture 结论与磁盘一致
                        （VM 无 /dev/video0 ⇒ 判 fail，环境有摄像头 ⇒ 判 ok，两种环境
                        都不假红）。无需 ivsboxd。**并行跑两份会因端口冲突假红**。
+  test_prov_e2e.c      ivsbox-provision 设备侧 × 工装侧 端到端（M6/S5.5 协议定稿，
+                       **自包含**）：自己 fork+execl 拉起设备侧（`--dry-run`，不写裸
+                       分区），自己扮演工装侧（回环 UDP ＋ libivmodules 组包函数）。
+                       e01 搜索应答字段与启动参数一致；e02 update_mac 回 success 且
+                       身份已换成新 ID/MAC；e03 坏 MAC 回 fault；e04 未实现指令
+                       （update_relay）**一个字节都不回**；e05 垃圾包静默且进程不罢工。
+                       端口自 37201 起自动挑（占用则顺延，全占 ⇒ SKIP 退出 0）；
+                       二进制缺失 ⇒ SKIP。**不需要工厂标记、不需要 ivsboxd**。
 
 【运行方式】
   # 只跑自包含用例（无需先起任何服务）

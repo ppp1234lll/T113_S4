@@ -40,9 +40,8 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M5-S5.2/S5.4 本地通道方法路由 iv_ctl ＋ 配置事务（版本门） | 已实现（VM 全量验证 ＋ 反向证伪 2 条；审计落 control.db、事务通知接线待补） | 2026-10-14 09:10 | `iv_ctl.h`/`iv_ctl.c` 13 方法；`system.snapshot` 老格式与"未知方法静默"两条老契约保住；`config.apply` 版本门＋失败回滚；`main.c` 多客户端＋reboot/settime 钩子；单测 `test_ctl.c` 15 组 |
 | M5-S5.5 ivsbox-provision 组播出厂工装 | 已实现（VM 全量验证 ＋ 反向证伪 1 条；组播默认值与报文格式待用户冻结） | 2026-10-14 09:10 | `iv_provision.h`/`iv_provision.c` ＋ `tools/provision`；56 B 身份记录＋XOR 混淆＋裸分区直写（无 `O_CREAT`）；`IVPR` 报文四道校验；工厂标记闸门；单测 `test_prov.c` |
 | M6-S6.0~S6.3 视频链路（收编 bird_media ＋ 回环桥接 ＋ 断网录像） | 已实现（VM 全量验证 ＋ 集成 ＋ 反向证伪 5 条；S6.4/S6.5/S6.6 与 URL 表生产来源待补） | 2026-10-14 11:01 | `ivsbox/media/` 收编 bird_media（零改动）＋ `iv_media`/`iv_recctl` 新模块 ＋ `iv_ctl` 4 方法 ＋ agent/main 装配 ＋ `monitor-media.sh`/`S67ivsboxmedia`；test 33/33、集成 6/6、反向证伪 5/5。详见本文件文末 2026-10-14 11:01 节
+| M6-S5.5 收口 组播协议定稿：设备搜索 ＋ 设备 ID/MAC 配置 | 已实现（协议层重写 ＋ 工装双角色 ＋ 单测重写 ＋ 集成 7/7 ＋ 反向证伪 5/5） | 2026-10-14 12:28 | 按《蜂鸟物联打印软件协议20250220.xlsx》把自定义 `IVPR` 帧换成 **JSON over 组播**（`239.255.255.252:37200`），只实现 `search` 与 `update_mac`，其余 6 条静默；手写容错扫描器不用 json-c；`iv_prov_decide()` 纯决策；工具双角色 `--search`/`--set-id`。详见本文件文末 2026-10-14 12:28 节
 |===
-
-== 2026-10-09 11:38|===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
 
@@ -1668,4 +1667,26 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 === 未做（登记）
 
 - S6.4 视频读取（卡平台文件服务协议）、S6.5 SD 卡策略、S6.6 音频（卡 §18.6）、RTSP URL 表生产来源（卡 §18.5＋各路地址/账号）、bird_media 无鉴权（M8）、板端实测（未覆盖事实）。
+
+== 2026-10-14 12:28 S5.5 组播协议定稿（设备搜索 ＋ 设备ID/MAC 配置）
+
+=== 干了什么事
+
+- *协议权威*：用户给定《蜂鸟物联打印软件协议20250220.xlsx》；原自定义 `IVPR` 二进制帧整套作废，改 **JSON over UDP 组播**，组播 `239.255.255.252:37200`（`249:65000` 属配置IP/服务器地址，仅登记常量）。
+- *报文*：`{"info":{"tid":"<6位HEX>","date":"YYYYMMDD"},"data":{"types":"<指令>",...}}`；写出严格 JSON，读入容忍尾逗号/键序/空白/未知键；手写扫描器（不用 json-c，分层纪律）。
+- *只做两条*：`search`（仅答广播 `000000` 或点名，回 tnam/mcu/mod/sv/mac/ip/nm/gw/inip/outip/iccid）；`update_mac`（`tid` 按**新设备 ID**写入、`000000` 只改 MAC；mac 三种分隔符都认、非法回 `fault` 不落盘）。其余 6 条指令**静默**。
+- *决策与 IO 分离*：`iv_prov_decide()` 纯函数；工具双角色（设备侧监听/应答/写 `private`；工装侧 `--search`/`--set-id`/`--watch`），`--reply-unicast` 回请求来源。
+
+=== 验证
+
+- VM：`test`/`asan`/`tsan` 各 33/33；`analyze`/`arm` 零告警；集成 **7/7**（新增 test_prov_e2e 真拉起设备侧进程）；反向证伪 **5/5**；package 完整。
+
+=== 抓出的真缺陷（集成用例的功劳）
+
+- 设备侧只给 `--mac` 时身份 `devid=0` ⇒ search 回包 `tid=000000`；修＝回包 tid 一律以本机 tid 为准。
+- 子进程 stdout 接管道全缓冲 ⇒ 「listening」行不可见，脚本无法判就绪；修＝行缓冲。
+
+=== 未做（登记）
+
+- 其余 6 条指令；`iccid`/`mcu`/`inip`/`outip`/`name`/`password` 字段来源；板端真机实测（未覆盖事实）；`update_mac` 的 `tid` 语义待用户确认。
 

@@ -44,6 +44,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M6-S6.5 前置 配置键接线：录像路数与 URL 表来源落地 | 已实现（`IV_CFG_ITEMS_MAX` 192 ＋ `camera.ch` 8 路 ＋ `camera.rec.*` ＋ `reboot_max` 0 ＋ `cfg_rec_sources()` 接线 ＋ 集成 8/8 ＋ 反向证伪 4/4） | 2026-10-14 14:50 | 纠正旧说法：`camera.ch.N.url`/`.record` **本就存在**，缺的是**没人读** ⇒ 新增 `cfg_rec_sources()`（url＋record **AND** 才进表）；**录像 8／探测 6／`CNS` 6** 三域独立不得一起抬。详见本文件文末 2026-10-14 14:50 节
 | M6-S6.4/S6.5 视频读取（HTTP Range 下载）＋ SD 卡策略 | 已实现（新增 `iv_storage` ＋ core `iv_sha256` ＋ `iv_web_media`；test/asan/tsan 35/35；集成 8/8＋1 SKIP；反向证伪 9/9；**方式一平台上传按协议未定不做**） | 2026-10-14 16:10 | S6.5＝`statfs` 巡检 ＋ 水位 85/90/95/70（升档即时、降档到 70% 才解除）＋ REC→ALARM→SNAP 删序 ＋ 有界 64 候选窗 ＋ 最近 120 s 切片不删；S6.4＝`/media` Range（206/416/ETag/If-Range/`?sha=1` 校验值/1 s 窗口限速/取消）。容量闸门 `iv_recctl_gate()` 由 agent 每拍喂。详见本文件文末 2026-10-14 16:10 节 |
 | M6 退出条件收口（§16.2 场景 6 ＋ SD 告警出口） | 已实现（VM 全量验证 ＋ 反向证伪 3 条；平台侧 `ERR` 上报卡跨端协商） | 2026-10-14 16:40 | 核实出**真缺口**：`iv_storage` 的 `fault/alarm` 此前**除单测无任何生产调用者**，`sys.overview`（架构 §9.1 总览页"SD 卡"＋媒体页"存储水位"的数据源）里没有 storage 段 ⇒ §16.2 场景 6 要求的"产生明确告警"落不了地。本轮把 `storage` 段接进 `sys.overview`（`build_storage()`）＋ 新增 `iv_storage_enabled()` 把"未启用"与"巡检过且正常"分开（未启用只给 `enabled:false`，不给零值字段冒充健康）。新增 `tests/integration/test_sd_fault_e2e.c`：私有 user+mount ns ＋ tmpfs，用 `IVSBOX_SD_ROOT` 把存储根指到"存在／不存在(拔卡)／`size=1M` tmpfs 灌满(写满)"三种受控位置，每种真拉起一次 `ivsboxd`，从本地通道验 `fault/alarm/level/allow_new/stop_rec` ＋ 告警日志行，并**三种情形都断言 `system.snapshot` 仍应答**（控制业务不受影响）。VM `test`/`asan`/`tsan` 各 35/35、`arm`/`package` rc=0、集成 **9 passed ＋ 1 SKIP**、**反向证伪 3/3 抓出**。*未做：平台 `ERR` 故障码上报 SD（`iv_err.h` 无 SD 码值、类型段 `0x4~0xF` 归属未冻结，卡跨端协商）；板端真机实测*。详见本文件文末 2026-10-14 16:40 节。 |
+| M7-S7.1 升级包格式与验签器（`iv_ota`） | 已实现（模块 ＋ 单测 13 组 ＋ VM 全量验证 ＋ 反向证伪 10 条；**装配接线归 S7.2、量产公钥未部署、板端未复跑**） | 2026-10-14 17:30 | 新增 `iv_ota.h` / `src/modules/ota/iv_ota.c` / `tests/unit/test_ota.c`。包＝头(16B)＋清单(行式 ASCII)＋负载＋Ed25519 签名(64B)，**总长严格相等**、不做宽容解析；九步验签（结构→清单→负载长度→公钥→**签名**→型号→硬件区间→软件版本→逐文件 SHA-256），签名通过前不采信清单语义。签名用 OpenSSL EVP（架构 §14"复用可信密码库"；板端 sysroot 实测 OpenSSL 1.1.1a 有 `EVP_PKEY_ED25519`），**不自写椭圆曲线**；校验值仍用 core 的 `iv_sha256`。两端 `LDLIBS` 追加 `-lcrypto`，ARM 产物 `NEEDED` 已见 `libcrypto.so.1.1`。**fail-closed**：内置公钥未部署时返 `IV_ENOTSUP` 且输出全零 ⇒ 拒绝一切包（不给假密钥）。VM `test`/`asan`/`tsan` 36/36、`host`/`analyze`/`arm` rc=0 零告警；反向证伪 10/10 抓出。详见本文件文末 2026-10-14 17:30 节。 |
 |===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
@@ -1799,3 +1800,47 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 * **S6.4 方式一**（设备主动向平台文件服务分片上传）—— 卡平台文件服务协议。
 * **场景 5 的真机部分**：真摄像机 RTSP 片段可被 `ffprobe` 解析且时间连续 —— 属真机现场（与 M4 退出条件同性质），只登记不推进。
 * 板端真机实测（未覆盖事实）。
+
+== M7-S7.1 升级包格式与验签器（`iv_ota`）
+
+=== 干了什么事
+
+* 新增 `include/ivsbox/iv_ota.h`（契约）、`src/modules/ota/iv_ota.c`（实现，进 `libivmodules`）、`tests/unit/test_ota.c`（13 组用例）。**落点是 modules 而非 core**：本模块用第三方库（OpenSSL），而 core 纪律是"只允许 libc"。
+* **包格式**（全部小端）：`magic[8]="IVSOTA01"` ＋ `u32 manifest_len` ＋ `u32 payload_len` ＋ 清单 ＋ 负载 ＋ `sig[64]`（Ed25519，**覆盖签名之前的全部字节**）。**总长必须严格等于 `16+manifest_len+payload_len+64`**。
+* **清单**＝行式 ASCII（`key=value`，末行也必须 `\n`）：必需键 `pkgfmt/model/hwmin/hwmax/version/minrollback/files` ＋ N 行 `file=<相对路径>:<size>:<sha256>`。未知键、重复单值键、`files=` 与 `file=` 行数不等、大写 hex、无尾换行、空行/空键一律判非法 —— **不做宽容解析**（包是我们自己的格式，容忍只会让验签器与安装器对"包内容"理解不一致）。
+* **路径围栏**（`path_ok()`）：拒绝对路径、空分量（前导/尾随/连续 `/`）、`.` 与 `..` 分量、`\` 与 `:`、控制字符；放行 `ivsbox.json` 这类含点的正常文件名。**故意比 POSIX 严**：误拒可接受，误放不可接受。
+* **API**：`iv_ota_ver_parse/ver_cmp/ver_format`、`iv_ota_manifest_parse`（纯函数、**不改输入缓冲**，因为文件版是只读 mmap）、`iv_ota_verify_mem`、`iv_ota_verify_file`（`open`+`fstat`+`mmap(MAP_PRIVATE)`，**不写、不创建、不改文件**；512 MB 上限挡畸形容器）、`iv_ota_builtin_pubkey`、`iv_ota_reason_name`。
+* **九步验签，顺序固定**：结构 → 清单 → 负载长度 vs 清单合计 → 公钥 → **签名** → 型号 → 硬件版本区间 → 软件版本（包版本必须严格大于本机、且本机 ≥ `minrollback`）→ 逐文件 SHA-256。前两步必须在验签前完成（否则读不到要验的字节），**第 3 步之后到签名通过之前不再有任何"看内容"的判断**：清单在验签通过前一律当攻击者可控数据。
+* **密码学分工**：升级包**校验值**＝core 自写 `iv_sha256`；**发布者认证**＝OpenSSL EVP Ed25519（modules）。**不自写椭圆曲线** —— 架构 §14 要求"复用项目现有可信密码库"，且**实测**板端 sysroot 就有 OpenSSL **1.1.1a**（`usr/lib/libcrypto.so.1.1`、`libcrypto.a`、`usr/include/openssl/evp.h` 有 `EVP_PKEY_ED25519`），宿主（编译 VM）有 **3.0.2** ＋ `libssl-dev`。两端 `LDLIBS` 追加 `-lcrypto`。
+* **fail-closed**：`iv_ota_builtin_pubkey()` 当前返回 `IV_ENOTSUP` 且把输出清零（量产公钥未部署）。**刻意不给一把假密钥**：假密钥的效果同样是"全拒"，但调用方拿不到"是我没配密钥"这个信息，现场会把"密钥未部署"误判成"包被篡改"。`pubkey_usable()` 另外把全零公钥也当"未配置"（拒因 `no-pubkey`）。
+
+=== 解决什么问题
+
+* §16.2 场景 9 要求"未签名或型号不匹配的升级包必须被拒绝"，而在此之前工程里**连"什么算一个合法包"都没定义**（`src/modules/ota/` 只有一个 readme 占位）⇒ 该判据落不了地。本步把格式与拒绝条件钉死，并把**每条拒绝理由**都做成可被单测单独触发、且能被反向证伪的点。
+* `ivsbox-updater`（S7.2）将来只需调一个 `iv_ota_verify_file()` 并读 `reason` 决定怎么上报，不必自己解析字节。
+
+=== 影响范围
+
+* **新增运行期依赖**：`-lcrypto`（宿主与板端）。ARM 产物 `readelf -d` 已见 `NEEDED libcrypto.so.1.1`；**板端 rootfs 是否真有该 so 待现场核对**（板子不在线），缺则改用 sysroot 里的 `libcrypto.a` 静态链。
+* `src/modules/ota/iv_ota.c` 进 `libivmodules.a` ⇒ `ivsboxd` / `ivsbox-updater` / 全部单测都会链到它。**本步不改任何既有调用路径**：没有装配层接线（收命令 / 下载 / 上报进度随 S7.2），故既有功能行为零变化。
+* **未覆盖 / TODO**：装配层接线（S7.2）；量产公钥部署（发布侧产出公钥，私钥不入库）；`mmap` 只读区在"并发截断"下会 `SIGBUS` —— S7.2 把包下到临时目录 + 独占命名即可回避，已登记。
+
+=== 怎么验证
+
+* VM（编译机 `192.168.2.115`）全量：`make test` **36/36**（新增 `test_ota` 通过，其余 35 条无回归；SKIP 1 条＝既有 `no IFF_UP-clear iface to probe`）、`make asan` 与 `setarch -R make tsan` **36/36 零 sanitizer 报告**、`make host` rc=0（`ivsboxd`/`ivsbox-web`/`ivsbox-media`/`ivsbox-updater`/`ivsbox-provision` 全出）、`make analyze` rc=0、`make arm` rc=0 **零告警**且产物为 ARM EABI5、新文件单独 `-fanalyzer` 零报告。
+* **反向证伪 10/10 全部抓出**（每条：编译干净 → 用例变红 → 还原 → 复绿）：型号比对、签名校验、硬件区间、公钥判定、降级判断、`minrollback` 判断、逐文件 SHA-256、负载长度核对、路径围栏、magic 校验。
+** 首轮 `负载长度核对` 变异是 **0 FAIL**（被后面第 9 步的摘要核对"吸收"了，属**等价变异、不算证据**）⇒ 补一条独立用例（造一个"负载比清单合计长 1 字节、且用真密钥重新签名"的包：逐文件摘要与签名都成立，只有第 3 步能拦）后复验为 **1 FAIL**。
+* **未验证（如实登记）**：**板端未复跑** —— 板子（原 `192.168.2.120`）不在线；本机与编译 VM 对 `192.168.2.0/24` 全段 ping ＋ 对 9 台在线主机逐个试 key 登录，均无开发板响应。故 ARM 侧证据**只到"交叉编译零告警 ＋ `NEEDED` 含 `libcrypto.so.1.1`"**，缺"ARM 版单测输出与宿主逐字一致"与"板端 libcrypto 实际存在"两条。
+
+=== 沉淀的纪律
+
+* **"复用项目现有可信密码库"要先查板端，再决定要不要自研**：本步先用两条命令证实 sysroot 里有 OpenSSL 1.1.1a 与 `EVP_PKEY_ED25519`，才敢照架构口径用库 —— 反过来，若板端真的没有，自写 Ed25519 会是完全不同量级的风险与工作量。
+* **"能拒"比"能过"难写**：13 组用例里 12 组都在问"这包该不该被拒"；把"看不懂的输入一律判非法"写死，比留几个宽容分支安全得多。
+* **等价变异要认出来**：实现里两条检查互相覆盖时，其中一条的变异会 0 FAIL —— 那不是"用例没用"，而是**这条检查目前无法被观察**，必须补一条只能由它拦下的用例，否则它就是"删掉也不会有人发现"的死检查。
+* **未部署的密钥不要用假值顶着**：假密钥让行为"看起来一样"（都是拒），却把"密钥没部署"与"包被篡改"两个完全不同的现场问题搅在一起。
+
+=== 未做（如实登记）
+
+* **装配层接线**：`ivsboxd` 收升级命令 / 下载 / 上报进度 —— 属 M7-S7.2（本模块已就绪，等着被调）。
+* **量产发布公钥**：`iv_ota_builtin_pubkey()` 是占位（`IV_ENOTSUP` ＋ 全零输出）；公钥由发布侧密钥工程产出后写入 `src/modules/ota/`，**私钥绝不入库**（规则 3 第 6 条）。
+* **板端真机实测**（板子不在线，未覆盖事实）。

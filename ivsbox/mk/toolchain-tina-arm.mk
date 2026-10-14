@@ -21,9 +21,15 @@ LDFLAGS := $(LDFLAGS_COMMON)
 # —— 典型的"VM 绿、板端挂"。
 # -ljson-c：M1-S8 配置模块需要。sysroot 里只有 libjson-c.so / .so.4、**没有 .a**
 # ⇒ 板端对它是动态依赖，运行时由 rootfs 的 libjson-c.so.4 提供（已确认存在）。
-LDLIBS  := -lpthread -ljson-c -lsqlite3 -lm
+LDLIBS  := -lpthread -ljson-c -lsqlite3 -lm -lcrypto
 # -lm：M2-S2.5 的 iv_gps 用 cos/sqrt 做位移判定的近似换算（equirectangular）。
 # 板端 rootfs 的 glibc 自带 libm.so.6（已随 libjson-c / libsqlite3 一并在板端验证）。
+# -lcrypto：M7-S7.1 的 OTA 验签用 OpenSSL EVP 的 Ed25519。**版本敏感**：Ed25519
+# 要 OpenSSL >= 1.1.1。sysroot 实测（2026-10-14）
+#   /opt/EmbedSky/Tina/arm-buildroot-linux-gnueabi/sysroot/usr/lib/libcrypto.so.1.1
+#   OPENSSL_VERSION_TEXT "OpenSSL 1.1.1a"、usr/include/openssl/evp.h 有 EVP_PKEY_ED25519
+# ⇒ 交叉链接可用。**板端 rootfs 是否装着 libcrypto.so.1.1 待现场核对**（板子当时不在线），
+# 已登记在修改记录；若板端缺库，改用 sysroot 里的 libcrypto.a 静态链（同目录已具备）。
 
 ifdef SYSROOT
 CFLAGS  += --sysroot=$(SYSROOT)

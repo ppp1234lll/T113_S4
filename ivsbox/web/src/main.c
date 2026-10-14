@@ -24,6 +24,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -79,6 +80,7 @@ static const char *status_text(int s)
 {
     switch (s) {
     case 200: return "OK";
+    case 206: return "Partial Content";
     case 400: return "Bad Request";
     case 401: return "Unauthorized";
     case 403: return "Forbidden";
@@ -86,6 +88,7 @@ static const char *status_text(int s)
     case 405: return "Method Not Allowed";
     case 413: return "Payload Too Large";
     case 414: return "URI Too Long";
+    case 416: return "Range Not Satisfiable";
     case 500: return "Internal Server Error";
     case 503: return "Service Unavailable";
     default:  return "Error";
@@ -99,6 +102,11 @@ static void conn_close(int slot)
 {
     if (slot < 0 || slot >= (int)IV_WEB_MAX_CONN)
         return;
+    /* S6.4：文件体可能还开着 fd，先关它再关连接。 */
+    if (g_conn[slot].send_fd >= 0) {
+        (void)close(g_conn[slot].send_fd);
+        g_conn[slot].send_fd = -1;
+    }
     if (g_conn[slot].fd >= 0)
         (void)close(g_conn[slot].fd);
     g_conn[slot].fd = -1;
@@ -113,6 +121,20 @@ static int conn_slot_free(void)
             return i;
     }
     return -1;
+}
+
+/* 取一个头的值（跳前导空白），超长截断，恒 NUL 结尾。 */
+static void hdr_value(const char *v, char *dst, size_t cap)
+{
+    size_t i = 0;
+
+    while (*v == ' ' || *v == '\t')
+        v++;
+    while (v[i] != '\0' && i + 1u < cap) {
+        dst[i] = v[i];
+        i++;
+    }
+    dst[i] = '\0';
 }
 
 /* --------------------------------------------------------------------------
@@ -193,6 +215,10 @@ static int parse_req(iv_web_conn_t *c, iv_web_req_t *req)
             if (v < 0 || v > (long)IV_WEB_BODY_MAX)
                 return IV_EPROTO;
             c->body_need = (size_t)v;
+        } else if (strncasecmp(line, "Range:", 6) == 0) {
+            hdr_value(line + 6, req->range, sizeof(req->range));
+        } else if (strncasecmp(line, "If-Range:", 9) == 0) {
+            hdr_value(line + 9, req->if_range, sizeof(req->if_range));
         } else if (strncasecmp(line, "Cookie:", 7) == 0) {
             const char *sid = strstr(line + 7, "ivs_sid=");
 
@@ -230,8 +256,30 @@ static int parse_req(iv_web_conn_t *c, iv_web_req_t *req)
  * -------------------------------------------------------------------------- */
 static void build_response(iv_web_conn_t *c, const iv_web_resp_t *rsp, size_t body_len)
 {
-    char head[RSP_HEAD_OFF];
-    int  n;
+    char        head[RSP_HEAD_OFF];
+    int         n;
+    int         ffd = -1;
+    struct stat fst;
+    size_t      clen = body_len;
+
+    /* S6.4：文件体 —— 先打开，成功才把 Content-Length 定为文件段长度。
+     * O_NOFOLLOW 是第三道围栏（media 层已 realpath 解过符号链接）。 */
+    if (rsp->file_path != NULL) {
+        ffd = open(rsp->file_path, O_RDONLY | O_NOFOLLOW);
+        if (ffd >= 0 && (fstat(ffd, &fst) != 0 || !S_ISREG(fst.st_mode))) {
+            (void)close(ffd);
+            ffd = -1;
+        }
+        if (ffd < 0) {
+            /* 竞态：解析后文件被清理/替换。回不带体的 404，别再往下走。 */
+            c->wlen = (size_t)snprintf(c->wbuf, sizeof(c->wbuf),
+                                       "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n"
+                                       "Connection: close\r\n\r\n");
+            c->wsent = 0u;
+            return;
+        }
+        clen = (size_t)rsp->file_len;
+    }
 
     n = snprintf(head, sizeof(head),
                  "HTTP/1.1 %d %s\r\n"
@@ -239,12 +287,13 @@ static void build_response(iv_web_conn_t *c, const iv_web_resp_t *rsp, size_t bo
                  "Content-Length: %zu\r\n"
                  "Connection: close\r\n"
                  "Cache-Control: no-store\r\n"
-                 "%s%s%s"
+                 "%s%s%s%s"
                  "\r\n",
-                 rsp->status, status_text(rsp->status), rsp->ctype, body_len,
+                 rsp->status, status_text(rsp->status), rsp->ctype, clen,
                  rsp->set_cookie ? "Set-Cookie: " : "",
                  rsp->set_cookie ? rsp->cookie : "",
-                 rsp->set_cookie ? "\r\n" : "");
+                 rsp->set_cookie ? "\r\n" : "",
+                 rsp->has_extra ? rsp->extra : "");
     /* ⚠ 头终止空行的配平（集成用例 test_web_http w01/w02 实证）：
      * 终止符是最后的 "\r\n"，它必须**有且只有一个**。早先写成 `"%s%s" "\r\n"`，
      * 带 Set-Cookie 的响应头从未被终止（curl 表现为 200 + Cookie 齐全但 body 恒 0 字节）；
@@ -256,6 +305,8 @@ static void build_response(iv_web_conn_t *c, const iv_web_resp_t *rsp, size_t bo
                      "HTTP/1.1 500 Internal Server Error\r\n"
                      "Content-Length: 0\r\nConnection: close\r\n\r\n");
         if (n < 0 || (size_t)n >= sizeof(head)) {
+            if (ffd >= 0)
+                (void)close(ffd);
             c->wlen = 0u;
             return;
         }
@@ -271,6 +322,19 @@ static void build_response(iv_web_conn_t *c, const iv_web_resp_t *rsp, size_t bo
     memcpy(c->wbuf, head, (size_t)n);
     c->wlen = (size_t)n + body_len;
     c->wsent = 0u;
+
+    /* S6.4：把文件体挂到连接上，正文由 on_writable 一块块 pread->send。
+     * clen 与 send_left 同源（rsp->file_len），不一致会立刻被浏览器察觉。 */
+    c->send_fd   = ffd;
+    c->send_off  = rsp->file_off;
+    c->send_left = (ffd >= 0) ? rsp->file_len : 0u;
+    c->flen      = 0u;
+    c->fsent     = 0u;
+    c->rl_bps           = g_ctx.media_bps;
+    c->rl_win_start_ms  = iv_web_now_ms();
+    c->rl_sent          = 0u;
+    c->rl_wait_until_ms = 0u;
+    c->rl_holds         = 0u;
 }
 
 /* --------------------------------------------------------------------------
@@ -290,6 +354,8 @@ static void handle_req(iv_web_conn_t *c, const iv_web_req_t *req)
 
     rc = iv_web_api_handle(&g_ctx, req, body, body_cap, &body_len, &rsp);
     if (rc == IV_ENOTSUP)
+        rc = iv_web_media_handle(&g_ctx, req, body, body_cap, &body_len, &rsp);
+    if (rc == IV_ENOTSUP)
         rc = iv_web_static_handle(&g_ctx, req, body, body_cap, &body_len, &rsp);
     if (rc != IV_OK) {
         body_len = (size_t)snprintf(body, body_cap,
@@ -299,7 +365,8 @@ static void handle_req(iv_web_conn_t *c, const iv_web_req_t *req)
         rsp.set_cookie = 0;
     }
 
-    build_response(c, &rsp, body_len);
+    /* 文件体不进 wbuf ⇒ 传给 build_response 的 body 长度取 0。 */
+    build_response(c, &rsp, (rsp.file_path != NULL) ? 0u : body_len);
     c->last_ms = iv_web_now_ms();
 }
 
@@ -310,6 +377,11 @@ static void on_readable(int slot)
     ssize_t        n;
     iv_web_req_t   req;
     int            prc;
+
+    /* S6.4：文件体阶段 rbuf 正被当作发送块缓冲用，绝不能被 recv 覆盖。
+     * 一连接一请求，此时再来数据（pipeline/探活）直接丢弃。 */
+    if (c->send_fd >= 0)
+        return;
 
     if (c->rlen >= sizeof(c->rbuf) - 1u) {
         /* 缓冲满还没成形：回 413 并准备关。**必须写进 wbuf** —— on_writable 只发
@@ -351,26 +423,98 @@ static void on_readable(int slot)
     handle_req(c, &req);
 }
 
-/* 写事件：把 wbuf 里剩下的发完即关。 */
+/* S6.4 限速：返回"本轮最多能发多少字节"。0 表示本窗口配额已尽，
+ * 已把"再等 IV_WEB_RL_WAIT_MS"记进 rl_wait_until_ms（主循环据此唤醒）。 */
+static size_t rl_allow(iv_web_conn_t *c, uint64_t now, size_t want)
+{
+    uint64_t left;
+
+    if (c->rl_bps == 0u)
+        return want;                       /* 0 = 不限速 */
+    if (now < c->rl_win_start_ms || now - c->rl_win_start_ms >= IV_WEB_RL_WIN_MS) {
+        c->rl_win_start_ms = now;          /* 开新窗口，配额清零 */
+        c->rl_sent = 0u;
+    }
+    if (c->rl_sent >= (uint64_t)c->rl_bps) {
+        c->rl_wait_until_ms = now + IV_WEB_RL_WAIT_MS;
+        c->rl_holds++;
+        return 0u;
+    }
+    left = (uint64_t)c->rl_bps - c->rl_sent;
+    return (left > (uint64_t)want) ? want : (size_t)left;
+}
+
+/* 写事件：先发响应头（wbuf），再流式发文件体（若有）。发完即关。
+ * 客户端中途断开会让 send() 直接失败 ⇒ 关连接关 fd，**已发字节不回滚** ——
+ * 这就是 S6.4 要求的"取消"的全部语义，不需要额外控制帧。 */
 static void on_writable(int slot)
 {
     iv_web_conn_t *c = &g_conn[slot];
+    uint64_t       now = iv_web_now_ms();
     ssize_t        n;
 
-    if (c->wsent >= c->wlen) {
+    /* 1) 响应头（Content-Length/Content-Range/ETag…）。头很小，不参与限速。 */
+    if (c->wsent < c->wlen) {
+        n = send(c->fd, c->wbuf + c->wsent, c->wlen - c->wsent, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                return;
+            conn_close(slot);
+            return;
+        }
+        c->wsent += (size_t)n;
+        c->last_ms = now;
+        if (c->wsent < c->wlen)
+            return;
+    }
+
+    if (c->send_fd < 0) {
+        conn_close(slot);                  /* 普通响应：头发完即结束 */
+        return;
+    }
+    if (c->send_left == 0u) {
         conn_close(slot);
         return;
     }
-    n = send(c->fd, c->wbuf + c->wsent, c->wlen - c->wsent, MSG_NOSIGNAL);
+
+    /* 2) 文件体：块缓冲复用 rbuf（请求已解析完，本阶段不会再读它）。 */
+    if (c->flen == 0u || c->fsent >= c->flen) {
+        size_t  want = (c->send_left > (uint64_t)IV_WEB_FILE_CHUNK)
+                           ? (size_t)IV_WEB_FILE_CHUNK
+                           : (size_t)c->send_left;
+        ssize_t r = pread(c->send_fd, c->rbuf, want, (off_t)c->send_off);
+
+        if (r <= 0) {
+            /* 读失败或文件被截断：继续发会给出内容不完整的假成功，直接收连接。 */
+            IV_LOG_W(WEB_MOD, "media read failed at off=%llu: %s",
+                     (unsigned long long)c->send_off, strerror(errno));
+            conn_close(slot);
+            return;
+        }
+        c->flen  = (size_t)r;
+        c->fsent = 0u;
+    }
+
+    {
+        size_t allow = rl_allow(c, now, c->flen - c->fsent);
+
+        if (allow == 0u)
+            return;                        /* 配额尽：等 poll 超时唤醒 */
+        n = send(c->fd, c->rbuf + c->fsent, allow, MSG_NOSIGNAL);
+    }
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
             return;
         conn_close(slot);
         return;
     }
-    c->wsent += (size_t)n;
-    c->last_ms = iv_web_now_ms();
-    if (c->wsent >= c->wlen)
+    c->fsent    += (size_t)n;
+    c->send_off += (uint64_t)n;
+    c->send_left = (c->send_left > (uint64_t)n) ? (c->send_left - (uint64_t)n) : 0u;
+    c->rl_sent  += (uint64_t)n;
+    c->last_ms   = now;
+
+    if (c->send_left == 0u && c->fsent >= c->flen)
         conn_close(slot);
 }
 
@@ -439,6 +583,7 @@ static void do_accept(void)
         }
         memset(&g_conn[slot], 0, sizeof(g_conn[slot]));
         g_conn[slot].fd = cfd;
+        g_conn[slot].send_fd = -1;   /* memset 会把 send_fd 清成 0（＝stdin！） */
         g_conn[slot].last_ms = iv_web_now_ms();
     }
 }
@@ -449,9 +594,12 @@ static void do_accept(void)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "usage: %s [--port N] [--root DIR] [--chan PATH] [--pass PW] [--version]\n"
-            "  defaults: port %d, root %s, chan %s\n",
-            argv0, WEB_PORT_DEF, WEB_ROOT_DEF, IV_CHAN_PATH_DEFAULT);
+            "usage: %s [--port N] [--root DIR] [--chan PATH] [--pass PW]\n"
+            "          [--media-root DIR] [--media-bps N] [--version]\n"
+            "  defaults: port %d, root %s, chan %s\n"
+            "            media-root %s, media-bps %u (0 = unlimited)\n",
+            argv0, WEB_PORT_DEF, WEB_ROOT_DEF, IV_CHAN_PATH_DEFAULT,
+            IV_WEB_MEDIA_ROOT_DEFAULT, IV_WEB_MEDIA_BPS_DEFAULT);
 }
 
 int main(int argc, char *argv[])
@@ -464,10 +612,15 @@ int main(int argc, char *argv[])
     g_ctx.static_root = WEB_ROOT_DEF;
     g_ctx.chan_fd     = -1;
     (void)snprintf(g_ctx.pass, sizeof(g_ctx.pass), "%s", WEB_PASS_DEF);
+    (void)snprintf(g_ctx.media_root, sizeof(g_ctx.media_root), "%s",
+                   IV_WEB_MEDIA_ROOT_DEFAULT);
+    g_ctx.media_bps = IV_WEB_MEDIA_BPS_DEFAULT;
     g_ctx.rng = (uint32_t)((uint64_t)time(NULL) ^ (uint64_t)getpid()) | 1u;
 
-    for (i = 0; i < (int)IV_WEB_MAX_CONN; i++)
+    for (i = 0; i < (int)IV_WEB_MAX_CONN; i++) {
         g_conn[i].fd = -1;
+        g_conn[i].send_fd = -1;
+    }
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) {
@@ -481,6 +634,11 @@ int main(int argc, char *argv[])
             g_ctx.chan_path = argv[++i];
         } else if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc) {
             (void)snprintf(g_ctx.pass, sizeof(g_ctx.pass), "%.*s", 63, argv[++i]);
+        } else if (strcmp(argv[i], "--media-root") == 0 && i + 1 < argc) {
+            (void)snprintf(g_ctx.media_root, sizeof(g_ctx.media_root), "%.*s",
+                           (int)sizeof(g_ctx.media_root) - 1, argv[++i]);
+        } else if (strcmp(argv[i], "--media-bps") == 0 && i + 1 < argc) {
+            g_ctx.media_bps = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else {
             usage(argv[0]);
             return 1;
@@ -495,6 +653,13 @@ int main(int argc, char *argv[])
 
         if (env != NULL && env[0] != '\0')
             (void)snprintf(g_ctx.pass, sizeof(g_ctx.pass), "%.*s", 63, env);
+        env = getenv("IVSBOX_WEB_MEDIA_ROOT");
+        if (env != NULL && env[0] != '\0')
+            (void)snprintf(g_ctx.media_root, sizeof(g_ctx.media_root), "%.*s",
+                           (int)sizeof(g_ctx.media_root) - 1, env);
+        env = getenv("IVSBOX_WEB_MEDIA_BPS");
+        if (env != NULL && env[0] != '\0')
+            g_ctx.media_bps = (uint32_t)strtoul(env, NULL, 10);
     }
 
     /* 日志失败不致命：host 上没有 /mnt/UDISK/log 是常态，Web 照样要能跑。 */
@@ -514,11 +679,13 @@ int main(int argc, char *argv[])
     }
     IV_LOG_I(WEB_MOD, "ivsbox-web listening on :%d, root=%s, chan=%s",
              port, g_ctx.static_root, g_ctx.chan_path);
+    IV_LOG_I(WEB_MOD, "media root=%s bps=%u", g_ctx.media_root, g_ctx.media_bps);
 
     while (!g_stop) {
         struct pollfd pf[IV_WEB_MAX_CONN + 1];
         int           map[IV_WEB_MAX_CONN + 1];
         int           nfds = 0;
+        int           timeout = 1000;
         uint64_t      now;
 
         pf[0].fd      = g_listen_fd;
@@ -527,17 +694,35 @@ int main(int argc, char *argv[])
         map[0] = -1;
         nfds = 1;
 
+        now = iv_web_now_ms();
         for (i = 0; i < (int)IV_WEB_MAX_CONN; i++) {
+            int pending;
+            int waiting;
+
             if (g_conn[i].fd < 0)
                 continue;
+            /* S6.4：还欠客户端字节 = 响应头没发完，或文件体还没收尾。 */
+            pending = (g_conn[i].wsent < g_conn[i].wlen) || (g_conn[i].send_fd >= 0);
+            /* 限速配额用尽：本轮**不注册 POLLOUT**（POLLOUT 电平触发会立刻再报，
+             * 空转烧 CPU），改为把等待截止折进 poll 超时，由超时唤醒。 */
+            waiting = pending && (g_conn[i].rl_wait_until_ms > now);
             pf[nfds].fd      = g_conn[i].fd;
-            pf[nfds].events  = (g_conn[i].wlen > 0u) ? POLLOUT : POLLIN;
+            pf[nfds].events  = pending ? (waiting ? 0 : POLLOUT) : POLLIN;
             pf[nfds].revents = 0;
             map[nfds] = i;
+            if (waiting) {
+                uint64_t d  = g_conn[i].rl_wait_until_ms - now;
+                int      di = (d > 1000u) ? 1000 : (int)d;
+
+                if (di < 1)
+                    di = 1;
+                if (di < timeout)
+                    timeout = di;
+            }
             nfds++;
         }
 
-        n = poll(pf, (nfds_t)nfds, 1000);
+        n = poll(pf, (nfds_t)nfds, timeout);
         if (n < 0) {
             if (errno == EINTR)
                 continue;

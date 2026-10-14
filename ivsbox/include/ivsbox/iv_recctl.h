@@ -73,6 +73,11 @@ typedef struct {
     uint8_t         recording;     /* 0/1：本机在录 */
     uint64_t        down_since_ms; /* 0 = 尚未全断 */
     uint64_t        up_since_ms;   /* 0 = 尚未恢复 */
+    /* ---- S6.5 存储容量闸门（由 iv_recctl_gate() 每拍刷新）----
+     * gate_block：没空间时不**开**新录像；gate_stop：空间告急/故障时**立即停**。
+     * 二者都由装配层从 iv_storage 的决策里喂进来（见 iv_storage.h）。 */
+    uint8_t         gate_block;
+    uint8_t         gate_stop;
 } iv_recctl_t;
 
 /* ---------------------------------------------------------------------------
@@ -93,6 +98,16 @@ int iv_recctl_init(iv_recctl_t *r, const iv_recctl_cfg_t *cfg);
  * 返回本拍发生的状态变化数（0/1；start 或 stop 各算一次）。
  */
 int iv_recctl_step(iv_recctl_t *r, int wan_up, int plat_up, uint64_t now_ms,
+                   const iv_recctl_ops_t *ops);
+
+/*
+ * S6.5 存储容量闸门（装配层每拍在 step **之前**调用；判据来自 iv_storage）：
+ *   allow_new=0 ⇒ 抑制**开**新录像（水位 ≥90% 或 SD 故障）——已录的不受影响；
+ *   stop_rec=1  ⇒ 若在录则**立即**逐路 stop（水位 ≥95% 或 SD 故障），不等恢复防抖。
+ * 返回本次因 stop_rec 停掉的路数（0 = 没有需要停的）。step() 里也有一份等价兜底，
+ * 以防调用方漏调本函数。幂等：可每拍调用。
+ */
+int iv_recctl_gate(iv_recctl_t *r, int allow_new, int stop_rec,
                    const iv_recctl_ops_t *ops);
 
 /* 手动停录（关停/复位时用）：在录则逐路 stop 并清状态。返回停掉的路数。 */

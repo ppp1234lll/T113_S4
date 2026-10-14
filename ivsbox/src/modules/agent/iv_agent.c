@@ -41,6 +41,7 @@ static int  snmp_task_fn(iv_task_ctx_t *ctx);
 static void on_snmp_done(uint64_t id, int rc, const void *result,
                          size_t result_len, void *arg);
 static void rec_drive(iv_agent_t *a, uint64_t now);
+static void storage_drive(iv_agent_t *a, uint64_t now);
 static int  rec_media_start(int id, const char *url, void *arg);
 static int  rec_media_stop(int id, void *arg);
 
@@ -431,6 +432,27 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
         }
     }
 
+    /* ---- 5c. M6 SD 卡存储策略（S6.5，**不依赖 Reactor**，两种模式同装）----
+     * 每拍（netmgr 节拍，1 s）巡检一轮：statfs 读容量 ＋ 有界目录扫描 → 纯决策
+     * → 按需删最旧可删。决策（allow_new/stop_rec）由 storage_drive() 喂给
+     * recctl 的容量闸门。全程非阻塞、无常驻 fd、无 worker 线程。 */
+    if (cfg->storage_enable) {
+        iv_storage_cfg_t scfg;
+
+        iv_storage_cfg_default(&scfg);
+        if (cfg->storage_root[0] != '\0')
+            (void)snprintf(scfg.root, sizeof(scfg.root), "%.*s",
+                           (int)sizeof(scfg.root) - 1, cfg->storage_root);
+        if (iv_storage_init(&a->stg, &scfg, NULL) != IV_OK) {
+            IV_LOG_W(AG_MOD, "storage policy init failed, SD guard disabled");
+        } else {
+            char rbuf[IV_STORAGE_PATH_MAX];
+
+            iv_storage_root_resolve(scfg.root, rbuf, sizeof(rbuf));
+            IV_LOG_I(AG_MOD, "storage policy up, root=%s", rbuf);
+        }
+    }
+
     /* ---- 6. 本层定时器（仅 Reactor 模式；r == NULL 时由调用方按节拍推进）---- */
     if (r != NULL) {
         a->pb_timer = iv_timer_add(r, IV_AGENT_PROBE_TICK_MS, on_pb_timer, a);
@@ -468,6 +490,7 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
         (void)iv_device_tick(&a->dev, now_ms);
     env_feed(a, now_ms);
     (void)iv_recovery_tick(&a->rec, now_ms);
+    storage_drive(a, now_ms); /* M6-S6.5：SD 水位闸门（先于 rec_drive，同拍生效） */
     rec_drive(a, now_ms); /* M6-S6.3：断网录像状态机（每拍喂判据） */
     (void)iv_report_step(&a->rp, now_ms);
     return IV_OK;
@@ -602,6 +625,27 @@ static void rec_drive(iv_agent_t *a, uint64_t now)
     ops.stop  = rec_media_stop;
     ops.arg   = a;
     (void)iv_recctl_step(&a->recm, wan_up, plat_up, now, &ops);
+}
+
+/* ---------------------------------------------------------------------------
+ * M6-S6.5 SD 卡策略驱动（判据口径见 iv_storage.h 文件头）
+ * 顺序有意：先 storage（本轮可能腾出空间）→ 再 gate（用最新档位闸住录像）→
+ * 最后由 rec_drive 在**同一拍**里按闸门开/停。三者同节拍，不存在"闸门滞后一拍"。
+ * ------------------------------------------------------------------------- */
+static void storage_drive(iv_agent_t *a, uint64_t now)
+{
+    iv_recctl_ops_t ops;
+
+    if (!a->stg.inited)
+        return;
+    (void)iv_storage_step(&a->stg, now);
+    if (!a->media.inited)
+        return; /* 无媒体链 ⇒ recctl 未装配（open 里 gate 过），闸门无处可喂 */
+    ops.start = rec_media_start;
+    ops.stop  = rec_media_stop;
+    ops.arg   = a;
+    (void)iv_recctl_gate(&a->recm, iv_storage_allow_new(&a->stg),
+                         iv_storage_stop_rec(&a->stg), &ops);
 }
 
 /* 把本层掌握的"非采集板事实"注入上报层：CNS（六路摄像机网络状态）＋ MN（主网两路）。
@@ -928,6 +972,7 @@ static void on_nm_timer(void *arg)
     netmgr_feed(a, now);
     (void)iv_netmgr_tick(&a->nm, now);
     env_feed(a, now); /* 主网 MN 更新 ＋ 故障沿（1 s 粒度足够） */
+    storage_drive(a, now); /* M6-S6.5：与 iv_agent_step（r==NULL 模式）同装同驱动 */
     rec_drive(a, now); /* M6-S6.3：与 iv_agent_step（r==NULL 模式）同装同驱动 */
     if (a->r != NULL)
         a->nm_timer = iv_timer_add(a->r, IV_AGENT_NETMGR_TICK_MS, on_nm_timer, a);
@@ -1010,6 +1055,11 @@ iv_media_t *iv_agent_media(iv_agent_t *a)
 iv_recctl_t *iv_agent_recctl(iv_agent_t *a)
 {
     return (a != NULL) ? &a->recm : NULL;
+}
+
+iv_storage_t *iv_agent_storage(iv_agent_t *a)
+{
+    return (a != NULL) ? &a->stg : NULL;
 }
 
 uint64_t iv_agent_door_events(const iv_agent_t *a)

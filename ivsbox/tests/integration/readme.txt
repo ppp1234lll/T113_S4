@@ -77,6 +77,17 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
                        `extras rejected`。**这条是 app 层 `cfg_rec_sources()` 的唯一
                        证据**（app 层 .c 不进静态库，单测链接不到）。需
                        `build/host/ivsboxd`（缺 ⇒ SKIP）；`unshare -rm` 不可用 ⇒ SKIP。
+  test_web_media_e2e.c M6-S6.4 媒体下载（HTTP Range）端到端（**自包含**）：自己
+                       fork+execl 拉起 `build/host/ivsbox-web`（二进制缺失 ⇒ SKIP 退出 0），
+                       `--media-root` 指向自建临时目录（内放一份确定内容的伪随机文件）、
+                       `--media-bps` 给 64 KiB/s，再用裸 socket 逐条打：未登录 401、登录取
+                       会话、全量 `?sha=1`（`X-SHA256` 必须与本地 `iv_sha256_file()` 一致，
+                       正文逐字节比对）、中段/后缀 Range 的 206 与 `Content-Range` 边界、
+                       越界 416、`If-Range` 失配退 200、`..` 穿越 403、**指向媒体根之外的
+                       符号链接也必须 403**（这是路径围栏第二道 `realpath()` 复核的真实
+                       攻击面 —— 符号链接文件名完全合法，第一道逐段检查拦不住它）、缺失
+                       404、限速用墙钟证明（去掉限速会立刻变红）、中途 cancel 后服务仍可用、
+                       反复下载无 fd 泄漏。**不需要 ivsboxd**。
 
 【运行方式】
   # 只跑自包含用例（无需先起任何服务）

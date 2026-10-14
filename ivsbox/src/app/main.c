@@ -651,6 +651,12 @@ static int agent_setup(void)
      * ＋ `camera.rec.hold_ms`/`.debounce_ms`。未配的路留空、状态机自然跳过。 */
     cfg_rec_sources(&ac);
 
+    /* SD 卡策略（S6.5）：默认启用。根目录**刻意不接配置键**（§18.5 拍板：
+     * 容量与水位都是运行时事实/工程常量）—— 留空 ⇒ 环境变量 ⇒ 默认 /mnt/sdcard，
+     * 与 media 抓拍目录同源。板端实际挂载点仍是待确认事实（登记在 docs）。 */
+    ac.storage_enable = 1;
+    ac.storage_root[0] = '\0';
+
     ac.devid = 0u;
 
     if (iv_agent_open(&g_agent, &ac, g_reactor, iv_clock_monotonic_ms()) != IV_OK) {

@@ -9,12 +9,16 @@
  *   c04 期间任一恢复（wan 或 plat 单独活）即打断"全断"计时
  *   c05 start 全被拒 ⇒ 不置位 recording、下拍重试（down_since 连续）
  *   c06 stop_all 手动收尾 + recording 读数
+ *   c07 S6.5 容量闸门：关闸抑制开录、开闸即录、水位告急立即停录、step 兜底路径
  *
  * 反向证伪（本用例内建）：
  *   f1 若把"保持"判据去掉（到达 hold 前就开录），c02 的保持段会提前动作；
  *   f2 若把"恢复防抖"去掉（恢复沿立即停录），c02 的恢复段会提前动作；
  *   f3 若把"恢复＝任一条件活"误写成"平台活才算恢复"，c04 的 wan 单独恢复段会
  *      继续计时并把录制停掉。
+ *   f4 若去掉"闸门关时不核准开录"（step 里删掉 gate_block 判断），c07 会在关闸
+ *      状态下开录；
+ *   f5 若去掉"闸门要求停录即立即停"，c07 会一直录到恢复防抖（或根本不录）。
  * 三者都由对应的 chk 钉死：动作次数是精确断言，多一次/少一次都红。
  */
 #include <stdio.h>
@@ -202,10 +206,51 @@ int main(void)
     chk(iv_recctl_stop_all(&r, &ops) == 0, "c06: stop_all idempotent when idle");
     chk(f.n_stop == 2, "c06: no extra stop when idle");
 
+    /* ---------------- c07 S6.5 容量闸门 ---------------- */
+    memset(&f, 0, sizeof(f));
+    chk(iv_recctl_init(&r, &cfg) == IV_OK, "c07: init ok");
+
+    /* 关闸（allow_new=0）：双断并保持 hold 之后**仍不**开录 */
+    chk(iv_recctl_gate(&r, 0, 0, &ops) == 0, "c07: gate(block) reports nothing to stop");
+    chk(iv_recctl_step(&r, 0, 0, 1000, &ops) == 0, "c07: down edge armed");
+    chk(iv_recctl_step(&r, 0, 0, 11000, &ops) == 0, "c07: blocked start suppressed (f4)");
+    chk(f.n_start == 0, "c07: no start while the storage gate blocks (f4)");
+    chk(iv_recctl_recording(&r) == 0, "c07: not recording while blocked");
+
+    /* 开闸：同一断网沿（down_since 连续）下一拍即开录，不必重新等 hold */
+    chk(iv_recctl_gate(&r, 1, 0, &ops) == 0, "c07: gate(open)");
+    chk(iv_recctl_step(&r, 0, 0, 12000, &ops) == 1, "c07: start once the gate opens");
+    chk(f.n_start == 2, "c07: both channels started after unblock");
+    chk(iv_recctl_recording(&r) == 1, "c07: recording after unblock");
+
+    /* 录制中水位告急（stop_rec=1）：立即停录，不等 debounce */
+    memset(&f, 0, sizeof(f));
+    chk(iv_recctl_gate(&r, 0, 1, &ops) == 2, "c07: gate(stop) stops both channels (f5)");
+    chk(f.n_stop == 2, "c07: immediate stop when storage is full (f5)");
+    chk(iv_recctl_recording(&r) == 0, "c07: recording cleared by the gate");
+
+    /* 闸门归位后不残留：需重新满足开录条件（hold 重新计时） */
+    memset(&f, 0, sizeof(f));
+    chk(iv_recctl_gate(&r, 1, 0, &ops) == 0, "c07: gate reset");
+    chk(iv_recctl_step(&r, 0, 0, 20000, &ops) == 0, "c07: hold re-armed after gate stop");
+    chk(f.n_start == 0, "c07: no instant restart after a gate stop");
+    chk(iv_recctl_step(&r, 0, 0, 30000, &ops) == 1, "c07: restart requires a fresh hold");
+    chk(f.n_start == 2, "c07: restarted after hold");
+
+    /* step() 兜底：绕过 gate 直接置位也要停录 */
+    memset(&f, 0, sizeof(f));
+    r.gate_stop = 1;
+    chk(iv_recctl_step(&r, 0, 0, 31000, &ops) == 1, "c07: step honours gate_stop");
+    chk(f.n_stop == 2, "c07: stopped via the step safe path");
+    chk(iv_recctl_recording(&r) == 0, "c07: recording cleared by the safe path");
+    r.gate_stop = 0;
+    chk(iv_recctl_step(&r, 0, 0, 40000, &ops) == 0, "c07: clean state after safe-path stop");
+
     if (g_fail != 0) {
         fprintf(stderr, "test_recctl FAILED (%d)\n", g_fail);
         return 1;
     }
-    printf("test_recctl passed (hold/debounce edges, retry-on-reject, manual stop)\n");
+    printf("test_recctl passed (hold/debounce edges, retry-on-reject, manual stop, "
+           "storage gate)\n");
     return 0;
 }

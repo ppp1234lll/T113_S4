@@ -42,6 +42,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M6-S6.0~S6.3 视频链路（收编 bird_media ＋ 回环桥接 ＋ 断网录像） | 已实现（VM 全量验证 ＋ 集成 ＋ 反向证伪 5 条；S6.4/S6.5/S6.6 与 URL 表生产来源待补） | 2026-10-14 11:01 | `ivsbox/media/` 收编 bird_media（零改动）＋ `iv_media`/`iv_recctl` 新模块 ＋ `iv_ctl` 4 方法 ＋ agent/main 装配 ＋ `monitor-media.sh`/`S67ivsboxmedia`；test 33/33、集成 6/6、反向证伪 5/5。详见本文件文末 2026-10-14 11:01 节
 | M6-S5.5 收口 组播协议定稿：设备搜索 ＋ 设备 ID/MAC 配置 | 已实现（协议层重写 ＋ 工装双角色 ＋ 单测重写 ＋ 集成 7/7 ＋ 反向证伪 5/5） | 2026-10-14 12:28 | 按《蜂鸟物联打印软件协议20250220.xlsx》把自定义 `IVPR` 帧换成 **JSON over 组播**（`239.255.255.252:37200`），只实现 `search` 与 `update_mac`，其余 6 条静默；手写容错扫描器不用 json-c；`iv_prov_decide()` 纯决策；工具双角色 `--search`/`--set-id`。详见本文件文末 2026-10-14 12:28 节
 | M6-S6.5 前置 配置键接线：录像路数与 URL 表来源落地 | 已实现（`IV_CFG_ITEMS_MAX` 192 ＋ `camera.ch` 8 路 ＋ `camera.rec.*` ＋ `reboot_max` 0 ＋ `cfg_rec_sources()` 接线 ＋ 集成 8/8 ＋ 反向证伪 4/4） | 2026-10-14 14:50 | 纠正旧说法：`camera.ch.N.url`/`.record` **本就存在**，缺的是**没人读** ⇒ 新增 `cfg_rec_sources()`（url＋record **AND** 才进表）；**录像 8／探测 6／`CNS` 6** 三域独立不得一起抬。详见本文件文末 2026-10-14 14:50 节
+| M6-S6.4/S6.5 视频读取（HTTP Range 下载）＋ SD 卡策略 | 已实现（新增 `iv_storage` ＋ core `iv_sha256` ＋ `iv_web_media`；test/asan/tsan 35/35；集成 8/8＋1 SKIP；反向证伪 9/9；**方式一平台上传按协议未定不做**） | 2026-10-14 16:10 | S6.5＝`statfs` 巡检 ＋ 水位 85/90/95/70（升档即时、降档到 70% 才解除）＋ REC→ALARM→SNAP 删序 ＋ 有界 64 候选窗 ＋ 最近 120 s 切片不删；S6.4＝`/media` Range（206/416/ETag/If-Range/`?sha=1` 校验值/1 s 窗口限速/取消）。容量闸门 `iv_recctl_gate()` 由 agent 每拍喂。详见本文件文末 2026-10-14 16:10 节 |
 |===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
@@ -1719,3 +1720,44 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 === 未做（登记）
 
 - `camera.ch.6/7.ip` 不参与探测；SD 卡策略（S6.5 本体）；`camera.ch.N.url` 受 `IV_CFG_STR_MAX 160` 限；板端真机实测（未覆盖事实）。
+
+
+== 2026-10-14 16:10 S6.4 视频读取（HTTP Range 下载）＋ S6.5 SD 卡策略
+
+=== 干了什么事
+
+- *S6.5 `iv_storage`（新模块）*：`statfs` 读容量 ＋ 有界两层遍历（`<root>/video/<YYYYMMDD>/`）＋ 按需删最旧。
+  水位线 **85% 清理 / 90% 拒新 / 95% 停录告警 / 70% 恢复**；**升档立即生效、降档只有回到 70% 才解除**（迟滞，防阈值抖动）。
+  删除序 **普通录像 → 告警录像 → 抓图**（同类按 mtime 最旧优先）；**最近 120 s 的切片不删**（那正是正在写的分片）；单轮上限 32。
+  候选窗口**有界 64 条**（桶式保留）⇒ SD 上万条也不吃内存；`probe` 缓冲放句柄内复用（约 16 KB，不占栈）。
+  **决策与 IO 分离**：`iv_store_decide()` 是纯函数（无 IO / 无时间 / 无全局量），IO 走 `iv_storage_ops_t` 注入。
+- *S6.5 接线（容量闸门）*：`iv_recctl` 新增 `gate_block`/`gate_stop` ＋ `iv_recctl_gate(allow_new, stop_rec)`；
+  agent 的 `storage_drive()` 每拍 = 巡检 → 喂闸门 → **同拍** `rec_drive()` 决定开/停。
+  **`stop_rec` 立即逐路 stop（不等恢复防抖）；`allow_new=0` 不开新录像、已录的不动**（`down_since` 保留 ⇒ 腾出空间后下一拍即开录，无需重新等 hold）。
+- *S6.4 `/media` HTTP Range 下载*：路径围栏**三道**（逐段拒 `.`/`..` → `realpath()` 前缀复核 → `open(O_NOFOLLOW)`＋`fstat` 普通文件）；`/media` **必须鉴权**（静态页除外）。
+  Range 只认 `bytes=` 单区间（`a-b`/`a-`/`-n`）；起址越界 ⇒ **416 ＋ `Content-Range: bytes 星号 / size`**；`ETag: "<size>-<mtime>"` 恒给，`If-Range` 逐字节相等才认 Range、否则退全量 200；校验值 `X-SHA256` **只在 `?sha=1` 时算**。
+  正文**不进 `wbuf`**（96 KB 装不下录像）⇒ 记 `send_fd/send_off/send_left`，可写事件里 `pread`→`send`，块缓冲**复用 `rbuf`**；
+  **限速**按 1 s 窗口算配额，配额用尽把"再等 20 ms"折进 **poll 超时**；**取消**＝`send()` 失败即关连接（已发字节不回滚）。
+- *core 新增 SHA-256*：`iv_sha256_*`（FIPS 180-4；流式 ＋ `iv_sha256_file()` 16 KiB 分块不整读）。放 core 因为它**纯计算**、无 IO 无平台差异，"core 只准 libc"的纪律不破。
+- *顺手修正*：`web/src/readme.txt` 在 M5 交付时漏更新，仍写"仅入口占位桩"，已改为真实文件清单。
+
+=== 验证
+
+- VM：`test`/`asan`/`tsan` 各 **35/35**（新增 `test_storage` 10 组、`test_sha256` 4 组、`test_recctl` 增 c07 闸门）；`arm` rc=0 零告警；`package` rc=0；`-fanalyzer` 对本轮 9 个编译单元零报告。
+- 集成 **8/8 ＋ 1 SKIP**：新增 `test_web_media_e2e`（自包含拉起 `ivsbox-web`，`--media-bps 65536`）：401／登录／全量 `?sha=1` 的 `X-SHA256` 与本地摘要一致且正文逐字节比对／中段与后缀 Range 的 206 与 `Content-Range` 边界／416／`If-Range` 失配退全量／`..` 穿越 403／**指向媒体根外的符号链接 403**（围栏第二道的真实攻击面）／404／**限速用墙钟证明**／中途 cancel 后仍可用／反复下载无 fd 泄漏。SKIP 的是 `test_media_e2e`（宿主机缺 `lib_x86`）。
+- 反向证伪 **9/9 全部抓出**：水位 `>=`→`>`／去迟滞／类别比较反转／去最近切片保护／单轮上限失效／`iv_recctl` 忽略闸门／Range 起址偏 1／`realpath` 前缀复核恒真／限速关闭。逐条"编译干净 → 用例变红 → 还原 → 复绿 → md5 对账"。
+
+=== 沉淀的纪律
+
+- *反向证伪的靶子要选"现有断言能分辨"的那一处*：首轮 f5 选了「`max_del` 夹紧」，但用例只有 20 个候选 ⇒ 夹不夹紧结果一样 ⇒ **NOT CAUGHT**；换成「上限失效」才红。等价变异不算证据，遇到要换点。
+- *`plan->del[]` 的槽数与 `max_del` 是一对不变量*：f5 变异后先命中 `c06` 断言、随后 `stack smashing detected` ⇒ 「单轮上限夹到 `IV_STORAGE_DEL_MAX`」不只是策略，还是**内存安全**前提。
+- *注释里写 `/media/*` 会撞 `-Werror=comment`*（`/*` 提前开嵌套注释）⇒ 通配路径写成 `/media/...`；`bytes */size` 在注释里也会提前闭合注释，同样要改写。
+- *POLLOUT 是电平触发*：限速要让出 CPU 必须**不注册 POLLOUT** ＋ 把等待折进 poll 超时；只"发送 0 字节然后返回"会立刻再被唤醒 ⇒ 空转烧 CPU。
+
+=== 未做（登记）
+
+- **S6.4 方式一**（设备主动向平台文件服务分片上传）—— 卡平台文件服务协议，无协议可依，本轮不做。
+- **S6.5 的"按切片关闭同步而非每包 fsync"** —— 写盘同步在收编的媒体进程里由 FFmpeg 分片关闭路径承担；本模块只做"读容量/删最旧"，**不改上游源码**。
+- **SD 挂载点**（板端事实）：默认 `/mnt/sdcard`（与 bird_media `defs.h` 同源），待 COM28 串口核对。
+- **`ivsbox-media` 的 host 版**因宿主机缺 `lib_x86` 静态库无法链接 —— `.gitignore` 忽略 `*.a`、工作目录只带 `lib_arm`（**既有基线**，非本轮引入）。
+- 板端真机实测（未覆盖事实）。

@@ -24,6 +24,8 @@ int iv_recctl_init(iv_recctl_t *r, const iv_recctl_cfg_t *cfg)
     r->recording     = 0;
     r->down_since_ms = 0;
     r->up_since_ms   = 0;
+    r->gate_block    = 0;
+    r->gate_stop     = 0;
     return IV_OK;
 }
 
@@ -84,6 +86,12 @@ int iv_recctl_step(iv_recctl_t *r, int wan_up, int plat_up, uint64_t now_ms,
     if (r->cfg.n_url <= 0)
         return 0; /* 没配录像源：状态机旁路（但缓存不更新也无妨） */
 
+    /* S6.5 容量闸门（兜底路径）：闸门要求停录就立刻停，不等恢复防抖 ——
+     * SD 满/故障时继续录只会把写失败刷满日志。装配层通常已用 gate() 先处理过，
+     * 这里兜住"调用方漏调 gate"的情形。 */
+    if (r->gate_stop && r->recording)
+        return stop_all(r, ops);
+
     if (r->recording) {
         if (all_down) {
             r->up_since_ms = 0; /* 还断着：恢复计时清零 */
@@ -108,9 +116,43 @@ int iv_recctl_step(iv_recctl_t *r, int wan_up, int plat_up, uint64_t now_ms,
         r->down_since_ms = now_ms;
         return 0;
     }
-    if (now_ms - r->down_since_ms >= r->cfg.hold_ms)
+    if (now_ms - r->down_since_ms >= r->cfg.hold_ms) {
+        /* S6.5：没空间（水位 ≥90% 或 SD 故障）时不**开**新录像 —— 开了也写不下去。
+         * down_since 保留：腾出空间后下一拍闸门放开即开录，不必重新等 hold。 */
+        if (r->gate_block)
+            return 0;
         return start_all(r, ops);
+    }
     return 0;
+}
+
+int iv_recctl_gate(iv_recctl_t *r, int allow_new, int stop_rec,
+                   const iv_recctl_ops_t *ops)
+{
+    int i;
+    int n = 0;
+
+    if (r == NULL)
+        return IV_EINVAL;
+    r->gate_block = allow_new ? 0u : 1u;
+    r->gate_stop  = stop_rec ? 1u : 0u;
+
+    if (!r->gate_stop || !r->recording)
+        return 0;
+    if (ops == NULL)
+        return IV_EINVAL;
+
+    for (i = 0; i < r->cfg.n_url && i < IV_RECCTL_CH_N; i++) {
+        if (r->cfg.url[i][0] == '\0')
+            continue;
+        if (ops->stop(i, ops->arg) == IV_OK)
+            n++;
+    }
+    r->recording     = 0;
+    r->down_since_ms = 0;
+    r->up_since_ms   = 0;
+    IV_LOG_W(RC_MOD, "storage gate: recording stopped immediately (%d ch)", n);
+    return n;
 }
 
 int iv_recctl_stop_all(iv_recctl_t *r, const iv_recctl_ops_t *ops)

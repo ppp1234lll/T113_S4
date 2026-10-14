@@ -41,6 +41,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M5-S5.5 ivsbox-provision 组播出厂工装 | 已实现（VM 全量验证 ＋ 反向证伪 1 条；组播默认值与报文格式待用户冻结） | 2026-10-14 09:10 | `iv_provision.h`/`iv_provision.c` ＋ `tools/provision`；56 B 身份记录＋XOR 混淆＋裸分区直写（无 `O_CREAT`）；`IVPR` 报文四道校验；工厂标记闸门；单测 `test_prov.c` |
 | M6-S6.0~S6.3 视频链路（收编 bird_media ＋ 回环桥接 ＋ 断网录像） | 已实现（VM 全量验证 ＋ 集成 ＋ 反向证伪 5 条；S6.4/S6.5/S6.6 与 URL 表生产来源待补） | 2026-10-14 11:01 | `ivsbox/media/` 收编 bird_media（零改动）＋ `iv_media`/`iv_recctl` 新模块 ＋ `iv_ctl` 4 方法 ＋ agent/main 装配 ＋ `monitor-media.sh`/`S67ivsboxmedia`；test 33/33、集成 6/6、反向证伪 5/5。详见本文件文末 2026-10-14 11:01 节
 | M6-S5.5 收口 组播协议定稿：设备搜索 ＋ 设备 ID/MAC 配置 | 已实现（协议层重写 ＋ 工装双角色 ＋ 单测重写 ＋ 集成 7/7 ＋ 反向证伪 5/5） | 2026-10-14 12:28 | 按《蜂鸟物联打印软件协议20250220.xlsx》把自定义 `IVPR` 帧换成 **JSON over 组播**（`239.255.255.252:37200`），只实现 `search` 与 `update_mac`，其余 6 条静默；手写容错扫描器不用 json-c；`iv_prov_decide()` 纯决策；工具双角色 `--search`/`--set-id`。详见本文件文末 2026-10-14 12:28 节
+| M6-S6.5 前置 配置键接线：录像路数与 URL 表来源落地 | 已实现（`IV_CFG_ITEMS_MAX` 192 ＋ `camera.ch` 8 路 ＋ `camera.rec.*` ＋ `reboot_max` 0 ＋ `cfg_rec_sources()` 接线 ＋ 集成 8/8 ＋ 反向证伪 4/4） | 2026-10-14 14:50 | 纠正旧说法：`camera.ch.N.url`/`.record` **本就存在**，缺的是**没人读** ⇒ 新增 `cfg_rec_sources()`（url＋record **AND** 才进表）；**录像 8／探测 6／`CNS` 6** 三域独立不得一起抬。详见本文件文末 2026-10-14 14:50 节
 |===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
@@ -1690,3 +1691,31 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 
 - 其余 6 条指令；`iccid`/`mcu`/`inip`/`outip`/`name`/`password` 字段来源；板端真机实测（未覆盖事实）；`update_mac` 的 `tid` 语义待用户确认。
 
+== 2026-10-14 14:50 S6.5 前置：配置键接线（录像路数与 URL 表来源落地）
+
+=== 干了什么事
+
+- *容量抬升*：`IV_CFG_ITEMS_MAX` 128→**192**、`IV_CFG_ARR_MAX` 6→**8**（8 路 × 8 键 ＝ 64 ＋ 非数组 73 ＝ 137 项，128 装不下）。
+- *新键*：`camera.rec.hold_ms`＝10000、`camera.rec.debounce_ms`＝60000（原 `iv_recctl` 编译期常量改可配置，下界＝推进节拍）；`netthr.reboot_max` 出厂默认 3→**0**。
+- *接线（app 层）*：`main.c` 新增 `cfg_rec_sources()` —— `camera.ch.N.url` **且** `.record` 才进 `iv_agent_cfg_t.rec_url[]`；`camera.rec.*` → `iv_recctl_cfg_t`。
+- *口径纠正*：`camera.ch.N.url`/`.record` **本来就存在**（上一轮计划说的「新增 `rtsp` 键」不成立），缺的是**读取**。
+
+=== 三个路数域（独立，不得一起抬）
+
+- **录像 8**（`IV_RECCTL_CH_N`/`IV_MEDIA_CH_N`）；**探测 6**（`IV_CAMDET_CH_N`，`iv_recovery` 同）；**`CNS` 上报固定 6 宽**（格式串写死，架构 §18.1）。⇒ 第 7/8 路**只录不测**。
+
+=== 验证
+
+- VM：`test`/`asan`/`tsan` 各 **33/33**；`analyze`/`arm` 零告警；`package` 完整。
+- 集成 **8/8**（新增 `test_cfg_media_e2e`：`unshare -rm` ＋ tmpfs ＋ **真拉起 `ivsboxd`**），断言日志 `media bridge up, rec urls=1/8 hold=7000ms debounce=20000ms`。
+- 反向证伪 **4/4**（接线断／忽略 record／`ARR_MAX` 回 6／`camera.rec.*` 不接线），逐条还原复绿、md5 对账一致。
+
+=== 沉淀的纪律
+
+- *接线落在 `src/app/**.c` ⇒ 单测链接不到*（app 不进静态库）⇒ 只有**真拉起进程**的集成用例能抓；本轮 f1 变异单测 **NOT CAUGHT**、集成 **CAUGHT**，正是这一类。
+- *「键早就存在」与「有人读它」是两回事*：增字典前先 `grep` 该键是否已在默认值表，别把「没人消费」误判成「没有键」。
+- *栈代价要登记*：`cfg_item_t` ≈ 200 B ⇒ `sorted[IV_CFG_ITEMS_MAX]` 抬到 192 约 **38 KB**，`cfg_snapshot_t`/`render_json()`/`items_fingerprint()`/`watch_poll()` 各一份。
+
+=== 未做（登记）
+
+- `camera.ch.6/7.ip` 不参与探测；SD 卡策略（S6.5 本体）；`camera.ch.N.url` 受 `IV_CFG_STR_MAX 160` 限；板端真机实测（未覆盖事实）。

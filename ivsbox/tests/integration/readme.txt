@@ -12,6 +12,10 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
     - **自包含 ＋ 私有 netns**：除 pty / 回环 / 临时目录外，还自己 `unshare -rmn`
       进私有网络命名空间造 dummy 网卡（test_agent_switch）；`unshare` 不可用时
       **优雅 SKIP（退出 0）**，不弄红 `make itest`。
+    - **自包含 ＋ 私有 user/mount ns**：自己 `unshare -rm` + tmpfs 造出私有
+      `/mnt`、`/var/run`，再**真拉起 ivsboxd**（test_cfg_media_e2e）——它验的是
+      app 层接线，而 app 层 `.c` 不进静态库、单测链接不到，只能用真进程 + 落盘日志
+      做断言。同样 `unshare` 不可用即 SKIP。
 
 【文件说明】
   test_ctl_snapshot.c  ivsboxd 本地通道端到端往返（M1 退出条件第 2 条）：连
@@ -60,6 +64,19 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
                        （update_relay）**一个字节都不回**；e05 垃圾包静默且进程不罢工。
                        端口自 37201 起自动挑（占用则顺延，全占 ⇒ SKIP 退出 0）；
                        二进制缺失 ⇒ SKIP。**不需要工厂标记、不需要 ivsboxd**。
+  test_cfg_media_e2e.c S6.5 前置「配置接线」端到端（**自包含 ＋ 私有 user+mount ns**）：
+                       把自己 `unshare -rm` 重启进私有 user+mount ns，把 `/mnt` 与
+                       `/var/run` 挂成 tmpfs，写一份**含 8 路 `camera.ch` 数组**的
+                       ivsbox.json，**真拉起 `build/host/ivsboxd`**，再从它落盘的日志里
+                       断言 agent 装配那一行
+                       `media bridge up, rec urls=<有效>/<表长> hold=<ms> debounce=<ms>`。
+                       一行同时钉死四处：① 8 个数组元素被收下（IV_CFG_ARR_MAX 6→8，
+                       截断则第 8 路那条 URL 消失）；② 只有 **url 非空 且 record 为真**
+                       的那一路进表（另设两路反例）；③ hold/debounce 取自
+                       `camera.rec.*`（用 7000/20000 与出厂默认区分开）；④ 不得出现
+                       `extras rejected`。**这条是 app 层 `cfg_rec_sources()` 的唯一
+                       证据**（app 层 .c 不进静态库，单测链接不到）。需
+                       `build/host/ivsboxd`（缺 ⇒ SKIP）；`unshare -rm` 不可用 ⇒ SKIP。
 
 【运行方式】
   # 只跑自包含用例（无需先起任何服务）

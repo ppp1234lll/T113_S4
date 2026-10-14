@@ -237,9 +237,12 @@ typedef struct {
      *   /mnt/sdcard 根系走，登记为待板端事实）。
      * `rec_*`：断网录像（S6.3）。判据＝出口全断（迟滞结论）＋平台 TCP 断，
      *   保持 rec_hold_ms 才开录；恢复 rec_debounce_ms 才停录。
-     *   **URL 表暂无生产来源**（配置无 RTSP 地址键、发现档案无 URL 字段，
-     *   见 iv_recctl.h 文件头）⇒ app 层暂填 0 路，状态机自然旁路；
-     *   §18.5 冻结录像来源后填 rec_url 即活。 */
+     *   **来源已接线（2026-10-14，S6.5 前置）**：`camera.ch.N.url`（RTSP 地址，
+     *   含账密）＋ `camera.ch.N.record`（是否录像）**同时满足**该路才进表；
+     *   时间参数来自 `camera.rec.hold_ms` / `camera.rec.debounce_ms`
+     *   （0 ⇒ 用 recctl 默认 10 s / 60 s）。
+     *   ⚠ **两个路数域**：本表 8 路，但只有**前 6 路**会被网络探测
+     *   （平台上报帧 `CNS` 段固定 6 宽）⇒ 第 7/8 路**只录不测**。 */
     char     media_snap_dir[64];
     uint32_t rec_hold_ms;     /* 0 → IV_RECCTL_HOLD_MS_DEFAULT */
     uint32_t rec_debounce_ms; /* 0 → IV_RECCTL_DEBOUNCE_MS_DEFAULT */

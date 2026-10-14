@@ -204,8 +204,21 @@ static const cfg_default_t s_defaults[] = {
     D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.devStatus",
           "SNMP 槽位 devStatus＝设备状态（integer 0=bad/1=good；海康 MIB 无此节点⇒留空＝不采）",
           "", NULL),
-    /* 6 路 × 8 字段——逐路铺出（数组按元素存，这里给足 0..5 的默认槽）。
-     * ⚠ 密码字段**存 SM4 密文**（架构 §10.2），出厂默认空串＝未配置。*/
+    /* M6-S6.5 断网录像的**全局时间参数**：原为 `iv_recctl` 编译期常量
+     * （10 s / 60 s），2026-10-14 用户拍板改为可配置。路级开关与地址见下面
+     * `camera.ch.N.record`（是否录像）/ `camera.ch.N.url`（录像源 RTSP 地址）。
+     * 下界取 1000 ms＝录像状态机的推进节拍（`IV_AGENT_NETMGR_TICK_MS`），
+     * 小于一拍的值没有意义。 */
+    D_INT(IV_CFG_CLS_CAMERA, "camera.rec.hold_ms",
+          "断网开录保持（毫秒；出口全断持续此时长才开录）", 10000, 1000, 3600000),
+    D_INT(IV_CFG_CLS_CAMERA, "camera.rec.debounce_ms",
+          "复网停录去抖（毫秒；任一出口恢复持续此时长才停录）", 60000, 1000, 3600000),
+    /* 8 路 × 8 字段——逐路铺出（数组按元素存，这里给足 0..7 的默认槽）。
+     * ⚠ 探测侧只用**前 6 路**（平台上报帧 `CNS` 段固定 6 宽，`IV_REPORT_CNS_N`），
+     *   第 7/8 路是**只录不测**的槽位；两处路数故意不同，别一起抬。
+     * ⚠ 密码字段**存 SM4 密文**（架构 §10.2），出厂默认空串＝未配置。
+     * ⚠ `url` ＝录像源 RTSP 地址（含账密），受 `IV_CFG_STR_MAX`（160 含 NUL）限制；
+     *   `record` ＝该路是否录像。**两者同时满足**才进录像表 ⇒ 未配 / 参数错该路不录。 */
     D_STR(IV_CFG_CLS_CAMERA, "camera.ch.0.vendor", "第 1 路厂商", "", NULL),
     D_STR(IV_CFG_CLS_CAMERA, "camera.ch.0.ip", "第 1 路 IP", "", NULL),
     D_STR(IV_CFG_CLS_CAMERA, "camera.ch.0.mac", "第 1 路 MAC", "", NULL),
@@ -254,6 +267,22 @@ static const cfg_default_t s_defaults[] = {
     D_BOOL(IV_CFG_CLS_CAMERA, "camera.ch.5.record", "第 6 路是否录像", "false"),
     D_STR(IV_CFG_CLS_CAMERA, "camera.ch.5.stream", "第 6 路码流类型（main/sub）", "", "main,sub,"),
     D_STR(IV_CFG_CLS_CAMERA, "camera.ch.5.url", "第 6 路拉流地址", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.6.vendor", "第 7 路厂商", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.6.ip", "第 7 路 IP", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.6.mac", "第 7 路 MAC", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.6.user", "第 7 路用户名", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.6.pass", "第 7 路口令（SM4 密文）", "", NULL),
+    D_BOOL(IV_CFG_CLS_CAMERA, "camera.ch.6.record", "第 7 路是否录像", "false"),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.6.stream", "第 7 路码流类型（main/sub）", "", "main,sub,"),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.6.url", "第 7 路拉流地址", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.7.vendor", "第 8 路厂商", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.7.ip", "第 8 路 IP", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.7.mac", "第 8 路 MAC", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.7.user", "第 8 路用户名", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.7.pass", "第 8 路口令（SM4 密文）", "", NULL),
+    D_BOOL(IV_CFG_CLS_CAMERA, "camera.ch.7.record", "第 8 路是否录像", "false"),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.7.stream", "第 8 路码流类型（main/sub）", "", "main,sub,"),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.ch.7.url", "第 8 路拉流地址", "", NULL),
 
     /* ---- switch. 交换机配置（架构 §10.2：固定 1 台） ---- */
     D_STR(IV_CFG_CLS_SWITCH, "switch.ip", "交换机 IP", "", NULL),
@@ -310,7 +339,7 @@ static const cfg_default_t s_defaults[] = {
     D_INT(IV_CFG_CLS_NETTHR, "netthr.timeout_ms", "网络超时时间（毫秒）", 2000, 100, 60000),
     D_INT(IV_CFG_CLS_NETTHR, "netthr.loss_count", "丢包次数上限", 3, 1, 100),
     D_INT(IV_CFG_CLS_NETTHR, "netthr.reboot_max", "自愈重启次数上限（**0 = 禁用自愈**）",
-          3, 0, 100),
+          0, 0, 100), /* 2026-10-14 用户批准：出厂默认 3 → 0（对齐现网 net_reload=0） */
     D_INT(IV_CFG_CLS_NETTHR, "netthr.reboot_interval_s", "重启时间（秒，两次重启之间的最短间隔）",
           60, 1, 3600),
 

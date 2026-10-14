@@ -13,16 +13,22 @@
  *   - 平台可用 ＝ `iv_transport_state() == IV_TRANSPORT_UP`（平台 TCP 链路）。
  *   - 计划原文"主网＋平台双确认"落在"出口全断 ＋ 平台断"上：出口全断时平台
  *     TCP 必然也断，双条件取交集只是保守化，等价且不引入新判据。
- *   - hold/debounce 属 §18.5 冻结参数 ⇒ **暂为编译期常量**（不占 128 项配置
- *     表余量），§18.5 冻结后接配置键。
+ *   - hold/debounce **已接配置**（2026-10-14 S6.5 前置）：`camera.rec.hold_ms` /
+ *     `camera.rec.debounce_ms`（默认 10000 / 60000，下界 1000 ms＝推进节拍）；
+ *     cfg 传 0 ⇒ 回落到下面的 `IV_RECCTL_*_MS_DEFAULT`。
  *
  * **为什么单独成模块**：状态机要被单测用假时间轴逐拍验证（沿序列/保持/防抖/
  * 重触发），埋进 iv_agent 的 step 里就只能整机测。iv_agent 每拍喂一次输入即可。
  *
- * **URL 表的来源（卡 §18.5）**：当前配置体系无 RTSP 地址键（`camera.ch.N.stream`
- * 是码流类型 main/sub），设备发现档案（iv_dev_desc_t）也不含 URL ⇒ 生产 URL
- * 表暂为空（状态机自然无动作），待 §18.5 冻结录像路数/来源后由 app 层填入。
- * 表本体与状态机先落地，注入 URL 即活。
+ * **URL 表的来源（2026-10-14 已接线）**：`camera.ch.N.url`（第 N 路拉流地址，
+ * 值即 RTSP URL，**含账密**）＋ `camera.ch.N.record`（该路是否录像）——**两者
+ * 同时满足**该路才进表，由 app 层（`cfg_rec_sources()`）填 `n_url`/`url[]`。
+ * **空串路被本模块直接跳过**（`url[i][0] == '\0'`）⇒ 「配几路录几路」，
+ * 中间空洞不会对不存在的地址发 start。
+ * ⚠ 键**早已存在**于默认表（旧注释"无 RTSP 地址键"已过期，此处更正）；
+ *   地址长度受 `IV_CFG_STR_MAX`（160 含 NUL）限制。
+ * ⚠ `IV_RECCTL_CH_N`＝8 是**录像侧**路数；网络探测（`IV_CAMDET_CH_N`）仍是 6
+ *   （平台上报帧 `CNS` 段固定 6 宽）⇒ 第 7/8 路只录不测。
  */
 #ifndef IVSBOX_IV_RECCTL_H
 #define IVSBOX_IV_RECCTL_H
@@ -37,7 +43,8 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * 常量（§18.5 冻结前的编译期默认；冻结后改由 app 层从配置填）
+ * 常量：`CH_N`/`URL_MAX` 是**模块容量**；两个 `*_MS_DEFAULT` 只是"cfg 传 0 时"
+ * 的回落值（生产路径由 `camera.rec.hold_ms` / `.debounce_ms` 填）。
  * ------------------------------------------------------------------------- */
 #define IV_RECCTL_CH_N         8
 #define IV_RECCTL_URL_MAX      256

@@ -533,6 +533,50 @@ static void cfg_snmp_target(iv_agent_snmp_cfg_t *sc, const char *pfx,
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * S6.5 前置：**断网录像的接线**（键早在默认表里，本步只是把没人读的键接上）
+ *
+ *   - 路级：`camera.ch.N.url`（录像源 RTSP 地址，**含账密**）＋ `camera.ch.N.record`
+ *     （该路是否录像）。**两者同时满足**该路才进表；`n_url` 取"最后一个进表的路 ＋ 1"，
+ *     中间未进表的路**留空串** —— `iv_recctl` 对空串路直接跳过（`url[i][0] == '\0'`），
+ *     所以空洞不会对不存在的地址发 start。对齐用户 2026-10-14 拍板：
+ *     「配置完成后才进行录制，参数错误、未配置不录像」。
+ *   - 全局：`camera.rec.hold_ms` / `camera.rec.debounce_ms`（原为 recctl 编译期常量）。
+ *
+ * ⚠ 路数**两个域**：本表是**录像侧 8 路**（`IV_RECCTL_CH_N`）；只有**前 6 路**会被
+ *   网络探测（平台上报帧 `CNS` 段固定 6 宽），第 7/8 路**只录不测**。
+ * ⚠ 地址长度受 `IV_CFG_STR_MAX`（160 含 NUL）限制：超长的 URL 在 `set` 时就被拒。
+ * ------------------------------------------------------------------------- */
+static void cfg_rec_sources(iv_agent_cfg_t *ac)
+{
+    char    key[IV_CFG_KEY_MAX];
+    int64_t v = 0;
+    int     i;
+
+    ac->rec_n_url = 0;
+    for (i = 0; i < IV_RECCTL_CH_N; i++) {
+        const char *url = NULL;
+        int         rec = 0;
+
+        ac->rec_url[i][0] = '\0';
+        if (snprintf(key, sizeof(key), "camera.ch.%d.url", i) >= (int)sizeof(key))
+            continue;
+        if (iv_config_get_str(g_cfg, key, &url) != IV_OK || url == NULL || url[0] == '\0')
+            continue; /* 未配地址 ⇒ 该路不录 */
+        if (snprintf(key, sizeof(key), "camera.ch.%d.record", i) >= (int)sizeof(key))
+            continue;
+        if (iv_config_get_bool(g_cfg, key, &rec) != IV_OK || rec == 0)
+            continue; /* 录像开关未开 */
+        (void)snprintf(ac->rec_url[i], sizeof(ac->rec_url[i]), "%s", url);
+        ac->rec_n_url = i + 1;
+    }
+
+    if (iv_config_get_int(g_cfg, "camera.rec.hold_ms", &v) == IV_OK && v > 0)
+        ac->rec_hold_ms = (uint32_t)v;
+    if (iv_config_get_int(g_cfg, "camera.rec.debounce_ms", &v) == IV_OK && v > 0)
+        ac->rec_debounce_ms = (uint32_t)v;
+}
+
 static int agent_setup(void)
 {
     iv_agent_cfg_t ac;
@@ -602,6 +646,10 @@ static int agent_setup(void)
     cfg_snmp_target(&ac.snmp[IV_AGENT_SNMP_SW], "switch.snmp",
                     iv_snmp_sw_slots, (int)IV_SNMP_SW_SLOT_N,
                     cfg_ip_be("switch.ip"));
+
+    /* 断网录像（S6.3）的源表与时间参数（S6.5 前置）：`camera.ch.N.url`/`.record`
+     * ＋ `camera.rec.hold_ms`/`.debounce_ms`。未配的路留空、状态机自然跳过。 */
+    cfg_rec_sources(&ac);
 
     ac.devid = 0u;
 

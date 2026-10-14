@@ -175,8 +175,9 @@ static iv_config_t *reopen_cfg(void)
 /* ===========================================================================
  * §S8.1 ① + F1/F4：文件根本不存在 ⇒ 用内置默认值照常启动
  * 新口径：单文件、八分类、128 容量上限。变长 camera.ch 不预建槽位，
- * 无相机时默认项共 5+11+5+16+20+5+4+5 = 71 项。
- * （camera 16 = camera.search/detect.mode/detect.rtt_ms 共 3 ＋ SNMP 目标参数 4 ＋
+ * 无相机时默认项共 5+11+5+18+20+5+4+5 = 73 项。
+ * （camera 18 = camera.search/detect.mode/detect.rtt_ms/rec.hold_ms/rec.debounce_ms
+ *   共 5 ＋ SNMP 目标参数 4 ＋
  *   SNMP OID 槽位 9；switch 20 = switch.ip/vendor/model 共 3 ＋ SNMP 目标参数 5 ＋
  *   SNMP OID 槽位 12。camera.ch 是变长数组，此处不计。）
  * 反向证伪：若默认值表被清空 / 补齐逻辑不跑，items 与各默认值断言立刻失败。
@@ -202,9 +203,9 @@ static void case_defaults_startup(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c1: stat");
     chk(st.loaded == 0, "c1: loaded == 0 (started from built-in defaults)");
-    chk(st.items == 71u, "c1: 71 non-array defaults materialised");
+    chk(st.items == 73u, "c1: 73 non-array defaults materialised");
     chk(st.from_file == 0u, "c1: nothing came from the file");
-    chk(st.from_default == 71u, "c1: everything came from defaults");
+    chk(st.from_default == 73u, "c1: everything came from defaults");
     chk(st.invalid == 0u, "c1: a missing file is NOT an invalid value");
     chk(st.version == 0u, "c1: version is 0 when there is no file");
     chk(st.dirty == 0, "c1: not dirty right after open");
@@ -228,6 +229,18 @@ static void case_defaults_startup(void)
         "c1: sensor.temp_high is a double (factory 0.0 = unset)");
     chk(iv_config_get_int(c, "netthr.loss_count", &iv) == IV_OK && iv == 3,
         "c1: netthr.loss_count default 3");
+    /* S6.5 前置：录像时间参数与自愈上限的新出厂值（2026-10-14 用户批准） */
+    chk(iv_config_get_int(c, "camera.rec.hold_ms", &iv) == IV_OK && iv == 10000,
+        "c1: camera.rec.hold_ms default 10000");
+    chk(iv_config_get_int(c, "camera.rec.debounce_ms", &iv) == IV_OK && iv == 60000,
+        "c1: camera.rec.debounce_ms default 60000");
+    chk(iv_config_get_int(c, "netthr.reboot_max", &iv) == IV_OK && iv == 0,
+        "c1: netthr.reboot_max default 0 (self-heal off, 2026-10-14)");
+    /* 8 路槽位（**录像侧**口径）：第 8 路在默认表里，第 9 路不在 */
+    chk(iv_config_default_get(IV_CFG_NAME, "camera.ch.7.url", NULL, NULL, 0u) == IV_OK,
+        "c1: slot 7 (the 8th camera) has a default template");
+    chk(iv_config_default_get(IV_CFG_NAME, "camera.ch.8.url", NULL, NULL, 0u) == IV_ENOENT,
+        "c1: slot 8 (the 9th) does NOT exist (IV_CFG_ARR_MAX == 8)");
 
     chk(iv_config_origin(c, "sys.transport.mode", &org) == IV_OK && org == IV_CFG_FROM_DEFAULT,
         "c1: origin reports DEFAULT");
@@ -515,9 +528,9 @@ static void case_fill_and_origin(void)
         return;
 
     chk(iv_config_stat(c, &st) == IV_OK, "c5: stat");
-    chk(st.items == 71u, "c5: all non-array defaults are materialised");
+    chk(st.items == 73u, "c5: all non-array defaults are materialised");
     chk(st.from_file == 1u, "c5: exactly one key came from the file");
-    chk(st.from_default == 70u, "c5: seventy were filled from defaults");
+    chk(st.from_default == 72u, "c5: seventy-two were filled from defaults");
     chk(st.invalid == 0u, "c5: a MISSING key is not an INVALID key");
     chk(st.loaded == 1, "c5: the file itself loaded fine");
 
@@ -538,7 +551,7 @@ static void case_fill_and_origin(void)
  * F4：文件把子树写成标量（`"net": 5`）必须判非法并剔除，不能让它把整棵
  *     net.* 默认子树挡在门外。
  * 反向证伪：去掉 item_check() 里的 is_default_parent 分支后，invalid 会退回 0，
- *           而 items 也不再是 71 —— 这正是 F6 静默清空运行中配置的那条路。
+ *           而 items 也不再是 73 —— 这正是 F6 静默清空运行中配置的那条路。
  * ========================================================================= */
 static void case_parent_scalar_rejected(void)
 {
@@ -558,7 +571,7 @@ static void case_parent_scalar_rejected(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c6: stat");
     chk(st.invalid == 1u, "c6: the scalar that shadows a subtree is counted as invalid");
-    chk(st.items == 71u, "c6: the whole non-array default set is still there");
+    chk(st.items == 73u, "c6: the whole non-array default set is still there");
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && s[0] == '\0',
         "c6: net.* is usable again (defaulted empty)");
     chk(iv_config_get_int(c, "net", &iv) == IV_ENOENT, "c6: the offending key itself is gone");
@@ -814,18 +827,18 @@ static void case_array_support(void)
     chk(iv_config_array_len(c, "a..b", &n) == IV_EINVAL, "c10: a malformed arr_key");
 
     /* 下标越界：范围判定必须优先于空洞判定，detail 要明确指出 out of range。 */
-    chk(iv_config_set_str(c, "camera.ch.6.vendor", "oob") == IV_OK,
-        "c10: set element 6 (one past the 6-slot cap, no gap)");
+    chk(iv_config_set_str(c, "camera.ch.8.vendor", "oob") == IV_OK,
+        "c10: set element 8 (one past the 8-slot cap, no gap)");
     detail[0] = '\0';
     chk(iv_config_save(c, detail, sizeof(detail)) == IV_EINVAL,
         "c10: save refuses an out-of-range index that has NO gap");
-    chk(contains(detail, "camera.ch.6") && contains(detail, "out of range"),
+    chk(contains(detail, "camera.ch.8") && contains(detail, "out of range"),
         "c10: detail names it as out-of-range (not as a gap)");
-    iv_config_close(c); /* ch.6 无法用 set 删除，换个干净句柄做下一条 */
+    iv_config_close(c); /* ch.8 无法用 set 删除，换个干净句柄做下一条 */
 
     /* 另一个越界形态：ch.9（越界与空洞两条规则都该拒它）。
      * 注意不能在同一个句柄上连做 —— set_str("") 只是把值清空，**键仍在表里**，
-     * 上一条遗留的 ch.6 会先被判出来，detail 就指不到 ch.9。 */
+     * 上一条遗留的 ch.8 会先被判出来，detail 就指不到 ch.9。 */
     c = reopen_cfg();
     chk(c != NULL, "c10: fresh handle for the ch.9 probe");
     if (c != NULL) {
@@ -919,6 +932,31 @@ static void case_array_support(void)
                 "c10: six cameras stay six cameras");
             iv_config_close(cx);
         }
+
+        /* S6.5 前置：数组上限 6 → 8（**录像侧**路数）。
+         * 反向证伪：把 IV_CFG_ARR_MAX 改回 6 ⇒ "eight cameras stay eight"
+         *           与 "8th element is reachable" 立刻失败。
+         * 另一条：把 ITEMS_MAX 改回 128 ⇒ 137 项断言失败（8 路装不下）。 */
+        static const char EIGHT[] =
+            "{\"camera\":{\"ch\":[{\"vendor\":\"0\"},{\"vendor\":\"1\"},"
+            "{\"vendor\":\"2\"},{\"vendor\":\"3\"},{\"vendor\":\"4\"},"
+            "{\"vendor\":\"5\"},{\"vendor\":\"6\"},{\"vendor\":\"7\"}]}}\n";
+        iv_cfg_stat_t st8;
+
+        chk(write_file(pf, EIGHT, 0644u) == 0, "c10: seed eight cameras");
+        cx = reopen_cfg();
+        chk(cx != NULL, "c10: open eight-camera config");
+        if (cx != NULL) {
+            chk(iv_config_array_len(cx, "camera.ch", &n) == IV_OK && n == 8u,
+                "c10: eight cameras stay eight cameras (ARR_MAX == 8)");
+            chk(iv_config_get_str(cx, "camera.ch.7.vendor", &s) == IV_OK &&
+                    strcmp(s, "7") == 0,
+                "c10: the 8th element is reachable");
+            chk(iv_config_stat(cx, &st8) == IV_OK, "c10: stat on the eight-camera config");
+            chk(st8.items == 73u + 64u,
+                "c10: 8 slots x 8 fields + 73 base == 137 items (fits ITEMS_MAX 192)");
+            iv_config_close(cx);
+        }
     }
 }
 
@@ -982,7 +1020,7 @@ static void case_comment_roundtrip(void)
     chk(iv_config_stat(c, &st) == IV_OK, "c11: stat after round-trip");
     chk(st.loaded == 1, "c11: the rendered file parses back cleanly");
     chk(st.invalid == 0u, "c11: no value was rejected on the round-trip");
-    chk(st.items == 79u, "c11: 71 base keys plus one 8-field camera survived");
+    chk(st.items == 81u, "c11: 73 base keys plus one 8-field camera survived");
 
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "172.16.0.9") == 0,
         "c11: the string survived");

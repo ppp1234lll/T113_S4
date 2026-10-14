@@ -48,8 +48,12 @@
  *
  * **JSON 数组**（§S8.1 新增能力）：`camera.ch` 是数组，元素字段的条目键形如
  * `camera.ch.0.vendor`（元素下标进点分键）。数组长度独立记录，默认值只补到文件中
- * 实际存在的元素；因此 0 / 1 / 6 路都能准确表达。元素个数上限 IV_CFG_ARR_MAX，
+ * 实际存在的元素；因此 0 / 1 / 8 路都能准确表达。元素个数上限 IV_CFG_ARR_MAX，
  * 下标越界或中间空洞判非法。空数组合法。
+ *
+ * ⚠ `camera.ch` 是**录像侧**的 8 路槽位（对齐 S6.5：录像路数＝已配摄像机数 ≤ 8）。
+ *   **探测侧仍是 6 路**（`IV_CAMDET_CH_N`）——平台上报帧 `CNS` 段固定 6 宽
+ *   （`IV_REPORT_CNS_N`，架构 §18.1），不得随录像路数一起抬。两处路数**故意不同**。
  *
  * **double**（§S8.1 新增能力）：`IV_CFG_T_DBL` 用于 `elec.*` / `sensor.*` 的
  * 物理量阈值（电压 / 电流 / 功率 / 倾斜度 / 温度 / 湿度）。范围校验用 double
@@ -115,14 +119,20 @@ extern "C" {
  * 抬升的连带代价是**栈**：`cfg_snapshot_t`、`render_json()` / `items_fingerprint()`
  * 里的 `cfg_item_t sorted[ITEMS_MAX]`、`watch_poll()` 的快照，各自从约 9 KB 涨到约
  * 34 KB。reactor 线程栈默认 8 MB，够用；但**不要**在递归或深调用链里再复制这些数组。
+ *
+ * 2026-10-14 S6.5 前置容量抬升：`IV_CFG_ITEMS_MAX` 128 → **192**、`IV_CFG_ARR_MAX`
+ * 6 → **8**（均经用户批准）。依据：`camera.ch` 由 6 路扩到 8 路（＋16 条模板）、
+ * 新增 `camera.rec.hold_ms` / `camera.rec.debounce_ms`（＋2 条），最坏情形
+ * 「8 路 × 8 字段（64）＋ 非数组默认 73」＝ **137 项**，128 装不下。
+ * 连带代价同样是栈：`cfg_item_t` 约 200 B ⇒ `sorted[192]` 约 **38 KB**（原 26 KB）。
  * ------------------------------------------------------------------------- */
 #define IV_CFG_NAME_MAX   32u  /* 配置名（"ivsbox"）最大长度，含结尾 NUL */
 #define IV_CFG_SEG_MAX    32u  /* 单个键段最大长度，含结尾 NUL */
 #define IV_CFG_DEPTH_MAX  4u   /* 点分键最大段数（camera.ch.0.vendor = 4 段） */
 #define IV_CFG_KEY_MAX    96u  /* 扁平化后的完整点分键上限，含结尾 NUL */
-#define IV_CFG_STR_MAX    160u /* 字符串值上限，含结尾 NUL */
-#define IV_CFG_ITEMS_MAX  128u /* 单份配置的最大键数（§S8.1：32 → 128） */
-#define IV_CFG_ARR_MAX    6u   /* 数组元素个数上限（camera.ch 最多 6 路） */
+#define IV_CFG_STR_MAX    160u /* 字符串值上限，含结尾 NUL。⚠ 录像 URL 也受此限 */
+#define IV_CFG_ITEMS_MAX  192u /* 单份配置的最大键数（§S8.1：32 → 128；S6.5 前置：128 → 192） */
+#define IV_CFG_ARR_MAX    8u   /* 数组元素个数上限（camera.ch 最多 8 路，录像侧口径） */
 #define IV_CFG_PATH_MAX   256u /* 拼出的文件路径上限，含结尾 NUL */
 #define IV_CFG_SUBS_MAX   8u   /* 订阅者上限 */
 #define IV_CFG_HANDLES    4u   /* 同时打开的配置份数上限（静态池大小） */

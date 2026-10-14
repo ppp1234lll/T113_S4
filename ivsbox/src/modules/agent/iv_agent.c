@@ -414,9 +414,20 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
                 (void)snprintf(rcfg.url[n], sizeof(rcfg.url[n]), "%s",
                                cfg->rec_url[n]);
             (void)iv_recctl_init(&a->recm, &rcfg);
-            IV_LOG_I(AG_MOD, "media bridge up, rec urls=%d hold=%ums debounce=%ums",
-                     rcfg.n_url, (unsigned)rcfg.hold_ms,
-                     (unsigned)rcfg.debounce_ms);
+            /* 日志报 **有效路数 / 表长**：表长＝最后一个进表的路 ＋ 1，中间可能有
+             * 空串槽（未配地址/开关未开），而空串路被 recctl 直接跳过。两个数分开
+             * 报，产线与集成用例都能一眼看出"实际配了几路地址"和"表有多长"。 */
+            {
+                int n_eff = 0;
+
+                for (n = 0; n < rcfg.n_url; n++)
+                    if (rcfg.url[n][0] != '\0')
+                        n_eff++;
+                IV_LOG_I(AG_MOD,
+                         "media bridge up, rec urls=%d/%d hold=%ums debounce=%ums",
+                         n_eff, rcfg.n_url, (unsigned)rcfg.hold_ms,
+                         (unsigned)rcfg.debounce_ms);
+            }
         }
     }
 

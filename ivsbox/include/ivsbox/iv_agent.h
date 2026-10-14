@@ -323,6 +323,10 @@ int               iv_agent_active_ifindex(const iv_agent_t *a);
 iv_report_t      *iv_agent_report(iv_agent_t *a); /* 读上报链统计/状态用 */
 uint64_t          iv_agent_door_events(const iv_agent_t *a); /* S4.5 门开事件计数 */
 
+/* S4.1 摄像机探测句柄只读出口（M5-S5.1 新增：Web 总览要读 CNS 六路与检测方式）。
+ * 返回内部句柄，调用方只读；a 为 NULL 返回 NULL。 */
+const iv_camdet_t *iv_agent_camdet(const iv_agent_t *a);
+
 /* S4.4 主网第 w 路（0/1）的 MN 状态：1=正常 / 2=断开（迟滞判定后；0=尚未判定）。
  * 就是上报数据段 `MN=` 字段的生产者（见 iv_report.h 的 env.mn[]）。 */
 uint8_t           iv_agent_mn(const iv_agent_t *a, int w);

@@ -888,6 +888,14 @@ iv_report_t *iv_agent_report(iv_agent_t *a)
     return (a != NULL) ? &a->rp : NULL;
 }
 
+/* M5-S5.1：把内嵌的 camdet 句柄暴露给 Web 只读（总览页要读 CNS 六路与检测方式）。
+ * 返回的是**内部句柄**，调用方只读；未装配（r == NULL 且未 open）时它仍是
+ * 结构化的零值句柄，读 CNS 得到全 0（＝"未配置该路 IP"），语义正确。 */
+const iv_camdet_t *iv_agent_camdet(const iv_agent_t *a)
+{
+    return (a != NULL) ? &a->cd : NULL;
+}
+
 uint64_t iv_agent_door_events(const iv_agent_t *a)
 {
     return (a != NULL) ? a->door_events : 0u;

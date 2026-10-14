@@ -179,9 +179,13 @@ package: arm
 package-copy:
 	@mkdir -p packaging/bin packaging/scripts packaging/init.d
 	@cp $(BINS) packaging/bin/
-	@cp scripts/start_ivsbox.sh scripts/monitor.sh packaging/scripts/
-	@cp scripts/init.d/S62usb4g scripts/init.d/S65ivsboxd packaging/init.d/
-	@chmod +x packaging/scripts/start_ivsbox.sh packaging/scripts/monitor.sh packaging/init.d/S62usb4g packaging/init.d/S65ivsboxd
+	@cp scripts/start_ivsbox.sh scripts/monitor.sh scripts/monitor-web.sh packaging/scripts/
+	@cp scripts/init.d/S62usb4g scripts/init.d/S65ivsboxd scripts/init.d/S66ivsboxweb packaging/init.d/
+	# Web 静态资源（M5-S5.3）：模板与数据分离，页面改版不必重编固件。
+	@rm -rf packaging/web
+	@mkdir -p packaging/web/static
+	@cp -r web/static/. packaging/web/static/ 2>/dev/null || true
+	@chmod +x packaging/scripts/start_ivsbox.sh packaging/scripts/monitor.sh packaging/scripts/monitor-web.sh packaging/init.d/S62usb4g packaging/init.d/S65ivsboxd packaging/init.d/S66ivsboxweb
 	@for bin in $(BINS); do \
 		LC_ALL=C $(CROSS)readelf -h "$$bin" | grep -q "Machine:.*ARM" || { \
 			echo "package: ERROR, not ARM ELF: $$bin"; exit 1; \
@@ -270,17 +274,24 @@ $(MEDIA_BIN): $(MEDIA_OBJS)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(WEB_BIN): $(WEB_OBJS)
+# Web 进程要用 libivcore 的本地通道客户端（iv_chan）与日志（iv_log），故必须链
+# libivcore。**刻意不链 libivmodules**：Web 不直接碰配置 / 数据库，一切数据都发本地
+# 通道问 ivsboxd（架构 §10.4 单写者原则）——链上 modules 就等于把"能直接开库"的
+# 口子留给了 Web，"单写者"就成了纸面约定。
+$(WEB_BIN): $(WEB_OBJS) $(LIBCORE)
 	@mkdir -p $(dir $@)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $(WEB_OBJS) -L$(BUILD_DIR) -livcore $(LDLIBS)
 
 $(UPDATER_BIN): $(UPDATER_OBJS)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(PROVISION_BIN): $(PROVISION_OBJS)
+# 出厂工装要用 libivmodules 里的身份编解码 / 裸分区读写（iv_provision），故链整个
+# modules 静态库；`--gc-sections` 会把没用到的部分丢掉，不会把 sqlite3/json-c 的
+# 代码实际带进最终二进制（依赖仍是动态库，板端已具备）。
+$(PROVISION_BIN): $(PROVISION_OBJS) $(LIBMODULES) $(LIBHAL) $(LIBCORE)
 	@mkdir -p $(dir $@)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $(PROVISION_OBJS) -L$(BUILD_DIR) -livmodules -livhal -livcore $(LDLIBS)
 
 $(BUILD_DIR)/tests/unit/%: $(BUILD_DIR)/tests/unit/%.o $(LIBMODULES) $(LIBHAL) $(LIBCORE)
 	@mkdir -p $(dir $@)

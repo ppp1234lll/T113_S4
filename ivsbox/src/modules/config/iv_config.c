@@ -2218,6 +2218,22 @@ int iv_config_origin(const iv_config_t *c, const char *key, iv_cfg_origin_t *out
     return IV_OK;
 }
 
+/* M5-S5.1：取一个键的**当前类型**（Web 读写都要先知道该按哪种类型处理）。
+ * 键不存在返回 IV_ENOENT —— 与 get_*() 系列同口径，调用方据此区分
+ * "键在、只是类型不符"与"压根没这个键"。 */
+int iv_config_get_type(const iv_config_t *c, const char *key, iv_cfg_type_t *out)
+{
+    const cfg_item_t *it;
+
+    if (c == NULL || !c->used || key == NULL || out == NULL)
+        return IV_EINVAL;
+    it = item_find(c, key);
+    if (it == NULL)
+        return IV_ENOENT;
+    *out = it->type;
+    return IV_OK;
+}
+
 /* ---------------------------------------------------------------------------
  * 公开 API：F3
  * ------------------------------------------------------------------------- */
@@ -2364,6 +2380,22 @@ int iv_config_array_len(const iv_config_t *c, const char *arr_key, unsigned *n)
 uint64_t iv_config_version(const iv_config_t *c)
 {
     return (c != NULL && c->used) ? c->version : 0u;
+}
+
+/* M5-S5.1：把内存里的键按内部顺序枚举出来（见头文件说明）。
+ * 只读、不改任何状态；`i` 用 unsigned 是有意的 —— 调用方从 0 递增，
+ * 一旦越过 n_items 就返回 IV_ENOENT，不存在"负数下标"这条路。 */
+int iv_config_item_at(const iv_config_t *c, unsigned i, const char **key,
+                      iv_cfg_type_t *type)
+{
+    if (c == NULL || !c->used || key == NULL)
+        return IV_EINVAL;
+    if (i >= c->n_items)
+        return IV_ENOENT;
+    *key = c->items[i].key;
+    if (type != NULL)
+        *type = c->items[i].type;
+    return IV_OK;
 }
 
 int iv_config_stat(const iv_config_t *c, iv_cfg_stat_t *out)

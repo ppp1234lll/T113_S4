@@ -16,6 +16,9 @@ scripts/init.d  ——  sysvinit 开机服务脚本目录
   S65ivsboxd       ivsboxd 主控 sysvinit 脚本：start 只拉起 monitor.sh（主控由 monitor
                    唯一拉起，避免绕过熔断）；stop 先停 monitor 再停主控；restart 清熔断
                    状态（人工解除 G8 failsafe）后重启
+  S66ivsboxweb     ivsbox-web sysvinit 脚本（M5-S5.1）：start 只拉起 monitor-web.sh；
+                   stop 先停守护再停 Web；restart 清 .monitor-web.state。编号 66 > 65，
+                   让主控先建好本地通道 socket（/var/run/ivsbox/ctl）
   .gitkeep         目录占位文件（保留本目录入 git）
 
 【约定与注意事项】
@@ -23,8 +26,11 @@ scripts/init.d  ——  sysvinit 开机服务脚本目录
     rootfs 上的同名空目录（重启即丢）。
   - start() 只拉起 monitor.sh，不直启主控：init 直启会绕过 monitor 的 failsafe 熔断，
     跨复位的崩溃计数就攒不起来，持续崩溃会变成 30 分钟一轮的整机复位风暴。
-  - restart() 才清熔断状态文件（.monitor.state）：rcS 开机只调 start，故在 restart 清是安全的，
-    不能放进 start()。
+    S66ivsboxweb 同款：start() 只拉起 monitor-web.sh，不直启 ivsbox-web。
+  - Web 与主控改用**各自独立**的熔断状态文件（.monitor.state / .monitor-web.state），
+    且 monitor-web.sh 不碰看门狗 —— Web 是附属服务，崩溃不该触发整机复位。
+  - restart() 才清熔断状态文件（.monitor.state / .monitor-web.state）：rcS 开机只调 start，
+    故在 restart 清是安全的，不能放进 start()。
   - 路径口径（2026-09-30 用户定稿）：程序 /opt/ivsbox；数据 /mnt/UDISK/ivsbox；pidfile 在
     /var/run（tmpfs）。
   - 4G 拨号有两个触发源，靠"幂等 + flock"共存：镜像 udev 热插拔脚本（开机冷插拔通常即完成）

@@ -36,6 +36,9 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M4-S4.4 摄像机/主网故障断电重启（0xD1 ＋ 待发 FIFO） | 已实现（模块 ＋ 配置键 ＋ 装配接线 ＋ 单测 ＋ 集成 ＋ VM 全量验证 ＋ 反向证伪 10 条；**主网沿未接线**） | 2026-10-13 13:14 | 新增 `iv_recovery.h`/`iv_recovery.c`（零 malloc）＋ `test_recovery.c`（13 组）；改正 4 个模块 readme；`iv_report_send_cmd()` 通用下行出口；`iv_agent` 内嵌并接线 camdet 沿；`netthr.reboot_max` 下限 1→0（0＝禁用自愈）。单沿（1→2）触发：主网 ⇒ 继电器 1、任一摄像机 ⇒ 继电器 2~8 整排；OFF → 5 s → ON；冷却 60 s；限次耗尽只告警。**关键机制**：`iv_link` 同 cmd 在飞唯一 ⇒ 16 槽待发 FIFO、每拍最多 1 条、`IV_EBUSY` 留队头。VM `make test` 29/29；`host`/`arm`/`analyze`/`asan`/`tsan` RC=0 零告警零 sanitizer；反向证伪 10/10 捕获。**主网沿未接线**（主网五态无模块级出口，卡用户拍板）。 |
 | M4-S4.5 箱门事件触发抓拍回调（门开沿钩子） | 已实现（模块 ＋ 装配接线 ＋ 单测 ＋ 集成 ＋ VM 全量验证 ＋ 反向证伪 7 条；**板端实测待补**） | 2026-10-13 14:06 | `iv_status_t` 增 `iv_status_door_cb on_door` ＋ `on_door_arg` ＋ `iv_status_set_door_cb()`；`0xC1` 到达时**先更新镜像 `DS=2` 再同步触发钩子**。装配层 `iv_report_cfg_t` 增同名两字段 ＋ `status_apply_hooks()`（init/serial_drop/open 三处重挂），`iv_agent` 挂 `on_door_open`（**空实现＋日志＋计数**，抓图本体 M6-S6.2）＋ 新增 `iv_agent_door_events()`。**修掉两颗现场才会炸的地雷**：① 全量刷新原为整表赋值（`*st = next`）⇒ **`0xE1` 每 30 s 就把钩子清掉** ⇒ 改私有 `iv_status_mirror_t`（只换 `data`/`valid`）；② `serial_drop()` 的 `iv_status_init()` 同样清钩子 ⇒ `status_apply_hooks()` 统一重挂。`test_status` 第 13 组 ＋ `test_e2e_report` c02c（**经 cfg 接线**）/c09（**重连后仍在**）＋ `test_agent_switch` k02c（**真 agent ＋ 真 pty**）。VM `make test` 29/29 · 0 FAIL、`host`/`arm`/`analyze`/`asan`/`tsan` RC=0 零告警零 sanitizer（ARM ELF32 EABI5）；**反向证伪 7/7 捕获**。**口径澄清（2026-10-13 用户拍板）**：`DS` **1=关 / 2=开** 为本项目既定口径 ⇒ **无冲突、不需平台确认**；**本项目两套协议域** —— 与平台通信的指令同参考项目、与单片机采集板通信是另一套协议 ⇒ 参考项目 `0xC1`（`CONTROL_FAN`，平台协议）与本项目 `0xC1`（箱门，采集板协议）**编号相同但不可互证**。板端开门实测待补。 |
 | M4 装配接线收口（S4.2 触发 ＋ S4.3 慢池轮询 ＋ S4.4 主网沿） | 已实现（模块级接线 ＋ 集成用例 ＋ VM 全量验证 ＋ 反向证伪 7 条；*DB 落盘与板端实测待补*） | 2026-10-13 16:50 | 补齐 M4 三处"模块已实现但未接入 `iv_agent`/`main`"的装配：*S4.2*＝`iv_agent_open()` 增设备发现（`dev_enable` 闸、开机一次 `iv_device_start_search()`）＋ 平台命令 `0xE4` 路由；*S4.3*＝两个 SNMP 目标装配（`camera.snmp.*`/`switch.snmp.*`、**OID 槽位位置一一对应不压缩**）**经慢任务池收发**（`snmp_task_fn`/`on_snmp_done`、`iv_agent_step`/`on_pb_timer` 调 `iv_taskpool_process`）＋ 平台命令 `0xE7` 路由；*S4.4 主网沿*＝`camdet_feed()` 重写为 `env_feed()`，把 **`iv_netmgr_wan_is_up()`（带迟滞）** 映射 `MN=1/2`、自持 `mn_last[]` 做 1→2 沿检测后调 `iv_recovery_on_master_change()`。**★修掉真缺陷**：`iv_agent_open()` 原把 camdet/recovery/`0xA5` 装配写在 `if (r != NULL)` 内 ⇒ *`r == NULL` 模式下 `a->rec` 从不 init、主网/摄像机故障沿静默失效*（`test_agent_switch` 实测 `credit=0`、无 0xD1）；移出该分支并把"两种驱动模式装配一致"钉进 `iv_agent.h` 注释。新增 `tests/integration/test_agent_m4.c`（约 640 行，自带回环假 SNMP 应答器）＋ `test_agent_switch.c` 补 k02b/k04b/k06b。VM `host` 零告警、`setarch -R make test` *29/29*、`asan`/`tsan` 各 29/29 零报告、`analyze` 零告警、`arm` 出 ELF32 ARM；三集成用例三档 RC=0；`test_ctl_snapshot` RC=1 系非 root 环境受限（基线同）。*反向证伪 7/7*。*未做：DB 落盘（表结构待 S9）、板端实测*。详见本文件文末 2026-10-13 16:50 节。 |
+| M5-S5.1/S5.3 Web 服务与八页面（自研最小 HTTP/1.1，弃 SSI/CGI） | 已实现（VM 全量验证 ＋ 新增集成用例 ＋ 反向证伪 2 条；`ab` 真压测、板端走查、审计落盘待补） | 2026-10-14 09:10 | `web/src/` 五件（iv_web.h/iv_web_chan.c/iv_web_api.c/iv_web_static.c/main.c）＋ `web/static/` 三件；`monitor-web.sh` ＋ `S66ivsboxweb`；`WEB_BIN` 只链 `libivcore`。**统一测试修掉 3 个真缺陷**（parse_req 就地改写缓冲／响应头终止空行缺失／400 快路径写错缓冲区）。详见本文件文末 2026-10-14 09:10 节 |
+| M5-S5.2/S5.4 本地通道方法路由 iv_ctl ＋ 配置事务（版本门） | 已实现（VM 全量验证 ＋ 反向证伪 2 条；审计落 control.db、事务通知接线待补） | 2026-10-14 09:10 | `iv_ctl.h`/`iv_ctl.c` 13 方法；`system.snapshot` 老格式与"未知方法静默"两条老契约保住；`config.apply` 版本门＋失败回滚；`main.c` 多客户端＋reboot/settime 钩子；单测 `test_ctl.c` 15 组 |
+| M5-S5.5 ivsbox-provision 组播出厂工装 | 已实现（VM 全量验证 ＋ 反向证伪 1 条；组播默认值与报文格式待用户冻结） | 2026-10-14 09:10 | `iv_provision.h`/`iv_provision.c` ＋ `tools/provision`；56 B 身份记录＋XOR 混淆＋裸分区直写（无 `O_CREAT`）；`IVPR` 报文四道校验；工厂标记闸门；单测 `test_prov.c` |
 |===
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
@@ -1607,3 +1610,41 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 * **"两种驱动模式装配的东西必须完全一样"**：`r != NULL`（Reactor）与 `r == NULL`（调用方节拍驱动）**只允许差 netlink fd 与两个定时器的注册**，其余装配一律不得进 `if (r != NULL)`。单测天然覆盖不到（单测多走一种模式），只有集成用例同时跑两条路径才抓得出。已钉进 `iv_agent.h` 的 `iv_agent_open()` 注释。
 * **"卡用户拍板"之前先把出口找一遍**：S4.4 主网沿 13:14 被判"无模块级出口、卡用户"，实际 `iv_netmgr_wan_is_up()`（带迟滞）早在 S3.8（2026-10-10）就存在。判断"某步能否开工"必须核对**当前代码**，别沿用早前结论。
 * **`iv_agent_cfg_t` 只放值、不放指针**：本层对 cfg 整拷，任何指向调用方局部量的指针都会在 `a->cfg = *cfg;` 之后悬空（初版 `dev_ifname` 即踩此坑）。
+
+
+== 2026-10-14 09:10 M5 Web 与工装（S5.1~S5.5 全量落地 ＋ 统一验证修掉 3 个真缺陷）
+
+=== 解决什么问题
+
+* *Web 数据通路*：Web 进程**不直接碰配置与数据库**，一切数据经本地通道问 `ivsboxd`（`iv_ctl` 13 方法）。落实手段是构建级的——`WEB_BIN` **只链 `libivcore`**（本地通道客户端＋日志），链不上 libivmodules 就"想开库也没有符号"。
+* *两条老契约不能破*：`system.snapshot` 的老格式（`test_ctl_snapshot` 集成用例逐字断言）与"未知方法不产生任何应答"。`iv_ctl` 把它们作为路由表的一等公民保留。
+* *配置事务（S5.4）*：版本门在 `iv_ctl` 侧一次判死（唯一权威），Web 只做粗筛；`config.apply` 失败用静态备份数组回滚内存，保证"失败保留旧配置"。
+
+=== 影响范围
+
+* *新增目录*：`src/modules/ctl/`、`src/modules/provision/`、`web/src/`（原空骨架）、`web/static/`。
+* *`src/app/main.c`*：本地通道由"单客户端＋内置 snapshot 桩"改为**多客户端（4 槽）＋ `iv_ctl_handle()` 路由**；新增 `ctl_do_reboot()`（sync＋关看门狗＋`reboot(RB_AUTOBOOT)`）与 `ctl_do_settime()`；删除 `CHAN_SNAPSHOT` 老桩。
+* *构建脚本*：`WEB_BIN`/`PROVISION_BIN` 的链接库与 `package-copy` 归集清单；`MODULES_SRCS`/`TEST_SRCS`/`ITEST_SRCS` 通配自动纳入新文件。
+* *守护链路*：新增 `monitor-web.sh` ＋ `S66ivsboxweb`，与主控的 `monitor.sh`/`S65ivsboxd` **完全独立**（独立状态文件与 pidfile，且 **monitor-web 不碰看门狗**）。
+
+=== 验证方式与结果
+
+* *构建 / 回归（VM `tqt113`，`/tmp/wb_m5`，`make clean` 后全量重建）*：`make host` 零告警；`make test` **31/31**；`make asan` / `setarch -R make tsan` 各 **31/31 · 零 sanitizer/race 报告**；`make arm` 出 **ELF32 ARM**（`ivsbox-web` 52 KB、`ivsbox-provision` 24 KB，`--gc-sections` 把未用到的模块段裁掉）；`make analyze` 零报告。
+* *集成 5 个全绿*：`test_agent_m4` / `test_agent_switch` / `test_ctl_snapshot` / `test_e2e_report` / **新增 `test_web_http`**。前四个在 `unshare -rm` 用户命名空间内造出 `/mnt/UDISK` 与 `/var/run/ivsbox` 后跑通——`test_ctl_snapshot` 此前在 VM 上 RC=1 的"环境受限"定性由此获得**正向证据**（造出环境后即绿）。
+* *`test_web_http`（自拉被测进程，不需要 ivsboxd）*：静态／**头体分两次写的 POST**／三段逐块喂／鉴权 401／穿越三种变体／体上限 400／MIME／**fd 稳定性**（200 次连接级请求前后 `/proc/<pid>/fd` 数不变）。计划 S5.1 的 `ab -n 10000 -c 50` 在 VM 无 apache2-utils，暂以"连接级 churn＋fd 计数"等价替代，真压测待板端补。
+* *Web 端到端冒烟（curl）*：登录/总览/配置/`config.apply`（version 0→1）/**旧版本号重放被拒**（`e:-3 version conflict`）/穿越被挡/reboot 无 `confirm` 被拒/500 次请求 fd 6→6/登出。
+* *反向证伪 5/5*：`f1` 复原"就地改写 rbuf" ⇒ `test_web_http` 红；`f2` 复原"头终止空行缺失" ⇒ 红；`f3` 摘掉版本门 ⇒ `test_ctl` c10 红；`f4` 摘掉身份累加和 ⇒ `test_prov` p04 红；`f5` 未知方法写应答 ⇒ `test_ctl` c03 红。
+
+=== 三个真缺陷（统一测试阶段抓出，单测天然测不到）
+
+* *`parse_req` 就地改写接收缓冲*：把每个头行行尾的 `\r` 写成 `\0`。一条 POST 的头与体**分两次 `recv` 到达**（curl 的常态）时，第二次解析再也找不到 `\r\n\r\n` ⇒ 又返回 `IV_EAGAIN`，连接挂死到 30 s 空闲超时。**修法＝解析必须无副作用**：行拷进局部缓冲再判，接收缓冲只在拿到完整请求后于 body 末尾补 `\0`。
+* *响应头终止空行缺失*：`"%s%s" "\r\n"` 在带 `Set-Cookie` 时只产出一行 CRLF，**头从未被终止**，正文紧跟其后 ⇒ curl `size_download=0`。不带 Cookie 的路径恰好等价，缺陷被静态接口掩盖。第一版修法（给 `%s%s` 行补 CRLF）又让无 Cookie 路径多出一行，被 `Content-Length == body 字节数` 断言当场拦下 ⇒ **最终修法：行尾 CRLF 挂在第三个 `%s` 参数上，只有真写了 Cookie 行才补它的行尾**。
+* *400/413 快路径写错缓冲区*：响应 `snprintf` 进 `c->rbuf`，而 `on_writable` 只发 `c->wbuf` ⇒ 客户端收到 66 字节全零。
+
+=== 沉淀的纪律
+
+* **HTTP 解析必须无副作用**：接收缓冲会被多次解析（分段到达是常态，不是异常），任何"先改写再重试"的写法都会把第二次解析弄瞎。这类缺陷只有"真的分两次发"的集成测试抓得到。
+* **响应头格式串的可选行，行尾必须挂在可选参数上**：终止空行要"有且只有一个"，两种错误方向（少一行／多一行）都会让客户端行为异常，且各自只影响一半接口。
+* **快路径响应也必须落在发送缓冲**：`on_writable` 只认 `c->wbuf`，任何"顺手写进另一个缓冲"的快路径都是在发垃圾。
+* **需要 `/mnt/UDISK` 的集成用例可用 `unshare -rm` 在非 root 的编译机上跑绿**：`mount -t tmpfs none /mnt` ＋ `none /var/run` 即可造出 ivsboxd 需要的全部路径；注意命名空间退出**不会**杀掉里面起的进程，端口残留要用 `pkill -x`（不能用 `pkill -f`，会误杀 ssh 自身命令行）。
+* **用户级命名空间内的进程残留会冒充"修复无效"**：本轮曾因端口 18081 被上一轮的旧二进制占着，误判"分段请求仍然超时"；清理残留后同一份代码立即全绿。复现失败前先 `pkill -x` 清场。

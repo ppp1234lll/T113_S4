@@ -18,8 +18,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ivsbox/ivsbox.h"
@@ -27,6 +29,7 @@
 #include "ivsbox/iv_chan.h"
 #include "ivsbox/iv_clock.h"
 #include "ivsbox/iv_config.h"
+#include "ivsbox/iv_ctl.h"
 #include "ivsbox/iv_db.h"
 #include "ivsbox/iv_health.h"
 #include "ivsbox/iv_log.h"
@@ -42,7 +45,6 @@ static const char *const CAM_IP_KEY[IV_CAMDET_CH_N] = {
     "camera.ch.0.ip", "camera.ch.1.ip", "camera.ch.2.ip",
     "camera.ch.3.ip", "camera.ch.4.ip", "camera.ch.5.ip"
 };
-#define CHAN_SNAPSHOT "system.snapshot"
 
 /* 运行期全局句柄 */
 static iv_taskpool_t *g_pool;
@@ -55,13 +57,27 @@ static int            g_wd_fd = -1;
 /* M3 业务装配（约 35 KB，必须放静态区/堆，勿放栈） */
 static iv_agent_t     g_agent;
 
-/* 本地通道 */
-static int       g_listen_fd = -1;
-static iv_event_t *g_listen_ev;
-static int       g_client_fd = -1;
-static iv_event_t *g_client_ev;
+/* 本地通道（M5-S5.1 起改为**多客户端** ＋ 方法路由）：
+ * 原来只支持一个客户端、只认 system.snapshot。Web 进程会长期占一条连接，
+ * 调试工具/平台探活可能同时连进来，单客户端槽会让后来者被直接踢掉。 */
+#define CHAN_MAX_CLIENTS 4
+typedef struct {
+    int         fd;
+    iv_event_t *ev;
+} chan_cli_t;
 
-static char      g_rx_buf[IV_CHAN_RECV_CAP_MIN];
+static int         g_listen_fd = -1;
+static iv_event_t *g_listen_ev;
+static chan_cli_t  g_cli[CHAN_MAX_CLIENTS];
+
+/* iv_ctl 的上下文与方法路由结果缓冲（均在装配层单线程内使用）。
+ * 请求缓冲给通道最大包，响应缓冲给 iv_ctl 自己的上限。 */
+static iv_ctl_ctx_t g_ctl_ctx;
+static char         g_rx_buf[IV_CHAN_RECV_CAP_MIN];
+static char         g_rsp_buf[IV_CTL_RSP_MAX];
+
+/* 通道函数在下面定义，这里先声明：关停路径要先于定义使用它。 */
+static void chan_client_drop(int slot);
 
 /* ---------------------------------------------------------------------------
  * 干净退出
@@ -70,9 +86,11 @@ static void app_shutdown(void)
 {
     IV_LOG_I(APP_MOD, "shutting down ivsboxd");
 
-    if (g_client_fd >= 0) {
-        (void)close(g_client_fd);
-        g_client_fd = -1;
+    {
+        int i;
+
+        for (i = 0; i < CHAN_MAX_CLIENTS; i++)
+            chan_client_drop(i);
     }
     if (g_listen_fd >= 0) {
         (void)iv_chan_listen_close(g_listen_fd, IV_CHAN_PATH_DEFAULT);
@@ -156,60 +174,85 @@ static int watchdog_setup(void)
 }
 
 /* ---------------------------------------------------------------------------
- * 本地通道：对 system.snapshot 返回一个最小快照
+ * 本地通道：方法路由（M5-S5.1）
+ *
+ * 载荷解析、方法分发、响应拼装全部交给 `iv_ctl`（libivmodules，可单测）；
+ * 本文件只负责 fd 生命周期与收发。**未知方法静默不回**（`IV_ENOTSUP`）——
+ * S10 既有口径，且被 tests/integration/test_ctl_snapshot.c 钉死。
  * ------------------------------------------------------------------------- */
-static int snapshot_reply(int fd, const ivs_chan_hdr_t *req)
+
+/* 找一个空闲客户端槽；满返回 -1。 */
+static int chan_slot_free(void)
 {
-    ivs_chan_hdr_t hdr;
-    char           body[128];
-    int            n;
+    int i;
 
-    n = snprintf(body, sizeof(body),
-                 "{\"method\":\"system.snapshot\",\"version\":\"%s\",\"status\":\"ok\"}",
-                 iv_version_string());
-    if (n < 0 || n >= (int)sizeof(body))
-        return -1;
+    for (i = 0; i < CHAN_MAX_CLIENTS; i++) {
+        if (g_cli[i].fd < 0)
+            return i;
+    }
+    return -1;
+}
 
-    if (iv_chan_hdr_init(&hdr, IV_CHAN_TYPE_RSP, req->request_id, 0u, (uint32_t)n) != IV_OK)
-        return -1;
-
-    return iv_chan_send(fd, &hdr, body, (size_t)n);
+static void chan_client_drop(int slot)
+{
+    if (slot < 0 || slot >= CHAN_MAX_CLIENTS)
+        return;
+    if (g_cli[slot].ev != NULL && g_reactor != NULL) {
+        (void)iv_reactor_del(g_reactor, g_cli[slot].ev);
+        g_cli[slot].ev = NULL;
+    }
+    if (g_cli[slot].fd >= 0) {
+        (void)close(g_cli[slot].fd);
+        g_cli[slot].fd = -1;
+    }
 }
 
 static void on_chan_client(int fd, uint32_t events, void *arg)
 {
+    int            slot = (int)(intptr_t)arg;
     ivs_chan_hdr_t hdr;
-    size_t         payload_len;
+    size_t         payload_len = 0;
+    size_t         out_len = 0;
     int            rc;
-
-    (void)arg;
+    int            crc;
 
     if (events & (IV_EV_ERR | IV_EV_HUP | IV_EV_RDHUP)) {
-        rc = IV_ECONN;
-    } else {
-        rc = iv_chan_recv(fd, g_rx_buf, sizeof(g_rx_buf), &hdr, &payload_len);
+        chan_client_drop(slot);
+        return;
     }
 
+    rc = iv_chan_recv(fd, g_rx_buf, sizeof(g_rx_buf), &hdr, &payload_len);
     if (rc == IV_EAGAIN)
         return;
-
     if (rc != IV_OK) {
-        IV_LOG_I(APP_MOD, "channel client closed/error (fd=%d, rc=%d)", fd, rc);
-        iv_reactor_del(g_reactor, g_client_ev);
-        g_client_ev = NULL;
-        (void)close(fd);
-        g_client_fd = -1;
+        IV_LOG_I(APP_MOD, "channel client (slot=%d) closed/error, rc=%d", slot, rc);
+        chan_client_drop(slot);
+        return;
+    }
+    if (hdr.type != IV_CHAN_TYPE_REQ)
+        return; /* 这个方向只会来 REQ */
+
+    crc = iv_ctl_handle(&g_ctl_ctx,
+                        (const char *)g_rx_buf + IV_CHAN_HDR_SIZE, payload_len,
+                        g_rsp_buf, sizeof(g_rsp_buf), &out_len);
+    if (crc != IV_OK) {
+        /* IV_ENOTSUP = 未知方法 ⇒ **静默丢弃**（S10 口径）。
+         * 其余错误（缓冲太小、内存不足）属装配问题，同样不回，但留一条日志。 */
+        if (crc != IV_ENOTSUP)
+            IV_LOG_W(APP_MOD, "channel request handling failed: rc=%d", crc);
         return;
     }
 
-    if (hdr.type == IV_CHAN_TYPE_REQ && payload_len > 0) {
-        const char *payload = (const char *)g_rx_buf + IV_CHAN_HDR_SIZE;
-        if (payload_len < sizeof(CHAN_SNAPSHOT) - 1u ||
-            memcmp(payload, CHAN_SNAPSHOT, sizeof(CHAN_SNAPSHOT) - 1u) != 0) {
-            /* 非 snapshot 请求：静默忽略（S10 只验证 snapshot 通路） */
-        } else {
-            (void)snapshot_reply(fd, &hdr);
-        }
+    {
+        ivs_chan_hdr_t rh;
+        int            snd;
+
+        if (iv_chan_hdr_init(&rh, IV_CHAN_TYPE_RSP, hdr.request_id, 0u,
+                             (uint32_t)out_len) != IV_OK)
+            return;
+        snd = iv_chan_send(fd, &rh, g_rsp_buf, out_len);
+        if (snd != IV_OK)
+            IV_LOG_I(APP_MOD, "channel send failed (slot=%d, rc=%d)", slot, snd);
     }
 }
 
@@ -217,6 +260,7 @@ static void on_chan_listen(int fd, uint32_t events, void *arg)
 {
     iv_chan_peer_t peer;
     int            cfd;
+    int            slot;
 
     (void)events;
     (void)arg;
@@ -229,22 +273,24 @@ static void on_chan_listen(int fd, uint32_t events, void *arg)
         return;
     }
 
-    if (g_client_fd >= 0) {
-        /* S10 骨架只支持一个并发客户端，避免状态复杂 */
-        IV_LOG_W(APP_MOD, "channel client already connected, dropping new one");
+    slot = chan_slot_free();
+    if (slot < 0) {
+        IV_LOG_W(APP_MOD, "channel clients full (%d), dropping new one",
+                 CHAN_MAX_CLIENTS);
         (void)close(cfd);
         return;
     }
 
-    g_client_fd = cfd;
-    g_client_ev = iv_reactor_add(g_reactor, cfd, IV_EV_READ, on_chan_client, NULL);
-    if (g_client_ev == NULL) {
+    g_cli[slot].fd = cfd;
+    g_cli[slot].ev = iv_reactor_add(g_reactor, cfd, IV_EV_READ, on_chan_client,
+                                    (void *)(intptr_t)slot);
+    if (g_cli[slot].ev == NULL) {
         IV_LOG_E(APP_MOD, "channel client add to reactor failed");
         (void)close(cfd);
-        g_client_fd = -1;
-    } else {
-        IV_LOG_I(APP_MOD, "channel client connected (fd=%d, uid=%d)", cfd, (int)peer.uid);
+        g_cli[slot].fd = -1;
+        return;
     }
+    IV_LOG_I(APP_MOD, "channel client connected (slot=%d, uid=%d)", slot, (int)peer.uid);
 }
 
 /* ---------------------------------------------------------------------------
@@ -291,6 +337,42 @@ static int mkdir_for_channel(void)
     if (mkdir(dir, 0755) != 0 && errno != EEXIST)
         return -1;
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * 本地通道系统操作钩子（M5-S5.2）
+ *
+ * 只有这两个动作**必须由 ivsboxd 本体**执行（Web 进程做不了）：
+ *   - 重启：`reboot(2)` 要 root，且必须先把文件系统落盘（sync）再走，否则
+ *     UDISK 上的配置/队列可能停在 page cache 里没写下去。
+ *   - 对时：`clock_settime(CLOCK_REALTIME)` 影响全机，只有主控该做。
+ * 两个钩子都在**装配层单线程**内同步执行，故都得够快（架构 §4.2）。
+ * ------------------------------------------------------------------------- */
+static int ctl_do_reboot(void *arg)
+{
+    (void)arg;
+    (void)sync();
+    /* 正常停机前先停狗：否则 reboot 期间看门狗可能先咬、把复位做得更难看。
+     * 这里不 disable 也能重启成功，但保留顺序与 app_shutdown 一致。 */
+    if (g_wd_fd >= 0) {
+        (void)iv_watchdog_disable(g_wd_fd);
+        g_wd_fd = -1;
+    }
+    if (reboot(RB_AUTOBOOT) != 0)
+        return IV_EIO;
+    return IV_OK;
+}
+
+static int ctl_do_settime(int64_t wall_sec, void *arg)
+{
+    struct timespec ts;
+
+    (void)arg;
+    ts.tv_sec  = (time_t)wall_sec;
+    ts.tv_nsec = 0;
+    if (clock_settime(CLOCK_REALTIME, &ts) != 0)
+        return IV_EIO;
+    return IV_OK;
 }
 
 /* ---------------------------------------------------------------------------
@@ -537,7 +619,24 @@ static int app_init(void)
         return -1;
     }
 
-    /* 5. 本地通道服务 */
+    /* 5. 本地通道服务 ＋ 方法路由上下文（M5-S5.1）
+     * 客户端槽必须显式置 -1：静态数组默认全 0，而 0 是合法 fd（stdin），
+     * 不置 -1 会让"空闲槽"判定把 stdin 当成已连接客户端。 */
+    {
+        int i;
+
+        for (i = 0; i < CHAN_MAX_CLIENTS; i++) {
+            g_cli[i].fd = -1;
+            g_cli[i].ev = NULL;
+        }
+    }
+    memset(&g_ctl_ctx, 0, sizeof(g_ctl_ctx));
+    g_ctl_ctx.cfg         = g_cfg;
+    g_ctl_ctx.db          = g_db;
+    g_ctl_ctx.do_reboot   = ctl_do_reboot;
+    g_ctl_ctx.do_settime  = ctl_do_settime;
+    /* g_ctl_ctx.agent 在 agent_setup() 之后回填（见第 9 步）。 */
+
     if (mkdir_for_channel() != 0)
         IV_LOG_W(APP_MOD, "channel parent dir create failed: %s", strerror(errno));
 
@@ -582,6 +681,11 @@ static int app_init(void)
      *    必须在 reactor 创建之后（其定时器/fd 都要挂到 reactor）。 */
     if (agent_setup() != 0)
         return -1;
+
+    /* 9b. agent 就绪后再回填路由上下文的 agent 指针：
+     * iv_ctl 的 sys.overview / device.list / snmp.* / camera.search 都读它，
+     * 而第 5 步建通道时 agent 还没装配。 */
+    g_ctl_ctx.agent = &g_agent;
 
     /* 10. 健康线程（必须在 reactor 创建之后、run 之前） */
     g_health = iv_health_start_default(g_reactor, g_pool, g_wd_fd);

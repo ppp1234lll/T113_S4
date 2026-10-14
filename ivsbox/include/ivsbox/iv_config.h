@@ -239,6 +239,10 @@ int iv_config_get_dbl(const iv_config_t *c, const char *key, double *out);
 /* 这个键的值是文件给的还是默认补的（F4 要能区分，便于 Web 标"未配置"） */
 int iv_config_origin(const iv_config_t *c, const char *key, iv_cfg_origin_t *out);
 
+/* 这个键的**当前类型**（M5-S5.1 新增：Web 读写前必须知道该按哪种类型处理）。
+ * 键不存在返回 IV_ENOENT（与 get_* 系列同口径）；参数非法 IV_EINVAL。 */
+int iv_config_get_type(const iv_config_t *c, const char *key, iv_cfg_type_t *out);
+
 /* ---------------------------------------------------------------------------
  * F3 改参数
  * 只改内存，不碰磁盘；落盘由 save() 一次性完成。未知键也允许写（向前兼容），
@@ -354,6 +358,22 @@ int iv_config_subscribe(iv_config_t *c, uint32_t class_mask, iv_cfg_notify_fn fn
  * ------------------------------------------------------------------------- */
 int iv_config_default_get(const char *name, const char *key, iv_cfg_type_t *out_type,
                           char *out_text, size_t cap);
+
+/* ---------------------------------------------------------------------------
+ * 遍历内存中的键（M5-S5.1 配置页需要"列出这个分类下有哪些键"）
+ *
+ * 为什么必须有这个口子：`get_*()` 都是"给一个键取值"，而 Web 配置页拿到的
+ * 只有分类名（`net`），没法凭它反推出键清单。原先各页面只能把键名硬编码在
+ * 前端，改一个键就要动两边 —— 本函数让后端能把键**枚举**出来，前后端解耦。
+ *
+ * `i` 从 0 递增；命中返回 IV_OK 并填 `*key`（指向模块内部存储，生命周期同
+ * `iv_config_get_str` 的 `*out`），`type` 可为 NULL；`i >= n_items` 返回 IV_ENOENT。
+ * **顺序＝内部条目顺序**（默认值表顺序在前、文件中未知键随后），
+ * **不对调用方承诺任何排序**，需要稳定顺序请自行按 key 排序。
+ * 参数非法（c/key 为 NULL、句柄未使用）返回 IV_EINVAL。
+ * ------------------------------------------------------------------------- */
+int iv_config_item_at(const iv_config_t *c, unsigned i, const char **key,
+                      iv_cfg_type_t *type);
 
 #ifdef __cplusplus
 }

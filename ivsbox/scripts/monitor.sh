@@ -223,14 +223,21 @@ while true; do
     fi
 
     # ---- 受控远程通道守护（M8）----
-    # 两个方向都要兜：① 标记在、进程没了 ⇒ 通道静默失效，远程运维连不上，现象与
+    # 三个方向都要兜：① 标记在、进程没了 ⇒ 通道静默失效，远程运维连不上，现象与
     # "设备掉线"一模一样，现场最难查；② 标记没了、进程还在 ⇒ 远程入口绕过有效期
-    # 常开，这是安全事故，比失效危险得多。两端都按"标记"这一个判据对齐。
+    # 常开，这是安全事故，比失效危险得多；③ 标记在但**已过期** ⇒ 主控不在时
+    # `iv_tunnel_tick()` 没人跑，只剩这一层能执行有效期闸门（标记内容就是到期时刻，
+    # 由 iv_tunnel_enable 写入；⚠ 本脚本的 $now 是 /proc/uptime，判过期必须用 date）。
+    # "该不该在跑"的最终裁决交给 frp.sh 的 up（它内部同样判过期，幂等）。
     if [ -f "$IVSBOX_TUNNEL_FLAG" ]; then
-        if ! frpc_alive; then
+        tun_exp=$(tr -cd '0-9' < "$IVSBOX_TUNNEL_FLAG" 2>/dev/null)
+        tun_now=$(date +%s 2>/dev/null)
+        if [ -n "$tun_exp" ] && [ -n "$tun_now" ] && [ "$tun_now" -ge "$tun_exp" ] 2>/dev/null; then
+            tunnel_alert "标记已过期（主控不在？），停掉 frpc 并清标记"
+        elif ! frpc_alive; then
             tunnel_alert "标记存在但 frpc 不在，拉起"
-            sh "$TUNNEL_SCRIPT" up >/dev/null 2>&1
         fi
+        sh "$TUNNEL_SCRIPT" up >/dev/null 2>&1
     else
         if frpc_alive; then
             tunnel_alert "标记已清除，停掉 frpc（有效期闸门）"

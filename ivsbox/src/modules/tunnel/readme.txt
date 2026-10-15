@@ -12,11 +12,17 @@ src/modules/tunnel  ——  受控远程访问通道（M8-S8.1~S8.3）
   readme.txt   本文件。
 
   相关（不在此目录）：
-    scripts/frp.sh     frpc 进程起停（只按标记文件动作，不自己造标记）
-    scripts/monitor.sh 通道守护：标记在 ⇒ 保证进程在；标记不在 ⇒ 保证进程不在
+    scripts/frp.sh     frpc 进程起停（只按标记文件动作，不自己造标记）＋
+                       独立判标记里的到期时刻（主控不在时唯一的有效期闸门）
+    scripts/monitor.sh 通道守护：标记在 ⇒ 保证进程在；标记不在 ⇒ 保证进程不在；
+                       标记在但已过期 ⇒ 收掉（判过期用 date +%s，monitor 的 $now 是 uptime）
 
 【实现状态】
-  已实现（2026-10-15，M8-S8.1~S8.3）。尚未接线到装配层（属 S8.4）。
+  S8.1~S8.3 已实现（2026-10-15）：模块 ＋ 装配接线（`main.c`：SN 读身份分区、令牌读
+  `<secure>/tunnel.token`、resolver 落 127.0.0.1、5 s 周期 tick、配置热更新作废、
+  退出即关）＋ 配置键 `sys.tunnel.*` ＋ `iv_ctl` 的 `tunnel.status/enable/disable`。
+  标记文件内容＝到期时刻，`frp.sh`/`monitor.sh` 可独立判过期（有效期不依赖主控存活）。
+  摄像机受控代理（S8.5）未落地 ⇒ `camera:N` 目前恒报不可达；端到端连通待 frps 就位。
 
 【实现方式（2026-10-15 用户指定：与 BIRD 运维箱同款）】
   不自己写隧道、不自己发明通道协议，按参考项目

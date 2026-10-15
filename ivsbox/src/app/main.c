@@ -34,8 +34,10 @@
 #include "ivsbox/iv_db.h"
 #include "ivsbox/iv_health.h"
 #include "ivsbox/iv_log.h"
+#include "ivsbox/iv_provision.h"
 #include "ivsbox/iv_reactor.h"
 #include "ivsbox/iv_taskpool.h"
+#include "ivsbox/iv_tunnel.h"
 #include "ivsbox/iv_upd.h"
 #include "ivsbox/iv_version.h"
 #include "ivsbox/iv_watchdog.h"
@@ -82,6 +84,21 @@ static char         g_rsp_buf[IV_CTL_RSP_MAX];
 static void chan_client_drop(int slot);
 
 /* ---------------------------------------------------------------------------
+ * M8-S8.3 受控远程通道 —— 静态句柄（函数体在 cfg 辅助函数之后；app_shutdown 与
+ * on_config_event 都先于那些定义用到它们，故声明必须提在这里）。
+ * ------------------------------------------------------------------------- */
+static iv_tunnel_t  g_tunnel_store;  /* 句柄（约 2 KB，静态区；不占栈） */
+static iv_tunnel_t *g_tunnel = &g_tunnel_store;
+static iv_timer_t  *g_tunnel_timer;
+/* resolver 的目标端口与开关（装配时从配置读入；resolver 是回调，不便再读配置） */
+static uint16_t     g_tun_port_web   = 80u;
+static uint16_t     g_tun_port_media = 18000u;
+static uint16_t     g_tun_port_cam   = 8081u;
+static int          g_tun_cam_enable;
+
+static void tunnel_apply_cfg(void); /* 配置热更新回调要用 */
+
+/* ---------------------------------------------------------------------------
  * 干净退出
  * ------------------------------------------------------------------------- */
 static void app_shutdown(void)
@@ -97,6 +114,19 @@ static void app_shutdown(void)
     if (g_listen_fd >= 0) {
         (void)iv_chan_listen_close(g_listen_fd, IV_CHAN_PATH_DEFAULT);
         g_listen_fd = -1;
+    }
+
+    /* M8-S8.3：主控**干净退出**即关通道。有效期闸门跑在本进程里，进程不在了就不该
+     * 再留一条没人管的远程入口。代价是"运维远程重启主控会断线"—— 但重开只需平台
+     * 再发一条 tunnel.enable，比"重启后通道永久开着"安全。主控被 SIGKILL 时这条
+     * 走不到，兜底交给标记文件里的到期时刻（scripts/frp.sh 独立判过期）。 */
+    if (iv_tunnel_state(g_tunnel) == IV_TUNNEL_ON) {
+        (void)iv_tunnel_disable(g_tunnel, (uint64_t)time(NULL), IV_TUNNEL_STOP_LOCAL);
+        IV_LOG_I(APP_MOD, "tunnel: closed on shutdown");
+    }
+    if (g_tunnel_timer != NULL && g_reactor != NULL) {
+        (void)iv_timer_cancel(g_reactor, g_tunnel_timer);
+        g_tunnel_timer = NULL;
     }
 
     /* 健康线程必须在 taskpool/reactor 销毁前停掉 */
@@ -315,6 +345,9 @@ static void on_config_event(int fd, uint32_t events, void *arg)
     (void)events;
     (void)arg;
     (void)iv_config_watch_poll(g_cfg, NULL);
+    /* M8-S8.3：配置热更新后重取通道的服务端落点与代理端口（服务端一变，
+     * 正在开的会话被作废，见 tunnel_apply_cfg）。 */
+    tunnel_apply_cfg();
 }
 
 /* ---------------------------------------------------------------------------
@@ -447,6 +480,214 @@ static uint16_t cfg_port(const char *key)
     if (iv_config_get_int(g_cfg, key, &v) != IV_OK || v <= 0 || v > 65535)
         return 0u;
     return (uint16_t)v;
+}
+
+/* ---------------------------------------------------------------------------
+ * M8-S8.3 受控远程通道的装配（模块本体见 src/modules/tunnel/iv_tunnel.c）
+ * ---------------------------------------------------------------------------
+ * 这一层只做"只有装配层才知道的事"，四件：
+ *   ① **身份与令牌的来源**：SN 读工厂身份分区（架构钉死"身份不进配置"），令牌读
+ *      `<secure>/tunnel.token`（**也不进配置** —— 配置是明文 JSON 且 `config.all`
+ *      会把它整份导出给前端）。两者任一缺 ⇒ 通道开不了（fail-closed），
+ *      而不是编一个"看起来合理"的默认值。
+ *   ② **服务名 → 本机代理入口**的映射（resolver）。一律 127.0.0.1，模块侧另有环回
+ *      硬闸门兜底；摄像机 IP 因此永远进不了 `frpc.toml`。
+ *   ③ 配置键 `sys.tunnel.*` 的读取，以及**热更新**时把在开的会话作废。
+ *   ④ 周期 `tick()`（到期自动关）。**第二道兜底在 scripts/frp.sh**：标记文件内容
+ *      就是到期时刻，主控死了脚本也能判过期（见 iv_tunnel.h 头文件说明）。
+ * ------------------------------------------------------------------------- */
+
+/* 令牌落点：与 iv_prov 的 SECURE_DIR_DEFAULT 同源（/mnt/UDISK/ivsbox/secure）。
+ * ⚠ F8 密钥分离未实现，这个目录目前**不是**真正的机密存储（与 `camera.ch.N.pass`、
+ *   `camera.snmp.community` 同类已知欠账）；但它至少不会随 `config.all` 被导出、
+ *   也不会出现在日志里 —— 比塞进普通配置强。 */
+#define TUNNEL_TOKEN_FILE_DEFAULT "/mnt/UDISK/ivsbox/secure/tunnel.token"
+
+/* 到期巡检周期：有效期以小时计，1 s 级没必要，5 s 足够及时且不吵。 */
+#define TUNNEL_TICK_MS 5000
+
+/* 句柄与 resolver 的目标端口在文件头声明（app_shutdown / on_config_event 先于
+ * 本块用到它们），这里只放只与本块相关的常量与函数。 */
+
+/* 服务名 → 本机代理入口。**只可能返回环回地址**：frp 的 `localIP` 必须是本机可达
+ * 地址，所以摄像机 IP 永远进不了 `frpc.toml` —— 要访问摄像机只能过设备上的受控代理
+ * （架构 §9.3 / S8.5）。非环回由 iv_tunnel 再拦一次（EHOST）。 */
+static int tunnel_resolve(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t *port,
+                          void *arg)
+{
+    (void)arg;
+    if (svc == NULL || ip_be == NULL || port == NULL)
+        return IV_EINVAL;
+
+    /* ip_be 的约定＝"数值本身按大端读"（见 test_tunnel 的 rig 与 iv_tunnel 的渲染：
+     * 按字节取位输出 localIP），不要 htonl —— htonl 过的值在小端机上 >>24 是 0x01，
+     * 会被环回闸门当成非环回拒掉。 */
+    *ip_be = 0x7f000001u; /* 127.0.0.1 */
+    switch (svc->kind) {
+    case IV_TUNNEL_SVC_WEB:
+        *port = g_tun_port_web;
+        return IV_OK;
+    case IV_TUNNEL_SVC_MEDIA:
+        *port = g_tun_port_media;
+        return IV_OK;
+    case IV_TUNNEL_SVC_CAMERA:
+        /* S8.5 落地前本机没有这个监听口。报"不可达"（EUNMAPPED 的语义）比把它映射到
+         * 一个没人听的端口好：后者会让 frpc 起得来、连得上、但一访问就断，
+         * 现场排查会从"通道"一路查到"摄像机"，方向全错。 */
+        if (!g_tun_cam_enable)
+            return IV_ENOENT;
+        *port = g_tun_port_cam;
+        return IV_OK;
+    default:
+        return IV_EINVAL;
+    }
+}
+
+static const iv_tunnel_resolver_t s_tunnel_resolver = { tunnel_resolve, NULL };
+
+/* 读令牌：取文件第一行、去掉 CR/LF（平台下发多半带换行），其余忽略。
+ * 文件不在/为空**不算错误**：出厂未下发令牌的设备本来就该开不了通道。 */
+static void tunnel_read_token(char *out, size_t cap)
+{
+    const char *env  = getenv("IVSBOX_TUNNEL_TOKEN");
+    const char *path = getenv("IVSBOX_TUNNEL_TOKEN_FILE");
+    char        buf[IV_TUNNEL_TOKEN_MAX];
+    ssize_t     n;
+    size_t      i;
+    int         fd;
+
+    out[0] = '\0';
+    if (env != NULL && env[0] != '\0') {
+        (void)snprintf(out, cap, "%s", env);
+        return;
+    }
+    if (path == NULL || path[0] == '\0')
+        path = TUNNEL_TOKEN_FILE_DEFAULT;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        IV_LOG_W(APP_MOD, "tunnel: token file absent (%s) - channel cannot be opened", path);
+        return;
+    }
+    n = read(fd, buf, sizeof buf - 1u);
+    (void)close(fd);
+    if (n <= 0)
+        return;
+    buf[n] = '\0';
+    for (i = 0; i < (size_t)n; i++) {
+        if (buf[i] == '\n' || buf[i] == '\r') {
+            buf[i] = '\0';
+            break;
+        }
+    }
+    if (buf[0] != '\0')
+        (void)snprintf(out, cap, "%s", buf);
+}
+
+/* 读设备 SN：工厂身份分区里的 `devid`（＝协议里的 `tid`，6 位大写 HEX）—— 这是本工程
+ * 对应 BIRD 板卡 SN 的那个"设备固有标识"。
+ * 读不到就留空；**不退回 MAC / 随机值**：钥匙派生式两侧必须一致，编一个"看起来对"的
+ * SN 只会让运维侧算不出同一把钥匙，症状是"连不上但谁都没报错"。 */
+static void tunnel_read_sn(char *out, size_t cap)
+{
+    const char  *env = getenv("IVSBOX_TUNNEL_SN");
+    iv_prov_id_t id;
+    char         tid[IV_PROV_TID_MAX];
+    int          rc;
+
+    out[0] = '\0';
+    if (env != NULL && env[0] != '\0') {
+        (void)snprintf(out, cap, "%s", env);
+        return;
+    }
+    rc = iv_prov_private_read(NULL, &id);
+    if (rc != IV_OK) {
+        IV_LOG_W(APP_MOD, "tunnel: no device identity (private partition rc=%d) - "
+                          "channel cannot be opened", rc);
+        return;
+    }
+    iv_prov_tid_from_u32(id.devid, tid);
+    if (strcmp(tid, IV_PROV_TID_BROADCAST) == 0) {
+        IV_LOG_W(APP_MOD, "tunnel: device id is the broadcast placeholder (%s)", tid);
+        return;
+    }
+    (void)snprintf(out, cap, "%s", tid);
+}
+
+/* 读配置：服务端落点 ＋ 本机三个代理端口 ＋ 摄像机代理开关。
+ * 单独成函数是为了**配置热更新**也走同一条路（on_config_event）。 */
+static void tunnel_apply_cfg(void)
+{
+    const char *host = cfg_str("sys.tunnel.server.host");
+    uint16_t    port = cfg_port("sys.tunnel.server.port");
+    uint16_t    p;
+    int         bv = 0;
+
+    p = cfg_port("sys.tunnel.web.port");
+    if (p != 0u) g_tun_port_web = p;
+    p = cfg_port("sys.tunnel.media.port");
+    if (p != 0u) g_tun_port_media = p;
+    p = cfg_port("sys.tunnel.cam.port");
+    if (p != 0u) g_tun_port_cam = p;
+    if (iv_config_get_bool(g_cfg, "sys.tunnel.cam.enable", &bv) == IV_OK)
+        g_tun_cam_enable = (bv != 0);
+
+    if (port == 0u)
+        port = (uint16_t)IV_TUNNEL_PORT_DEF;
+
+    /* 服务端变了 ⇒ 正在开的会话立刻作废：钥匙是按旧服务端场景配的，留着它只会让运维
+     * "连得上但连不通"。身份与令牌不由配置改，故不在此列。 */
+    if (host != NULL && g_tunnel->server_addr[0] != '\0' &&
+        (strcmp(host, g_tunnel->server_addr) != 0 || port != g_tunnel->server_port)) {
+        (void)iv_tunnel_invalidate(g_tunnel);
+        IV_LOG_I(APP_MOD, "tunnel: frps -> %s:%u, any open session invalidated", host,
+                 (unsigned)port);
+    }
+    if (host != NULL)
+        (void)iv_tunnel_set_server(g_tunnel, host, port);
+}
+
+/* 周期巡检：到期自关。**回调内重挂**（iv_timer_add 是一次性语义，见 iv_reactor.h）。 */
+static void on_tunnel_tick(void *arg)
+{
+    (void)arg;
+    if (iv_tunnel_tick(g_tunnel, (uint64_t)time(NULL)) != 0)
+        IV_LOG_I(APP_MOD, "tunnel: ttl expired, channel closed and flag cleared");
+    g_tunnel_timer = iv_timer_add(g_reactor, TUNNEL_TICK_MS, on_tunnel_tick, NULL);
+}
+
+static void tunnel_setup(void)
+{
+    const char *env;
+    char        sn[IV_TUNNEL_SN_MAX];
+    char        token[IV_TUNNEL_TOKEN_MAX];
+
+    iv_tunnel_init(g_tunnel);
+
+    tunnel_read_sn(sn, sizeof sn);
+    tunnel_read_token(token, sizeof token);
+    if (sn[0] != '\0' && token[0] != '\0')
+        (void)iv_tunnel_set_identity(g_tunnel, sn, token);
+
+    /* 落点可被环境变量覆盖，验证时指到临时目录（与 IVSBOX_READY_MARK / IVSBOX_SD_ROOT
+     * 同口径）。生产不设这两个变量，走 iv_tunnel 的编译期默认。 */
+    env = getenv("IVSBOX_TUNNEL_CONF");
+    if (env != NULL || getenv("IVSBOX_TUNNEL_FLAG") != NULL) {
+        if (iv_tunnel_set_paths(g_tunnel, env, getenv("IVSBOX_TUNNEL_FLAG")) != IV_OK)
+            IV_LOG_W(APP_MOD, "tunnel: bad path override in environment");
+    }
+
+    (void)iv_tunnel_set_resolver(g_tunnel, &s_tunnel_resolver);
+    tunnel_apply_cfg();
+    g_ctl_ctx.tunnel = g_tunnel;
+
+    if (iv_tunnel_caps(g_tunnel) == 0u) {
+        IV_LOG_W(APP_MOD, "tunnel: capability unavailable (needs sn + token + frps host) - "
+                          "tunnel.enable will be refused");
+    }
+    g_tunnel_timer = iv_timer_add(g_reactor, TUNNEL_TICK_MS, on_tunnel_tick, NULL);
+    if (g_tunnel_timer == NULL)
+        IV_LOG_W(APP_MOD, "tunnel: tick timer not armed; ttl gate degraded to the shell side");
 }
 
 /* ---------------------------------------------------------------------------
@@ -782,6 +1023,10 @@ static int app_init(void)
     g_ctl_ctx.agent     = &g_agent;
     g_ctl_ctx.media     = &s_media_ops;
     g_ctl_ctx.media_arg = &g_agent;
+
+    /* 9c. M8-S8.3 受控远程通道装配（身份/令牌/服务端/落点/巡检定时器）。
+     *    在 9b 之后：与 agent 装配同级，都在 reactor 建好之后。 */
+    tunnel_setup();
 
     /* 10. 健康线程（必须在 reactor 创建之后、run 之前） */
     g_health = iv_health_start_default(g_reactor, g_pool, g_wd_fd);

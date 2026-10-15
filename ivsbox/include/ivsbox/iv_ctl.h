@@ -58,6 +58,13 @@
  *                                          落一个"请装这个包"请求（M7-S7.2）。
  *                                          **不做安装**：包须已落在 `<data_root>/ota/` 下，
  *                                          真正改盘的安装由 monitor.sh 拉起 ivsbox-updater 完成。
+ *   tunnel.status      —                   受控远程通道状态（开关/剩余秒/服务集合/能力位/
+ *                                          统计/上次会话；**不含钥匙与令牌**；M8-S8.3）
+ *   tunnel.enable      {"svcs":["web","camera:0"],"ttl":3600}
+ *                                          开通道（服务白名单 + 有效期，ttl 省略取
+ *                                          `sys.tunnel.ttl_s`）。**只落配置与标记**，
+ *                                          frpc 由 monitor.sh 拉起。
+ *   tunnel.disable     —                   关通道（清标记 + 留档）。
  *
  * ============================ 依赖与并发 ============================
  *   - 依赖方向：本模块在 libivmodules，允许依赖 libivcore/libivhal 与外部库；
@@ -79,6 +86,7 @@
 #include "ivsbox/iv_config.h"
 #include "ivsbox/iv_db.h"
 #include "ivsbox/iv_ret.h"
+#include "ivsbox/iv_tunnel.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -140,6 +148,13 @@ typedef struct {
      * 是 ivsbox-updater，这里只读状态、只落一个请求文件（单写者原则，架构 §10.4）。 */
     const char *ota_app_root;
     const char *ota_data_root;
+
+    /* 受控远程通道（M8-S8.3）。可空 ⇒ `tunnel.*` 三个方法返回 IV_ENOTSUP（与 media
+     * 同一口径：**"能调但没接"与"不许调"要能分开**）。
+     * 本模块**只做三件事**：读状态、调 `iv_tunnel` 的闸门、拼响应。它**不**碰 frpc
+     * 进程（归 `scripts/frp.sh` + `monitor.sh`）、**不**读 secretKey（钥匙只落在
+     * 0600 的 `frpc.toml` 里）、**不**把令牌回给调用方。 */
+    iv_tunnel_t *tunnel;
 } iv_ctl_ctx_t;
 
 /*

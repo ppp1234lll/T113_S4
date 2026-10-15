@@ -17,7 +17,7 @@
  *   t04 toml 渲染逐字钉：stcp / secretKey / localIP / localPort / 多项
  *   t05 非环回目标 ⇒ EHOST（想代理到网内别的机器，这是"禁 ip:port"的硬证据）
  *   t06 渲染拒绝面：身份缺 / 服务端缺 / resolver 缺或拒 / 数量越界 / 缓冲不足
- *   t07 开启：配置文件落盘且权限 0600、标记文件存在、重复开启 ⇒ ESTATE
+ *   t07 开启：配置文件落盘且权限 0600、标记文件存在且**内容＝到期时刻**、重复开启 ⇒ ESTATE
  *   t08 关闭：标记消失、状态 OFF、会话留档（时长与原因）
  *   t09 到期：tick 自动关、expires 计数、remain_s 递减
  *   t10 有效期：越界 ⇒ EBADARG；0 ⇒ 取默认
@@ -330,6 +330,18 @@ static void t07_enable(void)
     chk(file_mode_is(g_conf, 0600u), "t07: conf mode 0600 (secretKey inside)");
     chk(file_exists(g_flag), "t07: flag file exists");
     chk(iv_tunnel_remain_s(&t, 1000u) == 600u, "t07: remain");
+
+    /* 标记内容＝到期时刻（unix 秒）。这是"主控死了脚本也能判过期"的全部依据
+     * （见 scripts/frp.sh 的 flag_expired）：enable(600, now=1000) ⇒ 内容 1600。 */
+    fp = fopen(g_flag, "r");
+    chk(fp != NULL, "t07: open flag");
+    if (fp != NULL) {
+        char fl[64];
+
+        chk(fgets(fl, sizeof fl, fp) != NULL, "t07: flag has one line");
+        chk(strncmp(fl, "1600\n", 5) == 0, "t07: flag carries the expire instant");
+        fclose(fp);
+    }
 
     /* 配置文件里必须有派生出的钥匙，且不含摄像机地址 */
     fp = fopen(g_conf, "r");

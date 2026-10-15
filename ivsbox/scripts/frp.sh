@@ -7,17 +7,26 @@
 # 只管 **frpc 进程的起与停**。通道"该不该开"由 `ivsboxd` 里的 `iv_tunnel` 决定
 # （写好 `/etc/frp/frpc.toml` 后置起标记文件）。**标记文件是唯一真相**：
 #   标记在 ⇒ 进程该在；标记不在 ⇒ 进程必须不在。
-# 本脚本不造标记、不删标记（除 `stop`）—— 造标记等于让脚本自己决定"要不要开远程
-# 入口"，那道闸门就名存实亡了（这也是与 BIRD 版唯一有意不同的地方：BIRD 的
-# `start` 自己 touch 标记，它的开关由 Go 侧的 SetDebugMode 管；本工程把开关与
-# **有效期**一起交给 iv_tunnel，到期自动清标记，脚本跟着把进程收掉）。
+# 本脚本不造标记、不删标记（除 `stop` 与"发现已过期"）—— 造标记等于让脚本自己决定
+# "要不要开远程入口"，那道闸门就名存实亡了（这也是与 BIRD 版唯一有意不同的地方：
+# BIRD 的 `start` 自己 touch 标记，它的开关由 Go 侧的 SetDebugMode 管；本工程把开关
+# 与**有效期**一起交给 iv_tunnel，到期自动清标记，脚本跟着把进程收掉）。
+#
+# ============================ 有效期为什么要在这一层也判一次 ============================
+# `iv_tunnel_tick()` 跑在 `ivsboxd` 进程里 —— 主控不在（被 kill -9、崩溃、停在 monitor
+# 熔断窗口外）时它就没人跑了。若只有那一层，"开 1 小时后主控崩了"留下的就是**一条永久
+# 开着的远程入口**。
+# 故 `iv_tunnel_enable()` 把**到期时刻**（unix 秒，一行十进制）写进标记文件内容；本脚本
+# 每次被调用都先判过期，过期就删标记 + 停进程。这样有效期闸门**不依赖主控存活**。
+# 标记里没有数字（例如运维手工 `touch`）⇒ 视为**未过期**：不擅自关掉别人手工开的通道
+# （能 touch 这个文件的人本来就已经是 root，不是本闸门要防的对象）。
 #
 # ============================ 动作 ============================
-#   up    标记存在 ⇒ 拉起 frpc（幂等：已在跑就什么都不做）；标记不在 ⇒ 静默退出 0
-#         （monitor 每圈都调，不能因为"本来就该关"而报错刷屏）
+#   up    标记存在且未过期 ⇒ 拉起 frpc（幂等：已在跑就什么都不做）；已过期 ⇒ 收掉；
+#         标记不在 ⇒ 静默退出 0（monitor 每圈都调，不能因为"本来就该关"而报错刷屏）
 #   down  停掉 frpc（不动标记）
 #   stop  删标记 + 停进程：**运维手工关闭**用，等价于 iv_tunnel_disable() 的兜底
-#   status 诊断：打印标记 / 配置 / 进程三者的状态
+#   status 诊断：打印标记 / 到期 / 配置 / 进程四者的状态
 #
 # ============================ 为什么用 stcp 而不是 tcp ============================
 # 配置里的代理项一律 `type = "stcp"`：访问方必须也跑 frpc 并持有同一个 secretKey，
@@ -41,6 +50,20 @@ frpc_alive() {
     ps -o comm | grep -x frpc >/dev/null 2>&1
 }
 
+# 标记里的到期时刻（只留十进制数字；读不到/没数字 ⇒ 输出空）
+flag_expire() {
+    [ -f "$ENABLED_FLAG" ] || return 1
+    tr -cd '0-9' < "$ENABLED_FLAG" 2>/dev/null
+}
+
+# 0 ＝ 已过期；非 0 ＝ 未过期或判不出来（判不出来时不关，见文件头说明）
+flag_expired() {
+    EXP=$(flag_expire)
+    [ -n "$EXP" ] || return 1
+    NOW=$(date +%s 2>/dev/null) || return 1
+    [ "$NOW" -ge "$EXP" ] 2>/dev/null
+}
+
 # 只清进程，不动标记文件
 stop_process_only() {
     if [ -f "$PID_FILE" ]; then
@@ -56,6 +79,13 @@ stop_process_only() {
 do_up() {
     # 闸门优先：没有标记就不许起。这是"远程入口默认关闭"的物理保证。
     if [ ! -f "$ENABLED_FLAG" ]; then
+        return 0
+    fi
+    # 第二道闸门：标记在但已过期 ⇒ 收掉（主控不在时只剩这一层能管）。先删标记再杀
+    # 进程，免得 monitor 下一圈看到标记还在又把它拉起来。
+    if flag_expired; then
+        echo "frp.sh: 标记已过期（主控不在或已挂），停掉 frpc 并清标记"
+        do_stop
         return 0
     fi
     if frpc_alive; then
@@ -93,9 +123,15 @@ stop)
     do_stop
     ;;
 status)
-    [ -f "$ENABLED_FLAG" ] && echo "flag: present" || echo "flag: absent"
-    [ -f "$FRP_CONF" ] && echo "conf: present" || echo "conf: absent"
-    frpc_alive && echo "proc: running" || echo "proc: stopped"
+    if [ -f "$ENABLED_FLAG" ]; then
+        echo "flag: present (expire=$(flag_expire))"
+        if flag_expired; then echo "expired: yes"; else echo "expired: no"; fi
+    else
+        echo "flag: absent"
+        echo "expired: -"
+    fi
+    if [ -f "$FRP_CONF" ]; then echo "conf: present"; else echo "conf: absent"; fi
+    if frpc_alive; then echo "proc: running"; else echo "proc: stopped"; fi
     ;;
 *)
     echo "Usage: $0 {up|down|stop|status}"

@@ -46,7 +46,37 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M6 退出条件收口（§16.2 场景 6 ＋ SD 告警出口） | 已实现（VM 全量验证 ＋ 反向证伪 3 条；平台侧 `ERR` 上报卡跨端协商） | 2026-10-14 16:40 | 核实出**真缺口**：`iv_storage` 的 `fault/alarm` 此前**除单测无任何生产调用者**，`sys.overview`（架构 §9.1 总览页"SD 卡"＋媒体页"存储水位"的数据源）里没有 storage 段 ⇒ §16.2 场景 6 要求的"产生明确告警"落不了地。本轮把 `storage` 段接进 `sys.overview`（`build_storage()`）＋ 新增 `iv_storage_enabled()` 把"未启用"与"巡检过且正常"分开（未启用只给 `enabled:false`，不给零值字段冒充健康）。新增 `tests/integration/test_sd_fault_e2e.c`：私有 user+mount ns ＋ tmpfs，用 `IVSBOX_SD_ROOT` 把存储根指到"存在／不存在(拔卡)／`size=1M` tmpfs 灌满(写满)"三种受控位置，每种真拉起一次 `ivsboxd`，从本地通道验 `fault/alarm/level/allow_new/stop_rec` ＋ 告警日志行，并**三种情形都断言 `system.snapshot` 仍应答**（控制业务不受影响）。VM `test`/`asan`/`tsan` 各 35/35、`arm`/`package` rc=0、集成 **9 passed ＋ 1 SKIP**、**反向证伪 3/3 抓出**。*未做：平台 `ERR` 故障码上报 SD（`iv_err.h` 无 SD 码值、类型段 `0x4~0xF` 归属未冻结，卡跨端协商）；板端真机实测*。详见本文件文末 2026-10-14 16:40 节。 |
 | M7-S7.1 升级包格式与验签器（`iv_ota`） | 已实现（模块 ＋ 单测 13 组 ＋ VM 全量验证 ＋ 反向证伪 10 条；**装配接线归 S7.2、量产公钥未部署、板端未复跑**） | 2026-10-14 17:30 | 新增 `iv_ota.h` / `src/modules/ota/iv_ota.c` / `tests/unit/test_ota.c`。包＝头(16B)＋清单(行式 ASCII)＋负载＋Ed25519 签名(64B)，**总长严格相等**、不做宽容解析；九步验签（结构→清单→负载长度→公钥→**签名**→型号→硬件区间→软件版本→逐文件 SHA-256），签名通过前不采信清单语义。签名用 OpenSSL EVP（架构 §14"复用可信密码库"；板端 sysroot 实测 OpenSSL 1.1.1a 有 `EVP_PKEY_ED25519`），**不自写椭圆曲线**；校验值仍用 core 的 `iv_sha256`。两端 `LDLIBS` 追加 `-lcrypto`，ARM 产物 `NEEDED` 已见 `libcrypto.so.1.1`。**fail-closed**：内置公钥未部署时返 `IV_ENOTSUP` 且输出全零 ⇒ 拒绝一切包（不给假密钥）。VM `test`/`asan`/`tsan` 36/36、`host`/`analyze`/`arm` rc=0 零告警；反向证伪 10/10 抓出。详见本文件文末 2026-10-14 17:30 节。 |
 | M8-S8.1~S8.2 受控远程通道（服务名白名单 ＋ 钥匙派生 ＋ 通道闸门） | 已实现（新增 `iv_tunnel` 模块 ＋ `scripts/frp.sh` ＋ `monitor.sh` 守护段 ＋ 单测 12 组 ＋ VM 验证 ＋ 反向证伪 5 条；**装配接线归 S8.3、摄像机受控代理归 S8.5、端到端待 frps 就位**） | 2026-10-15 09:07 | 按用户指定改用与 `bird_20260623` 同款方式（frpc 外连 frps ＋ stcp ＋ 标记文件），**不再自研通道协议**。详见本文件 2026-10-15 09:07 节。 |
+| M8-S8.3 装配接线（身份/令牌来源 ＋ resolver 落本机代理 ＋ `sys.tunnel.*` ＋ `iv_ctl` 三方法 ＋ 到期兜底） | 已实现（配置键 7 条 ＋ `tunnel.status/enable/disable` ＋ `main.c` 装配/热更新作废/退出即关 ＋ 标记写到期时刻、脚本独立判过期 ＋ 单测新增 8 组 ＋ 集成 test_tunnel_e2e 真拉起 ivsboxd ＋ 反向证伪 5/5；`camera:N` 待 S8.5、真连通待 frps） | 2026-10-15 10:21 | SN＝身份分区 `devid`（fail-closed）；令牌＝`<secure>/tunnel.token`（**不进配置**，防 `config.all` 导出）；resolver 一律 `127.0.0.1`，`camera:N` 在 S8.5 前恒报不可达；标记文件内容＝到期时刻 ⇒ `frp.sh`/`monitor.sh` 独立判过期（有效期不依赖主控存活）。详见本文件 2026-10-15 10:21 节。 |
 |===
+
+== 2026-10-15 10:21 M8-S8.3 受控远程通道装配接线
+
+=== 干了什么事
+
+* `include/ivsbox/iv_ctl.h`：`iv_ctl_ctx_t` 新增 `tunnel` 接缝（可空 ⇒ `tunnel.*` 返回 `IV_ENOTSUP`，与 media 同口径"能调但没接≠不许调"）。
+* `src/modules/ctl/iv_ctl.c`：新增 `tunnel.status`（开关/剩余秒/服务集合/能力位/统计/上次会话，**响应里绝不出现 secretKey 与令牌**）、`tunnel.enable`（服务数组白名单＋重复项拒绝＋有效期缺省取 `sys.tunnel.ttl_s`）、`tunnel.disable`；方法表 19→22。
+* `src/modules/config/iv_config.c`：默认值表新增 `sys.tunnel.*` 7 键（`server.host/port`、`ttl_s`、`web/media/cam` 三端口、`cam.enable`），73→80 项。
+* `src/app/main.c`：装配 `iv_tunnel` —— SN 读工厂身份分区（`iv_prov_private_read`，广播占位 `000000` 不当 SN）、令牌读 `<secure>/tunnel.token`，均 fail-closed；resolver 目标一律 `127.0.0.1`（`web`→80、`media:N`→18000、`camera:N`→8081 且 S8.5 落地前恒报不可达）；配置热更新重读落点，服务端一变即在开会 `invalidate`（STOP_RECONF）；5 s 周期 `tick`；干净退出即关通道。
+* `iv_tunnel`：标记文件**内容改为到期时刻**（unix 秒）；新增 `iv_tunnel_stop_reason_name()`。
+* `scripts/frp.sh`：新增 `flag_expire`/`flag_expired`，`up` 先判过期（过期即删标记＋停进程）；无数字标记（人工 `touch`）按未过期处理。`scripts/monitor.sh`：守护段补第③方向"标记在但已过期"，判过期用 `date +%s`（monitor 的 `$now` 是 uptime）。
+* 测试：`test_ctl.c` 新增 c17~c24（接缝未接/状态外形/参数形态/开启落盘/重复开启/摄像机不可达/关闭留档/media 组合）；`test_tunnel.c` t07 钉标记内容；`test_config.c` 黄金计数 73→80、137→144、81→88；**新增** `tests/integration/test_tunnel_e2e.c`（真拉起 ivsboxd：接线、0600、只环回、ESTATE、关闭留档）。
+
+=== 解决什么问题
+
+S8.1/S8.2 交付后 `iv_tunnel` 是没接线的模块：身份、令牌、frps 落点、本机代理端口没有来源，Web/平台无法查询与开关。本轮补齐装配与可观测，并修掉两个设计层风险：① 有效期闸门跑在主控里，主控崩了就是"永久开着的远程入口" ⇒ 标记写到期时刻，脚本侧独立判过期；② `camera:N` 若映射到没人听的端口，现场排查方向全错 ⇒ S8.5 前明确报不可达。
+
+=== 影响范围
+
+* 配置默认值表 +7 条（黄金计数 80/144/88）；`iv_ctl` 方法表 +3（`test_ctl` 计数断言不受影响）。
+* 新增环境变量接缝（验证用，生产不设）：`IVSBOX_TUNNEL_SN/TOKEN/TOKEN_FILE/CONF/FLAG`。
+* 行为变更：主控干净退出即关通道（远程重启主控会断线，重开只需再发 `tunnel.enable`；SIGKILL 场景由脚本侧到期兜底）。
+* 未覆盖/待办：`camera:N` 本机代理在 S8.5 落地前恒不可达；frps 就位后的真连通；板端 `/usr/bin/frpc` 待现场核对；令牌下发通道待定；通道审计入 `control.db` 待表结构（S9）。
+
+=== 验证方式与结果
+
+* VM（tqt113）`make test` **38/38 全绿**（仅 1 个既有基线 SKIP），`make arm` 出 ARM ELF32 EABI5；`grep error:|warning:` 零输出。
+* 集成：`unshare -rm`＋tmpfs 内真拉起 `ivsboxd`，`test_ctl_snapshot` RC=0、**`test_tunnel_e2e` RC=0**（接线、`frpc.toml` 0600、只环回无私网地址、重复开启 `IV_ESTATE(-7)`、关闭留档 `stop:"local"`）。
+* **反向证伪 5/5 全部抓出并 md5 对账还原复绿**：M1 服务去重失效⇒c19d 红；M2 标记少算有效期⇒t07 红；M3 resolver 给 `10.0.0.1`⇒e2e 抓 `EHOST` 红；M4 停止原因名漂移⇒c23 红；M6 状态响应泄漏令牌⇒c18 红。教训：M3 还原后必须重链 `ivsboxd`（`make test` 不编主程序），否则"假红"。
 
 == 2026-10-15 09:07 M8-S8.1~S8.2 受控远程通道（与 BIRD 运维箱同款：frpc + stcp + 标记文件）
 

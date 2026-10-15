@@ -38,6 +38,17 @@ const char *iv_tunnel_reason_name(iv_tunnel_reason_t r)
     }
 }
 
+const char *iv_tunnel_stop_reason_name(int r)
+{
+    switch ((iv_tunnel_stop_reason_t)r) {
+    case IV_TUNNEL_STOP_NONE:    return "none";
+    case IV_TUNNEL_STOP_LOCAL:   return "local";
+    case IV_TUNNEL_STOP_EXPIRED: return "expired";
+    case IV_TUNNEL_STOP_RECONF:  return "reconf";
+    default:                     return "unknown";
+    }
+}
+
 static int rc_of(iv_tunnel_reason_t r)
 {
     switch (r) {
@@ -505,9 +516,19 @@ int iv_tunnel_enable(iv_tunnel_t *t, const iv_tunnel_svc_t *svcs, unsigned n,
     if (write_file_atomic(t->conf_path, txt, len, 0600) != 0) {
         r = IV_TUNNEL_EIO; goto deny;
     }
-    /* 标记文件＝"业务上需要这条通道"的唯一真相（monitor 只在它存在时守护 frpc）。 */
-    if (write_file_atomic(t->flag_path, "1\n", 2u, 0644) != 0) {
-        r = IV_TUNNEL_EIO; goto deny;
+    /* 标记文件＝"业务上需要这条通道"的唯一真相（monitor 只在它存在时守护 frpc）。
+     * **内容写到期时刻**：tick() 跑在 ivsboxd 里，主控不在时它就没人跑了；把到期
+     * 时刻留在标记里，`frp.sh`/`monitor.sh` 那一侧能独立判过期并收掉 frpc
+     * （见 scripts/frp.sh 的 flag_expired）。缺了这一手，"开 1 小时后主控崩了"就是
+     * 一条永久开着的远程入口。 */
+    {
+        char    ftxt[32];
+        uint64_t expire = now_s + (uint64_t)ttl_s;
+
+        (void)snprintf(ftxt, sizeof ftxt, "%llu\n", (unsigned long long)expire);
+        if (write_file_atomic(t->flag_path, ftxt, strlen(ftxt), 0644) != 0) {
+            r = IV_TUNNEL_EIO; goto deny;
+        }
     }
 
     t->state    = IV_TUNNEL_ON;

@@ -141,6 +141,24 @@ static const cfg_default_t s_defaults[] = {
     D_INT(IV_CFG_CLS_SYS, "sys.transport.mode",
           "传输模式：1=有线 2=无线 3=有线+无线 4=自动选择", 4, 1, 4),
     D_INT(IV_CFG_CLS_SYS, "sys.sample.period_ms", "采集周期（毫秒）", 1000, 100, 60000),
+    /* M8-S8.3 受控远程通道。这里**只放非机密的落点与端口**：令牌不进配置 —— 配置是
+     * 明文 JSON，而 `config.all` 会把整份配置导出去给前端，把共享密钥的原料塞进去
+     * 等于明文下发。令牌读 `<secure>/tunnel.token`（见 src/app/main.c 的 tunnel_token）。
+     * `server.host` 空 ⇒ 开不了通道（fail-closed，与 iv_tunnel 的 ENOSERVER 同源）。 */
+    D_STR(IV_CFG_CLS_SYS, "sys.tunnel.server.host",
+          "frps 地址（空＝不开通道；受控远程通道的服务端）", "", NULL),
+    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.server.port", "frps 端口（0＝默认 7000）", 0, 0, 65535),
+    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.ttl_s",
+          "通道默认有效期（秒；单次开启可用 ttl 覆写，上限 86400）", 3600, 60, 86400),
+    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.web.port",
+          "本机 Web 服务端口（`web` 的代理目标，一律 127.0.0.1）", 80, 1, 65535),
+    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.media.port",
+          "本机媒体服务端口（`media:N` 的代理目标；ivsbox-media 桥接）", 18000, 1, 65535),
+    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.cam.port",
+          "摄像机受控代理端口（`camera:N` 的代理目标；S8.5 落地后由 ivsbox-web 监听）",
+          8081, 1, 65535),
+    D_BOOL(IV_CFG_CLS_SYS, "sys.tunnel.cam.enable",
+          "摄像机受控代理可用（S8.5 落地前恒 false ⇒ `camera:N` 一律判不可达）", "false"),
 
     /* ---- net. 网络配置（架构 §10.2；原 net.wan.* 六项已删，网口由 sys.transport.mode 隐含） ---- */
     D_STR(IV_CFG_CLS_NET, "net.ip", "本机 IP 地址（空＝由 DHCP 分配）", "", NULL),

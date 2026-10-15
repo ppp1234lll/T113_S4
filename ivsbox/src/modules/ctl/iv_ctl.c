@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <json-c/json.h>
 
@@ -63,7 +64,10 @@ static const char *const k_methods[] = {
     "record.stop",
     "record.status",
     "ota.status",
-    "ota.request"
+    "ota.request",
+    "tunnel.status",
+    "tunnel.enable",
+    "tunnel.disable"
 };
 
 int iv_ctl_method_count(void)
@@ -1169,6 +1173,199 @@ static int m_ota_request(const iv_ctl_ctx_t *ctx, json_object *p, char *out, siz
     return rsp_data(d, out, cap, out_len);
 }
 
+/* ============================ tunnel.status / enable / disable（M8-S8.3） ============================ */
+
+/*
+ * 这一组方法**只碰闸门，不碰进程**：开通道＝渲染 `frpc.toml` + 置标记，真正起 frpc 的
+ * 是 `scripts/monitor.sh` 的守护段（模块层不该 fork 外部进程，那会让单测变成"起真
+ * 进程"）。响应里也**绝不出现钥匙**：secretKey 只落在 0600 的配置文件里，令牌连读都不读。
+ *
+ * 时间用 `time(NULL)`：本模块不是被测对象，装配层才是；`iv_tunnel` 自己坚持"时间由
+ * 调用方注入"，这里就是那个调用方。
+ */
+
+/* 服务集合 → JSON 字符串数组（渲染失败的名跳过，不因此整条失败） */
+static json_object *svc_arr(const iv_tunnel_svc_t *svc, unsigned n)
+{
+    json_object *arr = json_object_new_array();
+    unsigned     i;
+    char         s[IV_TUNNEL_SVC_MAX];
+
+    if (arr == NULL)
+        return NULL;
+    for (i = 0u; i < n; i++) {
+        if (iv_tunnel_svc_format(&svc[i], s, sizeof s) != IV_OK)
+            continue;
+        json_object_array_add(arr, json_object_new_string(s));
+    }
+    return arr;
+}
+
+static int m_tunnel_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_t *out_len)
+{
+    iv_tunnel_t        *t = ctx->tunnel;
+    iv_tunnel_stat_t    st;
+    iv_tunnel_session_t last;
+    json_object        *d;
+    json_object        *s;
+    uint64_t            now = (uint64_t)time(NULL);
+    uint32_t            caps;
+
+    if (t == NULL)
+        return IV_ENOTSUP;
+
+    caps = iv_tunnel_caps(t);
+    iv_tunnel_stat(t, &st);
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "on", json_object_new_boolean(
+                                   iv_tunnel_state(t) == IV_TUNNEL_ON ? 1 : 0));
+    json_object_object_add(d, "remain_s", json_object_new_int(
+                                  (int)iv_tunnel_remain_s(t, now)));
+    json_object_object_add(d, "ttl_s", json_object_new_int((int)t->ttl_s));
+    json_object_object_add(d, "svcs", svc_arr(t->svc, t->n_svc));
+    json_object_object_add(d, "caps", json_object_new_int((int)caps));
+    /* 能力位打成名字，前端不必记位号；ENABLED＝"身份/服务端/映射/落点全就位" */
+    json_object_object_add(d, "enabled", json_object_new_boolean(
+                                   (caps & IV_TUNNEL_CAP_ENABLED) != 0u ? 1 : 0));
+    json_object_object_add(d, "sn", json_object_new_string(t->sn));
+    json_object_object_add(d, "server", json_object_new_string(t->server_addr));
+    json_object_object_add(d, "server_port", json_object_new_int((int)t->server_port));
+    json_object_object_add(d, "conf", json_object_new_string(t->conf_path));
+    json_object_object_add(d, "flag", json_object_new_string(t->flag_path));
+
+    s = json_object_new_object();
+    if (s != NULL) {
+        json_object_object_add(s, "opens", json_object_new_int64((int64_t)st.opens));
+        json_object_object_add(s, "denies", json_object_new_int64((int64_t)st.denies));
+        json_object_object_add(s, "expires", json_object_new_int64((int64_t)st.expires));
+        json_object_object_add(s, "uptime_s", json_object_new_int64((int64_t)st.uptime_s));
+        json_object_object_add(d, "stat", s);
+    }
+
+    if (iv_tunnel_last_session(t, &last) == IV_OK) {
+        s = json_object_new_object();
+        if (s != NULL) {
+            json_object_object_add(s, "open_s", json_object_new_int64((int64_t)last.open_s));
+            json_object_object_add(s, "close_s", json_object_new_int64((int64_t)last.close_s));
+            json_object_object_add(s, "ttl_s", json_object_new_int((int)last.ttl_s));
+            json_object_object_add(s, "secs", json_object_new_int64(
+                                          (int64_t)(last.close_s - last.open_s)));
+            json_object_object_add(s, "stop", json_object_new_string(
+                                          iv_tunnel_stop_reason_name((int)last.stop_reason)));
+            json_object_object_add(s, "svcs", svc_arr(last.svc, last.n_svc));
+            json_object_object_add(d, "last", s);
+        }
+    }
+
+    return rsp_data(d, out, cap, out_len);
+}
+
+/* 解析 `svcs` 数组：白名单外的名字、重复项、数量越界一律拒（不静默忽略）。 */
+static int parse_svcs(json_object *p, iv_tunnel_svc_t *svcs, unsigned *n)
+{
+    json_object *arr = NULL;
+    int          cnt;
+    int          i;
+
+    if (p == NULL || !json_object_object_get_ex(p, "svcs", &arr) || arr == NULL ||
+        !json_object_is_type(arr, json_type_array))
+        return IV_EINVAL;
+    cnt = json_object_array_length(arr);
+    if (cnt <= 0 || (unsigned)cnt > IV_TUNNEL_PROXIES_MAX)
+        return IV_ERANGE;
+    for (i = 0; i < cnt; i++) {
+        json_object *e = json_object_array_get_idx(arr, i);
+        const char  *s;
+        unsigned     k;
+
+        if (e == NULL || !json_object_is_type(e, json_type_string))
+            return IV_EINVAL;
+        s = json_object_get_string(e);
+        if (s == NULL || iv_tunnel_svc_parse(s, strlen(s), &svcs[i]) != IV_OK)
+            return IV_EINVAL;
+        /* 重复项：同一服务开两次只会让 frpc 报重名，不如当场说清楚 */
+        for (k = 0u; k < (unsigned)i; k++) {
+            if (svcs[k].kind == svcs[i].kind && svcs[k].index == svcs[i].index)
+                return IV_EINVAL;
+        }
+    }
+    *n = (unsigned)cnt;
+    return IV_OK;
+}
+
+static int m_tunnel_enable(const iv_ctl_ctx_t *ctx, json_object *p, char *out, size_t cap,
+                           size_t *out_len)
+{
+    iv_tunnel_t         *t = ctx->tunnel;
+    iv_tunnel_svc_t      svcs[IV_TUNNEL_PROXIES_MAX];
+    unsigned             n = 0u;
+    int64_t              ttl = 0;
+    iv_tunnel_reason_t   why = IV_TUNNEL_OK;
+    json_object         *d;
+    int                  rc;
+
+    if (t == NULL)
+        return IV_ENOTSUP;
+    rc = parse_svcs(p, svcs, &n);
+    if (rc == IV_EINVAL)
+        return rsp_err(IV_EINVAL, "svcs must be a non-empty array of service names",
+                       out, cap, out_len);
+    if (rc == IV_ERANGE)
+        return rsp_err(IV_ERANGE, "too many services", out, cap, out_len);
+
+    /* 有效期：显式 `ttl` > 配置 `sys.tunnel.ttl_s` > 编译期默认 3600。 */
+    if (param_i64(p, "ttl", &ttl) != IV_OK || ttl <= 0) {
+        int64_t v = 0;
+
+        if (ctx->cfg != NULL &&
+            iv_config_get_int(ctx->cfg, "sys.tunnel.ttl_s", &v) == IV_OK && v > 0)
+            ttl = v;
+        else
+            ttl = (int64_t)IV_TUNNEL_TTL_DEF;
+    }
+
+    rc = iv_tunnel_enable(t, svcs, n, (uint32_t)ttl, (uint64_t)time(NULL), &why);
+    if (rc != IV_OK)
+        return rsp_err(rc, iv_tunnel_reason_name(why), out, cap, out_len);
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "on", json_object_new_boolean(1));
+    json_object_object_add(d, "ttl_s", json_object_new_int((int)t->ttl_s));
+    json_object_object_add(d, "remain_s", json_object_new_int(
+                                  (int)iv_tunnel_remain_s(t, (uint64_t)time(NULL))));
+    json_object_object_add(d, "svcs", svc_arr(t->svc, t->n_svc));
+    json_object_object_add(d, "note", json_object_new_string(
+        "frpc 由 scripts/monitor.sh 按标记文件拉起；到期后标记被清，进程随之收掉"));
+    return rsp_data(d, out, cap, out_len);
+}
+
+static int m_tunnel_disable(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_t *out_len)
+{
+    iv_tunnel_t *t = ctx->tunnel;
+    json_object *d;
+    int          rc;
+
+    if (t == NULL)
+        return IV_ENOTSUP;
+    rc = iv_tunnel_disable(t, (uint64_t)time(NULL), IV_TUNNEL_STOP_LOCAL);
+    if (rc != IV_OK)
+        return rsp_err(rc, iv_tunnel_reason_name(IV_TUNNEL_ESTATE), out, cap, out_len);
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "on", json_object_new_boolean(0));
+    json_object_object_add(d, "stop", json_object_new_string("local"));
+    json_object_object_add(d, "note", json_object_new_string(
+        "配置文件保留（0600），只清标记；monitor 下一圈停掉 frpc"));
+    return rsp_data(d, out, cap, out_len);
+}
+
 /* ============================ 入口 ============================ */
 
 int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
@@ -1261,6 +1458,12 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_ota_status(ctx, out, out_cap, out_len);
     else if (strcmp(method, "ota.request") == 0)
         rc = m_ota_request(ctx, params, out, out_cap, out_len);
+    else if (strcmp(method, "tunnel.status") == 0)
+        rc = m_tunnel_status(ctx, out, out_cap, out_len);
+    else if (strcmp(method, "tunnel.enable") == 0)
+        rc = m_tunnel_enable(ctx, params, out, out_cap, out_len);
+    else if (strcmp(method, "tunnel.disable") == 0)
+        rc = m_tunnel_disable(ctx, out, out_cap, out_len);
     else
         rc = IV_ENOTSUP; /* **不写 out**，由调用方静默丢弃 */
 

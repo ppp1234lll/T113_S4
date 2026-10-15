@@ -95,6 +95,7 @@ extern "C" {
  * -------------------------------------------------------------------------- */
 typedef struct {
     int      fd;
+    uint8_t  is_cam;    /* S8.5：1 = 来自摄像机代理专用口 ⇒ 只许走 cam 路由 */
     uint64_t last_ms;
     size_t   rlen;      /* rbuf 中已收字节 */
     int      hdr_done;  /* 请求头已收齐 */
@@ -132,6 +133,12 @@ typedef struct {
     char    token[IV_WEB_TOKEN_MAX];  /* Cookie 里的 ivs_sid（无则空串） */
     char    range[64];                /* Range: 头原文（S6.4；无则空串） */
     char    if_range[96];             /* If-Range: 头原文（S6.4；无则空串） */
+    /* S8.5 摄像机代理要原样转发的请求头（只取这三个，其余不透传 —— 代理不是管道，
+     * 转发面越窄越好：Host 由代理按目标重写，超响应面的头一律不带过去）。 */
+    char    ctype[64];                /* Content-Type（无则空串） */
+    char    cookie_raw[256];          /* Cookie 头原文（无则空串；token 只取 ivs_sid） */
+    char    auth[160];                /* Authorization（无则空串；浏览器对摄像机的
+                                         Basic 认证经此透传，**不是**配置里的凭据） */
     char   *body;                     /* 指向 conn->rbuf 内的体 */
     size_t  body_len;
 } iv_web_req_t;
@@ -149,6 +156,12 @@ typedef struct {
     /* S6.4 媒体下载（值语义，便于用命令行/环境变量覆盖） */
     char          media_root[IV_WEB_MEDIA_ROOT_MAX];
     uint32_t      media_bps;   /* 0 = 不限速 */
+
+    /* S8.5 摄像机受控代理：cam_port 为**本机代理监听口**（只绑 127.0.0.1；0 = 未开），
+     * 用作"目标是代理自己"的环回护栏；cam_upstream 是**摄像机侧的 Web 端口**（唯一
+     * 允许被代理的端口，默认 80）。两者都来自命令行/环境变量 —— Web 不读配置。 */
+    int           cam_port;
+    uint16_t      cam_upstream;
 
     int           chan_fd;     /* 惰性连接；-1 = 未连接 */
     iv_web_sess_t sess[IV_WEB_SESS_N];
@@ -203,6 +216,18 @@ void iv_web_sess_new(iv_web_ctx_t *ctx, char *out_token, size_t cap);
  * -------------------------------------------------------------------------- */
 int iv_web_media_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
                         char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp);
+
+/* --------------------------------------------------------------------------
+ * cam.c —— S8.5 摄像机受控代理（架构 §9.3）
+ * 只挂在**环回专用监听口**（frp 的 stcp visitor 落点）上，与主口完全隔离：
+ * 这里**没有**登录页、没有 /api、没有静态资源 —— 非法路径一律 404 且不透露本机在跑
+ * 什么。路由只有 `/cam/<N>/...`，目标 IP 只来自 ivsboxd 的配置键
+ * `camera.ch.<N>.ip`（经本地通道查询），端口只有 `cam_upstream` 一个 ⇒
+ * "白名单外地址不可达"在这里是物理事实，不是约定。
+ * 返回口径与 api/media 相同：IV_OK = 已填响应；IV_ENOTSUP = 路径不归我（404）。
+ * -------------------------------------------------------------------------- */
+int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
+                      char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp);
 
 /* --------------------------------------------------------------------------
  * static.c —— 静态文件

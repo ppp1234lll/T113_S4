@@ -27,12 +27,23 @@ web/src  ——  ivsbox-web 进程源码目录（自研最小 HTTP/1.1 服务）
                    三道（逐段拒 `.`/`..` → realpath 前缀复核 → open(O_NOFOLLOW)）；
                    Range（含后缀区间）/ETag/If-Range；`?sha=1` 时附 X-SHA256。
   iv_web_chan.c    本地通道客户端（连 ivsboxd 的 unix socket，一问一答）。
+  iv_web_cam.c     S8.5 摄像机受控代理：/cam/<N>/... → 反代 camera.ch.<N>.ip。
+                   只挂在**只绑 127.0.0.1** 的专用监听口上（与主口完全隔离，连接带
+                   is_cam 标记路由隔离）；目标 IP 只经本地通道查配置、上游端口只有
+                   cam_upstream 一个、环回护栏拒自指 —— "白名单外地址不可达"是物理
+                   事实。改写三形态（正文绝对 URL／Location／Set-Cookie Path），凭据
+                   零下发（SM4 密文本进程读都不读）。chunked/超限 502；MJPEG 长流、
+                   WebSocket 升级、插件页**不承诺**（登记口径）。
 
 【运行方式】
   make host / make arm    分别产出 build/host/ivsbox-web、build/arm/ivsbox-web
   运行：ivsbox-web [--port N] [--root DIR] [--chan PATH] [--pass PW]
                    [--media-root DIR] [--media-bps N]
+                   [--cam-port N] [--cam-upstream N]
                    [--heartbeat PATH] [--heartbeat-ms N]
+  S8.5：--cam-port（默认 8081，只绑 127.0.0.1；0 = 关闭代理入口）与 sys.tunnel.cam.port
+  同源（frp stcp visitor 落点）；--cam-upstream（默认 80）是摄像机侧 Web 端口（唯一
+  允许被代理的上游端口）。也可用 IVSBOX_WEB_CAM_PORT / IVSBOX_WEB_CAM_UPSTREAM 覆盖。
   口令也可用环境变量 IVSBOX_WEB_PASS；媒体根/限速可用 IVSBOX_WEB_MEDIA_ROOT /
   IVSBOX_WEB_MEDIA_BPS 覆盖（产线走命令行，环境变量留给开发/测试）。
   心跳路径/周期可用 IVSBOX_WEB_HEARTBEAT / IVSBOX_WEB_HEARTBEAT_MS 覆盖，**须与
@@ -50,7 +61,10 @@ web/src  ——  ivsbox-web 进程源码目录（自研最小 HTTP/1.1 服务）
     根内，并在 docs/修改记录.md 如实登记，不冒充"零偏离"。
   - 登录口令来源仍是命令行/环境变量，**欠账**：架构 §10 本应走 secure/ 密钥分离
     （F8 未实现，与 S4.3 的 SNMP community 同一笔账）。
+  - S8.5 专用口**不再叠会话/鉴权层**：入口由 M8 通道（stcp secretKey）把守，且只绑
+    环回。如安全评审提出再加。
+  - S8.5 改写为尽力而为的文本替换：各家摄像机页面形态各异，真机兼容性不承诺（计划口径）。
 
 【相关文档】
-  - ivsbox/docs/功能开发计划.md §S5.1~§S5.4、§S6.4
+  - ivsbox/docs/功能开发计划.md §S5.1~§S5.4、§S6.4、§S8.5
   - T113运维终端-系统架构设计.md §10.4、§16.1、§16.2

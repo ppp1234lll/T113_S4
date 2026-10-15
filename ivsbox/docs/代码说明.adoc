@@ -47,6 +47,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M7-S7.1 升级包格式与验签器（`iv_ota`） | 已实现（模块 ＋ 单测 13 组 ＋ VM 全量验证 ＋ 反向证伪 10 条；**装配接线归 S7.2、量产公钥未部署、板端未复跑**） | 2026-10-14 17:30 | 新增 `iv_ota.h` / `src/modules/ota/iv_ota.c` / `tests/unit/test_ota.c`。包＝头(16B)＋清单(行式 ASCII)＋负载＋Ed25519 签名(64B)，**总长严格相等**、不做宽容解析；九步验签（结构→清单→负载长度→公钥→**签名**→型号→硬件区间→软件版本→逐文件 SHA-256），签名通过前不采信清单语义。签名用 OpenSSL EVP（架构 §14"复用可信密码库"；板端 sysroot 实测 OpenSSL 1.1.1a 有 `EVP_PKEY_ED25519`），**不自写椭圆曲线**；校验值仍用 core 的 `iv_sha256`。两端 `LDLIBS` 追加 `-lcrypto`，ARM 产物 `NEEDED` 已见 `libcrypto.so.1.1`。**fail-closed**：内置公钥未部署时返 `IV_ENOTSUP` 且输出全零 ⇒ 拒绝一切包（不给假密钥）。VM `test`/`asan`/`tsan` 36/36、`host`/`analyze`/`arm` rc=0 零告警；反向证伪 10/10 抓出。详见本文件文末 2026-10-14 17:30 节。 |
 | M8-S8.1~S8.2 受控远程通道（服务名白名单 ＋ 钥匙派生 ＋ 通道闸门） | 已实现（新增 `iv_tunnel` 模块 ＋ `scripts/frp.sh` ＋ `monitor.sh` 守护段 ＋ 单测 12 组 ＋ VM 验证 ＋ 反向证伪 5 条；**装配接线归 S8.3、摄像机受控代理归 S8.5、端到端待 frps 就位**） | 2026-10-15 09:07 | 按用户指定改用与 `bird_20260623` 同款方式（frpc 外连 frps ＋ stcp ＋ 标记文件），**不再自研通道协议**。详见本文件 2026-10-15 09:07 节。 |
 | M8-S8.3 装配接线（身份/令牌来源 ＋ resolver 落本机代理 ＋ `sys.tunnel.*` ＋ `iv_ctl` 三方法 ＋ 到期兜底） | 已实现（配置键 7 条 ＋ `tunnel.status/enable/disable` ＋ `main.c` 装配/热更新作废/退出即关 ＋ 标记写到期时刻、脚本独立判过期 ＋ 单测新增 8 组 ＋ 集成 test_tunnel_e2e 真拉起 ivsboxd ＋ 反向证伪 5/5；`camera:N` 待 S8.5、真连通待 frps） | 2026-10-15 10:21 | SN＝身份分区 `devid`（fail-closed）；令牌＝`<secure>/tunnel.token`（**不进配置**，防 `config.all` 导出）；resolver 一律 `127.0.0.1`，`camera:N` 在 S8.5 前恒报不可达；标记文件内容＝到期时刻 ⇒ `frp.sh`/`monitor.sh` 独立判过期（有效期不依赖主控存活）。详见本文件 2026-10-15 10:21 节。 |
+| M8-S8.5 摄像机 Web 受控代理（专用环回监听 ＋ `/cam/<N>` 反代 ＋ URL/Location/Cookie 重写） | 已实现（`iv_web_cam.c` ＋ main.c 第二监听接线 ＋ 集成 test_web_cam_e2e 自包含 14 组 ＋ 反向证伪 6/6（含装配层 1 条）；**真机浏览器兼容性不承诺、端到端待 frps 就位**） | 2026-10-15 11:30 | 新增 `web/src/iv_web_cam.c`：只绑 `127.0.0.1` 的专用监听口（`--cam-port`，默认 8081 与 `sys.tunnel.cam.port` 同源），只认 `/cam/<N>/...`（N 0..7、禁前导零），目标 IP 只经本地通道查 `camera.ch.<N>.ip`、上游端口只有 `--cam-upstream` 一个 ⇒ "禁止任意 ip:port"是物理事实；环回护栏拒自指；凭据零下发（SM4 密文 Web 读都不读）。**集成用例当场抓出 2 个真缺陷**（绝对 URL 重写吞掉路径分隔符 `/`；纯 Set-Cookie 响应因 `has_extra` 未置位被整段丢弃）。详见本文件 2026-10-15 11:30 节。 |
 |===
 
 == 2026-10-15 10:21 M8-S8.3 受控远程通道装配接线
@@ -1988,3 +1989,70 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 * **平台侧"版本回退事件"上报**：`iv_err.h` 只有 ELEC/NET/SENSOR 三类、无 OTA/版本码值，类型段 `0x4~0xF` 是否冻结
   须与单片机侧协商（与 SD 告警同一卡点）⇒ 本轮只落 `ota/events.log`。
 * **板端真机实测**（板子仍不在线，未覆盖事实）。
+
+== 2026-10-15 11:30 M8-S8.5 摄像机 Web 受控代理
+
+=== 干了什么事
+
+* **把 §9.3 的"白名单外地址不可达"落成物理事实**：`web/src/` 新增 `iv_web_cam.c`（约 430 行），
+  `main.c` 增**第二监听**——只绑 `127.0.0.1` 的专用口（`--cam-port`，默认 8081 与
+  `sys.tunnel.cam.port` 同源；`0` ＝关闭）。局域网直接不可达，入口只有本机进程与持钥匙的
+  frp stcp visitor。专用口上**没有**登录页/`/api`/静态资源，非法路径一律 404 且不透露本机在跑什么。
+* **目标自由度被结构消灭**：路由只有 `/cam/<N>/...`（N 0..7、禁前导零 `/cam/01`），目标 IP 一律经
+  本地通道问 `ivsboxd` 的 `camera.ch.<N>.ip`（Web 不读配置、不连数据库；手写 `"value":"..."`
+  扫描器——Web 只链 libivcore，没有 json-c），上游端口只有 `--cam-upstream`（默认 80）一个。
+  URL 里没有任何能指定目标的位置。
+* **环回护栏**：目标＝本代理自己（`127.0.0.1:cam_port`）⇒ 拒绝，防自环放大。
+* **转发面刻意很窄**：方法只放行 GET/POST（其余 405）；请求头只透传 Content-Type/Cookie/
+  Authorization（Host 由代理按目标重写、每请求补 `Connection: close`）；响应整体缓冲
+  （受 wbuf 96 KB 约束，超限/无 Content-Length 的 chunked 一律 502）；连接预算 2 s（**非阻塞
+  connect＋poll**——阻塞 connect 的内核兜底可达两分钟，会把整个事件循环冻死）、总预算 8 s。
+  登记不承诺：MJPEG 长流、WebSocket 升级、插件页（实时视频走 RTSP/私有流，不在本代理职责内）。
+* **改写三形态**：正文里的绝对 URL（`http://<ip>[:<port>]/x` → `/cam/<N>/x`）、`Location`、
+  `Set-Cookie` 的 `Path=`。正文里的**站内相对路径原样透传**（计划口径"真机兼容性不承诺"，
+  只做这三种文本替换）。
+* **凭据零下发**：配置里存的摄像机口令（SM4 密文）本进程读都不读（不链 libivmodules、没有
+  SM4）——浏览器看到的一切都是摄像机自己的登录流经代理原样往返；"自动注入登录"不做。
+* **装配接线**：`do_accept(lfd, is_cam)` 按监听来源给连接打 `is_cam` 标记 ⇒ `handle_req` 里
+  路由隔离（专用口连接只走 cam 路由）；CLI/env（`--cam-port/--cam-upstream`、
+  `IVSBOX_WEB_CAM_PORT/IVSBOX_WEB_CAM_UPSTREAM`）与心跳等键同口径；停机关 `g_cam_fd`。
+
+=== 怎么验证
+
+* 新增自包含集成用例 `tests/integration/test_web_cam_e2e.c`（约 560 行，**不需要 ns/tmpfs**）：
+  进程内 fork 假 ivsboxd（libivcore chan 帧应答 `config.get camera.ch.<N>.ip`，测试表给值）＋
+  假摄像机（echo/302/Set-Cookie/含绝对 URL 的页面）＋ 两个 ivsbox-web（第二个专测环回护栏：
+  `--cam-upstream == --cam-port`）。14 组断言：主口不服务摄像机路由、专用口 `/api` `/` 一律 404
+  且不发会话 Cookie、页面代理＋绝对 URL/相对链接改写、302 Location 改写、Set-Cookie Path 改写、
+  POST 体＋三个头逐字透传、未配置 502、不在线 502、非法路由/方法 404/405、护栏 502 "refused"、
+  fd 稳定性。
+* **集成当场抓出 2 个真缺陷**（都在 `iv_web_cam.c`）：
+** 绝对 URL 重写把路径分隔符 `/` 吞掉（`http://ip:port/login.js` → `/cam/0login.js`）——
+   修复＝needle 带尾 `/`、替换成 `prefix+"/"`；
+** 纯 Set-Cookie 响应（无 Location）`has_extra` 未置位 ⇒ Cookie 整段被 `build_response` 丢弃——
+   修复＝`cookies_to_extra` 返回写入量，>0 时置位。
+* VM 全量：`make test` **38/38**（1 个既有基线 SKIP）；`test_web_http`、`test_web_media_e2e`
+  回归绿（web 层改动未伤既有行为）；`make arm` 出 ARM ELF32 EABI5。
+* **反向证伪 6/6 全部抓出并 md5 对账还原复绿**：
+** M1（装配层）`do_accept(g_cam_fd, 1)` 的 is_cam 标记去掉 ⇒ **21 项 FAIL**——连接落到 static
+   的 404，路由隔离整个失效（教训 1：接线在装配层，单测测不到，只有真拉起进程的集成抓得到）；
+** M2 重写替换串去掉尾 `/` ⇒ c03b；M3 Cookie extra 不置位 ⇒ c05b；M4 Cookie Path 插入点
+   差 5 字节（插在 `Path=` 前面）⇒ c05b；M5 前导零检查去掉 ⇒ c09a；M6 环回护栏去掉 ⇒ c12a。
+
+=== 沉淀的纪律
+
+* **"自由度"要消灭在结构里，不是靠代码自觉**：URL 只有 N 一个变量、IP 只来自配置键、端口只有一个、
+  监听只绑环回——四条物理事实比任何"输入校验"都硬。
+* **改写类功能的测试必须断言"改完的样子"而不是"没报错"**：本轮 c03b 若只断言 200，会放过
+  `/cam/0login.js` 这种把页面改残的缺陷。
+* **变异判编译失败用 make 退出码，不能用输出含 "error" 判断**——每行编译命令都含 `-Werror`，
+  子串匹配会全部误判（本轮实测）。
+
+=== 未做（如实登记）
+
+* **真机浏览器兼容性**：各家摄像机 Web 页的绝对地址/插件/多端口形态各异，计划口径"不承诺"，
+  待现场样本验证；摄像机 Web 端口集合（是否只有 80）待现场确认。
+* **端到端远程连通**：frps 就位后的完整链路（visitor → stcp → 专用口 → 代理 → 摄像机）待 frps
+  与客户允许远程入站后联调（§9.4 前置 ①②③）。
+* **专用口未配 TLS/鉴权**：入口由 stcp 的 secretKey 把守（访问方须持钥匙），代理层不再叠加
+  一层会话——登记为架构口径，如安全评审提出再补。

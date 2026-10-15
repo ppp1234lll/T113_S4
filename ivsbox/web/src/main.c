@@ -48,9 +48,18 @@
 #define WEB_HB_PATH_DEF "/tmp/ivsbox-web.heartbeat"
 #define WEB_HB_MS_DEF   5000u
 
+/* ---- S8.5 摄像机代理专用监听 ----
+ * cam_port：**只绑 127.0.0.1** 的第二监听口（默认 8081，与 sys.tunnel.cam.port 同源
+ * —— frp stcp visitor 的落点就是它）。0 = 不开（关闭代理入口）。
+ * cam_upstream：摄像机侧 Web 端口（唯一允许被代理的上游端口，默认 80）。
+ * 与 iv_web_cam.c 的 IV_WEB_CAM_UPSTREAM_DEFAULT 同值：一个面向监听、一个面向上游。 */
+#define WEB_CAM_PORT_DEF      8081
+#define WEB_CAM_UPSTREAM_DEF  80u
+
 static iv_web_ctx_t  g_ctx;
 static iv_web_conn_t g_conn[IV_WEB_MAX_CONN];
 static int           g_listen_fd = -1;
+static int           g_cam_fd    = -1;  /* S8.5：摄像机代理专用口（-1 = 未开） */
 static volatile sig_atomic_t g_stop = 0;
 
 static const char *g_hb_path   = WEB_HB_PATH_DEF;
@@ -272,9 +281,13 @@ static int parse_req(iv_web_conn_t *c, iv_web_req_t *req)
             hdr_value(line + 6, req->range, sizeof(req->range));
         } else if (strncasecmp(line, "If-Range:", 9) == 0) {
             hdr_value(line + 9, req->if_range, sizeof(req->if_range));
+        } else if (strncasecmp(line, "Content-Type:", 13) == 0) {
+            hdr_value(line + 13, req->ctype, sizeof(req->ctype));
         } else if (strncasecmp(line, "Cookie:", 7) == 0) {
             const char *sid = strstr(line + 7, "ivs_sid=");
 
+            /* S8.5：Cookie 头**原文**也要留给摄像机代理（浏览器↔摄像机自己的会话） */
+            hdr_value(line + 7, req->cookie_raw, sizeof(req->cookie_raw));
             if (sid != NULL) {
                 size_t i = 0;
 
@@ -286,6 +299,8 @@ static int parse_req(iv_web_conn_t *c, iv_web_req_t *req)
                 }
                 req->token[i] = '\0';
             }
+        } else if (strncasecmp(line, "Authorization:", 14) == 0) {
+            hdr_value(line + 14, req->auth, sizeof(req->auth));
         }
         p = e + 2;
     }
@@ -404,6 +419,27 @@ static void handle_req(iv_web_conn_t *c, const iv_web_req_t *req)
     memset(&rsp, 0, sizeof(rsp));
     rsp.status = 200;
     (void)snprintf(rsp.ctype, sizeof(rsp.ctype), "application/json");
+
+    if (c->is_cam) {
+        /* S8.5：摄像机代理专用口。**只**认 /cam/<N>/...，其余一律一个不透露信息的
+         * 404 —— 这里没有登录页、没有 /api、没有静态资源，任何东西都不落出层外。 */
+        rc = iv_web_cam_handle(&g_ctx, req, body, body_cap, &body_len, &rsp);
+        if (rc == IV_ENOTSUP) {
+            rsp.status    = 404;
+            rsp.set_cookie = 0;
+            (void)snprintf(rsp.ctype, sizeof(rsp.ctype), "text/plain");
+            body_len = (size_t)snprintf(body, body_cap, "not found\n");
+            rc = IV_OK;
+        }
+        if (rc != IV_OK) {
+            body_len = (size_t)snprintf(body, body_cap,
+                                        "{\"ok\":false,\"e\":%d,\"msg\":\"internal\"}", rc);
+            rsp.status = 500;
+            (void)snprintf(rsp.ctype, sizeof(rsp.ctype), "application/json");
+        }
+        build_response(c, &rsp, body_len);
+        return;
+    }
 
     rc = iv_web_api_handle(&g_ctx, req, body, body_cap, &body_len, &rsp);
     if (rc == IV_ENOTSUP)
@@ -574,7 +610,10 @@ static void on_writable(int slot)
 /* --------------------------------------------------------------------------
  * 监听
  * -------------------------------------------------------------------------- */
-static int make_listener(int port)
+/* 监听指定地址与端口。ip_be 是"数值按大端读"的全工程约定值（0x7F000001 = 127.0.0.1）；
+ * 0 = INADDR_ANY（主口）。sockaddr 要的是网络字节序内存布局，故这里 htonl 是**正确**的
+ * —— 别与 iv_tunnel 渲染那处"勿 htonl"混淆：那边是取字节判断，这边是填 sockaddr。 */
+static int make_listener_at(uint32_t ip_be, int port)
 {
     struct sockaddr_in addr;
     int                fd;
@@ -587,7 +626,7 @@ static int make_listener(int port)
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = (ip_be == 0u) ? htonl(INADDR_ANY) : htonl(ip_be);
     addr.sin_port        = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         (void)close(fd);
@@ -604,13 +643,13 @@ static int make_listener(int port)
     return fd;
 }
 
-static void do_accept(void)
+static void do_accept(int lfd, int is_cam)
 {
     for (;;) {
         int slot = conn_slot_free();
         int cfd;
 
-        cfd = accept(g_listen_fd, NULL, NULL);
+        cfd = accept(lfd, NULL, NULL);
         if (cfd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 return;
@@ -636,6 +675,7 @@ static void do_accept(void)
         }
         memset(&g_conn[slot], 0, sizeof(g_conn[slot]));
         g_conn[slot].fd = cfd;
+        g_conn[slot].is_cam = (uint8_t)is_cam; /* 路由隔离的依据（S8.5） */
         g_conn[slot].send_fd = -1;   /* memset 会把 send_fd 清成 0（＝stdin！） */
         g_conn[slot].last_ms = iv_web_now_ms();
     }
@@ -649,22 +689,28 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s [--port N] [--root DIR] [--chan PATH] [--pass PW]\n"
             "          [--media-root DIR] [--media-bps N]\n"
+            "          [--cam-port N] [--cam-upstream N]\n"
             "          [--heartbeat PATH] [--heartbeat-ms N] [--version]\n"
             "  defaults: port %d, root %s, chan %s\n"
-            "            media-root %s, media-bps %u (0 = unlimited)\n",
+            "            media-root %s, media-bps %u (0 = unlimited)\n"
+            "            cam-port %d (127.0.0.1 only, 0 = off), cam-upstream %u\n",
             argv0, WEB_PORT_DEF, WEB_ROOT_DEF, IV_CHAN_PATH_DEFAULT,
-            IV_WEB_MEDIA_ROOT_DEFAULT, IV_WEB_MEDIA_BPS_DEFAULT);
+            IV_WEB_MEDIA_ROOT_DEFAULT, IV_WEB_MEDIA_BPS_DEFAULT,
+            WEB_CAM_PORT_DEF, (unsigned)WEB_CAM_UPSTREAM_DEF);
 }
 
 int main(int argc, char *argv[])
 {
     int port = WEB_PORT_DEF;
+    int cam_port = WEB_CAM_PORT_DEF;
     int i;
     int n;
 
     g_ctx.chan_path   = IV_CHAN_PATH_DEFAULT;
     g_ctx.static_root = WEB_ROOT_DEF;
     g_ctx.chan_fd     = -1;
+    g_ctx.cam_port    = cam_port;          /* 环回护栏用（iv_web_cam.c） */
+    g_ctx.cam_upstream = WEB_CAM_UPSTREAM_DEF;
     (void)snprintf(g_ctx.pass, sizeof(g_ctx.pass), "%s", WEB_PASS_DEF);
     (void)snprintf(g_ctx.media_root, sizeof(g_ctx.media_root), "%s",
                    IV_WEB_MEDIA_ROOT_DEFAULT);
@@ -693,6 +739,10 @@ int main(int argc, char *argv[])
                            (int)sizeof(g_ctx.media_root) - 1, argv[++i]);
         } else if (strcmp(argv[i], "--media-bps") == 0 && i + 1 < argc) {
             g_ctx.media_bps = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--cam-port") == 0 && i + 1 < argc) {
+            cam_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--cam-upstream") == 0 && i + 1 < argc) {
+            g_ctx.cam_upstream = (uint16_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--heartbeat") == 0 && i + 1 < argc) {
             g_hb_path = argv[++i];
         } else if (strcmp(argv[i], "--heartbeat-ms") == 0 && i + 1 < argc) {
@@ -706,6 +756,11 @@ int main(int argc, char *argv[])
         usage(argv[0]);
         return 1;
     }
+    if (cam_port < 0 || cam_port > 65535) {
+        usage(argv[0]);
+        return 1;
+    }
+    g_ctx.cam_port = cam_port; /* CLI 终值（环回护栏与监听同源，不许分叉） */
     {
         const char *env = getenv("IVSBOX_WEB_PASS");
 
@@ -725,6 +780,20 @@ int main(int argc, char *argv[])
         env = getenv("IVSBOX_WEB_HEARTBEAT_MS");
         if (env != NULL && env[0] != '\0')
             g_hb_ms = (uint32_t)strtoul(env, NULL, 10);
+        /* S8.5：摄像机代理监听/上游端口。cam-port 0 = 关闭代理入口。
+         * 环境变量在 CLI 之后生效口径与其它键一致：没设就用 CLI 值。 */
+        env = getenv("IVSBOX_WEB_CAM_PORT");
+        if (env != NULL && env[0] != '\0') {
+            cam_port = atoi(env);
+            if (cam_port < 0 || cam_port > 65535) {
+                usage("ivsbox-web");
+                return 1;
+            }
+            g_ctx.cam_port = cam_port;
+        }
+        env = getenv("IVSBOX_WEB_CAM_UPSTREAM");
+        if (env != NULL && env[0] != '\0')
+            g_ctx.cam_upstream = (uint16_t)strtoul(env, NULL, 10);
     }
 
     /* 日志失败不致命：host 上没有 /mnt/UDISK/log 是常态，Web 照样要能跑。 */
@@ -735,20 +804,35 @@ int main(int argc, char *argv[])
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
 
-    g_listen_fd = make_listener(port);
+    g_listen_fd = make_listener_at(0u, port);
     if (g_listen_fd < 0) {
         IV_LOG_E(WEB_MOD, "listen on port %d failed: %s", port, strerror(errno));
         fprintf(stderr, "ivsbox-web: listen on port %d failed: %s\n",
                 port, strerror(errno));
         return 1;
     }
+    /* S8.5：摄像机代理专用口 —— **只绑 127.0.0.1**，局域网直接不可达；
+     * 入口只有本机进程与持钥匙的 frp stcp visitor。0 = 关闭。 */
+    if (g_ctx.cam_port > 0) {
+        g_cam_fd = make_listener_at(0x7f000001u, g_ctx.cam_port);
+        if (g_cam_fd < 0) {
+            IV_LOG_E(WEB_MOD, "cam listen on 127.0.0.1:%d failed: %s",
+                     g_ctx.cam_port, strerror(errno));
+            fprintf(stderr, "ivsbox-web: cam listen on 127.0.0.1:%d failed: %s\n",
+                    g_ctx.cam_port, strerror(errno));
+            return 1;
+        }
+    }
     IV_LOG_I(WEB_MOD, "ivsbox-web listening on :%d, root=%s, chan=%s",
              port, g_ctx.static_root, g_ctx.chan_path);
     IV_LOG_I(WEB_MOD, "media root=%s bps=%u", g_ctx.media_root, g_ctx.media_bps);
+    IV_LOG_I(WEB_MOD, "cam proxy %s (upstream port %u)",
+             (g_cam_fd >= 0) ? "enabled" : "off",
+             (unsigned)g_ctx.cam_upstream);
 
     while (!g_stop) {
-        struct pollfd pf[IV_WEB_MAX_CONN + 1];
-        int           map[IV_WEB_MAX_CONN + 1];
+        struct pollfd pf[IV_WEB_MAX_CONN + 2];
+        int           map[IV_WEB_MAX_CONN + 2];
         int           nfds = 0;
         int           timeout = 1000;
         uint64_t      now;
@@ -762,6 +846,15 @@ int main(int argc, char *argv[])
         pf[0].revents = 0;
         map[0] = -1;
         nfds = 1;
+
+        /* S8.5：摄像机代理专用口。map=-2 区分来源 ⇒ accept 时打 is_cam 标记。 */
+        if (g_cam_fd >= 0) {
+            pf[nfds].fd      = g_cam_fd;
+            pf[nfds].events  = POLLIN;
+            pf[nfds].revents = 0;
+            map[nfds] = -2;
+            nfds++;
+        }
 
         now = iv_web_now_ms();
         for (i = 0; i < (int)IV_WEB_MAX_CONN; i++) {
@@ -803,8 +896,12 @@ int main(int argc, char *argv[])
             if (pf[i].revents == 0)
                 continue;
             if (map[i] < 0) {
-                if (pf[i].revents & POLLIN)
-                    do_accept();
+                if (pf[i].revents & POLLIN) {
+                    if (map[i] == -2)
+                        do_accept(g_cam_fd, 1);
+                    else
+                        do_accept(g_listen_fd, 0);
+                }
                 continue;
             }
             if (pf[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
@@ -834,6 +931,8 @@ int main(int argc, char *argv[])
         conn_close(i);
     if (g_listen_fd >= 0)
         (void)close(g_listen_fd);
+    if (g_cam_fd >= 0)
+        (void)close(g_cam_fd);
     iv_web_chan_close(&g_ctx);
     IV_LOG_I(WEB_MOD, "ivsbox-web stopped");
     return 0;

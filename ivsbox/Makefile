@@ -202,12 +202,14 @@ package-copy:
 	@cp $(BINS) packaging/bin/
 	@cp scripts/start_ivsbox.sh scripts/monitor.sh scripts/monitor-web.sh scripts/monitor-media.sh packaging/scripts/
 	@cp scripts/ivsbox-run.sh packaging/scripts/
+	# 受控远程通道的 frpc 起停脚本（M8；monitor.sh 按标记文件调它）
+	@cp scripts/frp.sh packaging/scripts/
 	@cp scripts/init.d/S62usb4g scripts/init.d/S65ivsboxd scripts/init.d/S66ivsboxweb scripts/init.d/S67ivsboxmedia packaging/init.d/
 	# Web 静态资源（M5-S5.3）：模板与数据分离，页面改版不必重编固件。
 	@rm -rf packaging/web
 	@mkdir -p packaging/web/static
 	@cp -r web/static/. packaging/web/static/ 2>/dev/null || true
-	@chmod +x packaging/scripts/start_ivsbox.sh packaging/scripts/monitor.sh packaging/scripts/monitor-web.sh packaging/scripts/monitor-media.sh packaging/scripts/ivsbox-run.sh packaging/init.d/S62usb4g packaging/init.d/S65ivsboxd packaging/init.d/S66ivsboxweb packaging/init.d/S67ivsboxmedia
+	@chmod +x packaging/scripts/start_ivsbox.sh packaging/scripts/monitor.sh packaging/scripts/monitor-web.sh packaging/scripts/monitor-media.sh packaging/scripts/ivsbox-run.sh packaging/scripts/frp.sh packaging/init.d/S62usb4g packaging/init.d/S65ivsboxd packaging/init.d/S66ivsboxweb packaging/init.d/S67ivsboxmedia
 	@for bin in $(BINS); do \
 		LC_ALL=C $(CROSS)readelf -h "$$bin" | grep -q "Machine:.*ARM" || { \
 			echo "package: ERROR, not ARM ELF: $$bin"; exit 1; \

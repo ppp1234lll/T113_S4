@@ -45,7 +45,44 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M6-S6.4/S6.5 视频读取（HTTP Range 下载）＋ SD 卡策略 | 已实现（新增 `iv_storage` ＋ core `iv_sha256` ＋ `iv_web_media`；test/asan/tsan 35/35；集成 8/8＋1 SKIP；反向证伪 9/9；**方式一平台上传按协议未定不做**） | 2026-10-14 16:10 | S6.5＝`statfs` 巡检 ＋ 水位 85/90/95/70（升档即时、降档到 70% 才解除）＋ REC→ALARM→SNAP 删序 ＋ 有界 64 候选窗 ＋ 最近 120 s 切片不删；S6.4＝`/media` Range（206/416/ETag/If-Range/`?sha=1` 校验值/1 s 窗口限速/取消）。容量闸门 `iv_recctl_gate()` 由 agent 每拍喂。详见本文件文末 2026-10-14 16:10 节 |
 | M6 退出条件收口（§16.2 场景 6 ＋ SD 告警出口） | 已实现（VM 全量验证 ＋ 反向证伪 3 条；平台侧 `ERR` 上报卡跨端协商） | 2026-10-14 16:40 | 核实出**真缺口**：`iv_storage` 的 `fault/alarm` 此前**除单测无任何生产调用者**，`sys.overview`（架构 §9.1 总览页"SD 卡"＋媒体页"存储水位"的数据源）里没有 storage 段 ⇒ §16.2 场景 6 要求的"产生明确告警"落不了地。本轮把 `storage` 段接进 `sys.overview`（`build_storage()`）＋ 新增 `iv_storage_enabled()` 把"未启用"与"巡检过且正常"分开（未启用只给 `enabled:false`，不给零值字段冒充健康）。新增 `tests/integration/test_sd_fault_e2e.c`：私有 user+mount ns ＋ tmpfs，用 `IVSBOX_SD_ROOT` 把存储根指到"存在／不存在(拔卡)／`size=1M` tmpfs 灌满(写满)"三种受控位置，每种真拉起一次 `ivsboxd`，从本地通道验 `fault/alarm/level/allow_new/stop_rec` ＋ 告警日志行，并**三种情形都断言 `system.snapshot` 仍应答**（控制业务不受影响）。VM `test`/`asan`/`tsan` 各 35/35、`arm`/`package` rc=0、集成 **9 passed ＋ 1 SKIP**、**反向证伪 3/3 抓出**。*未做：平台 `ERR` 故障码上报 SD（`iv_err.h` 无 SD 码值、类型段 `0x4~0xF` 归属未冻结，卡跨端协商）；板端真机实测*。详见本文件文末 2026-10-14 16:40 节。 |
 | M7-S7.1 升级包格式与验签器（`iv_ota`） | 已实现（模块 ＋ 单测 13 组 ＋ VM 全量验证 ＋ 反向证伪 10 条；**装配接线归 S7.2、量产公钥未部署、板端未复跑**） | 2026-10-14 17:30 | 新增 `iv_ota.h` / `src/modules/ota/iv_ota.c` / `tests/unit/test_ota.c`。包＝头(16B)＋清单(行式 ASCII)＋负载＋Ed25519 签名(64B)，**总长严格相等**、不做宽容解析；九步验签（结构→清单→负载长度→公钥→**签名**→型号→硬件区间→软件版本→逐文件 SHA-256），签名通过前不采信清单语义。签名用 OpenSSL EVP（架构 §14"复用可信密码库"；板端 sysroot 实测 OpenSSL 1.1.1a 有 `EVP_PKEY_ED25519`），**不自写椭圆曲线**；校验值仍用 core 的 `iv_sha256`。两端 `LDLIBS` 追加 `-lcrypto`，ARM 产物 `NEEDED` 已见 `libcrypto.so.1.1`。**fail-closed**：内置公钥未部署时返 `IV_ENOTSUP` 且输出全零 ⇒ 拒绝一切包（不给假密钥）。VM `test`/`asan`/`tsan` 36/36、`host`/`analyze`/`arm` rc=0 零告警；反向证伪 10/10 抓出。详见本文件文末 2026-10-14 17:30 节。 |
+| M8-S8.1~S8.2 受控远程通道（服务名白名单 ＋ 钥匙派生 ＋ 通道闸门） | 已实现（新增 `iv_tunnel` 模块 ＋ `scripts/frp.sh` ＋ `monitor.sh` 守护段 ＋ 单测 12 组 ＋ VM 验证 ＋ 反向证伪 5 条；**装配接线归 S8.3、摄像机受控代理归 S8.5、端到端待 frps 就位**） | 2026-10-15 09:07 | 按用户指定改用与 `bird_20260623` 同款方式（frpc 外连 frps ＋ stcp ＋ 标记文件），**不再自研通道协议**。详见本文件 2026-10-15 09:07 节。 |
 |===
+
+== 2026-10-15 09:07 M8-S8.1~S8.2 受控远程通道（与 BIRD 运维箱同款：frpc + stcp + 标记文件）
+
+=== 干了什么事
+
+- *`ivsbox/include/ivsbox/iv_tunnel.h` / `ivsbox/src/modules/tunnel/iv_tunnel.c`（新增，进 `libivmodules.a`）*
+  - **服务名白名单**：`iv_tunnel_svc_parse()` 只认 `web` / `camera:N`（N<6）/ `media:N`（N<8）；`camera:06`（前导零）、`camera:6`（越界）、`192.168.1.10`、`1.2.3.4:80`、`http://x`、`web:80` 等一律拒。
+  - **钥匙派生**：`iv_tunnel_secret()` ＝ `hex(MD5(sn + token + svc)[0..8))`（16 个小写 hex），走 OpenSSL EVP。**`svc` 进派生式** ⇒ 授权看 Web 不会顺带授权看摄像机；`svc` 为空时与 BIRD `utils.GenerateSTCPKey` 逐字节等价。
+  - **渲染**：`iv_tunnel_render()` 输出 `frpc.toml`（`serverAddr`/`serverPort`/`auth.token` ＋ 每个服务一个 `[[proxies]]`，`type="stcp"`、`secretKey`、环回 `localIP`、`localPort`）。
+  - **环回硬闸门**：resolver 给的目标必须落在 127.0.0.0/8，否则 `EHOST` —— 摄像机 IP 永远进不了配置文件。
+  - **闸门**：`enable()`（渲染 → 原子落盘 0600 → 置标记）/ `disable()`（清标记 ＋ 会话留档）/ `tick()`（到期自关）/ `invalidate()`（身份变更作废）；`caps()` 仅在身份＋frps＋resolver＋路径全就位时置位。
+- *`ivsbox/scripts/frp.sh`（新增）*：`up/down/stop/status`，照 BIRD `scripts/frp.sh` 同构；**只按标记动作、不自己造标记**。
+- *`ivsbox/scripts/monitor.sh`*：新增通道守护段（标记在⇒保证 frpc 在；标记不在⇒保证 frpc 不在）＋ `frpc_alive()`、带 300 s 节流的 `tunnel_alert()`。
+- *`ivsbox/Makefile`*：`package-copy` 增加 `scripts/frp.sh` 的复制与 `+x`。
+- *`ivsbox/tests/unit/test_tunnel.c`（新增，12 组）*：白名单 18 类非法、钥匙四条黄金向量、toml 逐字比对、环回闸门、落盘权限 0600、开关/到期/重复开启、能力位、统计与会话留档、NULL 安全。
+
+=== 解决什么问题
+
+- *M8 没有可执行步骤*：计划里只有一句"暂缓"＋三条前置，架构 §9.4 与 §16.2 场景 10（"远程代理无法访问白名单之外的 IP 和端口"）落不了地。
+- *前置条件 ① 被换掉而不是被绕过*：原口径要求"平台服务端实现通道协议"，改为复用 frps/frpc 之后，这条变成"是否已有 frps 与运维侧 frpc"——不需要新的跨端协议，也就不需要"平台无感知"这种自相矛盾的承诺。
+- *摄像机 IP 不该出现在通道配置里*：frp 的 `localIP` 只能是本机可达地址，因此访问摄像机必须过设备上的受控代理（§9.3/S8.5）。本模块把这条做成硬闸门（`EHOST`），而不是"靠配置时小心"。
+- *远程入口默认关、且能自己关*：开启必带有效期（默认 3600 s、上限 86400 s），到期 `tick()` 清标记，进程由脚本收掉 —— 不依赖人记得去关。
+
+=== 影响范围
+
+- *新增依赖*：运行期依赖板端存在 `/usr/bin/frpc`（**待现场核对**）与运维侧 frps；编译期沿用既有的 `-lcrypto`（MD5 走 EVP），**Makefile 的库与标志未改**。
+- *未接线*：`iv_tunnel` 目前无生产调用者（装配接线在 S8.3），因此**当前不改变任何运行时行为**；`monitor.sh` 新增的守护段在标记文件不存在时不做任何事。
+- *有意偏离参考项目*：BIRD 的 `frp.sh start` 自己 touch 标记，本工程由 `iv_tunnel` 按有效期写标记、脚本只读它 —— 否则"到期自动关"这道闸门会被脚本自己绕过。
+- *待确认*：MD5 派生是为与运维侧互操作沿用（非完整性校验用途）；若运维侧只认 BIRD 的单服务公式，需约定 `svc` 取值（当前在 `svc` 为空时完全等价）。
+
+=== 验证方式与结果
+
+- 编译 VM（tqt113）：`make TARGET=host build/host/tests/unit/test_tunnel` **零告警**（-Werror 下通过），运行输出 `test_tunnel passed`，RC=0（12 组全绿）。
+- **反向证伪 5/5 全部抓出并还原复绿**：M1 去掉环回闸门 ⇒ 抓 `t05: camera ip rejected (EHOST)`；M2 钥匙不按服务区分 ⇒ 3 条 FAIL；M3 到期边界差一 ⇒ 6 条 FAIL；M4 配置权限改 0644 ⇒ 1 条 FAIL；M5 关闭不删标记 ⇒ 3 条 FAIL。
+- **已知基线（非本次引入）**：`make build`（含 `ivsbox-media`）在 VM 上仍因 `media/third_party/ffmpeg/lib_x86/*.a` 缺失失败（`.gitignore` 含 `*.a`）。
+- *未做*：装配接线与配置键（S8.3）、摄像机 Web 受控代理（S8.5）、端到端连通性（待 frps）、板端实测。
 
 == 2026-10-09 11:38 程序与数据分家（程序迁 `/opt/ivsbox`，数据留 UDISK）
 

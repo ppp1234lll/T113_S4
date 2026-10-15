@@ -79,6 +79,16 @@ IVSBOX_BOOT_KILL_GRACE_S=${IVSBOX_BOOT_KILL_GRACE_S:-5}
 # ivsboxd 落下的"请装这个包"请求（由本地通道的 ota.request 方法写）。
 OTA_REQUEST=$IVSBOX_HOME/ota/request
 
+# ---- 受控远程通道（M8）----
+# 标记文件由 ivsboxd 的 iv_tunnel 按**有效期**写/清（M8-S8.2）；本脚本只按它起停
+# frpc 进程。**标记是唯一真相**：进程在不在不算数，因为进程崩溃是常态，而"标记没了
+# 进程还在"是绕过有效期闸门的远程入口常开 —— 后者危险得多。
+IVSBOX_TUNNEL_FLAG=${IVSBOX_TUNNEL_FLAG:-/tmp/ivsbox-tunnel.enabled}
+TUNNEL_SCRIPT=${TUNNEL_SCRIPT:-$IVSBOX_APP_DIR/scripts/frp.sh}
+# 通道告警节流：frpc 起不来（例如板端根本没装 frpc）时不能每 5 s 刷一条日志。
+TUNNEL_ALERT_GAP=${TUNNEL_ALERT_GAP:-300}
+TUNNEL_LAST_ALERT=0
+
 # 状态文件是单行三列：`<window_start_mono> <restarts> <failsafe_until_mono>`，
 # 全部是 /proc/uptime 的整数秒（见文件头"时间基准"）。读入后逐列做"是不是纯数字"
 # 的兜底：状态文件被写坏/复位打断写半截时按"零历史"处理，绝不让坏文件卡死守护循环。
@@ -116,6 +126,19 @@ alert() {
 
 ivsboxd_alive() {
     ps -o comm | grep -x ivsboxd >/dev/null 2>&1
+}
+
+frpc_alive() {
+    # frpc 是 ELF 二进制，`-o comm` 判定可靠（对 shell 脚本会看到解释器名，故不用 -f）。
+    ps -o comm | grep -x frpc >/dev/null 2>&1
+}
+
+tunnel_alert() {
+    # 节流：同一类告警在 TUNNEL_ALERT_GAP 秒内只记一次。
+    if [ $((now - TUNNEL_LAST_ALERT)) -ge "$TUNNEL_ALERT_GAP" ]; then
+        alert "tunnel: $1"
+        TUNNEL_LAST_ALERT=$now
+    fi
 }
 
 state_read
@@ -196,6 +219,22 @@ while true; do
             # 升级自检从这一刻开始计时。每次重拉都**重新计时**：新版崩溃后被重拉，应该
             # 按"这一次"算，而不是把上一实例已经等掉的时间累进来。
             BOOT_T0=$now
+        fi
+    fi
+
+    # ---- 受控远程通道守护（M8）----
+    # 两个方向都要兜：① 标记在、进程没了 ⇒ 通道静默失效，远程运维连不上，现象与
+    # "设备掉线"一模一样，现场最难查；② 标记没了、进程还在 ⇒ 远程入口绕过有效期
+    # 常开，这是安全事故，比失效危险得多。两端都按"标记"这一个判据对齐。
+    if [ -f "$IVSBOX_TUNNEL_FLAG" ]; then
+        if ! frpc_alive; then
+            tunnel_alert "标记存在但 frpc 不在，拉起"
+            sh "$TUNNEL_SCRIPT" up >/dev/null 2>&1
+        fi
+    else
+        if frpc_alive; then
+            tunnel_alert "标记已清除，停掉 frpc（有效期闸门）"
+            sh "$TUNNEL_SCRIPT" down >/dev/null 2>&1
         fi
     fi
 

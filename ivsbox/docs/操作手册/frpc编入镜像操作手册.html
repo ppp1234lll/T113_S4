@@ -162,8 +162,16 @@ SDK 里 <code>buildroot/buildroot-201902/board/embedsky/</code> 下<strong>只�
 <code>CONFIG_VFP=y</code> / <code>CONFIG_VFPv3=y</code> / <code>CONFIG_NEON=y</code>，<strong>能跑</strong>。
 <code>linux_arm</code> 是静态 Go 二进制，不涉及 C 互操作，浮点 ABI 差异无影响；仅当真跑不起来才换 <code>_arm_hf</code>。</p>
 <h3>2.2 下载并验签（在编译 VM 上）</h3>
-<pre><code class="language-bash">cd /tmp &amp;&amp; curl -L --retry 3 -O https://github.com/fatedier/frp/releases/download/v0.68.0/frp_0.68.0_linux_arm.tar.gz
+<pre><code class="language-bash"># 1) 切到临时目录
+cd /tmp
+
+# 2) 下载 v0.68.0 linux_arm 发布包（--retry 3：网络失败自动重试 3 次）
+curl -L --retry 3 -O https://github.com/fatedier/frp/releases/download/v0.68.0/frp_0.68.0_linux_arm.tar.gz
+
+# 3) 校验 tarball 的 SHA256，期望输出 frp_0.68.0_linux_arm.tar.gz: OK
 echo '3944595c77cc8242a9d94a840b59966f018ddaeb3e93e4301d803e7c7ed31b8e  frp_0.68.0_linux_arm.tar.gz' | sha256sum -c -
+
+# 4) 解包
 tar xzf /tmp/frp_0.68.0_linux_arm.tar.gz
 </code></pre>
 <p>期望输出 <code>frp_0.68.0_linux_arm.tar.gz: OK</code>。
@@ -172,11 +180,17 @@ tar xzf /tmp/frp_0.68.0_linux_arm.tar.gz
 <h2>3. Step 2 —— 放进 overlay</h2>
 <p><strong>放 <code>usr/bin</code>，不要放 <code>opt</code></strong>：天嵌一键脚本 <code>auto_build.sh</code> 会 <code>rm -rf .../rootfs_overlay/opt</code>
 再重灌 PDA/Qt 内容，<strong>不碰 <code>usr/bin</code></strong>。放 <code>opt</code> 会被静默清掉。</p>
-<pre><code class="language-bash">install -m 0755 /tmp/frp_0.68.0_linux_arm/frpc /opt/Embedsky/mount/t113_tina/buildroot/buildroot-201902/board/embedsky/tqt113-s3/rootfs_overlay/usr/bin/frpc
+<pre><code class="language-bash"># 以 0755（rwxr-xr-x）权限把解出的 frpc 装进 rootfs overlay 的 usr/bin
+install -m 0755 /tmp/frp_0.68.0_linux_arm/frpc /opt/Embedsky/mount/t113_tina/buildroot/buildroot-201902/board/embedsky/tqt113-s3/rootfs_overlay/usr/bin/frpc
 </code></pre>
 <p>立刻自检（三条都要对）：</p>
-<pre><code class="language-bash">ls -la /opt/Embedsky/mount/t113_tina/buildroot/buildroot-201902/board/embedsky/tqt113-s3/rootfs_overlay/usr/bin/frpc
+<pre><code class="language-bash"># 1) 权限与大小，期望 -rwxr-xr-x / 15073464
+ls -la /opt/Embedsky/mount/t113_tina/buildroot/buildroot-201902/board/embedsky/tqt113-s3/rootfs_overlay/usr/bin/frpc
+
+# 2) 文件类型，期望 ELF 32-bit LSB executable, ARM, EABI5 ... statically linked
 file /opt/Embedsky/mount/t113_tina/buildroot/buildroot-201902/board/embedsky/tqt113-s3/rootfs_overlay/usr/bin/frpc
+
+# 3) 校验和，期望 9040d099f4cd992cd31f3d0057ec29cab2b388c74f1b59b9f7f65982ba571c71
 sha256sum /opt/Embedsky/mount/t113_tina/buildroot/buildroot-201902/board/embedsky/tqt113-s3/rootfs_overlay/usr/bin/frpc
 </code></pre>
 <table>
@@ -203,8 +217,23 @@ sha256sum /opt/Embedsky/mount/t113_tina/buildroot/buildroot-201902/board/embedsk
 </table>
 <hr />
 <h2>4. Step 3 —— 重新构建 rootfs + 打包</h2>
-<pre><code class="language-bash">cd /opt/Embedsky/mount/t113_tina &amp;&amp; source build/envsetup.sh
-{ ./build.sh; echo &quot;BUILD_RC=$?&quot;; ./build.sh pack; echo &quot;PACK_RC=$?&quot;; } &gt; /tmp/build_frpc.log 2&gt;&amp;1 &amp;
+<pre><code class="language-bash"># 1) 进入 SDK 根目录
+cd /opt/Embedsky/mount/t113_tina
+
+# 2) 初始化构建环境（build.sh 依赖它导出的变量与函数）
+source build/envsetup.sh
+
+# 3) 后台执行全量构建；无参 ./build.sh 才会同时刷新 rootfs.ext4。
+#    构建结束后把退出码写进日志，出现 BUILD_RC=0 即构建成功
+( ./build.sh; echo &quot;BUILD_RC=$?&quot; ) &gt; /tmp/build_frpc.log 2&gt;&amp;1 &amp;
+
+# 4) 实时跟踪构建日志；Ctrl+C 只退出 tail，不影响后台构建
+tail -f /tmp/build_frpc.log
+
+# 5) 构建成功后（日志里已出现 BUILD_RC=0）再后台执行打包，日志追加进同一文件
+( ./build.sh pack; echo &quot;PACK_RC=$?&quot; ) &gt;&gt; /tmp/build_frpc.log 2&gt;&amp;1 &amp;
+
+# 6) 跟踪打包日志，出现 PACK_RC=0 即打包成功
 tail -f /tmp/build_frpc.log
 </code></pre>
 <p>看到 <code>BUILD_RC=0</code> 与 <code>PACK_RC=0</code> 即成功。
@@ -265,7 +294,10 @@ ls -la /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/t113_s4_lin
 <p>用 PhoenixSuit / LiveSuit 刷入
 <code>/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img</code>。</p>
 <p>板端执行：</p>
-<pre><code class="language-bash">/usr/bin/frpc -v
+<pre><code class="language-bash"># 查看版本，期望输出 0.68.0
+/usr/bin/frpc -v
+
+# 查看文件属性，期望 -rwxr-xr-x / 15073464
 ls -la /usr/bin/frpc
 </code></pre>
 <p>期望 <code>frpc -v</code> 输出 <code>0.68.0</code>。</p>
@@ -314,7 +346,8 @@ ls -la /usr/bin/frpc
 </table>
 <hr />
 <h2>8. 收尾清理（规则 6）</h2>
-<pre><code class="language-bash">rm -rf /tmp/frp_0.68.0_linux_arm /tmp/frp_0.68.0_linux_arm.tar.gz /tmp/build_frpc.log
+<pre><code class="language-bash"># 删除解包目录、下载包与构建日志，不留临时文件
+rm -rf /tmp/frp_0.68.0_linux_arm /tmp/frp_0.68.0_linux_arm.tar.gz /tmp/build_frpc.log
 </code></pre>
 <hr />
 <h2>实现记录</h2>
@@ -328,6 +361,12 @@ ls -la /usr/bin/frpc
 </tr>
 </thead>
 <tbody>
+<tr>
+<td>命令拆分与注释（全部代码块）</td>
+<td>已实现</td>
+<td>2026-10-15 16:58</td>
+<td>依用户要求把复合命令（<code>&amp;&amp;</code> 串联、<code>{ ...; }</code> 分组）拆成单条指令，并逐条加注释说明预期输出；<code>.md</code> 与 HTML 副本同步</td>
+</tr>
 <tr>
 <td>frpc 编入镜像操作手册</td>
 <td>已实现</td>

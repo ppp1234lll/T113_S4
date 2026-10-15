@@ -137,23 +137,51 @@ tail -f /tmp/build_frpc.log
 ## 5. Step 4 —— 验证真进镜像了
 
 ```bash
-# 5a. overlay 是否被应用进 target
+# 5a. overlay 是否被应用进 buildroot 的 target/ 目录
 ls -la /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/buildroot/target/usr/bin/frpc
+# 期望：-rwxr-xr-x / 15073464
 
-# 5b. 是否真进了 rootfs.ext4（免 root，e2fsprogs 的 debugfs 可直接读）
-debugfs -R 'stat /usr/bin/frpc' /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/rootfs.ext4
-# 期望：Type: regular   Mode: 0755   Size: 15073464
+# 5b. 读**文件系统里的 inode**；注意用 buildroot 产出的那枚**裸 ext4**（原因见下方 ⚠）
+debugfs -R 'stat /usr/bin/frpc' /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/buildroot/images/rootfs.ext2
+# 期望：Inode: ...  Type: regular  Mode: 0755  Size: 15073464
 
-# 5c. 固件时间戳刷新了
+# 5c. 固件刷新了：看时间戳，并与上一版比**大小增量**
 ls -la /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img
+# 期望：比上一版正好大 15076352 字节（＝ frpc 15073464 ＋ ext4 元数据 2888）
 ```
 
-5b 是最硬的证据 —— 直接读镜像里的文件系统，绕开"构建脚本说成功了"。
+5b + 5c 合起来是最硬的证据 —— 直接读文件系统里的 inode、并对固件体积增量做算术，绕开"构建脚本说成功了"。
+
+### ⚠ 别拿 `out/.../rootfs.ext4` 去喂 `debugfs`
+
+`/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/rootfs.ext4` **不是裸 ext4**，
+它是 **Android sparse image**（`file` 会报 `Android sparse image, version: 1.0`）。用 `debugfs`
+打开它只会得到：
+
+```text
+debugfs 1.46.5 (30-Dec-2021)
+debugfs: Bad magic number in super-block while trying to open .../rootfs.ext4
+stat: Filesystem not open
+```
+
+原因：`make_ext4` 按分区表把 rootfs 做成 **2 GiB 裸 ext4**（`size = 4194304` 扇区 × 512 字节），
+然后**稀疏化**（只存非零块，落盘约 600 MB）以加快烧录 —— 最终 `.img` 里装的就是这枚稀疏镜像。
+要 `debugfs` 就得读**裸的那枚**：`.../buildroot/buildroot/images/rootfs.ext2`（1 GiB，
+尺寸由 buildroot 的 `BR2_TARGET_ROOTFS_EXT2_SIZE` 决定）。VM 上没有 `simg2img`，
+没法把稀疏镜像还原成裸镜像。
+
+若一定要在**稀疏镜像**上取证，可按特征串确认 frpc 已进镜像：
+
+```bash
+# frpc 二进制自带 "fatedier/frp" 等字符串，命中即说明内容确实在这枚镜像里
+grep -a -c fatedier/frp /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/rootfs.ext4
+# 期望：非 0（实测 31）
+```
 
 ### 容量不必担心
 
 `/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/pack_out/sys_partition.fex` 里 rootfs 分区
-`size = 4194304`，**单位是 512 字节扇区 ⇒ 2 GiB**；当前 `rootfs.ext4` 仅约 560 MiB。
+`size = 4194304`，**单位是 512 字节扇区 ⇒ 2 GiB**，这正是裸 ext4 的尺寸（稀疏化后落盘约 600 MB）。
 加 15 MB 余量充足。
 
 ---
@@ -182,7 +210,8 @@ ls -la /usr/bin/frpc
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `debugfs ... /usr/bin/frpc` 报 not found | rootfs 没刷新 | 你很可能用了 `./build.sh buildroot_rootfs` —— 改回 `./build.sh` |
-| `target/usr/bin/frpc` 有、`rootfs.ext4` 里没有 | 缺 `pack_buildroot_rootfs` | 同上；或没跑 `./build.sh pack` |
+| `debugfs` 报 `Bad magic number in super-block` / `Filesystem not open` | 读的是 **Android sparse image**（`out/.../rootfs.ext4`），不是裸 ext4，debugfs 不认 | 改读裸的那枚 `.../buildroot/buildroot/images/rootfs.ext2`；或在稀疏镜像上用 `grep -a fatedier/frp` 取证（见 §5） |
+| `target/usr/bin/frpc` 有、但镜像里没有 | 缺 `pack_buildroot_rootfs` | 同上；或没跑 `./build.sh pack` |
 | overlay 里的 frpc 不见了 | 放到了 `rootfs_overlay/opt` | 重新放到 `usr/bin`（`auto_build.sh` 会清 `opt`） |
 | `install: 无法创建普通文件 '/usr/bin/frpc': 权限不够` | 路径塌成了 VM 自己的 `/usr/bin`（多半是用了空变量 `"$OV/..."`） | 用本手册的**绝对路径**；**不要加 `sudo`**，那是往 VM 系统目录装，与板子无关 |
 | `file` 显示 x86-64 / 别的架构 | 下错包 | 必须 `frp_0.68.0_linux_arm.tar.gz` |
@@ -203,6 +232,7 @@ rm -rf /tmp/frp_0.68.0_linux_arm /tmp/frp_0.68.0_linux_arm.tar.gz /tmp/build_frp
 
 | 功能 | 状态 | 完成时间 | 说明 |
 |---|---|---|---|
+| Step 4 验证命令修正（`debugfs` 读裸 ext4） | 已修正 | 2026-10-15 17:38 | 原命令拿 **Android sparse** 的 `out/.../rootfs.ext4` 喂 `debugfs`，必报 `Bad magic number in super-block`；改为读 `.../buildroot/buildroot/images/rootfs.ext2`，并补稀疏镜像下的 `grep -a fatedier/frp` 取证与"固件体积增量"判据 |
 | 命令拆分与注释（全部代码块） | 已实现 | 2026-10-15 16:58 | 依用户要求把复合命令（`&&` 串联、`{ ...; }` 分组）拆成单条指令，并逐条加注释说明预期输出；`.md` 与 HTML 副本同步 |
 | frpc 编入镜像操作手册 | 已实现 | 2026-10-15 16:42 | 依用户要求新建：把 frpc 二进制编进 T113 rootfs 并打包的完整链路；全文绝对路径、不使用变量 |
 | overlay 落点核实（`board/embedsky/tqt113-s3`） | 已核实 | 2026-10-15 16:35 | 芯片 `t113_s4` 但板级目录名为 `tqt113-s3`（天嵌设计，SDK 内无 s4 板目录） |

@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>frpc 编入镜像操作手册</title>
+<style>
+:root{
+  --fg:#1f2328; --fg-soft:#57606a; --bg:#ffffff; --panel:#f6f8fa;
+  --border:#d0d7de; --accent:#0969da; --warn-bg:#fff8e5; --warn-bd:#d4a72c;
+  --code-fg:#0550ae;
+}
+*{box-sizing:border-box;}
+html{-webkit-text-size-adjust:100%;}
+body{
+  margin:0; padding:0; background:var(--bg); color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",
+    "Microsoft YaHei","PingFang SC","Hiragino Sans GB",Roboto,Helvetica,Arial,sans-serif;
+  font-size:15px; line-height:1.75; word-wrap:break-word;
+}
+.wrap{max-width:1000px; margin:0 auto; padding:40px 32px 80px;}
+header.doc{border-bottom:2px solid var(--border); padding-bottom:16px; margin-bottom:28px;}
+header.doc h1{margin:0 0 10px; font-size:28px; line-height:1.35; letter-spacing:.2px;}
+header.doc .meta{color:var(--fg-soft); font-size:13px; line-height:1.7;}
+header.doc .meta code{font-size:12.5px;}
+h2{margin:38px 0 14px; padding-bottom:7px; font-size:21px; border-bottom:1px solid var(--border);}
+h3{margin:26px 0 10px; font-size:17px;}
+h4{margin:20px 0 8px; font-size:15.5px;}
+p{margin:12px 0;}
+ul,ol{margin:12px 0; padding-left:26px;}
+li{margin:5px 0;}
+li>ul,li>ol{margin:6px 0;}
+a{color:var(--accent); text-decoration:none;}
+a:hover{text-decoration:underline;}
+strong{font-weight:600;}
+hr{border:0; border-top:1px solid var(--border); margin:34px 0;}
+code{
+  font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,"Courier New",
+    "Microsoft YaHei",monospace;
+  font-size:12.9px; background:var(--panel); color:var(--code-fg);
+  padding:.15em .4em; border-radius:4px; border:1px solid rgba(0,0,0,.04);
+}
+pre{
+  background:var(--panel); border:1px solid var(--border); border-radius:8px;
+  padding:14px 16px; overflow-x:auto; margin:14px 0; line-height:1.6;
+}
+pre code{background:none; border:0; padding:0; color:var(--fg); font-size:12.9px;}
+blockquote{
+  margin:14px 0; padding:10px 16px; color:var(--fg);
+  background:var(--warn-bg); border-left:4px solid var(--warn-bd); border-radius:0 6px 6px 0;
+}
+blockquote p{margin:6px 0;}
+blockquote p:first-child{margin-top:0;}
+blockquote p:last-child{margin-bottom:0;}
+table{border-collapse:collapse; width:100%; margin:16px 0; font-size:14px; display:table;}
+th,td{border:1px solid var(--border); padding:8px 12px; text-align:left; vertical-align:top;}
+th{background:var(--panel); font-weight:600; white-space:nowrap;}
+tbody tr:nth-child(even){background:#fbfcfd;}
+table code{font-size:12.4px;}
+footer.doc{margin-top:56px; padding-top:16px; border-top:1px solid var(--border);
+  color:var(--fg-soft); font-size:12.5px;}
+@media (max-width:700px){
+  .wrap{padding:24px 16px 60px;}
+  table{display:block; overflow-x:auto; white-space:nowrap;}
+  th,td{white-space:normal;}
+}
+@media print{
+  body{font-size:11.5pt;}
+  .wrap{max-width:none; padding:0;}
+  pre,blockquote,table{page-break-inside:avoid;}
+  h2{page-break-after:avoid;}
+  a{color:var(--fg); text-decoration:none;}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="doc">
+  <h1>frpc 编入镜像操作手册</h1>
+  <div class="meta">
+    由 <code>ivsbox/docs/操作手册/frpc编入镜像操作手册.md</code> 生成 · 2026-10-15 ·
+    <strong>内容以 .md 为准</strong>（本 HTML 只作阅读与打印用，不单独维护）
+  </div>
+</header>
+
+<blockquote>
+<p><strong>这份手册只干一件事：把 frpc 二进制塞进 T113 的 rootfs 并打成新固件。</strong>
+不涉及通道怎么开、配置怎么写、运维侧怎么连（那些属 M8 使用侧，另见对应文档）。</p>
+<p>适用：编译 VM <code>tqt113</code>（<code>embedsky</code> 用户）+ 天嵌 T113-S4 Tina Linux SDK。
+<strong>全文命令一律用绝对路径，不使用 shell 变量</strong> —— 变量跨终端/跨会话会丢，曾因此把文件误写到 <code>/usr/bin</code>。</p>
+</blockquote>
+<hr />
+<h2>1. 先记住这四条绝对路径</h2>
+<table>
+<thead>
+<tr>
+<th>用途</th>
+<th>绝对路径</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SDK 根</td>
+<td><code>/opt/Embedsky/mount/t113_tina</code></td>
+</tr>
+<tr>
+<td><strong>放 frpc 的地方（rootfs overlay）</strong></td>
+<td><code>/opt/Embedsky/mount/t113_tina/buildroot/buildroot-201902/board/embedsky/tqt113-s3/rootfs_overlay/usr/bin/frpc</code></td>
+</tr>
+<tr>
+<td>构建产物根</td>
+<td><code>/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot</code></td>
+</tr>
+<tr>
+<td>最终固件</td>
+<td><code>/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img</code></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>⚠ <strong>芯片是 <code>t113_s4</code>，但板级目录叫 <code>tqt113-s3</code> —— 这不是笔误，别改成 s4。</strong>
+SDK 里 <code>buildroot/buildroot-201902/board/embedsky/</code> 下<strong>只有 <code>tqt113-s3</code> 一个目录</strong>，S4 复用它是天嵌的设计。
+本次构建的有效配置 <code>/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/buildroot/.config</code>
+里就明写 <code>BR2_ROOTFS_OVERLAY="board/embedsky/tqt113-s3/rootfs_overlay"</code>；天嵌官方一键脚本 <code>auto_build.sh</code>
+里也是这个路径。</p>
+</blockquote>
+<hr />
+<h2>2. Step 1 —— 取 frpc（版本锁死 v0.68.0 / linux_arm）</h2>
+<h3>2.1 为什么必须是这一版</h3>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>版本</td>
+<td><strong>0.68.0</strong> —— 必须与 frps、运维侧 visitor 同版本族</td>
+</tr>
+<tr>
+<td>资产名</td>
+<td><code>frp_0.68.0_linux_arm.tar.gz</code>（<strong>不是</strong> <code>_arm_hf</code>）</td>
+</tr>
+<tr>
+<td>tarball SHA256</td>
+<td><code>3944595c77cc8242a9d94a840b59966f018ddaeb3e93e4301d803e7c7ed31b8e</code></td>
+</tr>
+<tr>
+<td>解出的 <code>frpc</code> 大小</td>
+<td><code>15073464</code> 字节</td>
+</tr>
+<tr>
+<td>解出的 <code>frpc</code> SHA256</td>
+<td><code>9040d099f4cd992cd31f3d0057ec29cab2b388c74f1b59b9f7f65982ba571c71</code></td>
+</tr>
+</tbody>
+</table>
+<p>选型依据（已实测）：<code>frpc</code> 是 <code>ELF 32-bit LSB, ARM, EABI5, statically linked</code>，含 VFP 指令；
+板端内核配置 <code>/opt/Embedsky/mount/t113_tina/out/t113_s4/kernel/build/.config</code> 里有
+<code>CONFIG_VFP=y</code> / <code>CONFIG_VFPv3=y</code> / <code>CONFIG_NEON=y</code>，<strong>能跑</strong>。
+<code>linux_arm</code> 是静态 Go 二进制，不涉及 C 互操作，浮点 ABI 差异无影响；仅当真跑不起来才换 <code>_arm_hf</code>。</p>
+<h3>2.2 下载并验签（在编译 VM 上）</h3>
+<pre><code class="language-bash">cd /tmp &amp;&amp; curl -L --retry 3 -O https://github.com/fatedier/frp/releases/download/v0.68.0/frp_0.68.0_linux_arm.tar.gz
+echo '3944595c77cc8242a9d94a840b59966f018ddaeb3e93e4301d803e7c7ed31b8e  frp_0.68.0_linux_arm.tar.gz' | sha256sum -c -
+tar xzf /tmp/frp_0.68.0_linux_arm.tar.gz
+</code></pre>
+<p>期望输出 <code>frp_0.68.0_linux_arm.tar.gz: OK</code>。
+<strong>校验不通过就不要往下走</strong> —— 这是个要进固件的可执行文件，来源必须对得上。</p>
+<hr />
+<h2>3. Step 2 —— 放进 overlay</h2>
+<p><strong>放 <code>usr/bin</code>，不要放 <code>opt</code></strong>：天嵌一键脚本 <code>auto_build.sh</code> 会 <code>rm -rf .../rootfs_overlay/opt</code>
+再重灌 PDA/Qt 内容，<strong>不碰 <code>usr/bin</code></strong>。放 <code>opt</code> 会被静默清掉。</p>
+<pre><code class="language-bash">install -m 0755 /tmp/frp_0.68.0_linux_arm/frpc /opt/Embedsky/mount/t113_tina/buildroot/buildroot-201902/board/embedsky/tqt113-s3/rootfs_overlay/usr/bin/frpc
+</code></pre>
+<p>立刻自检（三条都要对）：</p>
+<pre><code class="language-bash">ls -la /opt/Embedsky/mount/t113_tina/buildroot/buildroot-201902/board/embedsky/tqt113-s3/rootfs_overlay/usr/bin/frpc
+file /opt/Embedsky/mount/t113_tina/buildroot/buildroot-201902/board/embedsky/tqt113-s3/rootfs_overlay/usr/bin/frpc
+sha256sum /opt/Embedsky/mount/t113_tina/buildroot/buildroot-201902/board/embedsky/tqt113-s3/rootfs_overlay/usr/bin/frpc
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>检查</th>
+<th>期望</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>权限/大小</td>
+<td><code>-rwxr-xr-x</code> / <code>15073464</code></td>
+</tr>
+<tr>
+<td>类型</td>
+<td><code>ELF 32-bit LSB executable, ARM, EABI5 ... statically linked</code></td>
+</tr>
+<tr>
+<td>SHA256</td>
+<td><code>9040d099f4cd992cd31f3d0057ec29cab2b388c74f1b59b9f7f65982ba571c71</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>4. Step 3 —— 重新构建 rootfs + 打包</h2>
+<pre><code class="language-bash">cd /opt/Embedsky/mount/t113_tina &amp;&amp; source build/envsetup.sh
+{ ./build.sh; echo &quot;BUILD_RC=$?&quot;; ./build.sh pack; echo &quot;PACK_RC=$?&quot;; } &gt; /tmp/build_frpc.log 2&gt;&amp;1 &amp;
+tail -f /tmp/build_frpc.log
+</code></pre>
+<p>看到 <code>BUILD_RC=0</code> 与 <code>PACK_RC=0</code> 即成功。
+1 核 VM 全量约 20~40 分钟 —— kernel / u-boot 都是增量，主要时间花在 rootfs。</p>
+<h3>⚠ 这一步有个坑：<strong>不要只用 <code>./build.sh buildroot_rootfs</code></strong></h3>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>重编 <code>target/</code></th>
+<th>刷新 <code>rootfs.ext4</code>（<code>make_ext4</code>）</th>
+<th>可用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>./build.sh buildroot_rootfs</code></td>
+<td>✅</td>
+<td><strong>❌</strong></td>
+<td>❌ 后面 pack 打出来是旧 rootfs，frpc 不在里面</td>
+</tr>
+<tr>
+<td><code>./build.sh</code>（无参）</td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><code>./auto_build.sh t113_s4 buildroot</code></td>
+<td>✅</td>
+<td>✅</td>
+<td>✅ 但会顺带清空重灌 <code>rootfs_overlay/opt</code></td>
+</tr>
+</tbody>
+</table>
+<p>原因：<code>buildroot_rootfs</code> 在 <code>build/mkcommon.sh</code> 里只派发到 <code>build_buildroot_rootfs</code>，
+<strong>不包含 <code>pack_buildroot_rootfs</code></strong>；执行 <code>make_ext4</code> 的是后者，而它只被
+<code>build_linuxdev</code>（＝ <code>./build.sh</code> 无参）经由 <code>build_rootfs</code> 调用。</p>
+<hr />
+<h2>5. Step 4 —— 验证真进镜像了</h2>
+<pre><code class="language-bash"># 5a. overlay 是否被应用进 target
+ls -la /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/buildroot/target/usr/bin/frpc
+
+# 5b. 是否真进了 rootfs.ext4（免 root，e2fsprogs 的 debugfs 可直接读）
+debugfs -R 'stat /usr/bin/frpc' /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/rootfs.ext4
+# 期望：Type: regular   Mode: 0755   Size: 15073464
+
+# 5c. 固件时间戳刷新了
+ls -la /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img
+</code></pre>
+<p>5b 是最硬的证据 —— 直接读镜像里的文件系统，绕开"构建脚本说成功了"。</p>
+<h3>容量不必担心</h3>
+<p><code>/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/pack_out/sys_partition.fex</code> 里 rootfs 分区
+<code>size = 4194304</code>，<strong>单位是 512 字节扇区 ⇒ 2 GiB</strong>；当前 <code>rootfs.ext4</code> 仅约 560 MiB。
+加 15 MB 余量充足。</p>
+<hr />
+<h2>6. Step 5 —— 刷机后在板端确认</h2>
+<p>用 PhoenixSuit / LiveSuit 刷入
+<code>/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img</code>。</p>
+<p>板端执行：</p>
+<pre><code class="language-bash">/usr/bin/frpc -v
+ls -la /usr/bin/frpc
+</code></pre>
+<p>期望 <code>frpc -v</code> 输出 <code>0.68.0</code>。</p>
+<hr />
+<h2>7. 排障速查（只管"编进镜像"这条链）</h2>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>原因</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>debugfs ... /usr/bin/frpc</code> 报 not found</td>
+<td>rootfs 没刷新</td>
+<td>你很可能用了 <code>./build.sh buildroot_rootfs</code> —— 改回 <code>./build.sh</code></td>
+</tr>
+<tr>
+<td><code>target/usr/bin/frpc</code> 有、<code>rootfs.ext4</code> 里没有</td>
+<td>缺 <code>pack_buildroot_rootfs</code></td>
+<td>同上；或没跑 <code>./build.sh pack</code></td>
+</tr>
+<tr>
+<td>overlay 里的 frpc 不见了</td>
+<td>放到了 <code>rootfs_overlay/opt</code></td>
+<td>重新放到 <code>usr/bin</code>（<code>auto_build.sh</code> 会清 <code>opt</code>）</td>
+</tr>
+<tr>
+<td><code>install: 无法创建普通文件 '/usr/bin/frpc': 权限不够</code></td>
+<td>路径塌成了 VM 自己的 <code>/usr/bin</code>（多半是用了空变量 <code>"$OV/..."</code>）</td>
+<td>用本手册的<strong>绝对路径</strong>；<strong>不要加 <code>sudo</code></strong>，那是往 VM 系统目录装，与板子无关</td>
+</tr>
+<tr>
+<td><code>file</code> 显示 x86-64 / 别的架构</td>
+<td>下错包</td>
+<td>必须 <code>frp_0.68.0_linux_arm.tar.gz</code></td>
+</tr>
+<tr>
+<td>板端 <code>frpc -v</code> 报 <code>cannot execute binary file</code> / SIGILL</td>
+<td>极少数情况浮点兼容问题</td>
+<td>换 <code>frp_0.68.0_linux_arm_hf.tar.gz</code> 重做 Step 2~5</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>8. 收尾清理（规则 6）</h2>
+<pre><code class="language-bash">rm -rf /tmp/frp_0.68.0_linux_arm /tmp/frp_0.68.0_linux_arm.tar.gz /tmp/build_frpc.log
+</code></pre>
+<hr />
+<h2>实现记录</h2>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>状态</th>
+<th>完成时间</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>frpc 编入镜像操作手册</td>
+<td>已实现</td>
+<td>2026-10-15 16:42</td>
+<td>依用户要求新建：把 frpc 二进制编进 T113 rootfs 并打包的完整链路；全文绝对路径、不使用变量</td>
+</tr>
+<tr>
+<td>overlay 落点核实（<code>board/embedsky/tqt113-s3</code>）</td>
+<td>已核实</td>
+<td>2026-10-15 16:35</td>
+<td>芯片 <code>t113_s4</code> 但板级目录名为 <code>tqt113-s3</code>（天嵌设计，SDK 内无 s4 板目录）</td>
+</tr>
+<tr>
+<td>构建路径坑核实（<code>buildroot_rootfs</code> 不刷 <code>rootfs.ext4</code>）</td>
+<td>已核实</td>
+<td>2026-10-15 16:25</td>
+<td><code>mkcommon.sh</code> 派发链：<code>buildroot_rootfs</code> → <code>build_buildroot_rootfs</code>（无 <code>make_ext4</code>）</td>
+</tr>
+<tr>
+<td>frpc 版本与完整性核实（v0.68.0 / linux_arm）</td>
+<td>已核实</td>
+<td>2026-10-15 16:20</td>
+<td>与官方 <code>frp_sha256_checksums.txt</code> 逐字节一致；ELF 架构与板端内核 VFP 能力已交叉核对</td>
+</tr>
+</tbody>
+</table>
+<footer class="doc">
+  IVSBox · 天嵌 TQT113 / T113-S4 · 生成时间 2026-10-15
+</footer>
+</div>
+</body>
+</html>

@@ -132,6 +132,10 @@ typedef struct {
     iv_agent_t  *agent;
     iv_db_t     *db;
 
+    /* S9 延伸（2026-10-15）：写操作审计落 control.db 的接缝。可空 ⇒ 只写日志。
+     * `db` 字段保留（snapshot 等方法仍用），审计统一走 store（绑定式写入）。 */
+    iv_store_t  *store;
+
     const iv_ctl_media_ops_t *media;
     void                     *media_arg;
 

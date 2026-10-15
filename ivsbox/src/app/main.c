@@ -56,6 +56,7 @@ static iv_reactor_t  *g_reactor;
 static iv_health_t   *g_health;
 static iv_config_t   *g_cfg;
 static iv_db_t       *g_db;
+static iv_store_t    *g_store;
 static int            g_wd_fd = -1;
 
 /* M3 业务装配（约 35 KB，必须放静态区/堆，勿放栈） */
@@ -150,6 +151,10 @@ static void app_shutdown(void)
     if (g_cfg != NULL) {
         iv_config_close(g_cfg);
         g_cfg = NULL;
+    }
+    if (g_store != NULL) {
+        iv_store_close(g_store); /* 只清句柄；db 的关闭在下面 */
+        g_store = NULL;
     }
     if (g_db != NULL) {
         iv_db_close(g_db);
@@ -883,6 +888,8 @@ static int agent_setup(void)
      * 目标 IP 复用既有键：摄像机＝`camera.ch.0.ip`（现网"查摄像机1"），
      * 交换机＝`switch.ip`；OID 槽位键名即语义（见 iv_snmp.h 规范表）。 */
     ac.pool = g_pool;
+    /* S9 延伸：档案/SNMP/网络历史落 control.db（store 在第 2b 步就绪）。 */
+    ac.store = g_store;
     cfg_snmp_target(&ac.snmp[IV_AGENT_SNMP_CAM], "camera.snmp",
                     iv_snmp_cam_slots, (int)IV_SNMP_CAM_SLOT_N,
                     cfg_ip_be("camera.ch.0.ip"));
@@ -935,6 +942,14 @@ static int app_init(void)
         return -1;
     }
 
+    /* 2b. control.db 表结构（S9 延伸）。fail-open：建表失败（磁盘满/只读）只
+     * 告警，档案/审计/网络历史降级为"只写日志"，主控照常跑 —— 这与上面
+     * "db 打不开即退出"不同：那是主数据，这是辅助数据。 */
+    if (iv_store_open(g_db, &g_store) != IV_OK) {
+        IV_LOG_W(APP_MOD, "control.db schema ensure failed -- persist off");
+        g_store = NULL;
+    }
+
     /* 3. 慢任务池（必须在 reactor 创建前，worker 继承信号掩码） */
     g_pool = iv_taskpool_create(0, 0);
     if (g_pool == NULL) {
@@ -966,6 +981,7 @@ static int app_init(void)
     memset(&g_ctl_ctx, 0, sizeof(g_ctl_ctx));
     g_ctl_ctx.cfg         = g_cfg;
     g_ctl_ctx.db          = g_db;
+    g_ctl_ctx.store       = g_store;
     g_ctl_ctx.do_reboot   = ctl_do_reboot;
     g_ctl_ctx.do_settime  = ctl_do_settime;
     /* g_ctl_ctx.agent 在 agent_setup() 之后回填（见第 9 步）。 */

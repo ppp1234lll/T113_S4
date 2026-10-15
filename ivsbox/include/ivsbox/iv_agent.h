@@ -94,6 +94,7 @@
 #include "ivsbox/iv_probe.h"
 #include "ivsbox/iv_reactor.h"
 #include "ivsbox/iv_recctl.h"
+#include "ivsbox/iv_store.h"
 #include "ivsbox/iv_storage.h"
 #include "ivsbox/iv_recovery.h"
 #include "ivsbox/iv_report.h"
@@ -231,6 +232,12 @@ typedef struct {
      * 卡住整个事件循环，属架构 §4.2 明令禁止）。下标见 IV_AGENT_SNMP_*。 */
     iv_taskpool_t *pool;
     iv_agent_snmp_cfg_t snmp[IV_AGENT_SNMP_TARGET_N];
+
+    /* ---- S9 延伸：control.db 落盘（2026-10-15）----
+     * 可空 ⇒ 只写日志不落库（fail-open：档案/审计是辅助数据，建表失败
+     * （磁盘满/只读）不得拖死主控）。挂上后：设备发现结果 upsert 进
+     * `device`、SNMP 结果进 `snmp_latest`、出口切换进 `net_event`。 */
+    iv_store_t *store;
 
     /* ---- M6 媒体（S6.1/S6.2/S6.3）----
      * `media_snap_dir`：门开/ctl 自动命名的抓拍落盘目录；空串 →

@@ -58,12 +58,14 @@
 
 #include "ivsbox/iv_agent.h"
 #include "ivsbox/iv_crc.h"
+#include "ivsbox/iv_db.h"
 #include "ivsbox/iv_device.h"
 #include "ivsbox/iv_log.h"
 #include "ivsbox/iv_proto.h"
 #include "ivsbox/iv_report.h"
 #include "ivsbox/iv_ret.h"
 #include "ivsbox/iv_snmp.h"
+#include "ivsbox/iv_store.h"
 #include "ivsbox/iv_taskpool.h"
 
 #define STEP_MS 50u
@@ -620,6 +622,9 @@ static int scenario(void)
     uint16_t            uport  = 0;
     iv_agent_cfg_t      cfg;
     iv_taskpool_t      *pool = NULL;
+    iv_db_t            *tdb = NULL;
+    iv_store_t         *tstore = NULL;
+    char                dbdir[128] = "";
     iv_dev_desc_t       desc;
     const char         *name = NULL;
     const char         *oid  = NULL;
@@ -723,6 +728,25 @@ static int scenario(void)
     cfg.dev_local_mac[0] = 0x02;
     cfg.dev_local_mac[5] = 0x01;
     cfg.pool             = pool;
+
+    /* S9 延伸：装配 control.db（真实磁盘文件）。m01 段 cfg.store 仍为 NULL
+     * （cfg_default 清零），顺带验过 NULL 守卫不炸。 */
+    {
+        char dbpath[256];
+
+        chk(mk_tmpdir(dbdir, sizeof dbdir) == 0, "m09 store tmpdir");
+        if (dbdir[0] == '\0') {
+            (void)close(usrv);
+            (void)close(master);
+            rm_tmpdir(qdir);
+            return 1;
+        }
+        (void)snprintf(dbpath, sizeof dbpath, "%s/control.db", dbdir);
+        chk(iv_db_open(dbpath, &tdb) == IV_OK && tdb != NULL, "m09 iv_db_open");
+        chk(iv_store_open(tdb, &tstore) == IV_OK && tstore != NULL,
+            "m09 iv_store_open (schema ensured)");
+        cfg.store = tstore;
+    }
 
     /* 摄像机目标：9 槽位**位置一一对应**；空串＝该槽不采 */
     {
@@ -933,6 +957,49 @@ static int scenario(void)
     }
 
     /* =======================================================================
+     * m09 S9 延伸：SNMP 结果落 control.db（装配层接线：on_snmp_done → iv_store）
+     *   行集口径：job 覆盖全部已配槽位数（cam 9 + sw 6 = 15 行），未配/无应答
+     *   槽位落 ok=0 行（S4.3"不乱填"）⇒ 读侧表现为 ENOENT。
+     *   device 表：store 行数必须等于档案条数（每条新档案 upsert 一次，MAC
+     *   主键去重后一一对应）。**不断言 ==0**：ifname 不存在时 if_nametoindex
+     *   返回 0，AF_PACKET 套接字不绑定 ⇒ 测试机会收到宿主机真实网段流量，
+     *   档案非空是环境产物而非接线缺陷（一致性才是接线的真不变量）。
+     * ======================================================================= */
+    {
+        char    v[128];
+        int64_t n = 0;
+
+        chk(iv_store_snmp_value(tstore, "switch", iv_snmp_sw_slots[0],
+                                v, sizeof v) == IV_OK &&
+                strcmp(v, "SW-NAME") == 0,
+            "m09 SW slot0 landed in snmp_latest (recent-value)");
+        chk(iv_store_snmp_value(tstore, "camera", iv_snmp_cam_slots[6],
+                                v, sizeof v) == IV_OK &&
+                strcmp(v, "42") == 0,
+            "m09 CAM slot6 integer landed as \"42\" (num path)");
+        chk(iv_store_snmp_value(tstore, "switch", iv_snmp_sw_slots[5],
+                                v, sizeof v) == IV_OK &&
+                strcmp(v, "1") == 0,
+            "m09 SW slot5 walk stores first row only (num=1)");
+        chk(iv_store_snmp_value(tstore, "switch", iv_snmp_sw_slots[1],
+                                v, sizeof v) == IV_ENOENT,
+            "m09 SW slot1 (unconfigured, ok=0 row) reads back ENOENT");
+        chk(iv_store_snmp_value(tstore, "camera", iv_snmp_cam_slots[8],
+                                v, sizeof v) == IV_ENOENT,
+            "m09 CAM slot8 (no response, ok=0) reads back ENOENT (不乱填)");
+        chk(iv_store_rows(tstore, "snmp_latest", &n) == IV_OK && n == 15,
+            "m09 snmp_latest has 15 rows (cam 9 + sw 6, all slots landed)");
+        if (n != 15)
+            printf("m09 DEBUG snmp_latest rows=%lld\n", (long long)n);
+        chk(iv_store_rows(tstore, "device", &n) == IV_OK &&
+                n == (int64_t)iv_agent_device_count(&g_agent),
+            "m09 device rows == archive count (store mirrors archive)");
+        if (n != (int64_t)iv_agent_device_count(&g_agent))
+            printf("m09 DEBUG device rows=%lld archive=%d\n", (long long)n,
+                   iv_agent_device_count(&g_agent));
+    }
+
+    /* =======================================================================
      * m08 收口
      * ======================================================================= */
     iv_agent_close(&g_agent);
@@ -940,6 +1007,9 @@ static int scenario(void)
     chk(iv_device_is_open(iv_agent_device(&g_agent)) == 0,
         "m08 device discovery closed (UDP + AF_PACKET released)");
 
+    iv_store_close(tstore);
+    iv_db_close(tdb);
+    rm_tmpdir(dbdir);
     iv_taskpool_destroy(pool);
     (void)close(usrv);
     (void)close(master);
@@ -948,7 +1018,7 @@ static int scenario(void)
     if (g_fail == 0)
         printf("test_agent_m4 passed (device discovery wiring + 0xE4 route; snmp "
                "collect through the taskpool: scalar GET / table GETNEXT / "
-               "no-value slots; 0xE7 route)\n");
+               "no-value slots; 0xE7 route; snmp results landed to control.db)\n");
     else
         printf("test_agent_m4 FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

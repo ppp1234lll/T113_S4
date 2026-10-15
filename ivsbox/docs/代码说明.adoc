@@ -47,6 +47,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M7-S7.1 升级包格式与验签器（`iv_ota`） | 已实现（模块 ＋ 单测 13 组 ＋ VM 全量验证 ＋ 反向证伪 10 条；**装配接线归 S7.2、量产公钥未部署、板端未复跑**） | 2026-10-14 17:30 | 新增 `iv_ota.h` / `src/modules/ota/iv_ota.c` / `tests/unit/test_ota.c`。包＝头(16B)＋清单(行式 ASCII)＋负载＋Ed25519 签名(64B)，**总长严格相等**、不做宽容解析；九步验签（结构→清单→负载长度→公钥→**签名**→型号→硬件区间→软件版本→逐文件 SHA-256），签名通过前不采信清单语义。签名用 OpenSSL EVP（架构 §14"复用可信密码库"；板端 sysroot 实测 OpenSSL 1.1.1a 有 `EVP_PKEY_ED25519`），**不自写椭圆曲线**；校验值仍用 core 的 `iv_sha256`。两端 `LDLIBS` 追加 `-lcrypto`，ARM 产物 `NEEDED` 已见 `libcrypto.so.1.1`。**fail-closed**：内置公钥未部署时返 `IV_ENOTSUP` 且输出全零 ⇒ 拒绝一切包（不给假密钥）。VM `test`/`asan`/`tsan` 36/36、`host`/`analyze`/`arm` rc=0 零告警；反向证伪 10/10 抓出。详见本文件文末 2026-10-14 17:30 节。 |
 | M8-S8.1~S8.2 受控远程通道（服务名白名单 ＋ 钥匙派生 ＋ 通道闸门） | 已实现（新增 `iv_tunnel` 模块 ＋ `scripts/frp.sh` ＋ `monitor.sh` 守护段 ＋ 单测 12 组 ＋ VM 验证 ＋ 反向证伪 5 条；**装配接线归 S8.3、摄像机受控代理归 S8.5、端到端待 frps 就位**） | 2026-10-15 09:07 | 按用户指定改用与 `bird_20260623` 同款方式（frpc 外连 frps ＋ stcp ＋ 标记文件），**不再自研通道协议**。详见本文件 2026-10-15 09:07 节。 |
 | M8-S8.3 装配接线（身份/令牌来源 ＋ resolver 落本机代理 ＋ `sys.tunnel.*` ＋ `iv_ctl` 三方法 ＋ 到期兜底） | 已实现（配置键 7 条 ＋ `tunnel.status/enable/disable` ＋ `main.c` 装配/热更新作废/退出即关 ＋ 标记写到期时刻、脚本独立判过期 ＋ 单测新增 8 组 ＋ 集成 test_tunnel_e2e 真拉起 ivsboxd ＋ 反向证伪 5/5；`camera:N` 待 S8.5、真连通待 frps） | 2026-10-15 10:21 | SN＝身份分区 `devid`（fail-closed）；令牌＝`<secure>/tunnel.token`（**不进配置**，防 `config.all` 导出）；resolver 一律 `127.0.0.1`，`camera:N` 在 S8.5 前恒报不可达；标记文件内容＝到期时刻 ⇒ `frp.sh`/`monitor.sh` 独立判过期（有效期不依赖主控存活）。详见本文件 2026-10-15 10:21 节。 |
+| S9 延伸：control.db 表结构与落盘（iv_store 四表 ＋ 四生产者接线） | 已实现（`iv_store` 模块 ＋ `iv_db_handle()` ＋ main.c 2b 步装配 ＋ test_store 9 组 ＋ 集成 m09/k04/c11a-c11b ＋ VM 全量验证 ＋ 反向证伪 7/7 含接线层 2 条；**Web 展示方法按需后补、板端实测随板端复跑组**） | 2026-10-15 12:20 | 新增 `include/ivsbox/iv_store.h` ＋ `src/modules/store/iv_store.c`：四张表（device 主键 MAC/first_seen 保留/上限 64；snmp_latest 最近值 ok=0 不乱填；audit 上限 512 detail 不含口令；net_event 上限 512）＋ schema 版本门（user_version >1 ⇒ IV_EPROTO 不降级）＋ 全 prepared statement ＋ 表名白名单 ＋ fail-open。`iv_db` 增 `iv_db_handle()`。四生产者接线（装配层）：`on_dev_found`→device_upsert、`on_snmp_done`→逐槽位 snmp_put、`iv_ctl` 三方法成功路径→audit（绝不记键值）、`agent_reconnect`→net_event；main.c 第 2b 步 open、关停先 store 后 db。**单测当场抓出 2 个真缺陷**：trim_table 对 device 引用不存在的 id 列（⇒键列/排序列按表参数化）；audit/net_event 占位符绑定错位 ⇒ result 列落错（⇒拆成一一对应的两个 insert）。**集成断言纠偏（登记）**：m09 初版断言 device==0 被环境证伪——ifname 不存在 ⇒ if_nametoindex()==0 ⇒ AF_PACKET 不绑定 ⇒ 测试机收到宿主机真实流量（环境产物非缺陷）；未配槽位也落 ok=0 行（15=cam 9+sw 6）。改为环境无关不变量（store 行数==档案条数、行数=已配槽位总数）。详见本文件 2026-10-15 12:20 节。 |
 | M8-S8.5 摄像机 Web 受控代理（专用环回监听 ＋ `/cam/<N>` 反代 ＋ URL/Location/Cookie 重写） | 已实现（`iv_web_cam.c` ＋ main.c 第二监听接线 ＋ 集成 test_web_cam_e2e 自包含 14 组 ＋ 反向证伪 6/6（含装配层 1 条）；**真机浏览器兼容性不承诺、端到端待 frps 就位**） | 2026-10-15 11:30 | 新增 `web/src/iv_web_cam.c`：只绑 `127.0.0.1` 的专用监听口（`--cam-port`，默认 8081 与 `sys.tunnel.cam.port` 同源），只认 `/cam/<N>/...`（N 0..7、禁前导零），目标 IP 只经本地通道查 `camera.ch.<N>.ip`、上游端口只有 `--cam-upstream` 一个 ⇒ "禁止任意 ip:port"是物理事实；环回护栏拒自指；凭据零下发（SM4 密文 Web 读都不读）。**集成用例当场抓出 2 个真缺陷**（绝对 URL 重写吞掉路径分隔符 `/`；纯 Set-Cookie 响应因 `has_extra` 未置位被整段丢弃）。详见本文件 2026-10-15 11:30 节。 |
 |===
 
@@ -2056,3 +2057,69 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
   与客户允许远程入站后联调（§9.4 前置 ①②③）。
 * **专用口未配 TLS/鉴权**：入口由 stcp 的 secretKey 把守（访问方须持钥匙），代理层不再叠加
   一层会话——登记为架构口径，如安全评审提出再补。
+
+== 2026-10-15 12:20 control.db 表结构与落盘（iv_store，S9 延伸）
+
+=== 干了什么事
+
+* **闭合"全库没有任何 CREATE TABLE"的欠账**：S4.2（发现档案）、S4.3（采集结果）、
+  S5.2（写操作审计）、§S9（网络历史）四处都登记着"落 control.db（表结构待 S9 定义）"。
+  本轮新增 `iv_store` 模块（`src/modules/store/`，进 libivmodules，走 core 的
+  `iv_db`＋sqlite3），一次交付**四张表 ＋ 写路径 ＋ 有界清理 ＋ 只读出口 ＋ 四个生产者接线**。
+* **四张表**：`device`（主键 MAC 文本，同 MAC 改 IP＝更新不建档、`first_seen` 只在建档写、
+  上限 64 满删最旧 last_seen）；`snmp_latest`（target+slot 主键最近值语义，无应答/未配槽位
+  落 ok=0、读侧一律 ENOENT——"不乱填"）；`audit`（config.apply/system.reboot/system.time，
+  detail 只含计数与确认摘要、按构造不含口令，上限 512）；`net_event`（出口切换等网络历史，
+  上限 512）。
+* **schema 版本门**：`PRAGMA user_version` 0=新库（建表后写 1）、1=当前（快路径跳过）、
+  >1=库比程序新 ⇒ `IV_EPROTO`，不猜、不降级读写。
+* **接线（生产者都在装配层）**：`on_dev_found`→device_upsert、`on_snmp_done`→逐槽位
+  snmp_put（槽位名按 which 取 `iv_snmp_sw_slots/cam_slots`，与配置键同序；值 str 优先、
+  否则 `%lld` num）、`iv_ctl` 三方法成功路径→audit（**绝不记键值**）、`agent_reconnect`
+  出口切换→net_event；`main.c` 第 2b 步 open（失败告警置 NULL 继续跑），关停先
+  `iv_store_close` 再 `iv_db_close`。
+
+=== 解决什么问题
+
+* **表结构从无到有**：`iv_db`（S9 主行）只给了打开/执行/事务，全库此前没有任何建表语句，
+  四处"落 control.db"都是空头支票；本步把表、键、上限、清理策略一次性定稿并落盘。
+* **防注入是结构性的**：写路径全部 `sqlite3_prepare_v2`＋`bind_*`（外部字符串只进绑定
+  参数，绝不拼串）；`iv_store_rows` 的表名走白名单，白名单外的字符串一律 `IV_EINVAL`。
+* **板端兼容**：device 的更新不用 UPSERT 语法（要 SQLite >= 3.24，板端版本未知），改
+  UPDATE-then-INSERT（`sqlite3_changes()` 判定）；**首轮单测当场抓出 2 个真缺陷**——
+  ① `trim_table` 对 device 表引用不存在的 `id` 列 ⇒ DELETE 报错 ⇒ 全部 upsert 假败
+  （键列/排序列改为按表参数化：device=mac/last_seen，audit/net_event=id/id）；
+  ② audit/net_event 共用一个 insert 时占位符绑定错位（绑了不存在的 ?5）⇒ result 列
+  落到文本参数上（拆成两个一一对应的 insert，并补 result 列真整数断言钉死）。
+* **fail-open 口径**：store 打不开（磁盘满/只读）只降级为日志，档案/审计是辅助数据，
+  **不得拖死主控**——与 `iv_db` 打不开即退出的主数据口径刻意不同。
+
+=== 影响哪里
+
+* 新增 `include/ivsbox/iv_store.h`、`src/modules/store/iv_store.c`（进 libivmodules，
+  Makefile 通配自动纳入）、`src/modules/store/readme.txt`。
+* `iv_db.h`/`iv_db.c` 增 `iv_db_handle()`（返回底层 sqlite3*，仅限模块内 prepared
+  statement 用；core 层不做任何 SQL）。
+* `iv_agent.h`/`iv_agent.c`：cfg 增 `store`（可空）；三个写点（dev_found/snmp_done/
+  reconnect）全 NULL 守卫。`iv_ctl.h`/`iv_ctl.c`：ctx 增 `store`，三个成功路径写审计。
+* `src/app/main.c`：第 2b 步装配 ＋ 两处 ctx 注入 ＋ 关停顺序。
+* 测试：`tests/unit/test_store.c`（9 组）、`test_ctl.c`（c11a/c11b）、
+  `tests/integration/test_agent_m4.c`（m09）、`test_agent_switch.c`（k04 net_event）。
+* **集成断言纠偏（登记，非代码缺陷）**：m09 初版断言 `device==0 行` 被环境证伪——
+  ifname 不存在时 `if_nametoindex()` 返回 0，AF_PACKET 套接字**不绑定** ⇒ 测试机收到
+  宿主机真实网段流量（档案非空是环境产物非接线缺陷）；`snmp_latest==6 行` 同理——
+  未配槽位也在 job 里 ⇒ 落 ok=0 行（15=cam 9+sw 6，与头文件口径一致）。两者都改为
+  环境无关的不变量断言（store 行数==档案条数；行数=已配槽位总数）。
+
+=== 怎么验证的
+
+* VM `make test` 全绿（含新 `test_store` 9 组与改过的 `test_ctl` c11a/c11b）；
+  `test_agent_m4`（m09 落库端到端）/`test_agent_switch`（k04 net_event）RC=0；
+  `make arm` 出 ARM ELF32 EABI5。
+* **反向证伪 7/7 全部抓出并 md5 对账还原复绿**：schema 版本门放行新库⇒s09 红；
+  trim 永不删行⇒s03 红；UPDATE 覆写 first_seen⇒s02 红；ok=0 回值⇒s04 红；
+  rows 白名单去掉⇒s07 红；**审计不写⇒test_ctl c11a 红（接线层）**；
+  **net_event 不写⇒k04 红（接线层）**。首条变异体曾撞 `-Wformat` 编译失败（假证伪），
+  改写为编译干净的行为变异后重做。
+* **未做（登记）**：Web 展示方法（device.list/snmp.result 读 store 的部分按需接）；
+  板端实测（板子离线，随板端复跑组）。

@@ -308,6 +308,13 @@ int iv_db_scalar_int(iv_db_t *db, const char *sql, int64_t *out)
     return ret;
 }
 
+void *iv_db_handle(iv_db_t *db)
+{
+    if (db == NULL || db->handle == NULL)
+        return NULL;
+    return db->handle;
+}
+
 int iv_db_check_integrity(iv_db_t *db)
 {
     sqlite3_stmt *stmt;

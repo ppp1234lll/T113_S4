@@ -25,6 +25,7 @@ src/modules  ——  libivmodules：业务模块层（一个子目录一个模�
   report/               上报装配层（采集板链路→状态镜像→平台报文→持久队列→TCP 传输）
   snmp/                 SNMP 采集与品牌 OID 模板
   status/               采集板状态镜像（IO/阈值/继电器在内存中的权威副本）
+  store/                control.db 表结构与落盘（device/snmp_latest/audit/net_event，S9 延伸）
   tunnel/               可选远程访问通道（暂缓，平台立项后启用）
 
 【约定与注意事项】

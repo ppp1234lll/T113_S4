@@ -763,6 +763,15 @@ static int m_config_apply(const iv_ctl_ctx_t *ctx, json_object *p,
     }
 
     newver = iv_config_version(ctx->cfg);
+    /* S9 延伸：审计落 control.db（detail 只含计数，**不含键值** —— items 里
+     * 可能出现 camera.ch.N.pass 这类键，值绝不进审计）。 */
+    if (ctx->store != NULL) {
+        char adetail[48];
+
+        (void)snprintf(adetail, sizeof adetail, "items=%d", n);
+        (void)iv_store_audit_add(ctx->store, "config.apply", adetail, 0,
+                                 (int64_t)time(NULL));
+    }
     {
         json_object *d = json_object_new_object();
 
@@ -963,6 +972,13 @@ static int m_system_time(const iv_ctl_ctx_t *ctx, json_object *p,
     rc = ctx->do_settime(ts, ctx->settime_arg);
     if (rc != IV_OK)
         return rsp_err(rc, "settime failed", out, cap, out_len);
+    if (ctx->store != NULL) {
+        char sd[40];
+
+        (void)snprintf(sd, sizeof sd, "wall=%lld", (long long)ts);
+        (void)iv_store_audit_add(ctx->store, "system.time", sd, 0,
+                                 (int64_t)time(NULL));
+    }
     return rsp_data(json_object_new_object(), out, cap, out_len);
 }
 
@@ -980,6 +996,10 @@ static int m_system_reboot(const iv_ctl_ctx_t *ctx, json_object *p,
         return rsp_err(IV_EPROTO, "confirm required", out, cap, out_len);
     if (ctx->do_reboot == NULL)
         return rsp_err(IV_ENOTSUP, "reboot not wired", out, cap, out_len);
+    /* S9 延伸：高风险操作审计（重启本体不可逆，先留痕再执行）。 */
+    if (ctx->store != NULL)
+        (void)iv_store_audit_add(ctx->store, "system.reboot", "confirm", 0,
+                                 (int64_t)time(NULL));
     (void)ctx->do_reboot(ctx->reboot_arg);
     d = json_object_new_object();
     if (d == NULL)

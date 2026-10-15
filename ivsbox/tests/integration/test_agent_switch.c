@@ -97,6 +97,7 @@
 #include <unistd.h>
 
 #include "ivsbox/iv_agent.h"
+#include "ivsbox/iv_db.h"
 #include "ivsbox/iv_frame.h" /* S4.5：造 0xC1 上行帧喂给 pty 假采集板 */
 #include "ivsbox/iv_log.h"
 #include "ivsbox/iv_netlink.h"
@@ -104,6 +105,7 @@
 #include "ivsbox/iv_probe.h"
 #include "ivsbox/iv_report.h"
 #include "ivsbox/iv_ret.h"
+#include "ivsbox/iv_store.h"
 #include "ivsbox/iv_transport.h"
 
 /* 两张 WAN 的接口名（架构 §18.3 冻结：无线=usb0 / 有线=eth0） */
@@ -605,6 +607,9 @@ static int scenario(void)
     uint16_t        port2  = 0;
     iv_agent_cfg_t  cfg;
     iv_report_env_t env;
+    iv_db_t        *tdb = NULL;
+    iv_store_t     *tstore = NULL;
+    char            dbdir[128] = "";
     int             fd_before;
     int             fd_base;
     int             i;
@@ -678,6 +683,33 @@ static int scenario(void)
     cfg.netthr_reboot_interval_s = 60u;
 
     /* ---- k01 装配起步 ---- */
+    /* S9 延伸：装配 control.db —— k04 的出口切换要落 net_event。store 的 db
+     * 文件句柄是**用例自建 fd**，k07 对账前必须先收掉（见收尾处）。 */
+    {
+        char dbpath[256];
+
+        if (mk_tmpdir(dbdir, sizeof dbdir) != 0) {
+            printf("SKIP: cannot create store tmpdir\n");
+            (void)close(master);
+            (void)close(ls);
+            rm_tmpdir(qdir);
+            return 0;
+        }
+        (void)snprintf(dbpath, sizeof dbpath, "%s/control.db", dbdir);
+        if (iv_db_open(dbpath, &tdb) != IV_OK || tdb == NULL ||
+            iv_store_open(tdb, &tstore) != IV_OK || tstore == NULL) {
+            printf("FAIL: cannot open control.db for net_event assertions\n");
+            iv_store_close(tstore);
+            iv_db_close(tdb);
+            (void)close(master);
+            (void)close(ls);
+            rm_tmpdir(qdir);
+            rm_tmpdir(dbdir);
+            return 1;
+        }
+        cfg.store = tstore;
+    }
+
     fd_before = count_open_fds();
     g_now     = 0u;
     iv_agent_init(&g_agent);
@@ -833,6 +865,16 @@ static int scenario(void)
     chk(iv_agent_netmgr_state(&g_agent) == IV_NETMGR_WIRED_UP, "k04 state WIRED_UP");
     chk(iv_agent_active_ifindex(&g_agent) == g_agent.wan_ifindex[IV_WAN_WIRED],
         "k04 active ifindex == resolved eth0 ifindex");
+    /* S9 延伸：此刻 switches==1 ⇒ net_event 恰好一行（agent_reconnect 接线；
+     * 行内容无只读出口，行数即接线证据；k06 回切后会变 2，故在此处断）。 */
+    {
+        int64_t n_ev = -1;
+
+        chk(iv_store_rows(tstore, "net_event", &n_ev) == IV_OK && n_ev == 1,
+            "k04 net_event has exactly 1 row (exit switch landed in control.db)");
+        if (n_ev != 1)
+            printf("k04 DEBUG net_event rows=%lld\n", (long long)n_ev);
+    }
 
     /* ---- k04b M4-S4.4：主网「正常 → 故障」沿 → 继电器 1 断电重启 ----
      * 装配层的 MN 生产者用 netmgr 的**迟滞结论**（`iv_netmgr_wan_is_up()`），
@@ -997,6 +1039,11 @@ static int scenario(void)
         (void)close(master);
     rm_tmpdir(qdir);
 
+    /* store 的 db fd 也是用例自建 fd —— 必须在 k07 的 fd 对账之前收掉 */
+    iv_store_close(tstore);
+    iv_db_close(tdb);
+    rm_tmpdir(dbdir);
+
     /* 只断言"不增"而非"严格相等"：库内可能有惰性缓存；增长才说明装配层漏关。 */
     {
         int after = count_open_fds();
@@ -1010,7 +1057,7 @@ static int scenario(void)
         printf("test_agent_switch passed "
                "(%s: link up/down -> probe, door-event, wan switch, real route "
                "change, tcp reconnect, queue backlog, hold_s switch-back, ordered replay, "
-               "MN fault edge -> relay 0xD1)\n",
+               "MN fault edge -> relay 0xD1; exit switch landed in control.db)\n",
                g_realnic ? "real-NIC" : "netns");
     else
         printf("test_agent_switch FAILED (%d)\n", g_fail);

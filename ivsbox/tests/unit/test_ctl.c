@@ -22,6 +22,8 @@
 
 #include "ivsbox/iv_config.h"
 #include "ivsbox/iv_ctl.h"
+#include "ivsbox/iv_db.h"
+#include "ivsbox/iv_store.h"
 #include "ivsbox/iv_log.h"
 #include "ivsbox/iv_media.h" /* IV_MEDIA_CH_N（c16 媒体方法的 id 上限） */
 #include "ivsbox/iv_ret.h"
@@ -176,8 +178,31 @@ int main(void)
         return 1;
     }
 
+    /* S9 延伸：真 db + store，验 config.apply 的审计落盘（装配接线断言）。 */
+    static char         dbtmpl[] = "/tmp/ivdb_XXXXXX";
+    static char         g_ddir[64];
+    static iv_db_t     *tdb = NULL;
+    static iv_store_t  *tstore = NULL;
+    int64_t             an = 0;
+
     memset(&ctx, 0, sizeof(ctx));
-    ctx.cfg = cfg; /* agent / db 保持 NULL：本用例只测配置与协议外形 */
+    ctx.cfg = cfg; /* agent 保持 NULL：本用例只测配置与协议外形 */
+    if (mkdtemp(dbtmpl) == NULL) {
+        fprintf(stderr, "mkdtemp(db) failed\n");
+        return 1;
+    }
+    (void)snprintf(g_ddir, sizeof(g_ddir), "%s", dbtmpl);
+    {
+        char dbp[128];
+
+        (void)snprintf(dbp, sizeof(dbp), "%s/control.db", g_ddir);
+        if (iv_db_open(dbp, &tdb) != IV_OK ||
+            iv_store_open(tdb, &tstore) != IV_OK) {
+            fprintf(stderr, "store open failed\n");
+            return 1;
+        }
+    }
+    ctx.store = tstore;
 
     /* ---------------- c17 接缝未接：tunnel.* 必须报"没接"，不是"不许调" ---------------- */
     j = call(&ctx, "{\"m\":\"tunnel.status\"}", &rc, raw, sizeof(raw));
@@ -355,6 +380,14 @@ int main(void)
         }
         if (j != NULL)
             json_object_put(j);
+
+        /* S9 延伸：成功的写操作必须留痕（审计里只有键数，绝无键值）。 */
+        chk(iv_store_rows(ctx.store, "audit", &an) == IV_OK && an == 1,
+            "c11a: config.apply wrote one audit row");
+        chk(iv_db_scalar_int(tdb,
+                "SELECT COUNT(*) FROM audit WHERE method='config.apply'"
+                " AND detail='items=1' AND result=0;", &an) == IV_OK && an == 1,
+            "c11b: audit row has method/detail/result as designed");
     }
 
     /* ---------------- c12 apply 拒绝：未知键 / 类型不符，且状态不变 --------- */
@@ -651,6 +684,15 @@ int main(void)
         (void)snprintf(p, sizeof(p), "%s/tunnel.enabled.tmp", g_tdir);
         (void)unlink(p);
         (void)rmdir(g_tdir);
+        iv_store_close(tstore);
+        iv_db_close(tdb);
+        {
+            char p2[128];
+
+            (void)snprintf(p2, sizeof(p2), "%s/control.db", g_ddir);
+            (void)unlink(p2);
+            (void)rmdir(g_ddir);
+        }
     }
 
     if (g_fail != 0) {

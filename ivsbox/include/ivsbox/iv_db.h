@@ -65,6 +65,13 @@ int iv_db_scalar_int(iv_db_t *db, const char *sql, int64_t *out);
 /* 运行 PRAGMA integrity_check，返回 IV_OK 表示通过。 */
 int iv_db_check_integrity(iv_db_t *db);
 
+/*
+ * 取底层 sqlite3*（**仅限模块内 prepared statement 使用**，如 iv_store 的
+ * 绑定式写入 —— iv_db.exec 只收拼串，防注入面收窄到"只用 bind"的模块）。
+ * 拿到后**不得** close/重新 open（所有权仍归 iv_db_t）。NULL 安全 ⇒ 返回 NULL。
+ */
+void *iv_db_handle(iv_db_t *db);
+
 /* 短事务 helper */
 #define iv_db_begin(db)    iv_db_exec((db), "BEGIN IMMEDIATE;")
 #define iv_db_commit(db)   iv_db_exec((db), "COMMIT;")

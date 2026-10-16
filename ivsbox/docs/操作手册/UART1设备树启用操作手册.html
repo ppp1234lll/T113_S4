@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UART1（GPS）设备树启用操作手册</title>
+<style>
+:root{
+  --fg:#1f2328; --fg-soft:#57606a; --bg:#ffffff; --panel:#f6f8fa;
+  --border:#d0d7de; --accent:#0969da; --warn-bg:#fff8e5; --warn-bd:#d4a72c;
+  --code-fg:#0550ae;
+}
+*{box-sizing:border-box;}
+html{-webkit-text-size-adjust:100%;}
+body{
+  margin:0; padding:0; background:var(--bg); color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",
+    "Microsoft YaHei","PingFang SC","Hiragino Sans GB",Roboto,Helvetica,Arial,sans-serif;
+  font-size:15px; line-height:1.75; word-wrap:break-word;
+}
+.wrap{max-width:1000px; margin:0 auto; padding:40px 32px 80px;}
+header.doc{border-bottom:2px solid var(--border); padding-bottom:16px; margin-bottom:28px;}
+header.doc h1{margin:0 0 10px; font-size:28px; line-height:1.35; letter-spacing:.2px;}
+header.doc .meta{color:var(--fg-soft); font-size:13px; line-height:1.7;}
+header.doc .meta code{font-size:12.5px;}
+h2{margin:38px 0 14px; padding-bottom:7px; font-size:21px; border-bottom:1px solid var(--border);}
+h3{margin:26px 0 10px; font-size:17px;}
+h4{margin:20px 0 8px; font-size:15.5px;}
+p{margin:12px 0;}
+ul,ol{margin:12px 0; padding-left:26px;}
+li{margin:5px 0;}
+li>ul,li>ol{margin:6px 0;}
+a{color:var(--accent); text-decoration:none;}
+a:hover{text-decoration:underline;}
+strong{font-weight:600;}
+hr{border:0; border-top:1px solid var(--border); margin:34px 0;}
+code{
+  font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,"Courier New",
+    "Microsoft YaHei",monospace;
+  font-size:12.9px; background:var(--panel); color:var(--code-fg);
+  padding:.15em .4em; border-radius:4px; border:1px solid rgba(0,0,0,.04);
+}
+pre{
+  background:var(--panel); border:1px solid var(--border); border-radius:8px;
+  padding:14px 16px; overflow-x:auto; margin:14px 0; line-height:1.6;
+}
+pre code{background:none; border:0; padding:0; color:var(--fg); font-size:12.9px;}
+blockquote{
+  margin:14px 0; padding:10px 16px; color:var(--fg);
+  background:var(--warn-bg); border-left:4px solid var(--warn-bd); border-radius:0 6px 6px 0;
+}
+blockquote p{margin:6px 0;}
+blockquote p:first-child{margin-top:0;}
+blockquote p:last-child{margin-bottom:0;}
+table{border-collapse:collapse; width:100%; margin:16px 0; font-size:14px; display:table;}
+th,td{border:1px solid var(--border); padding:8px 12px; text-align:left; vertical-align:top;}
+th{background:var(--panel); font-weight:600; white-space:nowrap;}
+tbody tr:nth-child(even){background:#fbfcfd;}
+table code{font-size:12.4px;}
+footer.doc{margin-top:56px; padding-top:16px; border-top:1px solid var(--border);
+  color:var(--fg-soft); font-size:12.5px;}
+@media (max-width:700px){
+  .wrap{padding:24px 16px 60px;}
+  table{display:block; overflow-x:auto; white-space:nowrap;}
+  th,td{white-space:normal;}
+}
+@media print{
+  body{font-size:11.5pt;}
+  .wrap{max-width:none; padding:0;}
+  pre,blockquote,table{page-break-inside:avoid;}
+  h2{page-break-after:avoid;}
+  a{color:var(--fg); text-decoration:none;}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="doc">
+  <h1>UART1（GPS）设备树启用操作手册</h1>
+  <div class="meta">
+    天嵌 TQT113 / T113-S4 · Tina Linux SDK（<code>linux-5.4</code>）· 2026-10-16 ·
+    本手册<strong>直接以 HTML 形态维护</strong>（无 <code>.md</code> 母本），
+    <strong>全文命令一条一行、各自独立可执行，一律绝对路径、不使用 shell 变量</strong>
+  </div>
+</header>
+
+<blockquote>
+<p><strong>这份手册只干一件事：把设备树里的 UART1 打开，让板端出现 <code>/dev/ttySAC1</code>。</strong>
+GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <strong>9600 8N1 无流控</strong>（2026-09-30 用户给的硬件事实）。</p>
+<p>适用：编译 VM <code>tqt113</code>（<code>embedsky</code> 用户）+ SDK 根 <code>/opt/Embedsky/mount/t113_tina</code>。
+不涉及 GPS 的 NMEA 解析、校时、上报（那些是 <code>ivsbox</code> 代码侧，另见 <code>docs/代码说明.adoc</code>）。</p>
+</blockquote>
+
+<hr />
+<h2>0. 先把原因说清楚：为什么出厂镜像里没有 ttySAC1</h2>
+<p>不是谁改坏了，而是 <strong>SDK 出厂配置里 UART1 就是关的</strong>，并且它的引脚组是空的：</p>
+<table>
+<thead>
+<tr><th>位置</th><th>出厂状态</th><th>后果</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&amp;uart1</code> 节点</td><td><code>status = "disabled";</code></td><td>内核不注册 uart1 设备 ⇒ 不建 <code>/dev/ttySAC1</code></td></tr>
+<tr><td><code>uart1_pins_a/b</code></td><td><code>// pins = "PE10", "PE11";</code>（<strong>被注释</strong>）</td><td>pin group 为空 ⇒ 就算把 status 改成 okay，PD21/PD22 也不会切到 UART1</td></tr>
+</tbody>
+</table>
+<p>实证：反编译 16:59 那版固件里的 dtb，<code>/soc@3000000/uart@2500400</code>（<code>device_type="uart1"</code>，<code>serial1</code> 别名指向它）就是
+<code>status = "disabled"</code>；<code>uart0</code>（<code>serial0</code>）同样是 disabled。所以板端只会有 <code>ttySAC2/3/4/5</code>，本来就没有 <code>ttySAC0</code> 与 <code>ttySAC1</code>。</p>
+<p>这条<strong>早已登记</strong>为遗留项 <strong>P1-13</strong>（<code>ivsbox/docs/代码说明.adoc:579</code>："GPS 走 UART1（PD21/PD22），但设备树里 <code>uart@2500400</code> 是 disabled ⇒ <code>/dev/ttySAC1</code> 不存在……启用须改 dts 并重烧 boot"）。
+与 frpc 编入镜像、与早前 uart0 的那次还原<strong>都无关</strong>（uart0 已还原成出厂 <code>#if 0</code>，当时重编出的 dtb 与上一版逐字节相同）。</p>
+
+<hr />
+<h2>1. 先记住四条绝对路径 + 一个"别改错文件"的坑</h2>
+<table>
+<thead>
+<tr><th>用途</th><th>绝对路径</th></tr>
+</thead>
+<tbody>
+<tr><td>SDK 根</td><td><code>/opt/Embedsky/mount/t113_tina</code></td></tr>
+<tr><td><strong>要改的 dts（编译用的就是这份）</strong></td><td><code>/opt/Embedsky/mount/t113_tina/kernel/linux-5.4/arch/arm/boot/dts/board.dts</code></td></tr>
+<tr><td>重编后的 dtb</td><td><code>/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/sunxi.dtb</code></td></tr>
+<tr><td>内核镜像（<strong>dtb 装在这里面</strong>）</td><td><code>/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/boot.img</code></td></tr>
+<tr><td>最终固件</td><td><code>/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img</code></td></tr>
+</tbody>
+</table>
+<blockquote>
+<p>⚠ <strong>SDK 里有<u>两份</u>名叫 <code>board.dts</code> 的文件，别改错：</strong></p>
+<p>① 内核树那份（本手册要改的，<strong>76337 字节</strong>）：<code>.../kernel/linux-5.4/arch/arm/boot/dts/board.dts</code>
+—— <code>arch/arm/boot/dts/Makefile</code> 里写着 <code>dtb-$(CONFIG_ARCH_SUN8IW20) += board.dtb</code>，<strong>编进固件的就是它</strong>。</p>
+<p>② 板级配置目录那份（<strong>56242 字节，不参与编译</strong>）：<code>.../device/config/chips/t113/configs/evb1_auto/linux-5.4/board.dts</code>
+（<code>device/config/.../evb1_auto/board.dts</code> 是指向它的软链）。<code>mkcmd.sh</code> 里那个"从配置目录拷到内核树"的 <code>cp</code> 位于
+<code>prepare_mkkernel()</code> 内，而该函数的调用处<strong>全部被注释掉</strong>，所以这份不会覆盖内核树。</p>
+<p>判据（已实测）：两份差 1123 行；固件 dtb 里含 <code>c906_ddr</code> 节点，<strong>只在内核树那份里有</strong>（配置目录那份为 0 处）。</p>
+</blockquote>
+
+<hr />
+<h2>2. Step 1 —— 备份（1 条命令）</h2>
+<p>先给原文件留一份带时间戳的副本，回滚时直接用。</p>
+<pre><code class="language-bash">cp -a /opt/Embedsky/mount/t113_tina/kernel/linux-5.4/arch/arm/boot/dts/board.dts /tmp/board.dts.bak-$(date +%m%d-%H%M)</code></pre>
+<p>本次执行的备份文件：<code>/tmp/board.dts.bak-1016-0833</code>，其 md5 <code>91d6efcad198e1521ca6081344c1b53a</code>（＝ SDK 出厂原始文件）。</p>
+
+<hr />
+<h2>3. Step 2 —— 改 4 处（3 条 <code>sed</code>，各一条一行）</h2>
+<p>三条命令<strong>顺序执行、互不依赖</strong>，可以逐条粘贴。</p>
+<h3>3.1 补上 uart1 的引脚（一条命令同时改两处注释行）</h3>
+<pre><code class="language-bash">sed -i 's|^[[:space:]]*//[[:space:]]*pins = "PE10", "PE11";|\tpins = "PD21", "PD22";|' /opt/Embedsky/mount/t113_tina/kernel/linux-5.4/arch/arm/boot/dts/board.dts</code></pre>
+<p>说明：文件里只有这两行含 <code>PE10/PE11</code>（<code>uart1_pins_a</code> 与 <code>uart1_pins_b</code>），一次全改。若脚本文件开头是
+<code>//	pins = "PE10", "PE11";</code>，说明还没改过；改完再跑一次不会有任何副作用（匹配不到即不动）。</p>
+<h3>3.2 打开 uart1 控制器</h3>
+<pre><code class="language-bash">sed -i '/^&amp;uart1 {/,/^};/{s|^[[:space:]]*status = "disabled";|\tstatus = "okay";|}' /opt/Embedsky/mount/t113_tina/kernel/linux-5.4/arch/arm/boot/dts/board.dts</code></pre>
+<p>说明：地址范围锁定在 <code>&amp;uart1 {</code> 到它自己的 <code>};</code> 之间，只改这个节点里的 status，不会碰到 uart2/uart3 等。</p>
+<h3>3.3 让出 PD22：关掉 pwm7（背光）</h3>
+<pre><code class="language-bash">sed -i '/^&amp;pwm7 {/,/^};/{s|^[[:space:]]*status = "okay";|\tstatus = "disabled";|}' /opt/Embedsky/mount/t113_tina/kernel/linux-5.4/arch/arm/boot/dts/board.dts</code></pre>
+<h3>3.4 改完应该长这样</h3>
+<table>
+<thead>
+<tr><th>位置（改前行号）</th><th>改前</th><th>改后</th></tr>
+</thead>
+<tbody>
+<tr><td><code>uart1_pins_a</code>（448）</td><td><code>//	pins = "PE10", "PE11";</code></td><td><code>pins = "PD21", "PD22";</code></td></tr>
+<tr><td><code>uart1_pins_b</code>（455）</td><td><code>//      pins = "PE10", "PE11";</code></td><td><code>pins = "PD21", "PD22";</code></td></tr>
+<tr><td><code>&amp;uart1</code>（861）</td><td><code>status = "disabled";</code></td><td><code>status = "okay";</code></td></tr>
+<tr><td><code>&amp;pwm7</code>（3093）</td><td><code>status = "okay";</code></td><td><code>status = "disabled";</code></td></tr>
+</tbody>
+</table>
+<blockquote>
+<p>⚠ <strong>为什么必须关 <code>&amp;pwm7</code>：PD22 在 SDK 默认配置里被 LCD 背光占用。</strong></p>
+<p>证据链：<code>pwm7_pin_a { pins = "PD22"; function = "pwm7"; }</code>（board.dts:766）＋ <code>&amp;pwm7 { status = "okay"; }</code>（board.dts:3089）＋
+背光驱动通道<strong>写死为 7</strong>：<code>drivers/video/backlight/pwm_bl.c:185  data-&gt;pwm_id = 7;</code>；且固件 dtb 里 <code>backlight</code> 节点是启用状态、<code>lcd_used = &lt;1&gt;</code>。
+两个驱动同时抢 PD22 会让 GPS 收不到数据（<code>dmesg</code> 常见 pin conflict 提示），所以用 PD22 收 GPS 前必须把 pwm7 关掉。</p>
+<p>⚠ <strong>若你的底板 LCD 背光确实接在 PD22</strong>，那就是硬件层面的二选一（GPS 与背光不能同时用），需要从原理图确认后改硬件。
+若 GPS 实际走的是另一组脚位，把 3.1 里的 <code>"PD21", "PD22"</code> 换成对应脚位即可 —— 驱动表里 UART1 可选三组：
+<code>PD21(TX)/PD22(RX)</code>（mux 4）、<code>PE10(TX)/PE11(RX)</code>（mux 3，SDK 注释里留的原值，当前 dtb 里无人占用）、<code>PB8(TX)/PB9(RX)</code>（mux 7）；
+换用 PE10/PE11 时 3.3 那条（关 pwm7）就不必执行。</p>
+</blockquote>
+
+<hr />
+<h2>4. Step 3 —— 核对改动（1 条命令）</h2>
+<pre><code class="language-bash">diff -u /tmp/board.dts.bak-1016-0833 /opt/Embedsky/mount/t113_tina/kernel/linux-5.4/arch/arm/boot/dts/board.dts</code></pre>
+<p>期望：<strong>恰好 4 行实质变化</strong>（3 个 <code>@@</code> 块：445 行附近 2 行、858 行附近 1 行、3090 行附近 1 行）。
+多一行少一行都说明改错了地方，先别往下编译。</p>
+
+<hr />
+<h2>5. Step 4 —— 编译前语法自检（2 条命令）</h2>
+<p>先自己用 <code>cpp</code> + <code>dtc</code> 走一遍设备树编译链，<strong>几秒钟</strong>就能发现括号/引号级别的错误，省掉一次 20 分钟的整包构建。</p>
+<pre><code class="language-bash">cpp -nostdinc -I /opt/Embedsky/mount/t113_tina/kernel/linux-5.4/include -I /opt/Embedsky/mount/t113_tina/kernel/linux-5.4/arch/arm/boot/dts -undef -D__DTS__ -x assembler-with-cpp -P /opt/Embedsky/mount/t113_tina/kernel/linux-5.4/arch/arm/boot/dts/board.dts -o /tmp/board.pp.dts</code></pre>
+<pre><code class="language-bash">dtc -I dts -O dtb -o /tmp/board.check.dtb /tmp/board.pp.dts</code></pre>
+<p>两条都<strong>无输出、退出码 0</strong> 即通过（会有 <code>Warning (node_name_vs_property_name)</code> 之类的既有告警，那是 SDK 自带的，可忽略）。</p>
+<pre><code class="language-bash">grep -n -A6 '^&amp;uart1 {' /tmp/board.pp.dts</code></pre>
+<p>期望看到 <code>status = "okay";</code>。</p>
+
+<hr />
+<h2>6. Step 5 —— 重编 dtb → 重做 boot.img → 打包</h2>
+<p>四条准备命令，逐条执行（后两条是真编译）：</p>
+<pre><code class="language-bash">cd /opt/Embedsky/mount/t113_tina</code></pre>
+<pre><code class="language-bash">source build/envsetup.sh</code></pre>
+<pre><code class="language-bash">./build.sh dts</code></pre>
+<pre><code class="language-bash">./build.sh bootimg</code></pre>
+<pre><code class="language-bash">./build.sh pack</code></pre>
+<table>
+<thead>
+<tr><th>命令</th><th>干什么</th><th>本次实测</th></tr>
+</thead>
+<tbody>
+<tr><td><code>./build.sh dts</code></td><td>只重编设备树：<code>board.dts</code> → <code>board.dtb</code> → 拷成 <code>out/.../buildroot/sunxi.dtb</code></td><td>rc=0，约 17 秒，<code>sunxi.dtb</code> 62404 → <strong>62452</strong> 字节</td></tr>
+<tr><td><code>./build.sh bootimg</code></td><td><strong>把新 dtb 压进 <code>boot.img</code></strong>（内核 dtb 就装在这枚镜像里）</td><td>rc=0，约 24 秒，<code>boot.img</code> 里新引脚串由 0 → <strong>2</strong> 处</td></tr>
+<tr><td><code>./build.sh pack</code></td><td>按分区表重新打包整包固件（从 <code>out/</code> 取件）</td><td>产出下节的 <code>.img</code></td></tr>
+</tbody>
+</table>
+<blockquote>
+<p>⚠ <strong>只跑 <code>./build.sh dts</code> 是不够的</strong>：它只刷新磁盘上的 <code>sunxi.dtb</code>，不进 <code>boot.img</code>。
+实测 <code>boot.img</code> 里恰好含 1 个设备树（FDT magic <code>d00dfeed</code> 出现 1 次），必须先 <code>./build.sh bootimg</code> 才会换成新的。
+<code>./build.sh pack</code> 只是把 <code>out/</code> 里的现成件打成一个 <code>.img</code>（<code>pack_out/boot.fex</code> 是指向 <code>../buildroot/boot.img</code> 的软链），<strong>它自己不会重编 dtb 或 boot.img</strong>。</p>
+<p>保底替代（全量，20~40 分钟，最不容易出错）：<code>./auto_build.sh t113_s4 buildroot</code> —— 等价于 autoconfig ＋ <code>./build.sh</code> ＋ <code>./build.sh pack</code>，
+但它会顺手清空重灌 <code>rootfs_overlay/opt</code>（frpc 在 <code>usr/bin</code>，不受影响）。</p>
+</blockquote>
+
+<hr />
+<h2>7. Step 6 —— 验证新 dtb 真进了固件（3 条命令）</h2>
+<p>第一步，把重编出来的 <code>sunxi.dtb</code> 反编译回文本：</p>
+<pre><code class="language-bash">dtc -I dtb -O dts /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/sunxi.dtb -o /tmp/v.dts</code></pre>
+<p>第二步，看 uart1 节点：</p>
+<pre><code class="language-bash">grep -n -A14 'uart@2500400' /tmp/v.dts</code></pre>
+<p>期望 <code>status = "okay";</code>。第三步是<strong>最硬的证据</strong> —— 直接到 <code>boot.img</code> 里数新引脚串出现的次数：</p>
+<pre><code class="language-bash">python3 -c "print(open('/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/boot.img','rb').read().count(b'PD21\x00PD22'))"</code></pre>
+<table>
+<thead>
+<tr><th>检查</th><th>期望</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>sunxi.dtb</code> 里 <code>uart@2500400</code></td><td><code>status = "okay";</code></td><td>改了 dts 且 <code>./build.sh dts</code> 跑过</td></tr>
+<tr><td><code>boot.img</code> 里 <code>PD21\0PD22</code> 次数</td><td><strong>2</strong>（改前是 0）</td><td><code>uart1_pins_a</code> 与睡眠组各一处；为 0 说明 <code>./build.sh bootimg</code> 没跑</td></tr>
+<tr><td><code>sunxi.dtb</code> 文件大小</td><td>比改前大几十字节（62404 → 62452）</td><td>新字符串进了字符串表，可作旁证</td></tr>
+</tbody>
+</table>
+
+<hr />
+<h2>8. Step 7 —— 刷机并在板端确认</h2>
+<p>用 PhoenixSuit / LiveSuit 刷入 <code>/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img</code>。板端逐条执行：</p>
+<pre><code class="language-bash">ls -l /dev/ttySAC*</code></pre>
+<p>期望多出 <code>/dev/ttySAC1</code>（原来的 <code>ttySAC2/3/4/5</code> 仍在）。</p>
+<pre><code class="language-bash">dmesg | grep -i ttySAC</code></pre>
+<p>期望有 uart1/ttySAC1 注册信息；<strong>若出现 <code>pin ... already requested</code> 之类字样</strong>，说明 PD22 还被别的驱动占着，回头查 <code>&amp;pwm7</code> 是否真的 disabled。</p>
+<pre><code class="language-bash">stty -F /dev/ttySAC1 9600 cs8 -parenb -cstopb -crtscts</code></pre>
+<pre><code class="language-bash">timeout 3 head -c 200 /dev/ttySAC1 | xxd | head</code></pre>
+<p>第二条能刷出 <code>$GNRMC</code>/<code>$GNGGA</code> 之类的 NMEA 文本，就说明 GPS 链路通了。</p>
+<blockquote>
+<p>装配侧提醒：<code>ivsbox</code> 打开 GPS 口必须用 <code>/dev/ttySAC1</code> ＋ <strong>9600 8N1 无流控</strong>（常量 <code>IV_GPS_UART_BAUD</code>），
+<strong>不能吃 <code>iv_serial_cfg_default()</code>（115200）的默认值</strong>，否则收不到数据；代码里刻意不提供默认串口路径。</p>
+</blockquote>
+
+<hr />
+<h2>9. 回滚（1 条命令）</h2>
+<pre><code class="language-bash">cp -a /tmp/board.dts.bak-1016-0833 /opt/Embedsky/mount/t113_tina/kernel/linux-5.4/arch/arm/boot/dts/board.dts</code></pre>
+<p>回滚后重跑 §6 的 <code>./build.sh dts</code>、<code>./build.sh bootimg</code>、<code>./build.sh pack</code> 三条即可恢复原状。</p>
+
+<hr />
+<h2>10. 排障速查</h2>
+<table>
+<thead>
+<tr><th>现象</th><th>原因</th><th>处理</th></tr>
+</thead>
+<tbody>
+<tr><td>板端没有 <code>/dev/ttySAC1</code></td><td>新 dtb 没进 <code>boot.img</code>（只跑了 <code>dts</code> 没跑 <code>bootimg</code>），或没重新 <code>pack</code>、没刷机</td><td>补 <code>./build.sh bootimg</code> ＋ <code>./build.sh pack</code>，用 §7 的 <code>boot.img</code> 计数自检（应为 2）</td></tr>
+<tr><td><code>ttySAC1</code> 有了但收不到数据</td><td>① 引脚选错（PD21/PD22 vs PE10/PE11，按原理图）；② 波特率不是 9600；③ PD22 仍被背光 PWM7 占用</td><td>核对 §3.4 的三组可选脚位；跑 <code>dmesg | grep -i 'pin\|ttySAC'</code> 看 pin 冲突；确认 <code>&amp;pwm7</code> 已 disabled</td></tr>
+<tr><td>编译报 <code>build dts failed</code> / dtc 报错</td><td>dts 语法被改坏</td><td>先跑 §5 的 <code>cpp</code> ＋ <code>dtc</code> 自检定位；再 <code>diff -u</code> 比对备份</td></tr>
+<tr><td>改了 dts 但 <code>sunxi.dtb</code> 没变化</td><td>改错了文件（改到了 <code>device/config/.../linux-5.4/board.dts</code> 那份）</td><td>改回内核树那份（见 §1 的 ⚠）</td></tr>
+<tr><td>板端连 <code>ttySAC0</code> 也没有</td><td>uart0 出厂就是 <code>#if 0</code>（disabled），与本次改动无关</td><td>需要 serial0 再单独评估（注意 PF2/PF4 与 <code>&amp;sdc0</code> 撞脚）</td></tr>
+<tr><td>刷机后 LCD 背光不亮/异常</td><td>§3.3 关掉了 <code>&amp;pwm7</code>，而底板背光正好走 PD22</td><td>硬件冲突：背光与 GPS 二选一，或改用 PE10/PE11 那组脚位</td></tr>
+</tbody>
+</table>
+
+<hr />
+<h2>11. 本次改动与执行记录</h2>
+<table>
+<thead>
+<tr><th>项</th><th>状态</th><th>时间</th><th>证据 / 说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>board.dts</code> 改 4 处（PD21/PD22 ＋ <code>&amp;uart1</code> okay ＋ <code>&amp;pwm7</code> disabled）</td><td>已落盘</td><td>2026-10-16 08:33</td><td>md5 <code>91d6efcad198e1521ca6081344c1b53a</code> → <code>77f1cefffb1f39adf679bf159e11a812</code>；<code>diff</code> 恰好 4 行</td></tr>
+<tr><td>备份</td><td>已做</td><td>2026-10-16 08:33</td><td><code>/tmp/board.dts.bak-1016-0833</code>（＝出厂原文件）</td></tr>
+<tr><td><code>cpp</code> ＋ <code>dtc</code> 语法自检</td><td>通过</td><td>2026-10-16 08:34</td><td>两条均 rc=0；预处理产物里 <code>&amp;uart1</code> 为 <code>okay</code>、<code>uart1_pins@0</code> 为 <code>pins = "PD21", "PD22"</code></td></tr>
+<tr><td><code>./build.sh dts</code> 重编 dtb</td><td>成功</td><td>2026-10-16 08:35</td><td>rc=0（17 s）；<code>sunxi.dtb</code> 62404 → 62452 字节；反编译确认 <code>uart@2500400 status="okay"</code>、<code>pwm7@2000c17 status="disabled"</code></td></tr>
+<tr><td><code>./build.sh bootimg</code> 重做内核镜像</td><td>成功</td><td>2026-10-16 08:36</td><td>rc=0（24 s）；<code>boot.img</code> 里 <code>PD21\0PD22</code> 由 0 → <strong>2</strong></td></tr>
+<tr><td><code>./build.sh pack</code> 打包固件</td><td><strong>待执行</strong></td><td>—</td><td>由使用者执行；产出 §1 表中的 <code>.img</code></td></tr>
+<tr><td>板端验证（<code>/dev/ttySAC1</code> ＋ NMEA）</td><td><strong>待执行</strong></td><td>—</td><td>需刷机；板子当前不在网（192.168.2.120/121/122 均无响应）</td></tr>
+<tr><td>本手册</td><td>已新建</td><td>2026-10-16</td><td>用户要求：HTML 格式、指令全部单条可执行</td></tr>
+</tbody>
+</table>
+
+<footer class="doc">
+  IVSBox · 天嵌 TQT113 / T113-S4 · 生成时间 2026-10-16 · 关联：<code>ivsbox/docs/代码说明.adoc</code> §2026-09-30（P1-13）、<code>ivsbox/docs/操作手册/readme.txt</code>
+</footer>
+</div>
+</body>
+</html>

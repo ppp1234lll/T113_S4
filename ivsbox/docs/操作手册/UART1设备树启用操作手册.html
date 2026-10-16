@@ -80,9 +80,40 @@ footer.doc{margin-top:56px; padding-top:16px; border-top:1px solid var(--border)
   <div class="meta">
     天嵌 TQT113 / T113-S4 · Tina Linux SDK（<code>linux-5.4</code>）· 2026-10-16 ·
     本手册<strong>直接以 HTML 形态维护</strong>（无 <code>.md</code> 母本），
-    <strong>全文命令一条一行、各自独立可执行，一律绝对路径、不使用 shell 变量</strong>
+    <strong>全文命令一条一行、各自独立可执行，一律绝对路径、不使用 shell 变量</strong><br />
+    <strong>命令来源标记</strong>：<strong>【官方】</strong>＝《TQT113_linux_系统开发手册》／《TQT113_linux_使用手册》的原文口径，
+    或 SDK 自带脚本/说明（<code>build.sh</code> 用法输出、<code>tools/</code> 下的官方 readme）；
+    <strong>【补充】</strong>＝本手册另加的防错与取证步骤（官方文档没有，可跳过不影响结果）。逐条对照见 <strong>§12</strong>
   </div>
 </header>
+
+<h2>命令来源总览（先看这一张表）</h2>
+<p>本手册的命令分两类。<strong>【官方】</strong>＝照抄天嵌官方文档或 SDK 自带脚本/说明的原文口径；
+<strong>【补充】</strong>＝本手册另加的防错、取证、自检步骤，官方文档里没有，<strong>跳过不影响最终结果</strong>。
+逐条出处见 <a href="#sec12">§12 逐条对照官方来源</a>。</p>
+<table>
+<thead>
+<tr><th>章节</th><th>内容</th><th>来源</th><th>官方出处</th></tr>
+</thead>
+<tbody>
+<tr><td>§0</td><td>为什么出厂没有 ttySAC1（原因分析，无命令）</td><td>【补充】</td><td>——（本项目自身的 dtb 反编译取证）</td></tr>
+<tr><td>§1</td><td>四条绝对路径、两份 <code>board.dts</code> 的坑</td><td>【官方】＋【补充】</td><td>《TQT113_linux_系统开发手册》§2.1.1「常用配置文件介绍」</td></tr>
+<tr><td>§2</td><td>备份 <code>board.dts</code>（<code>cp</code>）</td><td>【补充】</td><td>——</td></tr>
+<tr><td>§3</td><td>改 4 处（3 条 <code>sed</code>）</td><td>【补充】</td><td>——（官方只讲"改哪个文件"，不讲改法）</td></tr>
+<tr><td>§4</td><td><code>diff -u</code> 核对改动</td><td>【补充】</td><td>——</td></tr>
+<tr><td>§5</td><td><code>cpp</code> ＋ <code>dtc</code> 语法自检</td><td>【补充】</td><td>——（内核自带工具链，官方未写此用法）</td></tr>
+<tr><td><strong>§6.1</strong></td><td><strong><code>./build.sh kernel</code> ＋ <code>./build.sh pack</code></strong></td><td><strong>【官方】</strong></td><td>《TQT113_linux_系统开发手册》§2.1.5「修改设备树」原文：<em>设备树和内核是一起编译的，所以单独编译设备树的方法和单独编译内核一样</em></td></tr>
+<tr><td>§6.2</td><td><code>./build.sh dts</code> ＋ <code>./build.sh bootimg</code>（快速支路）</td><td>【补充】</td><td>——（SDK 实际存在的 target，官方文档未收录）</td></tr>
+<tr><td><strong>§8</strong></td><td><strong>烧录：USB 原厂工具 / fastboot</strong></td><td><strong>【官方】</strong></td><td>《TQT113_linux_使用手册》§3.1.2「USB原厂工具更新」、§3.1.5「fastboot更新」</td></tr>
+<tr><td>§7</td><td>验证新 dtb 进了 <code>boot.img</code></td><td>【补充】</td><td>——</td></tr>
+<tr><td>§9</td><td>回滚（<code>cp</code> 还原 ＋ 按 §6 重编）</td><td>【补充】</td><td>——</td></tr>
+<tr><td>§10</td><td>排障速查</td><td>【补充】</td><td>——</td></tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>一句话结论：官方只给两条命令 —— <code>./build.sh kernel</code>（编）与 <code>./build.sh pack</code>（打包）＋ 官方烧录方式。</strong>
+其余全部是本手册为了让结果可核对而加的取证步骤；<strong>全部命令一律绝对路径、一条一行、不使用 shell 变量</strong>（官方文档用相对路径与板名通配，本手册已逐条适配，见 §12 的"适配说明"列）。</p>
+</blockquote>
 
 <blockquote>
 <p><strong>这份手册只干一件事：把设备树里的 UART1 打开，让板端出现 <code>/dev/ttySAC1</code>。</strong>
@@ -130,6 +161,8 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 （<code>device/config/.../evb1_auto/board.dts</code> 是指向它的软链）。<code>mkcmd.sh</code> 里那个"从配置目录拷到内核树"的 <code>cp</code> 位于
 <code>prepare_mkkernel()</code> 内，而该函数的调用处<strong>全部被注释掉</strong>，所以这份不会覆盖内核树。</p>
 <p>判据（已实测）：两份差 1123 行；固件 dtb 里含 <code>c906_ddr</code> 节点，<strong>只在内核树那份里有</strong>（配置目录那份为 0 处）。</p>
+<p><strong>【官方】佐证</strong>：《TQT113_linux_系统开发手册》§2.1.1「常用配置文件介绍」把 <code>kernel/linux-5.4/arch/arm/boot/dts/board.dts</code> 直接列为<strong>内核设备树</strong>
+（同表里 <code>device/config/chips/t113/configs/evb1_auto/linux-5.4/config-5.4</code> 是内核配置单）—— 要改的就是这一份，与本手册结论一致。</p>
 </blockquote>
 
 <hr />
@@ -190,10 +223,10 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 
 <hr />
 <h2>6. Step 5 —— 编译并打包</h2>
-<h3>6.1 官方路径（首选）：一条命令把内核＋设备树一起编</h3>
-<p>天嵌官方文档对"单独编译内核 / 单独编译设备树"给的就是这条 —— <strong>设备树与内核一起编，所以改 dts 也走 <code>./build.sh kernel</code></strong>。</p>
+<h3>6.1 官方路径（首选）·【官方】：一条命令把内核＋设备树一起编</h3>
+<p><strong>【官方】</strong>天嵌官方文档对"单独编译内核 / 单独编译设备树"给的就是这条 —— <strong>设备树是和内核一起编译的，所以编译方法和单独编译内核一样</strong>：
+命令在 SDK 根目录执行。<strong>不需要先 <code>source build/envsetup.sh</code></strong>（实测直接执行即可，官方文档里也没有这一步）。</p>
 <pre><code class="language-bash">cd /opt/Embedsky/mount/t113_tina</code></pre>
-<pre><code class="language-bash">source build/envsetup.sh</code></pre>
 <pre><code class="language-bash">./build.sh kernel</code></pre>
 <pre><code class="language-bash">./build.sh pack</code></pre>
 <table>
@@ -201,8 +234,8 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 <tr><th>命令</th><th>干什么</th><th>本次实测</th></tr>
 </thead>
 <tbody>
-<tr><td><code>./build.sh kernel</code></td><td>编内核 ＋ 设备树，并<strong>顺带产出含新 dtb 的 <code>boot.img</code></strong>（官方文档口径）</td><td>rc=0，约 <strong>2 分 24 秒</strong></td></tr>
-<tr><td><code>./build.sh pack</code></td><td>按分区表把 <code>out/</code> 里的现成件打成整包固件</td><td>产出 §1 表中的 <code>.img</code></td></tr>
+<tr><td><code>./build.sh kernel</code> ·【官方】</td><td>编内核 ＋ 设备树，并<strong>顺带产出含新 dtb 的 <code>boot.img</code></strong>（官方文档口径）</td><td>rc=0，约 <strong>2 分 24 秒</strong></td></tr>
+<tr><td><code>./build.sh pack</code> ·【官方】</td><td>按分区表把 <code>out/</code> 里的现成件打成整包固件</td><td>产出 §1 表中的 <code>.img</code></td></tr>
 </tbody>
 </table>
 <p><code>./build.sh kernel</code> 一次刷新三样（本板实测路径）：</p>
@@ -216,7 +249,23 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 <tr><td><code>out/t113_s4/evb1_auto/buildroot/sunxi.dtb</code></td><td>新的设备树本体</td></tr>
 </tbody>
 </table>
-<h3>6.2 只改 dts 时的快速路径（可选，与 6.1 二选一）</h3>
+<p><strong>【官方】文档写的是通用板名，照抄路径会找不到文件 —— 本板实际路径对照：</strong></p>
+<table>
+<thead>
+<tr><th>官方文档里的路径（通用板名）</th><th>本板（TQT113 / T113-S4）实际路径</th></tr>
+</thead>
+<tbody>
+<tr><td><code>./out/t113/kernel/staging/boot.img</code></td><td><code>out/t113_s4/kernel/staging/boot.img</code> —— <code>./build.sh kernel</code> 的产物</td></tr>
+<tr><td><code>./out/pack_out/boot_package.fex</code></td><td><code>out/t113_s4/evb1_auto/pack_out/boot_package.fex</code> —— 打包阶段产物</td></tr>
+<tr><td>（文档未列）<code>pack</code> 真正取用的内核镜像</td><td><code>out/t113_s4/evb1_auto/pack_out/boot.fex</code> → 软链到 <code>out/t113_s4/evb1_auto/buildroot/boot.img</code></td></tr>
+<tr><td>（文档未列）最终整包固件</td><td><code>out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img</code></td></tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>【官方】保底替代（全量，20~40 分钟，最不容易出错）：</strong><code>./auto_build.sh t113_s4 buildroot</code> —— 官方一键脚本，
+等价于 autoconfig ＋ <code>./build.sh</code> ＋ <code>./build.sh pack</code>；它会顺手清空重灌 <code>rootfs_overlay/opt</code>（frpc 在 <code>usr/bin</code>，不受影响）。</p>
+</blockquote>
+<h3>6.2 只改 dts 时的快速路径 ·【补充】（可选，与 6.1 二选一）</h3>
 <pre><code class="language-bash">./build.sh dts</code></pre>
 <pre><code class="language-bash">./build.sh bootimg</code></pre>
 <table>
@@ -234,18 +283,9 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 <blockquote>
 <p>⚠ <strong>6.2 的坑：<code>./build.sh dts</code> 只刷新磁盘上的 <code>sunxi.dtb</code>，不碰 <code>boot.img</code></strong> —— 必须接一条 <code>./build.sh bootimg</code> 才生效。
 6.1 的 <code>./build.sh kernel</code> 内部已经含了这一步（<code>mkcmd.sh</code> 的 <code>build_kernel()</code> 末尾会调 <code>build_dts false</code>，并已产出 <code>boot.img</code>），所以走官方路径时不需要额外补命令。</p>
-<p><strong>注：<code>dts</code> / <code>bootimg</code> 这两个 target 官方文档没写</strong>，是 SDK 里实际存在的（<code>build/mkcommon.sh</code> 的分派行有 <code>dtb|brandy|bootloader|arisc|dts|kernel|modules|rtos|bootimg)</code>，
-<code>build/mkcmd.sh:1697 build_dts()</code>、<code>:1768 build_bootimg()</code>）—— 本手册两条都实测过（rc=0，耗时见上表）。</p>
-</blockquote>
-<blockquote>
-<p>⚠ <strong>6.2 的坑：<code>./build.sh dts</code> 只刷新磁盘上的 <code>sunxi.dtb</code>，不碰 <code>boot.img</code></strong> —— 必须接一条
-<code>./build.sh bootimg</code> 才生效。6.1 的 <code>./build.sh kernel</code> 内部已经含了设备树这一步，所以走官方路径时不用再补命令。</p>
-<p><strong>官方文档写的是通用板名，照抄会找不到文件 —— 本板实际路径对照：</strong></p>
-<p>· 文档 <code>./out/t113/kernel/staging/boot.img</code> → 本板 <code>out/t113_s4/kernel/staging/boot.img</code>（<code>./build.sh kernel</code> 的产物）<br />
-· 文档 <code>./out/pack_out/boot_package.fex</code> → 本板 <code>out/t113_s4/evb1_auto/pack_out/boot_package.fex</code>（打包阶段产物，属引导阶段，改造用的是下面这条链）<br />
-· 本板 <code>pack</code> 取内核镜像走的是 <code>out/t113_s4/evb1_auto/pack_out/boot.fex</code> → 软链到 <code>out/t113_s4/evb1_auto/buildroot/boot.img</code></p>
-<p>保底替代（全量，20~40 分钟，最不容易出错）：<code>./auto_build.sh t113_s4 buildroot</code> —— 等价于 autoconfig ＋ <code>./build.sh</code> ＋ <code>./build.sh pack</code>，
-但它会顺手清空重灌 <code>rootfs_overlay/opt</code>（frpc 在 <code>usr/bin</code>，不受影响）。</p>
+<p><strong>【补充】说明：<code>dts</code> / <code>bootimg</code> 这两个 target 官方文档没写</strong>，是 SDK 里实际存在的（<code>build/mkcommon.sh</code> 的分派行有 <code>dtb|brandy|bootloader|arisc|dts|kernel|modules|rtos|bootimg)</code>，
+<code>build/mkcmd.sh:1697 build_dts()</code>、<code>:1768 build_bootimg()</code>）—— 本手册两条都实测过（rc=0，耗时见上表）。
+若你的 SDK 里这两个 target 不存在或行为不同，<strong>一律以 §6.1 的官方路径 <code>./build.sh kernel</code> 为准</strong>（设备树与内核一起编，等效且不挑版本）。</p>
 </blockquote>
 
 <hr />
@@ -268,8 +308,23 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 </table>
 
 <hr />
-<h2>8. Step 7 —— 刷机并在板端确认</h2>
-<p>用 PhoenixSuit / LiveSuit 刷入 <code>/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img</code>。板端逐条执行：</p>
+<h2>8. Step 7 —— 烧录并在板端确认</h2>
+<p>官方给的更新方式<strong>两条</strong>（《TQT113_linux_系统开发手册》§2.1.5「更新设备树」就是指向这两条），按需要选一条：</p>
+<table>
+<thead>
+<tr><th>方式</th><th>适用</th><th>官方出处 / 工具（SDK 自带）</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>USB 原厂工具更新</strong></td><td><strong>本次改造走这条</strong>：一次把 <code>boot.img</code>、rootfs 等整包刷进去，最省事</td><td>《TQT113_linux_使用手册》<strong>§3.1.2「USB原厂工具更新」</strong>；Windows＝<strong>PhoenixSuit</strong>（<code>tools/tools_win/USB_update_and_produce/PhoenixSuit1.0.6.rar</code>，另有 <code>tools/tools_win/PhoenixSuit_CN.msi</code>）；Mac＝LiveSuit.app、Linux＝LiveSuitVxxx（同目录）</td></tr>
+<tr><td><strong>fastboot 更新</strong></td><td>只想单独换设备树、不想刷整包时用</td><td>《TQT113_linux_使用手册》<strong>§3.1.5「fastboot更新」</strong>；SDK 根目录自带 <code>fastboot.exe</code>（Windows）/ <code>fastboot</code>（Linux x86-64）；USB 驱动见 <code>tools/tools_win/USBDriver.rar</code>、<code>tools/tools_win/ALLWINNER_RNDIS_WINDOWS_DRIVER.rar</code></td></tr>
+</tbody>
+</table>
+<p>要刷的镜像（<code>./build.sh pack</code> 的产物）：<code>/opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img</code>。</p>
+<blockquote>
+<p>⚠ <strong>fastboot 的具体命令（分区名、参数）以《TQT113_linux_使用手册》§3.1.5 的原文为准</strong> —— 本手册不复写，避免与官方不一致。
+本手册只确保前一步的 <code>boot.img</code> 里确实带了新 dtb（见 §7）。</p>
+</blockquote>
+<p>板端逐条执行（先确认设备节点，再看数据）：</p>
 <pre><code class="language-bash">ls -l /dev/ttySAC*</code></pre>
 <p>期望多出 <code>/dev/ttySAC1</code>（原来的 <code>ttySAC2/3/4/5</code> 仍在）。</p>
 <pre><code class="language-bash">dmesg | grep -i ttySAC</code></pre>
@@ -285,7 +340,8 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 <hr />
 <h2>9. 回滚（1 条命令）</h2>
 <pre><code class="language-bash">cp -a /tmp/board.dts.bak-1016-0833 /opt/Embedsky/mount/t113_tina/kernel/linux-5.4/arch/arm/boot/dts/board.dts</code></pre>
-<p>回滚后重跑 §6 的 <code>./build.sh dts</code>、<code>./build.sh bootimg</code>、<code>./build.sh pack</code> 三条即可恢复原状。</p>
+<p>回滚后按 <strong>§6 重编并打包</strong>即可恢复原状：官方路径 <code>./build.sh kernel</code> ＋ <code>./build.sh pack</code>；
+或支路 <code>./build.sh dts</code> ＋ <code>./build.sh bootimg</code> ＋ <code>./build.sh pack</code>。</p>
 
 <hr />
 <h2>10. 排障速查</h2>
@@ -321,8 +377,53 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 <tr><td><code>./build.sh pack</code> 打包固件</td><td><strong>待执行</strong></td><td>—</td><td>由使用者执行；产出 §1 表中的 <code>.img</code></td></tr>
 <tr><td>板端验证（<code>/dev/ttySAC1</code> ＋ NMEA）</td><td><strong>待执行</strong></td><td>—</td><td>需刷机；板子当前不在网（192.168.2.120/121/122 均无响应）</td></tr>
 <tr><td>本手册</td><td>已新建</td><td>2026-10-16</td><td>用户要求：HTML 格式、指令全部单条可执行</td></tr>
+<tr><td>官方口径核对（本轮）</td><td>已完成</td><td>2026-10-16 09:04</td><td>按用户要求"指令全部参考官方手册来写"逐条过一遍：① 每条命令加【官方】/【补充】标记；② 新增「命令来源总览」表与 <strong>§12 逐条对照官方来源</strong>（12.1 官方 8 条 / 12.2 补充 8 条）；③ 删掉 §6.1 里官方没有的 <code>source build/envsetup.sh</code>（实测不需要）；④ §6.2 两段重复的 ⚠ 引用块合并为一段；⑤ §8 烧录换成《使用手册》§3.1.2／§3.1.5 两条官方路径。补装实测：无 envsetup 直接跑 <code>./build.sh dts</code> rc=0（17 s）。</td></tr>
 </tbody>
 </table>
+
+<hr />
+<h2 id="sec12">12. 逐条对照官方来源</h2>
+<p>本表把手册里<strong>每一条命令</strong>对到它的出处。<strong>【官方】</strong>＝有官方出处；<strong>【补充】</strong>＝本手册自加。
+「适配说明」一列写清本手册相对官方原文做了哪些改写（官方用相对路径/通用板名，本手册一律改成绝对路径、单条可执行）。</p>
+
+<h3>12.1 【官方】命令（照官方口径，只做路径适配）</h3>
+<table>
+<thead>
+<tr><th>#</th><th>本手册的命令</th><th>官方出处（原文口径）</th><th>适配说明</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td><code>cd /opt/Embedsky/mount/t113_tina</code></td><td>《系统开发手册》§2.1.5：<em>命令在 SDK 根目录执行</em></td><td>官方写作"SDK 根目录"；本手册给出本机绝对路径。这条只是切目录，也可直接写进下一条命令。</td></tr>
+<tr><td>2</td><td><code>./build.sh kernel</code></td><td>《系统开发手册》§2.1.5：<em>设备树和内核是一起编译的，所以单独编译设备树的方法和单独编译内核一样</em></td><td><strong>原文照抄</strong>，未做任何改写。官方截图里给的产物记为 <code>./out/t113/kernel/staging/boot.img</code>（通用板名），本板实际为 <code>out/t113_s4/kernel/staging/boot.img</code>。</td></tr>
+<tr><td>3</td><td><code>./build.sh pack</code></td><td>《系统开发手册》§2.1.5「修改设备树」的后续打包步骤（SDK 标准打包入口 <code>mk_pack()</code>）；<code>./build.sh --help</code> 用法输出里也列有此 target</td><td>原文照抄。</td></tr>
+<tr><td>4</td><td><code>./auto_build.sh t113_s4 buildroot</code>（§6.1 保底替代）</td><td>SDK 自带一键脚本 <code>auto_build.sh</code>（autoconfig ＋ <code>./build.sh</code> ＋ <code>./build.sh pack</code>）</td><td>官方脚本原文；本手册仅补注它会重灌 <code>rootfs_overlay/opt</code>。</td></tr>
+<tr><td>5</td><td>烧录：<strong>PhoenixSuit</strong>（Windows）/ LiveSuit（Mac、Linux）</td><td>《TQT113_linux_使用手册》§3.1.2「USB原厂工具更新」</td><td>工具路径取自 SDK 自带 <code>tools/tools_win/</code> 下的官方 readme（<code>tools/tools_win/README.txt</code>、<code>tools/tools_win/USB_update_and_produce/readme.txt</code>）：<code>PhoenixSuit1.0.6.rar</code>、<code>PhoenixSuit_CN.msi</code>、LiveSuit 对应 Mac/Linux32/Linux64。</td></tr>
+<tr><td>6</td><td>烧录：<strong>fastboot</strong>（SDK 根自带 <code>fastboot.exe</code> / <code>fastboot</code>）</td><td>《TQT113_linux_使用手册》§3.1.5「fastboot更新」</td><td><strong>具体命令（分区名、参数）本手册不复写，以官方 §3.1.5 原文为准</strong>，避免转述走样。USB 驱动：<code>tools/tools_win/USBDriver.rar</code>、<code>tools/tools_win/ALLWINNER_RNDIS_WINDOWS_DRIVER.rar</code>。</td></tr>
+<tr><td>7</td><td>要改的文件：<code>.../kernel/linux-5.4/arch/arm/boot/dts/board.dts</code></td><td>《系统开发手册》§2.1.1「常用配置文件介绍」把它列为<strong>内核设备树</strong></td><td>原文照抄；本手册另用 dtb 反编译（含 <code>c906_ddr</code> 节点）实证了"编进固件的就是这份"，见 §1。</td></tr>
+<tr><td>8</td><td>板端 <code>ls -l /dev/ttySAC*</code> 等确认命令</td><td>通用 Linux 串口确认法（非天嵌专有；天嵌文档在串口/调试章节给的也是同类检查）</td><td>本手册给了完整的 9600 8N1 打开与读数命令。</td></tr>
+</tbody>
+</table>
+
+<h3>12.2 【补充】命令（官方文档未收录，用于防错与取证）</h3>
+<table>
+<thead>
+<tr><th>#</th><th>本手册的命令 / 步骤</th><th>所在章节</th><th>为什么加它</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td><code>cp -a .../board.dts /tmp/board.dts.bak-$(date +%m%d-%H%M)</code></td><td>§2</td><td>官方未要求备份；一条命令换来回滚能力，代价为零。</td></tr>
+<tr><td>2</td><td>3 条 <code>sed -i</code>（改 PD21/PD22、<code>&amp;uart1</code> okay、<code>&amp;pwm7</code> disabled）</td><td>§3</td><td>官方只讲"改哪个文件"，不讲具体怎么改、也没有可复制的改法；本手册把它固化成 3 条幂等命令。</td></tr>
+<tr><td>3</td><td><code>diff -u</code> 与备份比对</td><td>§4</td><td>确认"恰好 4 行实质变化"，防止误伤其它节点。</td></tr>
+<tr><td>4</td><td><code>cpp ... board.dts -o /tmp/board.pp.dts</code> ＋ <code>dtc -I dts -O dtb ...</code></td><td>§5</td><td>秒级发现 dts 语法错误，省掉一次数十分钟的整包构建。用的是 SDK/内核自带工具链，不引入新依赖。</td></tr>
+<tr><td>5</td><td><code>./build.sh dts</code> ＋ <code>./build.sh bootimg</code></td><td>§6.2</td><td>官方未收录这两个 target（<code>build/mkcommon.sh</code> 分派行里有，<code>build_dts()</code>／<code>build_bootimg()</code> 有实现）。仅作快速支路，与官方 <code>kernel</code> 等效、二选一；官方文档写得更省心，不确定就只用 §6.1。</td></tr>
+<tr><td>6</td><td><code>dtc -I dtb -O dts .../sunxi.dtb -o /tmp/v.dts</code> ＋ <code>grep uart@2500400</code> ＋ <code>python3 -c "...boot.img'.count(b'PD21\\x00PD22')"</code></td><td>§7</td><td>官方文档没有"如何确认新 dtb 真的进了 <code>boot.img</code>"这一步；这 3 条是本手册交付的<strong>硬证据</strong>（引脚串计数应为 2）。</td></tr>
+<tr><td>7</td><td><code>/tmp/board.dts.bak-1016-0833</code> 还原 ＋ 按 §6 重编</td><td>§9</td><td>回滚路径，官方未给。回滚后的编译仍走 §6.1 官方命令。</td></tr>
+<tr><td>8</td><td>§10 排障速查表全部条目</td><td>§10</td><td>把本次实测踩到的坑（dtb 装在 <code>boot.img</code> 里、两份 <code>board.dts</code>、PD22 与 pwm7 冲突）固化成速查。</td></tr>
+</tbody>
+</table>
+
+<blockquote>
+<p><strong>结论：</strong>凡涉及"怎么编译、怎么打包、怎么烧录"的<strong>关键动作，本手册给的都是官方口径</strong>（<code>./build.sh kernel</code>、<code>./build.sh pack</code>、《使用手册》§3.1.2／§3.1.5）；
+其余命令是按<strong>绝对路径、单条可执行</strong>的要求补的取证步骤，且都标了【补充】，可按需跳过。</p>
+</blockquote>
 
 <footer class="doc">
   IVSBox · 天嵌 TQT113 / T113-S4 · 生成时间 2026-10-16 · 关联：<code>ivsbox/docs/代码说明.adoc</code> §2026-09-30（P1-13）、<code>ivsbox/docs/操作手册/readme.txt</code>

@@ -31,24 +31,32 @@ docs/操作手册  ——  分任务操作手册目录（怎么把代码变成�
                       `tools/` 下 readme。**直接以 HTML 形态维护（无 .md 母本）**；
                       全文命令单条可执行、绝对路径、不用变量。
                       2026-10-16 经用户要求新建（同日两轮复核：先按官方口径重写 §6，再按官方口径逐条核命令）。
-  镜像账号密码修改操作手册.html  改 T113 镜像账号 / 密码（**只此一条主线：改镜像，随烧写生效**）：
-                      现状实测（**账号 `root`、密码 `embedsky`**；串口 `::respawn:-/bin/sh` 免密直进、
-                      本手册不动它；网络登录服务未自启；`BR2_TARGET_GENERIC_ROOT_PASSWD=""` 故密码不被
-                      Buildroot 覆盖）→ **§2 照抄版 6 条命令：账号改 `t113`、密码改 `123456`**
-                      （备份 → `sed` 改名 `passwd`+`shadow` 两处 → `sed` 换哈希 → 核对 → **重建 rootfs
-                      ＋ `pack`** → `debugfs` 读 `rootfs.ext2` 验证 ＋ 刷机）→ §3 改任意账号的通用模板
-                      （改密码 / 改名 / 新增 / 删除 / 核对 ＋ 三个必须记住的点 ＋ 实测哈希对照）
-                      → §4 排障速查 → §5 本次实测记录 → §6 逐条对照来源。
-                      **含 3 个实测坑**：双引号里粘贴带 `$` 的哈希会被 shell 展开、双引号内嵌套 `\"$(...)\"`
-                      会把引号吃进盐导致登录不上、`rootfs.ext4` 是稀疏镜像不能喂 `debugfs`；⚠ **`./build.sh
-                      kernel` 不重建 rootfs**，改 `shadow` 必须走 `./build.sh buildroot_rootfs`；核实**改名
-                      root 安全**（overlay 内 `root` 全是注释/变量名、无 `chown root`；Buildroot `Makefile`
-                      里 `chown` 零命中）。**本手册无官方手册对应章节（已查证），故不标【官方】**，出处落到
-                      SDK 配置文件行号（`BR2_TARGET_GENERIC_ROOT_PASSWD` 等）＋ 本机实测；直接以 HTML
-                      形态维护（无 .md 母本）、命令单条可执行、绝对路径、不用变量。
-                      2026-10-16 经用户确认后登记（规则 7 第 2 条）；同日按用户"留一个方案就行"精简，
-                      **删去原方案 B（板端 `passwd`）/方案 C（串口加密码）/方案 D（新增账号）**，
-                      只留"改镜像"这一条主线（现状里保留"串口当前免密"仅为说明，不再给改法）。
+  镜像主机名与账号密码修改操作手册.html  改 T113 镜像的**主机名**（主线：串口提示符 `root@TQ113:/#`
+                      里被框住的 `TQ113`）/ 账号 / 密码，**只此一条主线：改 overlay 里的文件 → 重建 rootfs
+                      → `pack` → 刷机**。现状实测（**主机名 `TQ113`**，**只在 `etc/hostname` 与 `etc/hosts`
+                      两处**，开机由 `etc/inittab:27 ::sysinit:/bin/hostname -F /etc/hostname` 生效、
+                      提示符来自 `etc/profile:10 PS1='\u@\h:\w # '` 的 `\h` 动态取主机名 ⇒ 改文件即改提示符；
+                      **账号 `root`、密码 `embedsky`**；串口 `::respawn:-/bin/sh` 免密直进、本手册不动它；
+                      网络登录服务未自启；`BR2_TARGET_GENERIC_ROOT_PASSWD=""` 故密码不被 Buildroot 覆盖）
+                      → §1 要改的 4 个文件（overlay 的 `etc/{hostname,hosts,passwd,shadow}`）
+                      → **§2.1 改主机名（主任务，4 条命令：备份 → 改 `hostname` → 改 `hosts` → `grep -Hn .`
+                      核对 ＋ 还原）**、§2.2 改账号/密码（**可选**，6 条命令：`sed` 在 `passwd`+`shadow`
+                      两处改名 → `sed` 换哈希 → 核对）、§2.3 收尾（`./build.sh buildroot_rootfs` ＋
+                      `./build.sh pack` ＋ `debugfs` 读 `rootfs.ext2` 验证 ＋ 刷机）→ §3 改任意名字/账号的
+                      通用模板（改主机名 / 改密码 / 改名 / 新增 / 删除 / 核对 ＋ 三个必须记住的点 ＋
+                      实测哈希对照）→ §4 排障速查 → §5 本次实测记录 → §6 逐条对照来源。
+                      **含 4 个实测坑**：提示符里的名字是**主机名不是账号名**（去改 `passwd` 属白改）、
+                      改完刷机提示符不变多半是走了 `./build.sh kernel`（**它不重建 rootfs**，而
+                      `hostname`/`passwd`/`shadow` 都在 rootfs 里）、主机名要 `hostname`+`hosts` **两处同改**、
+                      `rootfs.ext4` 是 Android 稀疏镜像不能喂 `debugfs`（要用 `rootfs.ext2`）；账号部分另有
+                      「双引号里粘贴带 `$` 的哈希会被 shell 展开」的坑。**本手册无官方手册对应章节（已查证），
+                      故不标【官方】**，出处落到 SDK 配置文件/脚本行号（`etc/inittab:27`、`etc/profile:10`、
+                      `BR2_TARGET_GENERIC_ROOT_PASSWD` 等）＋ 本机实测；直接以 HTML 形态维护（无 .md 母本）、
+                      命令单条可执行、绝对路径、不用变量。
+                      2026-10-16 经用户确认后登记（规则 7 第 2 条）；同日用户澄清"要改的是提示符里的
+                      `TQ113`"（**那是主机名**），遂**以主机名为主线重写**并**取代原《镜像账号密码修改操作
+                      手册.html》（已删）**；此前按用户"留一个方案就行"精简，删去原方案 B（板端 `passwd`）/
+                      方案 C（串口加密码）/方案 D（新增账号）。
 
 【约定与注意事项】
   - 本目录文档按需新建，新建须经用户确认并登记（规则 7 第 2 条）。

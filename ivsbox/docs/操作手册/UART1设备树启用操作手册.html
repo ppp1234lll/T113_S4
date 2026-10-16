@@ -189,13 +189,36 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 <p>期望看到 <code>status = "okay";</code>。</p>
 
 <hr />
-<h2>6. Step 5 —— 重编 dtb → 重做 boot.img → 打包</h2>
-<p>四条准备命令，逐条执行（后两条是真编译）：</p>
+<h2>6. Step 5 —— 编译并打包</h2>
+<h3>6.1 官方路径（首选）：一条命令把内核＋设备树一起编</h3>
+<p>天嵌官方文档对"单独编译内核 / 单独编译设备树"给的就是这条 —— <strong>设备树与内核一起编，所以改 dts 也走 <code>./build.sh kernel</code></strong>。</p>
 <pre><code class="language-bash">cd /opt/Embedsky/mount/t113_tina</code></pre>
 <pre><code class="language-bash">source build/envsetup.sh</code></pre>
+<pre><code class="language-bash">./build.sh kernel</code></pre>
+<pre><code class="language-bash">./build.sh pack</code></pre>
+<table>
+<thead>
+<tr><th>命令</th><th>干什么</th><th>本次实测</th></tr>
+</thead>
+<tbody>
+<tr><td><code>./build.sh kernel</code></td><td>编内核 ＋ 设备树，并<strong>顺带产出含新 dtb 的 <code>boot.img</code></strong>（官方文档口径）</td><td>rc=0，约 <strong>2 分 24 秒</strong></td></tr>
+<tr><td><code>./build.sh pack</code></td><td>按分区表把 <code>out/</code> 里的现成件打成整包固件</td><td>产出 §1 表中的 <code>.img</code></td></tr>
+</tbody>
+</table>
+<p><code>./build.sh kernel</code> 一次刷新三样（本板实测路径）：</p>
+<table>
+<thead>
+<tr><th>产物</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>out/t113_s4/kernel/staging/boot.img</code></td><td><strong>官方文档说的就是它</strong>（文档写作 <code>./out/t113/kernel/staging/boot.img</code>，那是通用板名，本板为 <code>t113_s4</code>）</td></tr>
+<tr><td><code>out/t113_s4/evb1_auto/buildroot/boot.img</code></td><td><strong><code>pack</code> 实际取的那一枚</strong>（<code>pack_out/boot.fex</code> 是指向它的软链）</td></tr>
+<tr><td><code>out/t113_s4/evb1_auto/buildroot/sunxi.dtb</code></td><td>新的设备树本体</td></tr>
+</tbody>
+</table>
+<h3>6.2 只改 dts 时的快速路径（可选，与 6.1 二选一）</h3>
 <pre><code class="language-bash">./build.sh dts</code></pre>
 <pre><code class="language-bash">./build.sh bootimg</code></pre>
-<pre><code class="language-bash">./build.sh pack</code></pre>
 <table>
 <thead>
 <tr><th>命令</th><th>干什么</th><th>本次实测</th></tr>
@@ -203,13 +226,24 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 <tbody>
 <tr><td><code>./build.sh dts</code></td><td>只重编设备树：<code>board.dts</code> → <code>board.dtb</code> → 拷成 <code>out/.../buildroot/sunxi.dtb</code></td><td>rc=0，约 17 秒，<code>sunxi.dtb</code> 62404 → <strong>62452</strong> 字节</td></tr>
 <tr><td><code>./build.sh bootimg</code></td><td><strong>把新 dtb 压进 <code>boot.img</code></strong>（内核 dtb 就装在这枚镜像里）</td><td>rc=0，约 24 秒，<code>boot.img</code> 里新引脚串由 0 → <strong>2</strong> 处</td></tr>
-<tr><td><code>./build.sh pack</code></td><td>按分区表重新打包整包固件（从 <code>out/</code> 取件）</td><td>产出下节的 <code>.img</code></td></tr>
 </tbody>
 </table>
+<p><strong>为什么不直接用官方的 <code>kernel</code>：</strong>改 dts 时整编内核（2 分 24 秒）里绝大部分时间花在与本次改动无关的内核重新编译上；
+<code>dts</code> ＋ <code>bootimg</code> 两条加起来 41 秒就能得到同样的 <code>boot.img</code>。<strong>两者等效、二选一即可</strong>：
+用了 6.1 的 <code>./build.sh kernel</code> 就不用跑 6.2；反过来跑了 6.2 就不必再跑 <code>kernel</code>（内核没动）。</p>
 <blockquote>
-<p>⚠ <strong>只跑 <code>./build.sh dts</code> 是不够的</strong>：它只刷新磁盘上的 <code>sunxi.dtb</code>，不进 <code>boot.img</code>。
-实测 <code>boot.img</code> 里恰好含 1 个设备树（FDT magic <code>d00dfeed</code> 出现 1 次），必须先 <code>./build.sh bootimg</code> 才会换成新的。
-<code>./build.sh pack</code> 只是把 <code>out/</code> 里的现成件打成一个 <code>.img</code>（<code>pack_out/boot.fex</code> 是指向 <code>../buildroot/boot.img</code> 的软链），<strong>它自己不会重编 dtb 或 boot.img</strong>。</p>
+<p>⚠ <strong>6.2 的坑：<code>./build.sh dts</code> 只刷新磁盘上的 <code>sunxi.dtb</code>，不碰 <code>boot.img</code></strong> —— 必须接一条 <code>./build.sh bootimg</code> 才生效。
+6.1 的 <code>./build.sh kernel</code> 内部已经含了这一步（<code>mkcmd.sh</code> 的 <code>build_kernel()</code> 末尾会调 <code>build_dts false</code>，并已产出 <code>boot.img</code>），所以走官方路径时不需要额外补命令。</p>
+<p><strong>注：<code>dts</code> / <code>bootimg</code> 这两个 target 官方文档没写</strong>，是 SDK 里实际存在的（<code>build/mkcommon.sh</code> 的分派行有 <code>dtb|brandy|bootloader|arisc|dts|kernel|modules|rtos|bootimg)</code>，
+<code>build/mkcmd.sh:1697 build_dts()</code>、<code>:1768 build_bootimg()</code>）—— 本手册两条都实测过（rc=0，耗时见上表）。</p>
+</blockquote>
+<blockquote>
+<p>⚠ <strong>6.2 的坑：<code>./build.sh dts</code> 只刷新磁盘上的 <code>sunxi.dtb</code>，不碰 <code>boot.img</code></strong> —— 必须接一条
+<code>./build.sh bootimg</code> 才生效。6.1 的 <code>./build.sh kernel</code> 内部已经含了设备树这一步，所以走官方路径时不用再补命令。</p>
+<p><strong>官方文档写的是通用板名，照抄会找不到文件 —— 本板实际路径对照：</strong></p>
+<p>· 文档 <code>./out/t113/kernel/staging/boot.img</code> → 本板 <code>out/t113_s4/kernel/staging/boot.img</code>（<code>./build.sh kernel</code> 的产物）<br />
+· 文档 <code>./out/pack_out/boot_package.fex</code> → 本板 <code>out/t113_s4/evb1_auto/pack_out/boot_package.fex</code>（打包阶段产物，属引导阶段，改造用的是下面这条链）<br />
+· 本板 <code>pack</code> 取内核镜像走的是 <code>out/t113_s4/evb1_auto/pack_out/boot.fex</code> → 软链到 <code>out/t113_s4/evb1_auto/buildroot/boot.img</code></p>
 <p>保底替代（全量，20~40 分钟，最不容易出错）：<code>./auto_build.sh t113_s4 buildroot</code> —— 等价于 autoconfig ＋ <code>./build.sh</code> ＋ <code>./build.sh pack</code>，
 但它会顺手清空重灌 <code>rootfs_overlay/opt</code>（frpc 在 <code>usr/bin</code>，不受影响）。</p>
 </blockquote>
@@ -266,6 +300,8 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 <tr><td>改了 dts 但 <code>sunxi.dtb</code> 没变化</td><td>改错了文件（改到了 <code>device/config/.../linux-5.4/board.dts</code> 那份）</td><td>改回内核树那份（见 §1 的 ⚠）</td></tr>
 <tr><td>板端连 <code>ttySAC0</code> 也没有</td><td>uart0 出厂就是 <code>#if 0</code>（disabled），与本次改动无关</td><td>需要 serial0 再单独评估（注意 PF2/PF4 与 <code>&amp;sdc0</code> 撞脚）</td></tr>
 <tr><td>刷机后 LCD 背光不亮/异常</td><td>§3.3 关掉了 <code>&amp;pwm7</code>，而底板背光正好走 PD22</td><td>硬件冲突：背光与 GPS 二选一，或改用 PE10/PE11 那组脚位</td></tr>
+<tr><td>改了 dts、编译也没报错，但刷完板子还是老样子</td><td>走了 §6.2 的 <code>./build.sh dts</code> 却漏了 <code>./build.sh bootimg</code>；或走了 §6.1 但漏了 <code>pack</code> / 没刷机</td><td>按 §6 两条路<strong>二选一补齐</strong>；用 §7 的计数法自检（<code>boot.img</code> 内应为 2）</td></tr>
+<tr><td><code>./build.sh dts</code> 报 unknown target / 没反应</td><td>该 target 官方文档未收录，个别 SDK 版本可能未提供</td><td>改用官方路径 <code>./build.sh kernel</code>（设备树与内核一起编，等效且不挑版本）</td></tr>
 </tbody>
 </table>
 
@@ -281,6 +317,7 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 <tr><td><code>cpp</code> ＋ <code>dtc</code> 语法自检</td><td>通过</td><td>2026-10-16 08:34</td><td>两条均 rc=0；预处理产物里 <code>&amp;uart1</code> 为 <code>okay</code>、<code>uart1_pins@0</code> 为 <code>pins = "PD21", "PD22"</code></td></tr>
 <tr><td><code>./build.sh dts</code> 重编 dtb</td><td>成功</td><td>2026-10-16 08:35</td><td>rc=0（17 s）；<code>sunxi.dtb</code> 62404 → 62452 字节；反编译确认 <code>uart@2500400 status="okay"</code>、<code>pwm7@2000c17 status="disabled"</code></td></tr>
 <tr><td><code>./build.sh bootimg</code> 重做内核镜像</td><td>成功</td><td>2026-10-16 08:36</td><td>rc=0（24 s）；<code>boot.img</code> 里 <code>PD21\0PD22</code> 由 0 → <strong>2</strong></td></tr>
+<tr><td>官方路径 <code>./build.sh kernel</code> 复核</td><td>成功</td><td>2026-10-16 08:53</td><td>rc=0（约 2 分 24 秒）；一次刷新 <code>out/t113_s4/kernel/staging/boot.img</code> ＋ <code>out/t113_s4/evb1_auto/buildroot/boot.img</code> ＋ <code>sunxi.dtb</code>，<code>boot.img</code> 内新引脚串仍为 <strong>2</strong> ⇒ <strong>与天嵌官方文档口径一致</strong>（设备树与内核一起编）</td></tr>
 <tr><td><code>./build.sh pack</code> 打包固件</td><td><strong>待执行</strong></td><td>—</td><td>由使用者执行；产出 §1 表中的 <code>.img</code></td></tr>
 <tr><td>板端验证（<code>/dev/ttySAC1</code> ＋ NMEA）</td><td><strong>待执行</strong></td><td>—</td><td>需刷机；板子当前不在网（192.168.2.120/121/122 均无响应）</td></tr>
 <tr><td>本手册</td><td>已新建</td><td>2026-10-16</td><td>用户要求：HTML 格式、指令全部单条可执行</td></tr>

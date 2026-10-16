@@ -41,14 +41,22 @@ docs/操作手册  ——  分任务操作手册目录（怎么把代码变成�
                       → §1 要改的 4 个文件（overlay 的 `etc/{hostname,hosts,passwd,shadow}`）
                       → **§2.1 改主机名（主任务，4 条命令：备份 → 改 `hostname` → 改 `hosts` → `grep -Hn .`
                       核对 ＋ 还原）**、§2.2 改账号/密码（**可选**，6 条命令：`sed` 在 `passwd`+`shadow`
-                      两处改名 → `sed` 换哈希 → 核对）、§2.3 收尾（`./build.sh buildroot_rootfs` ＋
-                      `./build.sh pack` ＋ `debugfs` 读 `rootfs.ext2` 验证 ＋ 刷机）→ §3 改任意名字/账号的
+                      两处改名 → `sed` 换哈希 → 核对）、**§2.3 收尾：必须用「无参」`./build.sh`
+                      —— 不能用 `./build.sh buildroot_rootfs`！＋ `./build.sh pack` ＋ 两级验证
+                      （先 `debugfs` 读 Buildroot 的 `rootfs.ext2`，再用 `grep -ao "127\.0\.1\.1..."`
+                      直接搜打包输入 `rootfs.ext4` 与最终 `.img`）＋ 刷机** → §3 改任意名字/账号的
                       通用模板（改主机名 / 改密码 / 改名 / 新增 / 删除 / 核对 ＋ 三个必须记住的点 ＋
                       实测哈希对照）→ §4 排障速查 → §5 本次实测记录 → §6 逐条对照来源。
-                      **含 4 个实测坑**：提示符里的名字是**主机名不是账号名**（去改 `passwd` 属白改）、
-                      改完刷机提示符不变多半是走了 `./build.sh kernel`（**它不重建 rootfs**，而
-                      `hostname`/`passwd`/`shadow` 都在 rootfs 里）、主机名要 `hostname`+`hosts` **两处同改**、
-                      `rootfs.ext4` 是 Android 稀疏镜像不能喂 `debugfs`（要用 `rootfs.ext2`）；账号部分另有
+                      **含 5 个实测坑**：① 提示符里的名字是**主机名不是账号名**（去改 `passwd` 属白改）；
+                      ② **只跑 `./build.sh buildroot_rootfs` 是最常见的坑** —— 它只刷新 Buildroot 自己的
+                      `buildroot/buildroot/{target,images/rootfs.ext2}`，**不生成打包输入的 `rootfs.ext4`**
+                      （生成它的是 `build/mkcmd.sh:2201 pack_buildroot_rootfs()`，它只被
+                      `:2273 build_rootfs()` 调用，而 `build_rootfs()` 只被无参 `./build.sh` 的默认动作
+                      `:2436 build_linuxdev()` 调用）⇒ `pack` 打进去的还是旧 rootfs，**烧完仍是 `TQ113`**
+                      （2026-10-16 14:0x 实测复现并定位）；③ 走 `./build.sh kernel` 同样无效（压根不碰
+                      rootfs）；④ 主机名要 `hostname`+`hosts` **两处同改**；
+                      ⑤ `rootfs.ext4` 是 Android 稀疏镜像、`.img` 是整盘镜像，都**不能喂 `debugfs`**
+                      （要读裸 ext4 用 `rootfs.ext2`）；账号部分另有
                       「双引号里粘贴带 `$` 的哈希会被 shell 展开」的坑。**本手册无官方手册对应章节（已查证），
                       故不标【官方】**，出处落到 SDK 配置文件/脚本行号（`etc/inittab:27`、`etc/profile:10`、
                       `BR2_TARGET_GENERIC_ROOT_PASSWD` 等）＋ 本机实测；直接以 HTML 形态维护（无 .md 母本）、
@@ -57,6 +65,10 @@ docs/操作手册  ——  分任务操作手册目录（怎么把代码变成�
                       `TQ113`"（**那是主机名**），遂**以主机名为主线重写**并**取代原《镜像账号密码修改操作
                       手册.html》（已删）**；此前按用户"留一个方案就行"精简，删去原方案 B（板端 `passwd`）/
                       方案 C（串口加密码）/方案 D（新增账号）。
+                      **2026-10-16 14:13 修正**：用户反馈"烧录镜像后还是 `TQ113`"，查明上一版 §2.3 让跑
+                      `./build.sh buildroot_rootfs` 是错的（它不刷新打包输入的 `rootfs.ext4`），已改为
+                      **无参 `./build.sh`**，并在 VM 上按新口径实测通过（build＋pack 共 8 分 27 秒；
+                      最终 `.img` 里 `127.0.1.1 → t113`、`TQ113` 计数 0）。详见 `修改记录.md` 2026-10-16 14:13。
 
 【约定与注意事项】
   - 本目录文档按需新建，新建须经用户确认并登记（规则 7 第 2 条）。

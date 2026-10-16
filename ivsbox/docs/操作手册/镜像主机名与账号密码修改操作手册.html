@@ -179,15 +179,41 @@ Buildroot 的 <code>Makefile</code> 里也<strong>没有任何 <code>chown</code
 
 <h3>2.3 收尾：重建 rootfs ＋ 打包 ＋ 刷机（不管改了几处，都只做这一次）</h3>
 <pre><code class="language-bash">cd /opt/Embedsky/mount/t113_tina</code></pre>
-<pre><code class="language-bash">./build.sh buildroot_rootfs</code></pre>
+<pre><code class="language-bash">./build.sh</code></pre>
 <pre><code class="language-bash">./build.sh pack</code></pre>
 <blockquote>
-<p>⚠ <strong>别用 <code>./build.sh kernel</code></strong> —— 它只编内核＋设备树＋<code>boot.img</code>，<strong>不重建 rootfs</strong>，
-而 <code>hostname</code>/<code>passwd</code>/<code>shadow</code> 都在 rootfs 里，用它等于白改。
-嫌 <code>buildroot_rootfs</code> 不放心也可以改用全量 <code>./build.sh</code>（再 <code>./build.sh pack</code>），效果一样、只是更慢。</p>
+<p>⚠ <strong>必须用「无参」的 <code>./build.sh</code>。</strong>下面三种跑法看着都像"重新编译"，但只有第一种能让改动进固件：</p>
+<table>
+<thead>
+<tr><th>命令</th><th>刷新 Buildroot 的 <code>target/</code></th><th>刷新打包输入 <code>rootfs.ext4</code></th><th>烧完能看到新名</th></tr>
+</thead>
+<tbody>
+<tr><td><strong><code>./build.sh</code>（无参）</strong></td><td>✅</td><td>✅</td><td><strong>✅ 用这个</strong></td></tr>
+<tr><td><code>./build.sh buildroot_rootfs</code></td><td>✅</td><td><strong>❌</strong></td><td>❌ 后面 <code>pack</code> 打进固件的是旧 rootfs</td></tr>
+<tr><td><code>./build.sh kernel</code></td><td>❌</td><td>❌</td><td>❌ 只编内核，完全不碰 rootfs</td></tr>
+</tbody>
+</table>
+<p><strong>为什么：</strong><code>pack</code> 本身不生成 rootfs，它只把 <code>out/t113_s4/evb1_auto/buildroot/</code> 下<strong>现成的</strong> <code>rootfs.ext4</code> 打进固件。
+生成这枚 <code>rootfs.ext4</code> 的是 <code>build/mkcmd.sh:2201 pack_buildroot_rootfs()</code>（内部调 <code>:2083 make_ext4()</code>）；
+而 <code>pack_buildroot_rootfs()</code> <strong>只被</strong> <code>:2273 build_rootfs()</code> <strong>调用</strong>（<code>:2295</code>），
+<code>build_rootfs()</code> 又<strong>只被</strong> <code>:2436 build_linuxdev()</code> <strong>调用</strong>（<code>:2483</code>）——
+而 <code>build_linuxdev</code> 正是<strong>无参 <code>./build.sh</code> 的默认动作</strong>（<code>build/mkcommon.sh:34 ACTION="build_linuxdev;"</code>）。
+反过来看 <code>buildroot_rootfs</code>：<code>build/mkcommon.sh:70</code> 把它<strong>直接</strong>派发给 <code>build/mkcmd.sh:1304 build_buildroot_rootfs()</code>，
+<strong>整条链上都没有 <code>pack_buildroot_rootfs</code></strong> —— 所以它只刷新 Buildroot 自己的
+<code>buildroot/buildroot/{target, images/rootfs.ext2}</code>，<strong>不碰打包输入的 <code>rootfs.ext4</code></strong>。</p>
+<p>无参 <code>./build.sh</code> ＝ 全量（bootloader ＋ kernel ＋ rootfs）；<strong>本机 1 核 VM 实测 8 分 27 秒</strong>跑完 <code>./build.sh</code> ＋ <code>./build.sh pack</code>（缓存已就绪；从零或大改会明显更久）。<br />
+嫌重也可以用官方一键脚本 <code>./auto_build.sh t113_s4 buildroot</code>（<strong>内部已含 <code>./build.sh</code> ＋ <code>./build.sh pack</code>，跑完不用再 <code>pack</code></strong>），
+代价是它会 <code>rm -rf rootfs_overlay/opt</code> 再重灌。</p>
 </blockquote>
-<p>验证新值真进了镜像（改主机名就应看到 <code>t113</code>）：</p>
+<p>验证新值真进了镜像 —— <strong>分两级看</strong>：</p>
+<p><strong>① Buildroot 自己的产物</strong>（跑完无参 <code>./build.sh</code> 就该是 <code>t113</code>；但它对不对，<em>不代表</em>打包输入也对）：</p>
 <pre><code class="language-bash">debugfs -R "cat /etc/hostname" /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/buildroot/images/rootfs.ext2 2&gt;/dev/null</code></pre>
+<p><strong>② 打包输入 <code>rootfs.ext4</code> 与最终 <code>.img</code></strong> —— 这两枚是稀疏 ext4／整盘镜像，<code>debugfs</code> 读不了（会报 <code>Bad magic number</code>），
+<strong>直接搜字符串</strong>最省事；能搜出 <code>t113</code> 才算真进去了：</p>
+<pre><code class="language-bash">grep -ao "127\.0\.1\.1[^0-9A-Za-z]\{1,4\}[A-Za-z0-9]\{3,8\}" /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img</code></pre>
+<pre><code>127.0.1.1	t113</code></pre>
+<p>再看一眼<strong>旧名还有没有残留</strong>（应为 <code>0</code>）：</p>
+<pre><code class="language-bash">grep -ac "TQ113" /opt/Embedsky/mount/t113_tina/out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img</code></pre>
 <p>刷机方式见《TQT113_linux_使用手册》<strong>§3.1.2 USB 原厂工具更新</strong>（Windows＝PhoenixSuit）或 <strong>§3.1.5 fastboot 更新</strong>
 （具体命令以官方原文为准，本手册不复写）。刷完板端 <code>hostname</code> 应回 <code>t113</code>、提示符变成 <code>root@t113:/#</code>。
 想在当前这颗板子上<strong>立即看到</strong>（不重启）：执行 <code>hostname -F /etc/hostname</code>，再新开一个 shell。</p>
@@ -234,7 +260,8 @@ Buildroot 的 <code>Makefile</code> 里也<strong>没有任何 <code>chown</code
 <tr><th>现象</th><th>原因</th><th>处理</th></tr>
 </thead>
 <tbody>
-<tr><td>改完刷机，提示符<strong>还是 <code>root@TQ113</code></strong></td><td>走了 <code>./build.sh kernel</code>（<strong>不重建 rootfs</strong>）；或漏了 <code>pack</code> / 没刷机</td><td>改用 <code>./build.sh buildroot_rootfs</code>（或全量 <code>./build.sh</code>）＋ <code>pack</code></td></tr>
+<tr><td>改完刷机，提示符<strong>还是 <code>root@TQ113</code></strong></td><td><strong>最常见：只跑了 <code>./build.sh buildroot_rootfs</code></strong> —— 它<strong>不刷新打包输入的 <code>rootfs.ext4</code></strong>（见 §2.3）；其次才是走了 <code>./build.sh kernel</code>（压根不碰 rootfs）；再次是漏了 <code>pack</code> 或没刷机</td><td>用<strong>无参 <code>./build.sh</code></strong> ＋ <code>./build.sh pack</code>；先按 §2.3 ② 用 <code>grep</code> 确认 <code>.img</code> 里已是 <code>t113</code>、<code>TQ113</code> 计数为 <code>0</code>，再刷机</td></tr>
+<tr><td>改了 <code>rootfs_overlay</code> 里的文件，<strong>每次烧完都是旧值</strong></td><td>打包输入 <code>out/.../buildroot/rootfs.ext4</code> 是陈旧的 —— 用 <code>ls -la</code> 对比：它比 <code>out/.../buildroot/buildroot/target/</code> 旧，就说明 <code>pack_buildroot_rootfs()</code> 没跑过</td><td>跑无参 <code>./build.sh</code>（它会调 <code>pack_buildroot_rootfs()</code> 刷新 <code>rootfs.ext4</code>），再 <code>./build.sh pack</code></td></tr>
 <tr><td>提示符名字对了，但别的程序还报旧名</td><td><code>hosts</code> 没跟着改</td><td>补 <code>sed -i 's|TQ113|t113|' &lt;ETC&gt;/hosts</code> 再重编</td></tr>
 <tr><td>改完<strong>登录不上</strong></td><td>哈希写坏：多半是<strong>在双引号里粘贴了带 <code>$</code> 的哈希</strong>被 shell 展开</td><td>用 §3 的 <code>$(openssl ...)</code> 写法；核对时确认哈希只由 <code>[./0-9A-Za-z$]</code> 组成、<strong>没有引号字符</strong></td></tr>
 <tr><td><code>debugfs</code> 报 <code>Bad magic number in super-block</code></td><td>喂了 <code>out/.../buildroot/rootfs.ext4</code>（Android sparse image）</td><td>改用 <code>out/.../buildroot/buildroot/images/rootfs.ext2</code>（1 GiB 裸 ext4）</td></tr>
@@ -258,7 +285,9 @@ Buildroot 的 <code>Makefile</code> 里也<strong>没有任何 <code>chown</code
 <tr><td>§2.2 的改名 ＋ 改密码命令</td><td><strong>实测通过</strong>（在 <code>/tmp</code> 副本上跑）</td><td><code>passwd</code> → <code>t113:x:0:0:root:/root:/bin/sh</code>；<code>shadow</code> → <code>t113:$1$t113salt$BH93kyL/.APaEiPC8whDh/:1:0:99999:7:::</code>；独立 <code>openssl passwd -1 -salt t113salt '123456'</code> 输出<strong>完全一致</strong>；残留 <code>^root:</code> 行数 <strong>0 / 0</strong></td></tr>
 <tr><td>双引号内嵌套 <code>\"$(...)\"</code>（随机盐）的写法</td><td><strong>实测失败</strong>（已从手册中剔除）</td><td>盐里混进一个 <code>"</code>，得 <code>$1$"af59ccb$...</code> ⇒ 哈希无效、改完登录不上</td></tr>
 <tr><td>改名安全性</td><td>已核实</td><td>overlay 内 <code>root</code> 全是注释 / 变量名、无 <code>chown root</code>；Buildroot <code>Makefile</code> 里 <code>chown</code> 零命中</td></tr>
-<tr><td>重建 rootfs ＋ <code>pack</code> ＋ 刷机 ＋ 板端确认</td><td><strong>待执行</strong>（由使用者执行；板子不在网）</td><td>§2.3</td></tr>
+<tr><td><strong>只跑 <code>./build.sh buildroot_rootfs</code> ＋ <code>pack</code> 后烧机</strong></td><td><strong>❌ 仍是 <code>TQ113</code></strong>（用户 2026-10-16 反馈）</td><td>三枚文件对照：<code>buildroot/buildroot/images/rootfs.ext2</code>（11:49）里已是 <code>t113</code>；但<strong>打包输入</strong> <code>out/.../buildroot/rootfs.ext4</code> <strong>仍是 10-15 16:56 的旧件</strong>；最终 <code>.img</code>（13:56）里搜到 <code>127.0.1.1&lt;TAB&gt;TQ113</code>、<code>grep -ac "TQ113"</code> ＝ <strong>2</strong></td></tr>
+<tr><td>改走<strong>无参 <code>./build.sh</code></strong> ＋ <code>./build.sh pack</code></td><td><strong>✅ 修好</strong>（2026-10-16 14:05~14:12 实测）</td><td><code>BUILD_EXIT=0</code> / <code>PACK_EXIT=0</code>；打包输入 <code>rootfs.ext4</code> 刷新为 <strong>14:10</strong>；最终 <code>.img</code>（14:12）里 <code>grep -ao "127\.0\.1\.1..."</code> ⇒ <strong><code>127.0.1.1&nbsp;&nbsp;&nbsp;t113</code></strong>，<code>grep -ac "TQ113"</code> ⇒ <strong>0</strong>；耗时 <strong>8 分 27 秒</strong>（build ＋ pack，缓存已就绪）</td></tr>
+<tr><td>刷机 ＋ 板端确认（<code>hostname</code> 与提示符 <code>root@t113:/#</code>）</td><td><strong>待执行</strong>（由使用者执行；板子不在网）</td><td>§2.3 末段</td></tr>
 </tbody>
 </table>
 
@@ -273,8 +302,9 @@ Buildroot 的 <code>Makefile</code> 里也<strong>没有任何 <code>chown</code
 <tr><td>2</td><td>提示符里的主机名来自 <code>\h</code>（不是硬编码）</td><td><strong>【SDK】文件</strong>：<code>rootfs_overlay/etc/profile:10</code> <code>export PS1='\u@\h:\w # '</code></td></tr>
 <tr><td>3</td><td>改 <code>rootfs_overlay/etc/{passwd,shadow}</code></td><td><strong>【SDK】机制</strong>：Buildroot 的 rootfs overlay；实测 <code>out/.../buildroot/target/etc/shadow</code> 与 overlay <strong>逐字节一致</strong></td></tr>
 <tr><td>4</td><td>密码不被 Buildroot 覆盖</td><td><strong>【SDK】配置</strong>：<code>sun8iw20p1_t113_hf_defconfig:344</code> <code>BR2_TARGET_GENERIC_ROOT_PASSWD=""</code>；<code>:343</code> <code>BR2_TARGET_ENABLE_ROOT_LOGIN=y</code></td></tr>
-<tr><td>5</td><td><code>./build.sh buildroot_rootfs</code></td><td><strong>【SDK】target</strong>：<code>build/mkcommon.sh:70</code> 分派 → <code>build/mkcmd.sh:1304 build_buildroot_rootfs()</code></td></tr>
-<tr><td>6</td><td>全量 <code>./build.sh</code> ／ <code>./build.sh pack</code></td><td><strong>【SDK】脚本</strong>：<code>auto_build.sh</code> 第 15、16 行</td></tr>
+<tr><td>5</td><td><strong><code>./build.sh</code>（无参）</strong> —— 本手册 §2.3 采用</td><td><strong>【SDK】脚本</strong>：<code>build/mkcommon.sh:34 ACTION="build_linuxdev;"</code>（无参时的默认动作）→ <code>build/mkcmd.sh:2436 build_linuxdev()</code> → <code>:2483 build_rootfs()</code> → <code>:2295 pack_buildroot_rootfs()</code>（<code>:2201</code>）→ <code>make_ext4()</code>（<code>:2083</code>）写出 <code>out/.../buildroot/rootfs.ext4</code></td></tr>
+<tr><td>6</td><td><code>./build.sh buildroot_rootfs</code>（<strong>本手册明确不采用</strong>）</td><td><strong>【SDK】target</strong>：<code>build/mkcommon.sh:70</code> 直接派发 → <code>build/mkcmd.sh:1304 build_buildroot_rootfs()</code>；<strong>这条链上没有 <code>pack_buildroot_rootfs</code></strong>，故不产出 <code>rootfs.ext4</code></td></tr>
+<tr><td>7</td><td><code>./build.sh pack</code></td><td><strong>【SDK】脚本</strong>：<code>build/mkcommon.sh:80 pack*)</code> → <code>:122 ACTION="mk_pack"</code> → <code>build/mkcmd.sh:2534 mk_pack()</code> → 调 SDK 根目录的 <code>./pack</code>，按分区表把 <code>out/</code> 里<strong>现成的</strong>件打成整包</td></tr>
 <tr><td>7</td><td>串口当前免密（<code>::respawn:-/bin/sh</code>）</td><td><strong>【SDK】文件</strong>：<code>rootfs_overlay/etc/inittab</code> 第 37 行（本手册只作现状说明，不提供改法）</td></tr>
 <tr><td>8</td><td>刷机两种方式</td><td><strong>【官方】</strong>：《TQT113_linux_使用手册》§3.1.2「USB原厂工具更新」、§3.1.5「fastboot更新」（具体命令以官方原文为准）</td></tr>
 <tr><td>9</td><td><code>sed</code> / <code>openssl</code> / <code>debugfs</code> / <code>grep</code> 等命令</td><td><strong>【补充】</strong>：本手册自加的落盘与取证命令，已在 VM 上实测（§5）</td></tr>

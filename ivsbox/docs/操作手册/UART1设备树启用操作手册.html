@@ -262,8 +262,15 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 </tbody>
 </table>
 <blockquote>
-<p><strong>【官方】保底替代（全量，20~40 分钟，最不容易出错）：</strong><code>./auto_build.sh t113_s4 buildroot</code> —— 官方一键脚本，
-等价于 autoconfig ＋ <code>./build.sh</code> ＋ <code>./build.sh pack</code>；它会顺手清空重灌 <code>rootfs_overlay/opt</code>（frpc 在 <code>usr/bin</code>，不受影响）。</p>
+<p><strong>【官方】保底替代（全量，20~40 分钟，最不容易出错）：</strong><code>./auto_build.sh t113_s4 buildroot</code> —— 官方一键脚本。
+实测核对（2026-10-16，读 SDK 里 <code>auto_build.sh</code> 原文）它内部依次做：<code>rm -rf .../tqt113-s3/rootfs_overlay/opt</code> → 从 <code>pda_buildroot_T113.tar.xz</code> 重灌 <code>opt</code> → 拷 <code>test.mp4</code>／<code>webserver</code> →
+<code>source build/envsetup.sh</code> → <code>./build.sh autoconfig -k linux-5.4 -i t113_s4 -b evb1_auto -n default -o buildroot</code> → <code>./build.sh</code>（全量）→ <strong><code>./build.sh pack</code></strong>（脚本内已含打包）。</p>
+<p>⚠ <strong>它和 §6.1 是「二选一」，不要串着跑：</strong>
+① 已跑过 §6.1 的 <code>./build.sh kernel</code> ＋ <code>./build.sh pack</code> ⇒ <strong>不需要</strong>再跑 <code>auto_build.sh</code>（跑了＝全量重编一遍再打一次包，白等 20~40 分钟）；
+② 反过来跑了 <code>auto_build.sh</code> ⇒ <strong>不需要</strong>再单独跑 <code>./build.sh pack</code>（脚本里已经有这一步了）。</p>
+<p>⚠ <strong>参数顺序敏感：</strong><code>t113_s4</code> 必须在 <code>buildroot</code> 之前（脚本是先 <code>boardconfig</code> 设 <code>SOC</code> 再 <code>build_linux</code>）；写成 <code>./auto_build.sh buildroot t113_s4</code> 会因 <code>SOC</code> 未设而失败。</p>
+<p>⚠ <strong>它会删掉 <code>rootfs_overlay/opt</code> 再重灌</strong>（脚本第 6~11 行）。实测该目录现有 <code>EmbedSky/</code>、<code>test.mp4</code>、<code>tq_test_main_ota</code>，会被换回出厂内容；<strong>frpc 在 <code>usr/bin/frpc</code>，不受影响</strong>。
+但 <code>ivsbox</code> 的部署口径是<strong>程序落 <code>/opt/ivsbox</code></strong> —— 将来真机上板若走 <code>auto_build.sh</code>，<code>/opt/ivsbox</code> 会被连目录一起删；那种场景请改用 §6.1 的 <code>./build.sh kernel</code>（不碰 rootfs）。</p>
 </blockquote>
 <h3>6.2 只改 dts 时的快速路径 ·【补充】（可选，与 6.1 二选一）</h3>
 <pre><code class="language-bash">./build.sh dts</code></pre>
@@ -358,6 +365,8 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 <tr><td>刷机后 LCD 背光不亮/异常</td><td>§3.3 关掉了 <code>&amp;pwm7</code>，而底板背光正好走 PD22</td><td>硬件冲突：背光与 GPS 二选一，或改用 PE10/PE11 那组脚位</td></tr>
 <tr><td>改了 dts、编译也没报错，但刷完板子还是老样子</td><td>走了 §6.2 的 <code>./build.sh dts</code> 却漏了 <code>./build.sh bootimg</code>；或走了 §6.1 但漏了 <code>pack</code> / 没刷机</td><td>按 §6 两条路<strong>二选一补齐</strong>；用 §7 的计数法自检（<code>boot.img</code> 内应为 2）</td></tr>
 <tr><td><code>./build.sh dts</code> 报 unknown target / 没反应</td><td>该 target 官方文档未收录，个别 SDK 版本可能未提供</td><td>改用官方路径 <code>./build.sh kernel</code>（设备树与内核一起编，等效且不挑版本）</td></tr>
+<tr><td>已经 <code>pack</code> 完了，还要不要再跑 <code>./auto_build.sh t113_s4 buildroot</code></td><td><code>auto_build.sh</code> 内部已含 <code>./build.sh pack</code>（脚本第 16 行），两者是<strong>二选一</strong></td><td><strong>不需要</strong>。跑了它＝全量重编 ＋ 再打一次包（白等 20~40 分钟），而且会 <code>rm -rf rootfs_overlay/opt</code> 重灌（会删掉 <code>/opt/ivsbox</code>）。详见 §6.1 的 ⚠</td></tr>
+<tr><td>反过来：先跑了 <code>auto_build.sh</code>，还要再补 <code>./build.sh pack</code> 吗</td><td>脚本里已经调过 <code>pack</code></td><td>也不需要；<code>pack</code> 幂等，重复跑只是再打一次包、无害但无意义</td></tr>
 </tbody>
 </table>
 
@@ -378,6 +387,7 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 <tr><td>板端验证（<code>/dev/ttySAC1</code> ＋ NMEA）</td><td><strong>待执行</strong></td><td>—</td><td>需刷机；板子当前不在网（192.168.2.120/121/122 均无响应）</td></tr>
 <tr><td>本手册</td><td>已新建</td><td>2026-10-16</td><td>用户要求：HTML 格式、指令全部单条可执行</td></tr>
 <tr><td>官方口径核对（本轮）</td><td>已完成</td><td>2026-10-16 09:04</td><td>按用户要求"指令全部参考官方手册来写"逐条过一遍：① 每条命令加【官方】/【补充】标记；② 新增「命令来源总览」表与 <strong>§12 逐条对照官方来源</strong>（12.1 官方 8 条 / 12.2 补充 8 条）；③ 删掉 §6.1 里官方没有的 <code>source build/envsetup.sh</code>（实测不需要）；④ §6.2 两段重复的 ⚠ 引用块合并为一段；⑤ §8 烧录换成《使用手册》§3.1.2／§3.1.5 两条官方路径。补装实测：无 envsetup 直接跑 <code>./build.sh dts</code> rc=0（17 s）。</td></tr>
+<tr><td>"pack 之后还要不要 auto_build.sh" 核实（本轮）</td><td>已完成</td><td>2026-10-16 09:08</td><td>用户提问后读 SDK 的 <code>auto_build.sh</code> 原文核对：<code>build_linux()</code> ＝ <code>rm -rf .../tqt113-s3/rootfs_overlay/opt</code> ＋ tar 重灌 opt ＋ 拷 test.mp4/webserver ＋ <code>source build/envsetup.sh</code> ＋ <code>./build.sh autoconfig -k linux-5.4 -i ${SOC} -b evb1_auto -n default -o buildroot</code> ＋ <code>./build.sh</code> ＋ <code>./build.sh pack</code>（第 16 行）⇒ <strong>脚本内已含 pack，与 §6.1 二选一</strong>。同步写死 §6.1 的 ⚠ 段、§10 +2 行、§12.1 第 4 条。另核实：参数顺序 <code>t113_s4</code> 必须在 <code>buildroot</code> 前；<code>board/embedsky/</code> 下只有 <code>tqt113-s3</code> 一份 overlay（S3/S4 共用），其 <code>opt/</code> 现有 <code>EmbedSky/</code>、<code>test.mp4</code>、<code>tq_test_main_ota</code>，<code>usr/bin/frpc</code> 存在。</td></tr>
 </tbody>
 </table>
 
@@ -395,7 +405,7 @@ GPS 模组挂在 UART1，引脚 <strong>PD21 / PD22</strong>，链路参数 <str
 <tr><td>1</td><td><code>cd /opt/Embedsky/mount/t113_tina</code></td><td>《系统开发手册》§2.1.5：<em>命令在 SDK 根目录执行</em></td><td>官方写作"SDK 根目录"；本手册给出本机绝对路径。这条只是切目录，也可直接写进下一条命令。</td></tr>
 <tr><td>2</td><td><code>./build.sh kernel</code></td><td>《系统开发手册》§2.1.5：<em>设备树和内核是一起编译的，所以单独编译设备树的方法和单独编译内核一样</em></td><td><strong>原文照抄</strong>，未做任何改写。官方截图里给的产物记为 <code>./out/t113/kernel/staging/boot.img</code>（通用板名），本板实际为 <code>out/t113_s4/kernel/staging/boot.img</code>。</td></tr>
 <tr><td>3</td><td><code>./build.sh pack</code></td><td>《系统开发手册》§2.1.5「修改设备树」的后续打包步骤（SDK 标准打包入口 <code>mk_pack()</code>）；<code>./build.sh --help</code> 用法输出里也列有此 target</td><td>原文照抄。</td></tr>
-<tr><td>4</td><td><code>./auto_build.sh t113_s4 buildroot</code>（§6.1 保底替代）</td><td>SDK 自带一键脚本 <code>auto_build.sh</code>（autoconfig ＋ <code>./build.sh</code> ＋ <code>./build.sh pack</code>）</td><td>官方脚本原文；本手册仅补注它会重灌 <code>rootfs_overlay/opt</code>。</td></tr>
+<tr><td>4</td><td><code>./auto_build.sh t113_s4 buildroot</code>（§6.1 保底替代）</td><td>SDK 自带一键脚本 <code>auto_build.sh</code>：<code>build_linux()</code> 内依次 <code>autoconfig -k linux-5.4 -i t113_s4 -b evb1_auto -n default -o buildroot</code> ＋ <code>./build.sh</code> ＋ <code>./build.sh pack</code></td><td>官方脚本原文，2026-10-16 读文件核对过。<strong>脚本内已含 <code>pack</code>，故与 §6.1 二选一、不要串着跑</strong>；参数顺序 <code>t113_s4</code> 必须在 <code>buildroot</code> 前；它还会 <code>rm -rf rootfs_overlay/opt</code> 再重灌（<strong>会删掉 <code>/opt/ivsbox</code></strong>，frpc 在 <code>usr/bin</code> 不受影响）。</td></tr>
 <tr><td>5</td><td>烧录：<strong>PhoenixSuit</strong>（Windows）/ LiveSuit（Mac、Linux）</td><td>《TQT113_linux_使用手册》§3.1.2「USB原厂工具更新」</td><td>工具路径取自 SDK 自带 <code>tools/tools_win/</code> 下的官方 readme（<code>tools/tools_win/README.txt</code>、<code>tools/tools_win/USB_update_and_produce/readme.txt</code>）：<code>PhoenixSuit1.0.6.rar</code>、<code>PhoenixSuit_CN.msi</code>、LiveSuit 对应 Mac/Linux32/Linux64。</td></tr>
 <tr><td>6</td><td>烧录：<strong>fastboot</strong>（SDK 根自带 <code>fastboot.exe</code> / <code>fastboot</code>）</td><td>《TQT113_linux_使用手册》§3.1.5「fastboot更新」</td><td><strong>具体命令（分区名、参数）本手册不复写，以官方 §3.1.5 原文为准</strong>，避免转述走样。USB 驱动：<code>tools/tools_win/USBDriver.rar</code>、<code>tools/tools_win/ALLWINNER_RNDIS_WINDOWS_DRIVER.rar</code>。</td></tr>
 <tr><td>7</td><td>要改的文件：<code>.../kernel/linux-5.4/arch/arm/boot/dts/board.dts</code></td><td>《系统开发手册》§2.1.1「常用配置文件介绍」把它列为<strong>内核设备树</strong></td><td>原文照抄；本手册另用 dtb 反编译（含 <code>c906_ddr</code> 节点）实证了"编进固件的就是这份"，见 §1。</td></tr>

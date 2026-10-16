@@ -17,6 +17,15 @@
  * 到期时间固定 8 小时，不滑动续期（嵌入式下"一直有效"比"够久"更危险）。
  * 表满时**挤掉最早到期的那个**，而不是拒绝登录 —— 拒绝会让"忘了登出"的用户
  * 再也进不来，而挤掉最多让另一个人重新登录一次。
+ *
+ * ============================ M10：账号 ＋ 出厂默认口令闸门 ============================
+ * 登录体由 `{"pass":...}` 变为 `{"user":...,"pass":...}`；比对的是
+ * `iv_web_pass_hash()` 的摘要（`ctx->pass_hash`），**不是明文**（内存里也没有明文，
+ * 见 iv_web_pass.c 文件头）。账号错与口令错回**同一句** 401 —— 不告诉试探者
+ * "账号是对的、只差口令"。
+ * `ctx->must_change`（仍在出厂默认口令）为真时，除 `POST /api/passwd` 与
+ * `POST /api/logout` 一律 403 `must change password`。**闸门放服务端**：只做前端提示
+ * 等于没有防线 —— 知道出厂口令的人直接 curl 就能绕过去继续用设备。
  */
 #include <stdio.h>
 #include <string.h>
@@ -192,35 +201,62 @@ static void sess_drop(iv_web_ctx_t *ctx, const char *token)
  * 各接口
  * -------------------------------------------------------------------------- */
 
+/* 定长比较：不因"第几个字节不同"提前收工 —— 口令/摘要比对不给时间侧信道。
+ * 长度不等直接算失败，但**照样走完全程**（提前 return 会把长度也漏出去）。 */
+static int same_secret(const char *a, const char *b)
+{
+    size_t        i;
+    size_t        la = (a != NULL) ? strlen(a) : 0u;
+    size_t        lb = (b != NULL) ? strlen(b) : 0u;
+    unsigned char diff = (la == lb) ? 0u : 1u;
+
+    for (i = 0; i < la; i++)
+        diff |= (unsigned char)((unsigned char)a[i] ^ (unsigned char)b[(i < lb) ? i : 0u]);
+    return diff == 0u;
+}
+
 static int api_login(iv_web_ctx_t *ctx, const iv_web_req_t *req,
                      char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp)
 {
     json_object *o = body_json(req);
     const char  *pass = NULL;
+    const char  *user = NULL;
+    char         hex[IV_WEB_PASS_HEX_MAX];
     char         tok[IV_WEB_TOKEN_MAX];
+    int          ok;
 
     if (o != NULL) {
         json_object *v = NULL;
 
+        if (json_object_object_get_ex(o, "user", &v) && v != NULL)
+            user = json_object_get_string(v);
+        v = NULL;
         if (json_object_object_get_ex(o, "pass", &v) && v != NULL)
             pass = json_object_get_string(v);
     }
-    if (pass == NULL || strcmp(pass, ctx->pass) != 0) {
-        if (o != NULL)
-            json_object_put(o);
+    ok = (user != NULL) && (pass != NULL) && same_secret(user, ctx->user);
+    if (ok) {
+        iv_web_pass_hash(ctx->user, pass, hex);
+        ok = same_secret(hex, ctx->pass_hash);
+    }
+    if (o != NULL)
+        json_object_put(o);
+    if (!ok) {
+        /* 账号错 / 口令错 / 少字段 —— 同一句，且不区分（见文件头）。 */
         *out_len = api_err(out, cap, IV_EAUTH, "bad password");
         rsp->status = 401;
         (void)snprintf(rsp->ctype, sizeof(rsp->ctype), "application/json");
         rsp->len = *out_len;
         return IV_OK;
     }
-    if (o != NULL)
-        json_object_put(o);
 
     iv_web_sess_new(ctx, tok, sizeof(tok));
     rsp->set_cookie = 1;
     (void)snprintf(rsp->cookie, sizeof(rsp->cookie), "ivs_sid=%s; Path=/; HttpOnly", tok);
-    *out_len = (size_t)snprintf(out, cap, "{\"ok\":true,\"d\":{\"token\":\"%s\"}}", tok);
+    /* must_change 一并告诉前端：它据此直接切到"修改密码"视图，不用再探一次。 */
+    *out_len = (size_t)snprintf(out, cap,
+                                "{\"ok\":true,\"d\":{\"token\":\"%s\",\"must_change\":%s}}",
+                                tok, (ctx->must_change != 0) ? "true" : "false");
     (void)to_rsp(out, cap, out_len, rsp);
     return IV_OK;
 }
@@ -317,6 +353,87 @@ static int api_snmp_get(iv_web_ctx_t *ctx, const iv_web_req_t *req,
 }
 
 /* --------------------------------------------------------------------------
+ * 改密（M10）
+ * -------------------------------------------------------------------------- */
+static int api_passwd(iv_web_ctx_t *ctx, const iv_web_req_t *req,
+                      char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp)
+{
+    json_object *o = body_json(req);
+    const char  *nw = NULL;
+    const char  *old = NULL;
+    char         hex[IV_WEB_PASS_HEX_MAX];
+
+    if (o != NULL) {
+        json_object *v = NULL;
+
+        if (json_object_object_get_ex(o, "new", &v) && v != NULL)
+            nw = json_object_get_string(v);
+        v = NULL;
+        if (json_object_object_get_ex(o, "old", &v) && v != NULL)
+            old = json_object_get_string(v);
+    }
+
+    /* 1. 复杂度：服务端判（前端那份只是即时提示，**不是**闸门）。 */
+    if (iv_web_pass_rule(nw) != IV_OK) {
+        if (o != NULL)
+            json_object_put(o);
+        *out_len = api_err(out, cap, IV_EINVAL, IV_WEB_PASS_HINT_JSON);
+        rsp->status = 400;
+        rsp->len = *out_len;
+        return IV_OK;
+    }
+
+    /* 2. 非强制改密必须校验旧口令：会话可能是别人替你留下的，而改密是提权动作。
+     *    强制改密（must_change=1）路径**不校验**：用户刚用出厂口令登进来，
+     *    再让他抄一遍出厂口令没有意义（参考实现也是只给一个"新密码"字段）。 */
+    if (ctx->must_change == 0) {
+        if (old == NULL) {
+            if (o != NULL)
+                json_object_put(o);
+            *out_len = api_err(out, cap, IV_EINVAL, "old password required");
+            rsp->status = 400;
+            rsp->len = *out_len;
+            return IV_OK;
+        }
+        iv_web_pass_hash(ctx->user, old, hex);
+        if (!same_secret(hex, ctx->pass_hash)) {
+            if (o != NULL)
+                json_object_put(o);
+            *out_len = api_err(out, cap, IV_EAUTH, "bad password");
+            rsp->status = 401;
+            rsp->len = *out_len;
+            return IV_OK;
+        }
+    }
+
+    /* 3. **先落盘、再提交内存**：落盘失败就整体失败。反过来（先改内存再落盘）会
+     *    产出"改成功了、重启又变回出厂口令"——现场说不清也查不出。
+     *    未配置落盘（验证场景）按成功处理，只在日志里留一句。 */
+    iv_web_pass_hash(ctx->user, nw, hex);
+    {
+        int rc = iv_web_pass_save(ctx, ctx->user, hex);
+
+        if (rc != IV_OK && rc != IV_ENOTSUP) {
+            if (o != NULL)
+                json_object_put(o);
+            *out_len = api_err(out, cap, rc, "cannot save password");
+            rsp->status = 500;
+            rsp->len = *out_len;
+            return IV_OK;
+        }
+    }
+    if (o != NULL)
+        json_object_put(o);
+    (void)snprintf(ctx->pass_hash, sizeof(ctx->pass_hash), "%s", hex);
+    ctx->must_change = 0;
+    *out_len = (size_t)snprintf(out, cap, "{\"ok\":true}");
+    rsp->status = 200;
+    (void)snprintf(rsp->ctype, sizeof(rsp->ctype), "application/json");
+    rsp->len = *out_len;
+    return IV_OK;
+}
+
+/* --------------------------------------------------------------------------
  * 入口
  * -------------------------------------------------------------------------- */
 int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
@@ -348,6 +465,25 @@ int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
         return IV_OK;
     }
 
+    /* 出厂默认口令期：只放行"改密"与"登出"（M10）。前端拿这个 403 切到改密视图。 */
+    if (ctx->must_change != 0 &&
+        strcmp(req->path, "/api/passwd") != 0 &&
+        strcmp(req->path, "/api/logout") != 0) {
+        *out_len = api_err(out, cap, IV_ESTATE, "must change password");
+        rsp->status = 403;
+        rsp->len = *out_len;
+        return IV_OK;
+    }
+
+    if (strcmp(req->path, "/api/passwd") == 0) {
+        if (strcmp(req->method, "POST") != 0) {
+            *out_len = api_err(out, cap, IV_EINVAL, "POST required");
+            rsp->status = 405;
+            rsp->len = *out_len;
+            return IV_OK;
+        }
+        return api_passwd(ctx, req, out, cap, out_len, rsp);
+    }
     if (strcmp(req->path, "/api/logout") == 0)
         return api_logout(ctx, req, out, cap, out_len, rsp);
     if (strcmp(req->path, "/api/overview") == 0)

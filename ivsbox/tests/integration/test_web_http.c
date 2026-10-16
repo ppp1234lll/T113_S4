@@ -396,7 +396,7 @@ int main(int argc, char *argv[])
         size_t len;
         int    n;
 
-        blen = snprintf(body, sizeof(body), "{\"pass\":\"testpass\"}");
+        blen = snprintf(body, sizeof(body), "{\"user\":\"admin\",\"pass\":\"testpass\"}");
         n = snprintf(g_req, sizeof(g_req),
                      "POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\n"
                      "Content-Type: application/json\r\n"
@@ -425,7 +425,7 @@ int main(int argc, char *argv[])
         size_t len;
         int    n;
 
-        blen = snprintf(body, sizeof(body), "{\"pass\":\"testpass\"}");
+        blen = snprintf(body, sizeof(body), "{\"user\":\"admin\",\"pass\":\"testpass\"}");
         n = snprintf(g_req, sizeof(g_req),
                      "POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\n"
                      "Content-Length: %d\r\nConnection: close\r\n\r\n", blen);
@@ -441,10 +441,10 @@ int main(int argc, char *argv[])
         chk(cl > 0 && cl == bl, "w03b: body fully delivered after three-way split");
     }
 
-    /* ---------------- w04 口令错：401 + 有正文 ---------------- */
+    /* ---------------- w04 账号对、口令错：401 + 有正文 ---------------- */
     {
         char body[64];
-        int  blen = snprintf(body, sizeof(body), "{\"pass\":\"nope\"}");
+        int  blen = snprintf(body, sizeof(body), "{\"user\":\"admin\",\"pass\":\"nope\"}");
         int  n = snprintf(g_req, sizeof(g_req),
                           "POST /api/login HTTP/1.1\r\nHost: x\r\n"
                           "Content-Length: %d\r\nConnection: close\r\n\r\n", blen);

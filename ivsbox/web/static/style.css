@@ -189,3 +189,20 @@ button[disabled] { opacity: .5; cursor: not-allowed; }
 }
 .badge.ok { background: #e6f4ec; color: var(--ok); }
 .badge.err { background: #fbeae8; color: var(--err); }
+
+/* ---------------- 改密卡片（M10） ---------------- */
+/* 密码规则要"整块照抄"，用 <pre> 才能保住换行（服务端那句提示本身就是多行的）。 */
+.login-box .rule {
+  margin: 12px 0 0;
+  padding: 8px 10px;
+  background: #fafbfc;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+/* 服务端回的错误/提示里带换行（例如规则原文），别把它挤成一行 */
+.login-box .msg { white-space: pre-line; }

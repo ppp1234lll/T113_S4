@@ -443,7 +443,7 @@ int main(int argc, char *argv[])
     cookie[0] = '\0';
     {
         char body[64];
-        int  blen = snprintf(body, sizeof(body), "{\"pass\":\"testpass\"}");
+        int  blen = snprintf(body, sizeof(body), "{\"user\":\"admin\",\"pass\":\"testpass\"}");
         int  n = snprintf(g_req, sizeof(g_req),
                           "POST /api/login HTTP/1.1\r\nHost: x\r\n"
                           "Content-Length: %d\r\nConnection: close\r\n\r\n", blen);

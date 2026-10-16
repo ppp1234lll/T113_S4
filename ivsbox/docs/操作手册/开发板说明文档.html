@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>开发板说明文档</title>
+<style>
+:root{
+  --fg:#1f2328; --fg-soft:#57606a; --bg:#ffffff; --panel:#f6f8fa;
+  --border:#d0d7de; --accent:#0969da; --warn-bg:#fff8e5; --warn-bd:#d4a72c;
+  --code-fg:#0550ae;
+}
+*{box-sizing:border-box;}
+html{-webkit-text-size-adjust:100%;}
+body{
+  margin:0; padding:0; background:var(--bg); color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",
+    "Microsoft YaHei","PingFang SC","Hiragino Sans GB",Roboto,Helvetica,Arial,sans-serif;
+  font-size:16px; line-height:1.85; word-wrap:break-word;
+}
+.wrap{max-width:940px; margin:0 auto; padding:40px 32px 80px;}
+header.doc{border-bottom:2px solid var(--border); padding-bottom:16px; margin-bottom:26px;}
+header.doc h1{margin:0 0 10px; font-size:26px; line-height:1.35;}
+header.doc .meta{color:var(--fg-soft); font-size:13.5px; line-height:1.7;}
+h2{margin:36px 0 14px; padding-bottom:7px; font-size:20px; border-bottom:1px solid var(--border);}
+h3{margin:26px 0 10px; font-size:17px;}
+h4{margin:20px 0 8px; font-size:15px;}
+p{margin:12px 0;}
+ul,ol{margin:12px 0; padding-left:26px;}
+li{margin:6px 0;}
+strong{font-weight:600;}
+hr{border:0; border-top:1px solid var(--border); margin:32px 0;}
+code{
+  font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,"Courier New",
+    "Microsoft YaHei",monospace;
+  font-size:13.5px; background:var(--panel); color:var(--code-fg);
+  padding:.15em .4em; border-radius:4px; border:1px solid rgba(0,0,0,.04);
+}
+pre{
+  background:var(--panel); border:1px solid var(--border); border-radius:8px;
+  padding:12px 16px; overflow-x:auto; margin:12px 0; line-height:1.6;
+}
+pre code{background:none; border:0; padding:0; color:var(--fg); font-size:13.5px;}
+blockquote{
+  margin:14px 0; padding:12px 18px; color:var(--fg);
+  background:var(--warn-bg); border-left:4px solid var(--warn-bd); border-radius:0 6px 6px 0;
+}
+blockquote p{margin:6px 0;}
+blockquote p:first-child{margin-top:0;}
+blockquote p:last-child{margin-bottom:0;}
+table{border-collapse:collapse; width:100%; margin:16px 0; font-size:15px;}
+th,td{border:1px solid var(--border); padding:8px 12px; text-align:left; vertical-align:top;}
+th{background:var(--panel); font-weight:600; white-space:nowrap;}
+tbody tr:nth-child(even){background:#fbfcfd;}
+td code{white-space:nowrap;}
+footer.doc{margin-top:52px; padding-top:16px; border-top:1px solid var(--border);
+  color:var(--fg-soft); font-size:13px;}
+@media (max-width:700px){
+  .wrap{padding:24px 16px 60px;}
+  table{display:block; overflow-x:auto;}
+}
+@media print{
+  body{font-size:11pt;}
+  .wrap{max-width:none; padding:0;}
+  pre,blockquote,table{page-break-inside:avoid;}
+  h2{page-break-after:avoid;}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="doc">
+  <h1>开发板说明文档</h1>
+  <div class="meta">TQT113 开发板 · 2026-10-16 · 面向现场使用人员</div>
+</header>
+
+<blockquote>
+<p>连板子：账号 <code>root</code>，密码 <code>embedsky</code>（用串口线连的话不用密码）。</p>
+<p>看参数：参数都在 <code>/opt/EmbedSky/config/</code> 里，用 <code>cat</code> 就能看。</p>
+<p>看网页：浏览器打开 <code>http://板子IP/</code>（管理页默认 <code>admin</code> / <code>88888888</code>，首次登录必须改密码）。</p>
+</blockquote>
+
+<hr />
+
+<h2>1. 怎么登录开发板</h2>
+
+<table>
+<thead><tr><th>连接方式</th><th>地址</th><th>账号</th><th>密码</th></tr></thead>
+<tbody>
+<tr><td>串口线</td><td>串口 115200 8N1</td><td><code>root</code></td><td><strong>不用密码</strong>，接上直接进去</td></tr>
+<tr><td>网线 + SSH</td><td>板子的 IP</td><td><code>root</code></td><td><code>embedsky</code></td></tr>
+<tr><td>网线 + Telnet</td><td>板子的 IP</td><td><code>root</code></td><td><code>embedsky</code></td></tr>
+</tbody>
+</table>
+
+<p><strong>板子的 IP 是多少：</strong>本产品规定板子使用<strong>固定 IP</strong>（不由路由器自动分配），
+默认 <code>192.168.1.64</code>，怎么设置见第 2.5 节。</p>
+<p>想在板子上确认当前地址，接串口进去后敲：</p>
+<pre><code>ip addr show eth0</code></pre>
+<p>看 <code>inet</code> 后面那一串就是。</p>
+
+<p><strong>改密码：</strong>连上后敲 <code>passwd</code>，按提示输两遍新密码即可。</p>
+
+<hr />
+
+<h2>2. 设备参数一览（全部字段与出厂默认值）</h2>
+
+<h3>2.1 参数放在哪里、怎么看怎么改</h3>
+
+<p>全部参数都在 <code>/opt/EmbedSky/config/</code> 目录下，一共三个文件：</p>
+
+<table>
+<thead><tr><th>文件</th><th>里面是什么</th></tr></thead>
+<tbody>
+<tr><td><code>EmbedSkyProgress.ini</code></td><td><strong>主要参数</strong>：网络、时间、看门狗、升级、开机自启程序</td></tr>
+<tr><td><code>EmbedSky.ini</code></td><td>设备平台型号、GPIO 引脚</td></tr>
+<tr><td><code>appinit.ini</code></td><td>桌面上那些图标的清单</td></tr>
+</tbody>
+</table>
+
+<p><strong>查看</strong>（在板子上敲，三个文件同理）：</p>
+<pre><code>cat /opt/EmbedSky/config/EmbedSkyProgress.ini</code></pre>
+
+<p><strong>修改</strong>：用 <code>vi</code> 打开改，改完重启。</p>
+<pre><code>vi /opt/EmbedSky/config/EmbedSkyProgress.ini</code></pre>
+<pre><code>reboot</code></pre>
+
+<p>板子桌面上也有自带的设置程序（Network、SystemInfo 等），点着改和手工改是<strong>同一份数据</strong>，用哪个都行。</p>
+
+<h3>2.2 主要参数：EmbedSkyProgress.ini</h3>
+
+<p>下表是<strong>这个文件的全部内容</strong>，一行都不缺。"出厂默认值"就是板子刚烧完时的值。</p>
+
+<h4>[network_0] —— 第 0 个网口（eth0）</h4>
+<table>
+<thead><tr><th>字段名</th><th>出厂默认值</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>device_node</code></td><td><code>eth0</code></td><td>网卡名</td></tr>
+<tr><td><code>enable</code></td><td><code>1</code></td><td>是否启用本段配置。<code>1</code>＝启用（本产品用这个）</td></tr>
+<tr><td><code>ip_mode</code></td><td><code>staticIp</code></td><td>取 IP 的方式。<code>udhcpc</code>＝自动获取，<code>staticIp</code>＝用下面的固定 IP（本产品用这个）</td></tr>
+<tr><td><code>ip</code></td><td><code>192.168.1.64</code></td><td>固定 IP 地址（自动获取时不生效）</td></tr>
+<tr><td><code>netmask</code></td><td><code>255.255.255.0</code></td><td>子网掩码</td></tr>
+<tr><td><code>gateway</code></td><td><code>192.168.1.2</code></td><td>网关</td></tr>
+<tr><td><code>dns</code></td><td><code>114.114.114.114</code></td><td>DNS 服务器</td></tr>
+<tr><td><code>mac_mode</code></td><td><code>cpuid</code></td><td>MAC 的来源。<code>cpuid</code>＝按 CPU 编号自动生成</td></tr>
+<tr><td><code>mac</code></td><td><code>2E:A2:9E:EF:43:43</code></td><td>MAC 地址（<code>mac_mode=cpuid</code> 时不生效）</td></tr>
+</tbody>
+</table>
+
+<h4>[network_1] —— 第 1 个网口（eth1）</h4>
+<p>本板没有第二个网口，所以这一段出厂只有网卡名和模式，其余留空、不启用。</p>
+<table>
+<thead><tr><th>字段名</th><th>出厂默认值</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>device_node</code></td><td><code>eth1</code></td><td>网卡名</td></tr>
+<tr><td><code>enable</code></td><td><code>0</code></td><td>不启用</td></tr>
+<tr><td><code>ip_mode</code></td><td><code>udhcpc</code></td><td>自动获取</td></tr>
+<tr><td><code>ip</code></td><td>（空）</td><td>未填</td></tr>
+<tr><td><code>netmask</code></td><td>（空）</td><td>未填</td></tr>
+<tr><td><code>gateway</code></td><td>（空）</td><td>未填</td></tr>
+<tr><td><code>dns</code></td><td>（空）</td><td>未填</td></tr>
+<tr><td><code>mac_mode</code></td><td><code>cpuid</code></td><td>按 CPU 编号自动生成</td></tr>
+<tr><td><code>mac</code></td><td>（空）</td><td>未填</td></tr>
+</tbody>
+</table>
+
+<h4>[system] —— 系统</h4>
+<table>
+<thead><tr><th>字段名</th><th>出厂默认值</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>datetime_enable_p</code></td><td><code>0</code></td><td>开机是否强制设成下面的固定时间。<code>0</code>＝否</td></tr>
+<tr><td><code>datetime</code></td><td><code>2020-02-18 15:55:11</code></td><td>固定时间值</td></tr>
+<tr><td><code>nettiming_enable_p</code></td><td><code>1</code></td><td>是否开网络校时（NTP）。<code>1</code>＝开</td></tr>
+<tr><td><code>nettiming_server</code></td><td><code>ntp.sjtu.edu.cn</code></td><td>NTP 服务器地址</td></tr>
+<tr><td><code>led_enable_p</code></td><td><code>0</code></td><td>是否启用指示灯。<code>0</code>＝关</td></tr>
+<tr><td><code>led_select</code></td><td><code>led1</code></td><td>用哪一个指示灯</td></tr>
+<tr><td><code>network_num</code></td><td><code>1</code></td><td>启用几段网络配置。<code>1</code>＝只用 <code>[network_0]</code> 这一段</td></tr>
+</tbody>
+</table>
+
+<h4>[bootapp] —— 开机自动运行的程序</h4>
+<table>
+<thead><tr><th>字段名</th><th>出厂默认值</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>bootapp_num</code></td><td><code>1</code></td><td>自动启动几个程序</td></tr>
+<tr><td><code>bootapp_name1</code></td><td><code>/opt/EmbedSky/bin/TQPDA_Main</code></td><td>第 1 个自启程序（就是那个桌面）</td></tr>
+</tbody>
+</table>
+
+<h4>[watchdog] —— 看门狗</h4>
+<table>
+<thead><tr><th>字段名</th><th>出厂默认值</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>rootfswd_enable_p</code></td><td><code>0</code></td><td>根文件系统看门狗。<code>0</code>＝关</td></tr>
+<tr><td><code>rootfs_timeout</code></td><td><code>5</code></td><td>上面那个的超时时间（秒）</td></tr>
+<tr><td><code>sofewardWD_enable_p</code></td><td><code>1</code></td><td>软件看门狗。<code>1</code>＝开</td></tr>
+<tr><td><code>softward_timeout</code></td><td><code>10</code></td><td>软件看门狗超时时间（秒）</td></tr>
+<tr><td><code>softward_interval</code></td><td><code>3</code></td><td>喂狗间隔（秒）</td></tr>
+</tbody>
+</table>
+<p>注：字段名里的 <code>sofeward</code> 是文件里原本的拼写，照抄即可，别"改错别字"。</p>
+
+<h4>[ota] —— 升级</h4>
+<table>
+<thead><tr><th>字段名</th><th>出厂默认值</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>ota_local_enable_p</code></td><td><code>0</code></td><td>本地升级。<code>0</code>＝关</td></tr>
+<tr><td><code>ota_name</code></td><td><code>TQT113</code></td><td>升级包识别名</td></tr>
+<tr><td><code>ota_network_enable_p</code></td><td><code>0</code></td><td>网络升级。<code>0</code>＝关</td></tr>
+<tr><td><code>ip_port</code></td><td><code>http://192.168.1.96/</code></td><td>升级服务器地址</td></tr>
+</tbody>
+</table>
+
+<h3>2.3 平台信息：EmbedSky.ini</h3>
+
+<table>
+<thead><tr><th>段</th><th>字段名</th><th>出厂默认值</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>[SYSTEM]</code></td><td><code>platform</code></td><td><code>"T113"</code></td><td>芯片平台型号</td></tr>
+<tr><td><code>[gpio]</code></td><td><code>status</code></td><td><code>true</code></td><td>是否启用下面的 GPIO 列表</td></tr>
+<tr><td><code>[gpio]</code></td><td><code>file</code></td><td><code>"/sys/class/gpio"</code></td><td>GPIO 目录</td></tr>
+<tr><td><code>[gpio]</code></td><td><code>io</code></td><td><code>"P05,P06,P07,P10,P11,P12,P13,P14,P15,P16,P17"</code></td><td>11 个引脚名</td></tr>
+<tr><td><code>[gpio]</code></td><td><code>id</code></td><td><code>"405,406,407,408,409,410,411,412,413,414,415"</code></td><td>引脚编号，与上面一一对应</td></tr>
+</tbody>
+</table>
+<p>注：值外面带双引号是文件里原本就有的。</p>
+
+<h3>2.4 桌面菜单：appinit.ini</h3>
+
+<p>这个文件里每一项都是固定的三个字段：<code>icon</code>（图标）、<code>path</code>（程序路径）、
+<code>args</code>（启动参数，30 项全部都是 <code>-l//cn</code>，下表不再重复列）。一共 30 项：</p>
+
+<table>
+<thead><tr><th>菜单项（段名）</th><th>icon 图标</th><th>path 程序</th></tr></thead>
+<tbody>
+<tr><td><code>[Backlight]</code></td><td><code>/opt/EmbedSky/jpg/bl.png</code></td><td><code>/opt/EmbedSky/bin/tqbacklight</code></td></tr>
+<tr><td><code>[Buttons]</code></td><td><code>/opt/EmbedSky/jpg/button.png</code></td><td><code>/opt/EmbedSky/bin/tqbuttons</code></td></tr>
+<tr><td><code>[Camera]</code></td><td><code>/opt/EmbedSky/jpg/camera.png</code></td><td><code>/opt/EmbedSky/bin/tqcamera</code></td></tr>
+<tr><td><code>[Can]</code></td><td><code>/opt/EmbedSky/jpg/can.png</code></td><td><code>/opt/EmbedSky/bin/tqcan</code></td></tr>
+<tr><td><code>[Chart]</code></td><td><code>/opt/EmbedSky/jpg/charts.png</code></td><td><code>/opt/EmbedSky/bin/tqchart</code></td></tr>
+<tr><td><code>[File]</code></td><td><code>/opt/EmbedSky/jpg/file.png</code></td><td><code>/opt/EmbedSky/bin/tqfilebrowser</code></td></tr>
+<tr><td><code>[Gpio]</code></td><td><code>/opt/EmbedSky/jpg/gpio.png</code></td><td><code>/opt/EmbedSky/bin/tqgpio</code></td></tr>
+<tr><td><code>[Gsm]</code></td><td><code>/opt/EmbedSky/jpg/4g.png</code></td><td><code>/opt/EmbedSky/bin/tqgsm</code></td></tr>
+<tr><td><code>[HelloGl2]</code></td><td><code>/opt/EmbedSky/jpg/opengl2.png</code></td><td><code>/opt/EmbedSky/bin/TQHelloGl2</code></td></tr>
+<tr><td><code>[TQHttp]</code></td><td><code>/opt/EmbedSky/jpg/http.png</code></td><td><code>/opt/EmbedSky/bin/tqhttp</code></td></tr>
+<tr><td><code>[I2c]</code></td><td><code>/opt/EmbedSky/jpg/i2c.png</code></td><td><code>/opt/EmbedSky/bin/tqi2c</code></td></tr>
+<tr><td><code>[Network]</code></td><td><code>/opt/EmbedSky/jpg/network.png</code></td><td><code>/opt/EmbedSky/bin/tqnetwork</code></td></tr>
+<tr><td><code>[Ping]</code></td><td><code>/opt/EmbedSky/jpg/networktest.png</code></td><td><code>/opt/EmbedSky/bin/TQNetworkTest</code></td></tr>
+<tr><td><code>[Picture]</code></td><td><code>/opt/EmbedSky/jpg/pic.png</code></td><td><code>/opt/EmbedSky/bin/tqpicture</code></td></tr>
+<tr><td><code>[Rtc]</code></td><td><code>/opt/EmbedSky/jpg/rtc.png</code></td><td><code>/opt/EmbedSky/bin/TQRtc</code></td></tr>
+<tr><td><code>[Spi]</code></td><td><code>/opt/EmbedSky/jpg/spi.png</code></td><td><code>/opt/EmbedSky/bin/tqspi</code></td></tr>
+<tr><td><code>[Sql]</code></td><td><code>/opt/EmbedSky/jpg/sql.png</code></td><td><code>/opt/EmbedSky/bin/TQSqlTest</code></td></tr>
+<tr><td><code>[SystemInfo]</code></td><td><code>/opt/EmbedSky/jpg/systemInfo.png</code></td><td><code>/opt/EmbedSky/bin/TQSystemInfo</code></td></tr>
+<tr><td><code>[Terminal]</code></td><td><code>/opt/EmbedSky/jpg/term.png</code></td><td><code>/opt/EmbedSky/bin/TQTerminal</code></td></tr>
+<tr><td><code>[Uart]</code></td><td><code>/opt/EmbedSky/jpg/uart.png</code></td><td><code>/opt/EmbedSky/bin/tquart</code></td></tr>
+<tr><td><code>[WatchDog]</code></td><td><code>/opt/EmbedSky/jpg/watchDog.png</code></td><td><code>/opt/EmbedSky/bin/TQWatchDogClientTest</code></td></tr>
+<tr><td><code>[Wifi]</code></td><td><code>/opt/EmbedSky/jpg/wifi.png</code></td><td><code>/opt/EmbedSky/bin/tqwifi</code></td></tr>
+<tr><td><code>[Media]</code></td><td><code>/opt/EmbedSky/jpg/tqmediaplayer.png</code></td><td><code>/opt/EmbedSky/bin/tqmediaplayer</code></td></tr>
+<tr><td><code>[Adc]</code></td><td><code>/opt/EmbedSky/jpg/adc.png</code></td><td><code>/opt/EmbedSky/bin/TQAdc</code></td></tr>
+<tr><td><code>[BuleTooth]</code></td><td><code>/opt/EmbedSky/jpg/Bluetooth.png</code></td><td><code>/opt/EmbedSky/bin/TQBuleTooth</code></td></tr>
+<tr><td><code>[MultiScreen]</code></td><td><code>/opt/EmbedSky/jpg/MultiScreenDisplay.png</code></td><td><code>/opt/EmbedSky/bin/TQMultiScreenDisplay</code></td></tr>
+<tr><td><code>[ScreenTest]</code></td><td><code>/opt/EmbedSky/jpg/screenTest.png</code></td><td><code>/opt/EmbedSky/bin/ScreenDisplayTest</code></td></tr>
+<tr><td><code>[FontTest]</code></td><td><code>/opt/EmbedSky/jpg/fontTest.png</code></td><td><code>/opt/EmbedSky/bin/TQFontSet</code></td></tr>
+<tr><td><code>[TouchTest]</code></td><td><code>/opt/EmbedSky/jpg/touchTest.png</code></td><td><code>/opt/EmbedSky/bin/paint</code></td></tr>
+<tr><td><code>[autoTest]</code></td><td><code>/opt/EmbedSky/jpg/autoTest.png</code></td><td><code>/opt/EmbedSky/bin/TqTestTools/test_mainform</code></td></tr>
+</tbody>
+</table>
+<p>注：<code>[BuleTooth]</code> 是文件里原本的拼写（少了 t），照抄即可。</p>
+
+<h3>2.5 网络：只使用固定 IP（不用自动获取）</h3>
+
+<p>本产品规定板子使用<strong>固定 IP</strong>，不由路由器自动分配。相关字段都在
+<code>EmbedSkyProgress.ini</code> 里，取值如下：</p>
+
+<table>
+<thead><tr><th>段</th><th>字段名</th><th>应设为</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>[network_0]</code></td><td><code>enable</code></td><td><code>1</code></td><td>启用本段网络配置</td></tr>
+<tr><td><code>[network_0]</code></td><td><code>ip_mode</code></td><td><code>staticIp</code></td><td>取值就是 <code>staticIp</code>，不要写 <code>udhcpc</code></td></tr>
+<tr><td><code>[network_0]</code></td><td><code>ip</code></td><td><code>192.168.1.64</code></td><td>板子固定 IP（按现场实际填）</td></tr>
+<tr><td><code>[network_0]</code></td><td><code>netmask</code></td><td><code>255.255.255.0</code></td><td>子网掩码</td></tr>
+<tr><td><code>[network_0]</code></td><td><code>gateway</code></td><td><code>192.168.1.2</code></td><td>网关</td></tr>
+<tr><td><code>[network_0]</code></td><td><code>dns</code></td><td><code>114.114.114.114</code></td><td>DNS 服务器</td></tr>
+<tr><td><code>[system]</code></td><td><code>network_num</code></td><td><code>1</code></td><td>启用 1 段网络配置</td></tr>
+</tbody>
+</table>
+
+<p>改完 <code>reboot</code>。用桌面上的 <code>Network</code> 设置程序改更省事，它会自动帮你写这几个字段。</p>
+
+<p><strong>本版镜像出厂就是上表的取值</strong>：板子一上电就是
+<code>192.168.1.64</code>，<strong>不会去向路由器申请地址</strong>。§2.2 里
+<code>[network_0]</code> 与 <code>network_num</code> 的“出厂默认值”已按同一版镜像更新，两处是一致的。</p>
+
+<p>要接到别的网段，就改 <code>ip</code>、<code>netmask</code>、<code>gateway</code> 这三项，
+改完重启板子。<strong>IP 改了以后要用新地址访问</strong>（旧地址不再响应）。</p>
+
+<hr />
+
+<h2>3. 网页界面</h2>
+
+<p><strong>出厂自带的网页</strong></p>
+
+<table>
+<thead><tr><th>项目</th><th>内容</th></tr></thead>
+<tbody>
+<tr><td>打开地址</td><td><code>http://板子IP/</code></td></tr>
+<tr><td>账号</td><td>无</td></tr>
+<tr><td>密码</td><td>无</td></tr>
+</tbody>
+</table>
+
+<p>打开就能看，不用登录。</p>
+
+<blockquote>
+<p>注意：这个网页只是天嵌自带的演示页，<strong>不能用它设置设备</strong>。要改参数请看第 2 节。</p>
+</blockquote>
+
+<p><strong>板子上跑我们自己的程序（ivsbox）时：</strong></p>
+
+<table>
+<thead><tr><th>项目</th><th>内容</th></tr></thead>
+<tbody>
+<tr><td>打开地址</td><td><code>http://板子IP/</code></td></tr>
+<tr><td>默认账号</td><td><code>admin</code></td></tr>
+<tr><td>默认密码</td><td><code>88888888</code></td></tr>
+<tr><td>首次登录</td><td><strong>必须先修改密码</strong>，改完才能进其它页面</td></tr>
+<tr><td>密码规则</td><td>长度 <strong>8-12 位</strong>；必须同时包含<strong>大写字母、小写字母、数字</strong></td></tr>
+<tr><td>以后想改密码</td><td>进主界面后点左下角的 <strong>改密</strong>（要先输原密码）</td></tr>
+</tbody>
+</table>
+
+<p>默认密码 <code>88888888</code> 全是数字、不符合上面的规则，所以<strong>第一次登录一定会被要求改密码</strong>，
+这是正常的，不是故障。</p>
+
+<p><strong>新密码格式不符合规则时，页面会弹提示：</strong></p>
+<pre><code>请输入正确的密码格式：
+密码长度:8-12
+密码由数字+大写英文字母+小写英文字母组成</code></pre>
+
+<p>照这个要求重新输入即可。例：<code>Abc12345</code> 符合，<code>88888888</code> 不符合。</p>
+
+<hr />
+
+<h2>4. 常见问题</h2>
+
+<table>
+<thead><tr><th>现象</th><th>怎么办</th></tr></thead>
+<tbody>
+<tr><td>网页打不开、ping 也不通</td><td>先确认板子 IP（见第 1 节），再确认板子已经开机启动完成</td></tr>
+<tr><td>忘了密码</td><td>接串口线直接就能进（不用密码），进去后敲 <code>passwd</code> 重设</td></tr>
+<tr><td>FTP 连不上</td><td>出厂镜像没开 FTP 服务，属正常现象</td></tr>
+<tr><td>参数改了没生效</td><td>需要重启，敲 <code>reboot</code></td></tr>
+<tr><td>参数改乱了想恢复出厂</td><td>照第 2 节"出厂默认值"那一列抄回去，重启即可</td></tr>
+<tr><td>不知道板子 IP 是多少</td><td>板子用固定 IP，默认 <code>192.168.1.64</code>（见第 1 节、第 2.5 节）</td></tr>
+<tr><td>登录后让我改密码</td><td>首次登录必须改密码。新密码 8-12 位，且大写、小写、数字都要有</td></tr>
+</tbody>
+</table>
+
+<footer class="doc">
+  <p>本说明面向现场使用人员。若需要改镜像本身（改账号密码/主机名后重新打包、刷机），见同目录《镜像主机名与账号密码修改操作手册.html》。</p>
+</footer>
+</div>
+</body>
+</html>

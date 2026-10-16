@@ -300,6 +300,12 @@ int iv_web_media_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
         media_err(out, cap, out_len, rsp, 401, "unauthorized");
         return IV_OK;
     }
+    /* M10：出厂默认口令期连录像也不给下载 —— 否则"必须改密"只是不给看界面，
+     * 拿出厂口令的人照样能把录像拉走（与 api.c 的同名闸门同一口径）。 */
+    if (ctx->must_change != 0) {
+        media_err(out, cap, out_len, rsp, 403, "must change password");
+        return IV_OK;
+    }
 
     rel = req->path + MEDIA_PFX_LEN;
     if (rel[0] == '\0')

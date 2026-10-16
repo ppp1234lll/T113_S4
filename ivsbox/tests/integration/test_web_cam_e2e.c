@@ -612,7 +612,7 @@ int main(int argc, char *argv[])
     /* ---------------- c02 主口功能不受影响（登录仍 200） ---------------- */
     {
         char b[64];
-        int  blen = snprintf(b, sizeof b, "{\"pass\":\"x\"}");
+        int  blen = snprintf(b, sizeof b, "{\"user\":\"admin\",\"pass\":\"x\"}");
         int  n = snprintf(g_req, sizeof g_req,
                           "POST /api/login HTTP/1.1\r\nHost: x\r\n"
                           "Content-Length: %d\r\nConnection: close\r\n\r\n", blen);
@@ -625,7 +625,7 @@ int main(int argc, char *argv[])
     /* ---------------- c10 专用口路由隔离：/api/login 与 / 都是 404 ---------------- */
     {
         char b[64];
-        int  blen = snprintf(b, sizeof b, "{\"pass\":\"x\"}");
+        int  blen = snprintf(b, sizeof b, "{\"user\":\"admin\",\"pass\":\"x\"}");
         int  n = snprintf(g_req, sizeof g_req,
                           "POST /api/login HTTP/1.1\r\nHost: x\r\n"
                           "Content-Length: %d\r\nConnection: close\r\n\r\n", blen);

@@ -37,7 +37,10 @@ docs/操作手册  ——  分任务操作手册目录（怎么把代码变成�
                       两处**，开机由 `etc/inittab:27 ::sysinit:/bin/hostname -F /etc/hostname` 生效、
                       提示符来自 `etc/profile:10 PS1='\u@\h:\w # '` 的 `\h` 动态取主机名 ⇒ 改文件即改提示符；
                       **账号 `root`、密码 `embedsky`**；串口 `::respawn:-/bin/sh` 免密直进、本手册不动它；
-                      网络登录服务未自启；`BR2_TARGET_GENERIC_ROOT_PASSWD=""` 故密码不被 Buildroot 覆盖）
+                      网络登录服务**其实自启**（`S50sshd`/`S50telnet`/`S50adb_start`，2026-10-16 更正：旧写
+                      "未自启"是只看 overlay 目录所致，Buildroot 自带的这两个脚本在最终 rootfs 里，已在
+                      `.img` 内核对到 `S50sshd`；证据见《开发板账号密码与参数WEB登录说明.html》§1.3）；
+                      `BR2_TARGET_GENERIC_ROOT_PASSWD=""` 故密码不被 Buildroot 覆盖）
                       → §1 要改的 4 个文件（overlay 的 `etc/{hostname,hosts,passwd,shadow}`）
                       → **§2.1 改主机名（主任务，4 条命令：备份 → 改 `hostname` → 改 `hosts` → `grep -Hn .`
                       核对 ＋ 还原）**、§2.2 改账号/密码（**可选**，6 条命令：`sed` 在 `passwd`+`shadow`
@@ -69,6 +72,37 @@ docs/操作手册  ——  分任务操作手册目录（怎么把代码变成�
                       `./build.sh buildroot_rootfs` 是错的（它不刷新打包输入的 `rootfs.ext4`），已改为
                       **无参 `./build.sh`**，并在 VM 上按新口径实测通过（build＋pack 共 8 分 27 秒；
                       最终 `.img` 里 `127.0.1.1 → t113`、`TQ113` 计数 0）。详见 `修改记录.md` 2026-10-16 14:13。
+  开发板说明文档.html  **使用人员说明**（不是操作手册，也不是技术文档）：只讲"怎么用"，无取证/行号/来源对照。
+                      §1 怎么登录（账号 `root` / 密码 `embedsky`；串口线免密直进；SSH/Telnet；板子 IP 查法；`passwd` 改密码）；
+                      §2 **设备参数一览** —— 参数都在 `/opt/EmbedSky/config/`（`cat` 看、`vi` 改完 `reboot`、桌面
+                      设置程序改的是同一份数据），三个文件的**全部字段与出厂默认值**都列成表：
+                      `EmbedSkyProgress.ini` 六个段共 36 个字段（`[network_0]`/`[network_1]`/`[system]`/
+                      `[bootapp]`/`[watchdog]`/`[ota]`）、`EmbedSky.ini` 5 个字段（`[SYSTEM]`＋`[gpio]`）、
+                      `appinit.ini` 桌面 30 个菜单项（每项固定 `icon`/`path`/`args` 三字段，args 全为 `-l//cn`）；
+                      附 §2.5 **网络只使用固定 IP**（不用自动获取：`enable=1`、`ip_mode` 改静态、`network_num=1`，
+                      默认地址 `192.168.1.64`；并注明出厂镜像原值是自动获取）；§3 网页地址与口令（出厂演示页
+                      `http://板子IP/` 无账号密码、但只是演示页不能配设备；ivsbox 管理页**默认账号 `admin`、
+                      密码 `88888888`，首次登录必须先改密码**，密码规则 **8-12 位且大写/小写/数字都要有**，
+                      不合规时的弹窗提示语逐字取自用户给的参考实现
+                      `F://debug_2026//雅下//…//lwip_app//web_server//makefsdata-4g//fs//index.shtml`）；
+                      §4 七个常见问题。
+                      沿革：2026-10-16 用户要求"整理一个说明文档.html，先存放" → 随即指出"**不用写这么详细，简单就行……
+                      按照使用人员角度来写，不是技术人员**"（由 23.6 KB 取证版改成 7.3 KB 简版）→ 同日再要求
+                      "**修改名称：开发板说明文档.html**"并"**将当前板子的存储参数全部列出来，表明默认参数、字段名**"
+                      （该版 19.1 KB）→ 同日再要求"**① 开发板不自动获取 IP，只使用固定 IP；② WEB 界面默认账号、
+                      密码：admin、88888888，首次登录需要变更密码……密码必须包含大写、小写、数字**"（⇒ 本版 21.2 KB）。
+                      **文档里 131 条「字段名 / 默认值」已与镜像中的三个 ini 逐条脚本核对，缺失 0；密码提示语与
+                      参考实现逐字一致**。
+                      **2026-10-16 16:35 收尾**：用户同日要求“**两个都做**”（① 板子只用固定 IP；
+                      ② Web 用「`admin` / `88888888`」并首次登录强制改密），**镜像侧与代码侧均已落地**：
+                      ① 镜像——overlay 的 `EmbedSkyProgress.ini` 定为 `enable=1`/`ip_mode=staticIp`/`network_num=1`，
+                      并在 `etc/dhcpcd.conf` 追加 `denyinterfaces eth0`（否则 `rcS` 的 `S41dhcpcd` 会在
+                      `tq_progress` 之后又给 eth0 发一个 DHCP 地址，“只用固定 IP”就不成立）；
+                      ② 代码——ivsbox Web 改为「账号 `admin` / 初始口令 `88888888`」，
+                      出厂默认口令期除改密/登出外一律 403（新增 `iv_web_pass.c`、
+                      `POST /api/passwd`、落盘 `<secure>/web.passwd` 0600 且**只存 sha256**）。
+                      本文档的 §2.2/§2.5 取值已同步更新（旧版“出厂是自动获取”的说法已过期）。
+                      详见 `修改记录.md` 2026-10-16 16:35。
 
 【约定与注意事项】
   - 本目录文档按需新建，新建须经用户确认并登记（规则 7 第 2 条）。

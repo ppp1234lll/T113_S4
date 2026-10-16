@@ -2123,3 +2123,83 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
   改写为编译干净的行为变异后重做。
 * **未做（登记）**：Web 展示方法（device.list/snmp.result 读 store 的部分按需接）；
   板端实测（板子离线，随板端复跑组）。
+
+== 2026-10-16 16:35 ivsbox Web 账号与首次强制改密 ＋ 镜像侧"只用固定 IP"
+
+=== 干了什么事
+
+* **Web 从"只有口令"改成"账号 ＋ 口令，且口令只存摘要"**：新增 `web/src/iv_web_pass.c`
+  （`hash` / `rule` / `load` / `save` / `init`）。口令**不以明文留在任何地方** ——
+  落盘的是**域分隔摘要** `sha256("ivsbox-web|1|" ＋ user ＋ "|" ＋ pass)`
+  （`iv_sha256_*` 在 libivcore，Web 本就链 `-livcore`）；比较用**恒时** `same_secret()`
+  （长度不等也走满循环）；**账号错与口令错回同一个 401 `bad password`**；
+  `iv_web_pass_init()` 算完摘要立刻擦掉 `ctx->pass` ⇒ 进程内存里不留明文口令。
+* **首次强制改密（闸门在服务端）**：出厂默认口令期内，除 `POST /api/passwd` 与
+  `POST /api/logout` 外，`/api/` 与 `/media/` 一律 **403 `must change password`**。
+  `iv_web_media.c` 也补了这一道 —— 否则"被要求改密"的用户仍能把录像整包下走。
+  规则：8–12 位，且**大写、小写、数字都要有**（`lo && up && dg`）。
+* **落盘与权限**：`<secure>/web.passwd`（默认 `/mnt/UDISK/ivsbox/secure/web.passwd`），
+  一行 `v1 <user> <sha256hex>`；**强制 0600**（`O_RDONLY|O_NOFOLLOW` ＋ `fstat` 复核
+  `S_ISREG` ＋ `(mode & 0077) != 0` ⇒ **整份拒收**，回落出厂凭据且**不回写**该文件）；
+  写入走 `tmp → fsync → rename`，**先磁盘后内存**（落盘失败不认账）。
+* **前端**（`web/static/`）：登录表单加账号框；新增改密卡片（原密码/新密码/确认 ＋
+  规则原文）；`api()` 里 403 拦截 ⇒ 弹改密页；页脚加「改密」入口。
+* **镜像侧（编译 VM 的 SDK 树，不在本仓库）**：overlay 的 `EmbedSkyProgress.ini` 定为
+  `[network_0] enable=1` / `ip_mode=staticIp` / `[system] network_num=1`，并在
+  `etc/dhcpcd.conf` 追加 **`denyinterfaces eth0`**。
+
+=== 解决什么问题
+
+* **口令明文 ＋ 只认口令不认账号**：原实现把口令留在 `ctx->pass` 里逐字节比较、且没有账号
+  概念，一句 `--pass` 就是全部凭据；现在凭据是"账号 ＋ 口令"，且**摘要落盘、明文不驻留**，
+  即使 `web.passwd` 被读走也拿不到可用口令。
+* **出厂默认口令不换就一直能用**：这是产品要求"首次登录必须变更密码"的落点。闸门放在
+  **服务端**而不是只在前端拦 —— 前端那条正则与跳转都能被绕过。
+* **`[\s\S]` 与落盘格式冲突（有意偏离，登记）**：参考实现的正则 `[\s\S]{8,12}` 会放过
+  `\t`/`\n`，而本实现的落盘格式是**行式**的（`v1 <user> <hex>` 一行），口令里带控制字符
+  会把文件写坏 ⇒ **一律拒收控制字符**（`ch < 0x20 || ch == 0x7f`）。该偏离写在
+  `iv_web_pass.c` 文件头，并由集成用例 p04c（`"Abcd123\t"` ⇒ 400）钉住。
+* **"只用固定 IP"原本不成立**：`rcS` 遍历 `S??*` 时，`rc_daemon.S` 的 `tq_progress` 先按
+  ini 配上 `192.168.1.64`，**之后** `rcS` 的 `S41dhcpcd` 又对 eth0 跑一遍 DHCP ⇒ eth0 上会
+  同时挂一个固定 IP 和一个租约。加 `denyinterfaces eth0` 才真正"只走固定 IP"。
+
+=== 影响哪里
+
+* 新增 `ivsbox/web/src/iv_web_pass.c`；改动 `iv_web.h`（限额、ctx 字段、接口声明、
+  两处提示语宏）、`iv_web_api.c`（`same_secret` / `api_login` / `api_passwd` / 闸门）、
+  `iv_web_media.c`（闸门）、`main.c`（`--user` / `--pass-file`、env、`iv_web_pass_init`）。
+* `ivsbox/web/static/index.html` / `app.js` / `style.css`。
+* 测试：新增 `tests/integration/test_web_passwd.c`（12 组）；
+  `test_web_http.c` / `test_web_media_e2e.c` / `test_web_cam_e2e.c` 的登录体补 `"user"` 字段。
+* 文档：`docs/修改记录.md`、`docs/操作手册/开发板说明文档.html`（§2.2 / §2.5 / §3）、
+  `docs/操作手册/readme.txt`、`web/src/readme.txt`。
+* **未新增计划行（说明）**：本次是把 `功能开发计划.md` §S5.1 既有的"**登录鉴权与会话**
+  （参考项目仅前端 JS 口令比对）"这条要求**做实**，不是新功能项 ⇒ 计划文件不动。
+* **欠账不变**：`web.passwd` 仍在 UDISK 的 `secure/` 下、由 root 读写，**不是**密钥库；
+  架构 §10 的 F8 密钥分离**仍未实现**，与 SNMP community、隧道令牌**同一笔账**，
+  本次改动**不销账**。
+
+=== 怎么验证的
+
+* VM（`ssh tqt113`，隔离目录 `/tmp/wb-web`）：`make test` RC=0；`make asan` RC=0 且
+  **0** 条 ASan/LSan/UBSan 报告；`make arm` RC=0 **零告警**。
+* 四个 Web 集成用例全过：`test_web_http`、`test_web_passwd`、`test_web_media_e2e`、
+  `test_web_cam_e2e`。`test_web_passwd` 自带拉起 `ivsbox-web`，覆盖：出厂登录
+  （200 ＋ `must_change:true`）、闸门 403（overview/config/devices/media）而登出放行、
+  弱口令 5 例 400 ＋ **提示语逐字**比对、强制改密免原密码、改完闸门抬起、老口令失效、
+  **重启后新口令存活**、非 0600 文件拒收并回落出厂凭据（且文件保持 0644 不被改写）、
+  无会话 401、`GET /api/passwd` 405。
+* **反向证伪 7/7**（每条**都编译干净**，都让指定断言变红）：闸门失效⇒p03a~p03d；
+  去长度上限⇒10 行；字符类改"或"⇒12 行；不比对账号⇒p02a/p02b；落盘写**旧**摘要⇒5 行；
+  不清 `must_change`⇒8 行；0600 掩码写错⇒p12c/p12d。全部还原后 md5 与基线一致
+  （`iv_web_api.c`＝`a2320199…`、`iv_web_pass.c`＝`62d56db6…`）且用例复绿。
+  首条 0600 变异写成 `== 0x1234` 撞 `-Werror`（**编译失败不算证据**，按规则 5 弃用），
+  改成"掩码写错"后重做才成立。
+* **镜像侧取证**（重建 8 分 59 秒，`BUILD_EXIT=0` / `PACK_EXIT=0`）：`debugfs -R "cat
+  /opt/EmbedSky/config/EmbedSkyProgress.ini" <rootfs.ext2>` 见 `enable = 1` /
+  `ip_mode = staticIp` / `network_num = 1`；`debugfs -R "ls -l /opt/EmbedSky/config"`
+  无 `.bak`；整盘 `.img` 上 `grep -ac`：`.bak`=0、`= staticIp`=1、`denyinterfaces eth0`=1、
+  `= udhcpc`=1（只剩未启用的 `[network_1]`）。产物
+  `out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img`。
+* **未做（登记）**：真机刷机与板端确认（板子仍不在线）—— 待确认 eth0 只有一个地址
+  （没有第二个 DHCP 租约）、主机名 `t113`、浏览器进管理页首登被强制改密。

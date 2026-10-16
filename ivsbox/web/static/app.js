@@ -40,6 +40,10 @@
         var j;
         try { j = JSON.parse(t); } catch (e) { j = { ok: false, e: -1, msg: '响应不是 JSON' }; }
         j._status = r.status;
+        /* 仍在出厂默认密码（服务端 must_change=1）时，除改密与登出外一切 403。
+         * 这一句放在 api() 里统一接管：任何一次调用都是"该改密了"的信号，
+         * 不必让每个调用点各判一次（漏一个就漏一条路）。 */
+        if (r.status === 403 && j.msg === 'must change password') showChpass('', true);
         return j;
       });
     });
@@ -87,26 +91,73 @@
 
   var st = { page: 'overview', ver: 0, version: '' };
 
-  /* ==================== 登录 ==================== */
+  /* ==================== 登录 / 首次改密（M10） ==================== */
+  /* 口令规则与提示语：**与服务端是同一句话**（`web/src/iv_web.h` 的
+   * `IV_WEB_PASS_HINT_TEXT`，源头是参考实现 index.shtml:976 的 alert）。
+   * 前端这份只负责"输入时就告诉用户"，真正的闸门在服务端 —— 前端校验挡不住 curl。 */
+  var PASS_RULE = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[\s\S]{8,12}$/;
+  var PASS_HINT = '请输入正确的密码格式：\n密码长度:8-12\n密码由数字+大写英文字母+小写英文字母组成';
+
+  /* 刚登录成功后拿到的口令：只在**用户主动改密**时用来填 `old` 字段。
+   * 强制改密不要它（服务端那条路径不校验旧口令），页面刷新后也拿不到 —— 都不影响。 */
+  var lastPass = '';
+  var chpassForced = false;
+
   function showLogin(msg) {
-    $('#login').className = 'login';
+    $('#chpass').className = 'login hidden';
     $('#app').className = 'app hidden';
-    if (msg) $('#loginMsg').textContent = msg;
+    $('#login').className = 'login';
+    $('#loginMsg').textContent = msg || '';
+  }
+
+  /* forced=true：出厂默认密码，必须先改；false：用户自己点了"改密"（多要一个原密码）。 */
+  function showChpass(msg, forced) {
+    chpassForced = !!forced;
+    $('#login').className = 'login hidden';
+    $('#app').className = 'app hidden';
+    $('#chpass').className = 'login';
+    $('#chpassTitle').textContent = chpassForced ? '请修改登录密码' : '修改登录密码';
+    $('#chpassWhy').textContent = chpassForced
+      ? '设备仍在使用出厂默认密码，必须先修改才能继续使用。' : '';
+    $('#oldWrap').className      = chpassForced ? 'hidden' : '';
+    $('#chpassCancel').className = chpassForced ? 'ghost hidden' : 'ghost';
+    $('#chpassMsg').textContent  = msg || '';
   }
 
   function showApp() {
     $('#login').className = 'login hidden';
+    $('#chpass').className = 'login hidden';
     $('#app').className = 'app';
     buildNav();
     go(st.page);
   }
 
-  function tryLogin(pass) {
-    return api('/api/login', { method: 'POST', body: { pass: pass } }).then(function (r) {
-      if (r.ok && r.d && r.d.token) { $('#loginMsg').textContent = ''; showApp(); return true; }
-      showLogin(r.msg === 'bad password' ? '口令不正确' : (r.msg || '登录失败'));
-      return false;
-    }).catch(function () { showLogin('无法连接服务'); return false; });
+  function tryLogin(user, pass) {
+    return api('/api/login', { method: 'POST', body: { user: user, pass: pass } })
+      .then(function (r) {
+        if (r.ok && r.d && r.d.token) {
+          lastPass = pass;
+          $('#loginMsg').textContent = '';
+          /* 服务端说还得改密 —— 直接切改密卡片，不给进主界面 */
+          if (r.d.must_change) { showChpass('', true); return true; }
+          showApp();
+          return true;
+        }
+        showLogin(r.msg === 'bad password' ? '账号或密码不正确' : (r.msg || '登录失败'));
+        return false;
+      }).catch(function () { showLogin('无法连接服务'); return false; });
+  }
+
+  function changePass(oldPw, newPw, newPw2) {
+    if (newPw !== newPw2) { $('#chpassMsg').textContent = '两次输入的新密码不一致'; return; }
+    if (!PASS_RULE.test(newPw)) { $('#chpassMsg').textContent = PASS_HINT; return; }
+    api('/api/passwd', { method: 'POST', body: { old: oldPw, new: newPw } })
+      .then(function (r) {
+        if (r.ok) { lastPass = ''; toast('密码已修改', 'ok'); showApp(); return; }
+        if (r._status === 403) return;   /* 仍在待改密态：由 api() 接管切卡片 */
+        $('#chpassMsg').textContent = (r._status === 401) ? '原密码不正确'
+                                     : (r.msg || '修改失败');
+      }).catch(function () { $('#chpassMsg').textContent = '无法连接服务'; });
   }
 
   /* ==================== 导航 ==================== */
@@ -540,21 +591,37 @@
 
   /* ==================== 启动 ==================== */
   function boot() {
+    /* 规则原文一次填好（用 <pre> 才保得住换行） */
+    $('#passRule').textContent = PASS_HINT;
+
     $('#loginForm').addEventListener('submit', function (ev) {
       ev.preventDefault();
-      tryLogin($('#pass').value);
+      tryLogin($('#user').value, $('#pass').value);
+    });
+    $('#chpassForm').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      changePass(chpassForced ? lastPass : $('#oldpass').value,
+                 $('#newpass').value, $('#newpass2').value);
+    });
+    /* 侧栏"改密"：主动改密（要原密码，可返回） */
+    $('#chpassBtn').addEventListener('click', function () { showChpass('', false); });
+    $('#chpassCancel').addEventListener('click', function () {
+      $('#chpass').className = 'login hidden';
+      $('#app').className = 'app';
     });
     $('#logoutBtn').addEventListener('click', function () {
       api('/api/logout', { method: 'POST', body: {} }).then(function () {
+        lastPass = '';
         showLogin('已退出');
       });
     });
 
-    /* 探测会话是否还在：随便取一个需要鉴权的接口，401 就回登录页。 */
+    /* 探测会话是否还在：随便取一个需要鉴权的接口，401 就回登录页。
+     * 403（出厂默认密码还没改）不在这里另作处理 —— api() 已经切到改密卡片了。 */
     api('/api/overview').then(function (r) {
       if (r._status === 401) showLogin('');
       else if (r.ok) { st.version = (r.d && r.d.version) || ''; $('#verLabel').textContent = st.version; showApp(); }
-      else showLogin('');
+      else if (r._status !== 403) showLogin('');
     }).catch(function () { showLogin('无法连接服务'); });
   }
 

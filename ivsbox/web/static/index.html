@@ -11,10 +11,37 @@
   <div id="login" class="login hidden">
     <form id="loginForm" class="login-box" autocomplete="off">
       <h1>IVSBox 运维终端</h1>
-      <label for="pass">访问口令</label>
-      <input id="pass" type="password" name="pass" required>
+      <label for="user">账号</label>
+      <input id="user" type="text" name="user" required autocomplete="username">
+      <label for="pass">密码</label>
+      <input id="pass" type="password" name="pass" required autocomplete="current-password">
       <button type="submit">登录</button>
       <p id="loginMsg" class="msg" role="alert"></p>
+    </form>
+  </div>
+
+  <!-- 改密卡片（M10）：出厂默认密码时**强制**走这张卡，改完才进主界面；
+       主界面侧栏的"改密"按钮复用同一张卡（那时会多要一个"原密码"）。 -->
+  <div id="chpass" class="login hidden">
+    <form id="chpassForm" class="login-box" autocomplete="off">
+      <h1 id="chpassTitle">修改登录密码</h1>
+      <p id="chpassWhy" class="hint"></p>
+      <div id="oldWrap" class="hidden">
+        <label for="oldpass">原密码</label>
+        <input id="oldpass" type="password" name="oldpass" autocomplete="current-password">
+      </div>
+      <label for="newpass">新密码</label>
+      <input id="newpass" type="password" name="newpass" required autocomplete="new-password">
+      <label for="newpass2">确认新密码</label>
+      <input id="newpass2" type="password" name="newpass2" required autocomplete="new-password">
+      <div class="actions">
+        <button type="submit">确认修改</button>
+        <button type="button" id="chpassCancel" class="ghost hidden">返回</button>
+      </div>
+      <p id="chpassMsg" class="msg" role="alert"></p>
+      <!-- 规则原文由 app.js 填入（与服务端 web/src/iv_web.h 的 IV_WEB_PASS_HINT_TEXT
+           是同一句话，源头是参考实现 index.shtml:976）。 -->
+      <pre id="passRule" class="rule"></pre>
     </form>
   </div>
 
@@ -24,6 +51,7 @@
       <nav id="navList" class="nav-list"></nav>
       <div class="nav-foot">
         <span id="verLabel" class="dim"></span>
+        <button id="chpassBtn" class="link" type="button">改密</button>
         <button id="logoutBtn" class="link" type="button">退出</button>
       </div>
     </aside>

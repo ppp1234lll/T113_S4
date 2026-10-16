@@ -36,7 +36,13 @@
 #define WEB_MOD         "web"
 #define WEB_PORT_DEF    80
 #define WEB_ROOT_DEF    "/opt/ivsbox/web/static"
-#define WEB_PASS_DEF    "admin"
+/* ---- M10：登录账号与口令 ----
+ * `WEB_PASS_DEF` 原来是 `"admin"`（那是**口令**，与账号同名，纯属历史巧合）。
+ * 2026-10-16 用户定：**账号 `admin` / 口令 `88888888`，首次登录必须改密**。
+ * 这里的默认值只是**初始值**：盘上有 `<secure>/web.passwd` 时以文件为准
+ * （见 iv_web_pass.c 的 `iv_web_pass_init()`）。 */
+#define WEB_USER_DEF    IV_WEB_USER_DEF
+#define WEB_PASS_DEF    IV_WEB_PASS_DEF
 /* 响应头预留区：所有响应头都很短（固定 4 行 + 可选 Set-Cookie），512 绰绰有余。 */
 #define RSP_HEAD_OFF    512u
 
@@ -687,14 +693,18 @@ static void do_accept(int lfd, int is_cam)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "usage: %s [--port N] [--root DIR] [--chan PATH] [--pass PW]\n"
+            "usage: %s [--port N] [--root DIR] [--chan PATH]\n"
+            "          [--user NAME] [--pass PW] [--pass-file PATH]\n"
             "          [--media-root DIR] [--media-bps N]\n"
             "          [--cam-port N] [--cam-upstream N]\n"
             "          [--heartbeat PATH] [--heartbeat-ms N] [--version]\n"
             "  defaults: port %d, root %s, chan %s\n"
+            "            user %s, pass = factory default (must be changed on first login)\n"
+            "            pass-file %s (empty = do not persist)\n"
             "            media-root %s, media-bps %u (0 = unlimited)\n"
             "            cam-port %d (127.0.0.1 only, 0 = off), cam-upstream %u\n",
             argv0, WEB_PORT_DEF, WEB_ROOT_DEF, IV_CHAN_PATH_DEFAULT,
+            WEB_USER_DEF, IV_WEB_PASS_FILE_DEF,
             IV_WEB_MEDIA_ROOT_DEFAULT, IV_WEB_MEDIA_BPS_DEFAULT,
             WEB_CAM_PORT_DEF, (unsigned)WEB_CAM_UPSTREAM_DEF);
 }
@@ -711,7 +721,9 @@ int main(int argc, char *argv[])
     g_ctx.chan_fd     = -1;
     g_ctx.cam_port    = cam_port;          /* 环回护栏用（iv_web_cam.c） */
     g_ctx.cam_upstream = WEB_CAM_UPSTREAM_DEF;
+    (void)snprintf(g_ctx.user, sizeof(g_ctx.user), "%s", WEB_USER_DEF);
     (void)snprintf(g_ctx.pass, sizeof(g_ctx.pass), "%s", WEB_PASS_DEF);
+    (void)snprintf(g_ctx.pass_file, sizeof(g_ctx.pass_file), "%s", IV_WEB_PASS_FILE_DEF);
     (void)snprintf(g_ctx.media_root, sizeof(g_ctx.media_root), "%s",
                    IV_WEB_MEDIA_ROOT_DEFAULT);
     g_ctx.media_bps = IV_WEB_MEDIA_BPS_DEFAULT;
@@ -732,8 +744,17 @@ int main(int argc, char *argv[])
             g_ctx.static_root = argv[++i];
         } else if (strcmp(argv[i], "--chan") == 0 && i + 1 < argc) {
             g_ctx.chan_path = argv[++i];
+        } else if (strcmp(argv[i], "--user") == 0 && i + 1 < argc) {
+            (void)snprintf(g_ctx.user, sizeof(g_ctx.user), "%.*s",
+                           (int)sizeof(g_ctx.user) - 1, argv[++i]);
         } else if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc) {
-            (void)snprintf(g_ctx.pass, sizeof(g_ctx.pass), "%.*s", 63, argv[++i]);
+            /* M10 起 `--pass` 是**初始口令**（改过密码后以 `<secure>/web.passwd` 为准）。 */
+            (void)snprintf(g_ctx.pass, sizeof(g_ctx.pass), "%.*s",
+                           (int)sizeof(g_ctx.pass) - 1, argv[++i]);
+        } else if (strcmp(argv[i], "--pass-file") == 0 && i + 1 < argc) {
+            /* 空串 = 不落盘（验证用；改密只在内存生效）。 */
+            (void)snprintf(g_ctx.pass_file, sizeof(g_ctx.pass_file), "%.*s",
+                           (int)sizeof(g_ctx.pass_file) - 1, argv[++i]);
         } else if (strcmp(argv[i], "--media-root") == 0 && i + 1 < argc) {
             (void)snprintf(g_ctx.media_root, sizeof(g_ctx.media_root), "%.*s",
                            (int)sizeof(g_ctx.media_root) - 1, argv[++i]);
@@ -762,10 +783,19 @@ int main(int argc, char *argv[])
     }
     g_ctx.cam_port = cam_port; /* CLI 终值（环回护栏与监听同源，不许分叉） */
     {
-        const char *env = getenv("IVSBOX_WEB_PASS");
+        const char *env = getenv("IVSBOX_WEB_USER");
 
         if (env != NULL && env[0] != '\0')
-            (void)snprintf(g_ctx.pass, sizeof(g_ctx.pass), "%.*s", 63, env);
+            (void)snprintf(g_ctx.user, sizeof(g_ctx.user), "%.*s",
+                           (int)sizeof(g_ctx.user) - 1, env);
+        env = getenv("IVSBOX_WEB_PASS");
+        if (env != NULL && env[0] != '\0')
+            (void)snprintf(g_ctx.pass, sizeof(g_ctx.pass), "%.*s",
+                           (int)sizeof(g_ctx.pass) - 1, env);
+        env = getenv("IVSBOX_WEB_PASS_FILE");
+        if (env != NULL)
+            (void)snprintf(g_ctx.pass_file, sizeof(g_ctx.pass_file), "%.*s",
+                           (int)sizeof(g_ctx.pass_file) - 1, env);
         env = getenv("IVSBOX_WEB_MEDIA_ROOT");
         if (env != NULL && env[0] != '\0')
             (void)snprintf(g_ctx.media_root, sizeof(g_ctx.media_root), "%.*s",
@@ -800,6 +830,11 @@ int main(int argc, char *argv[])
     (void)iv_log_init("ivsbox-web");
     iv_log_set_stderr(1);
 
+    /* M10：口令哈希化 + 读盘（决定 must_change）。放在 listen 之前 ——
+     * 监听一旦建立就可能有登录请求，那时 pass_hash 必须是终值；放日志初始化之后
+     * 只是为了让"密码文件读不动"的告警真的写得出去。 */
+    (void)iv_web_pass_init(&g_ctx);
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
@@ -829,6 +864,10 @@ int main(int argc, char *argv[])
     IV_LOG_I(WEB_MOD, "cam proxy %s (upstream port %u)",
              (g_cam_fd >= 0) ? "enabled" : "off",
              (unsigned)g_ctx.cam_upstream);
+    /* 只报"要不要改密"与落点，**绝不报口令/哈希**（日志会进 /mnt/UDISK/log）。 */
+    IV_LOG_I(WEB_MOD, "auth user=%s must_change=%d pass_file=%s",
+             g_ctx.user, g_ctx.must_change,
+             (g_ctx.pass_file[0] != '\0') ? g_ctx.pass_file : "(none)");
 
     while (!g_stop) {
         struct pollfd pf[IV_WEB_MAX_CONN + 2];

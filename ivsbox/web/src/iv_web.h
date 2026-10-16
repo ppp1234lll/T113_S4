@@ -1,11 +1,11 @@
 /*
- * ivsbox-web 内部接口（M5-S5.1 / S5.3；S6.4 新增媒体下载）
+ * ivsbox-web 内部接口（M5-S5.1 / S5.3；S6.4 新增媒体下载；M10 新增登录账号与改密）
  *
  * ============================ 这个进程干什么 ============================
  * 对外给浏览器一个 HTTP 服务（静态页面 ＋ REST/JSON ＋ **媒体文件下载**），对内
  * **只通过本地通道**跟 `ivsboxd` 说话。它自己**不读配置文件、不碰数据库、不发平台
  * 报文** —— 这三件事都归 ivsboxd（架构 §10.4 单写者原则）。
- * 因此本进程**只链 libivcore**（用 iv_chan / iv_log / iv_ret），不链 libivmodules。
+ * 因此本进程**只链 libivcore**（用 iv_chan / iv_log / iv_ret / iv_sha256），不链 libivmodules。
  *
  * ============================ 为什么自写 HTTP 而不是拉个库 ============================
  * 计划 S5.1 要求"选型固定一种成熟嵌入式 HTTP 库或 uhttpd（登记选型并固化版本）"。
@@ -52,8 +52,21 @@
  * 理由：静态文件里没有任何设备数据（数据全由 JS 现拉），把登录页锁上反而没法登录；
  * 而媒体下载能拿到录像内容，必须鉴权。会话 token 是进程内存里的随机串，进程重启
  * 即全部失效（嵌入式下比落盘更安全也更简单）。
- * 口令当前来自命令行（`--pass`）或环境变量，**登记欠账**：架构 §10 本应走
- * `secure/` 密钥分离（F8 未实现，与 S4.3 的 `community` 同一笔账）。
+ *
+ * ---- M10：账号 ＋ 口令（2026-10-16 用户定） ----
+ * 默认 **账号 `admin` / 口令 `88888888`**（`IV_WEB_USER_DEF` / `IV_WEB_PASS_DEF`）。
+ * **出厂默认口令下一律强制改密**：`ctx->must_change == 1` 时，除
+ * `POST /api/passwd`（改密）与 `POST /api/logout`（登出）之外，`/api/` 与 `/media/` 开头的
+ * 路径一律 **403 + `msg:"must change password"`**。前端拿到 403 或登录响应里的
+ * `must_change:true` 就切到"修改密码"视图。**这条闸门放在服务端**：只靠前端提示
+ * 等于没防线——知道出厂口令的人直接 curl 就能继续用。
+ * 新口令复杂度由 `iv_web_pass_rule()` 判（8~12 位且含大写/小写/数字），
+ * 提示原文见 `IV_WEB_PASS_HINT_TEXT`（与参考实现逐字节一致，见 iv_web_pass.c 文件头）。
+ * 改密成功后写 `<secure>/web.passwd`（`0600`，**只存哈希**，见 iv_web_pass.c）。
+ * ⚠ 与 `--pass` / `IVSBOX_WEB_PASS` 的关系：那两个键现在是**初始口令**的来源（工厂/
+ * 验证用），盘上有密码文件时以文件为准。**登记欠账**：口令类数据走 `secure/` 的
+ * 密钥分离（F8）仍未实现，本文件所在目录不是真机密存储，与 S4.3 的 `community`
+ * 是同一笔账 —— 区别只是这里连明文都不落盘。
  */
 #ifndef IVSBOX_WEB_IV_WEB_H
 #define IVSBOX_WEB_IV_WEB_H
@@ -89,6 +102,34 @@ extern "C" {
 /* 限速窗口（ms）与"配额用完先等这么久" */
 #define IV_WEB_RL_WIN_MS   1000u
 #define IV_WEB_RL_WAIT_MS  20u
+
+/* --------------------------------------------------------------------------
+ * M10：登录账号 / 口令 / 改密
+ * -------------------------------------------------------------------------- */
+#define IV_WEB_USER_MAX      24u
+#define IV_WEB_PASS_MAX      64u
+#define IV_WEB_PASS_HEX_MAX  65u  /* sha256 十六进制 64 位 ＋ NUL */
+#define IV_WEB_PASS_PATH_MAX 256u
+#define IV_WEB_PASS_LEN_MIN  8u   /* 复杂度下限（与参考实现一致） */
+#define IV_WEB_PASS_LEN_MAX  12u  /* 复杂度上限 */
+
+#define IV_WEB_USER_DEF "admin"     /* 出厂账号 */
+#define IV_WEB_PASS_DEF "88888888"  /* 出厂口令（首次登录必须改掉） */
+/* 口令落盘：与 `tunnel.token` 同目录（架构 §10 的 `secure/`；S65ivsboxd 预建该目录）。 */
+#define IV_WEB_PASS_FILE_DEF "/mnt/UDISK/ivsbox/secure/web.passwd"
+
+/* 复杂度不合格时回给浏览器的提示：**与参考实现逐字节一致**
+ * 出处：雅下项目 `web_server/makefsdata-4g/fs/index.shtml` 第 976 行 ——
+ *   alert("请输入正确的密码格式：\n密码长度:8-12\n密码由数字+大写英文字母+小写英文字母组成")
+ * 纯文本版给前端/文档看，回 JSON 时用转义版（`\n` 是两字符转义）。
+ * 两处必须是同一句话——各写一遍迟早只改一处。
+ * **本串只进 HTTP 响应体，不经任何控制台/日志**，故这里直接保留中文原文
+ * （不用 `\x..` 转义写法：那样没人能目视校验它与参考实现是否一致）。 */
+#define IV_WEB_PASS_HINT_TEXT \
+    "请输入正确的密码格式：\n密码长度:8-12\n密码由数字+大写英文字母+小写英文字母组成"
+/* 同一句话的 JSON 版（换行写成 \n 两字符转义，供 api_err() 直接拼进 "msg"）。 */
+#define IV_WEB_PASS_HINT_JSON \
+    "请输入正确的密码格式：\\n密码长度:8-12\\n密码由数字+大写英文字母+小写英文字母组成"
 
 /* --------------------------------------------------------------------------
  * 连接
@@ -151,7 +192,15 @@ typedef struct {
 typedef struct {
     const char   *chan_path;   /* 本地通道接听点 */
     const char   *static_root; /* 静态资源根目录 */
-    char          pass[64];    /* 登录口令 */
+
+    /* ---- M10 登录凭据 ----
+     * `user` / `pass_hash` 是**登录比对的事实来源**；`pass` 只是启动期的种子
+     * （出厂默认 / `--pass` / env），`iv_web_pass_init()` 哈希完立即擦除明文。 */
+    char          user[IV_WEB_USER_MAX];
+    char          pass[IV_WEB_PASS_MAX];
+    char          pass_hash[IV_WEB_PASS_HEX_MAX];
+    char          pass_file[IV_WEB_PASS_PATH_MAX]; /* 空串 = 不落盘（验证用） */
+    int           must_change;  /* 1 = 仍在出厂默认口令 ⇒ 除改密/登出外一律 403 */
 
     /* S6.4 媒体下载（值语义，便于用命令行/环境变量覆盖） */
     char          media_root[IV_WEB_MEDIA_ROOT_MAX];
@@ -199,6 +248,20 @@ uint64_t iv_web_now_ms(void);
 uint32_t iv_web_rand(iv_web_ctx_t *ctx);
 
 /* --------------------------------------------------------------------------
+ * pass.c —— 口令：哈希 / 复杂度 / 落盘（M10）
+ *   - `iv_web_pass_hash()` 是登录比对与落盘**共用**的摘要函数（含域名前缀，见 .c 头）；
+ *   - `iv_web_pass_rule()` 是复杂度的**唯一权威**（服务端判，前端只做即时提示）；
+ *   - `iv_web_pass_init()` 在 main() 里调一次：读盘 → 定 `must_change` → 擦除明文种子；
+ *   - `iv_web_pass_save()` 原子落盘；**返回非 OK 时调用方不得提交到内存**
+ *     （否则"改了密码、重启又变回去"）。
+ * -------------------------------------------------------------------------- */
+void iv_web_pass_hash(const char *user, const char *pass, char out[IV_WEB_PASS_HEX_MAX]);
+int  iv_web_pass_rule(const char *pass);
+int  iv_web_pass_init(iv_web_ctx_t *ctx);
+int  iv_web_pass_load(iv_web_ctx_t *ctx);
+int  iv_web_pass_save(const iv_web_ctx_t *ctx, const char *user, const char *hex);
+
+/* --------------------------------------------------------------------------
  * api.c —— REST 路由 + 会话 + 本地通道
  * 返回 IV_OK 表示 out 里是完整响应体；IV_ENOTSUP 表示"这个路径不归我"。
  * -------------------------------------------------------------------------- */
@@ -212,7 +275,8 @@ void iv_web_sess_new(iv_web_ctx_t *ctx, char *out_token, size_t cap);
 /* --------------------------------------------------------------------------
  * media.c —— S6.4 录像文件下载（Range/ETag/校验值/限速/取消）
  * 与 api.c 同口径：IV_OK = 已填好响应；IV_ENOTSUP = 这个路径不归我。
- * 命中 /media/... 但**未登录** ⇒ 401；路径非法/越界 ⇒ 403；不存在 ⇒ 404。
+ * 命中 /media/... 但**未登录** ⇒ 401；**待改密（must_change）** ⇒ 403；
+ * 路径非法/越界 ⇒ 403；不存在 ⇒ 404。
  * -------------------------------------------------------------------------- */
 int iv_web_media_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
                         char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp);

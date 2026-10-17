@@ -140,10 +140,10 @@ footer.doc{margin-top:52px; padding-top:16px; border-top:1px solid var(--border)
 <tr><td><code>ip_mode</code></td><td><code>staticIp</code></td><td>取 IP 的方式。<code>udhcpc</code>＝自动获取，<code>staticIp</code>＝用下面的固定 IP（本产品用这个）</td></tr>
 <tr><td><code>ip</code></td><td><code>192.168.1.64</code></td><td>固定 IP 地址（自动获取时不生效）</td></tr>
 <tr><td><code>netmask</code></td><td><code>255.255.255.0</code></td><td>子网掩码</td></tr>
-<tr><td><code>gateway</code></td><td><code>192.168.1.2</code></td><td>网关</td></tr>
+<tr><td><code>gateway</code></td><td><code>192.168.1.1</code></td><td>网关</td></tr>
 <tr><td><code>dns</code></td><td><code>114.114.114.114</code></td><td>DNS 服务器</td></tr>
-<tr><td><code>mac_mode</code></td><td><code>cpuid</code></td><td>MAC 的来源。<code>cpuid</code>＝按 CPU 编号自动生成</td></tr>
-<tr><td><code>mac</code></td><td><code>2E:A2:9E:EF:43:43</code></td><td>MAC 地址（<code>mac_mode=cpuid</code> 时不生效）</td></tr>
+<tr><td><code>mac_mode</code></td><td><code>fixed</code></td><td>MAC 的来源。<code>fixed</code>＝就用下面 <code>mac</code> 字段填的固定 MAC（本产品用这个）</td></tr>
+<tr><td><code>mac</code></td><td><code>2E:A2:9E:EF:43:43</code></td><td>MAC 地址（<code>mac_mode=fixed</code> 时用它，本产品就是这样）</td></tr>
 </tbody>
 </table>
 
@@ -159,7 +159,7 @@ footer.doc{margin-top:52px; padding-top:16px; border-top:1px solid var(--border)
 <tr><td><code>netmask</code></td><td>（空）</td><td>未填</td></tr>
 <tr><td><code>gateway</code></td><td>（空）</td><td>未填</td></tr>
 <tr><td><code>dns</code></td><td>（空）</td><td>未填</td></tr>
-<tr><td><code>mac_mode</code></td><td><code>cpuid</code></td><td>按 CPU 编号自动生成</td></tr>
+<tr><td><code>mac_mode</code></td><td><code>fixed</code></td><td>用 <code>mac</code> 字段的固定 MAC（本段 <code>mac</code> 是空的，所以不生效）</td></tr>
 <tr><td><code>mac</code></td><td>（空）</td><td>未填</td></tr>
 </tbody>
 </table>
@@ -279,8 +279,10 @@ footer.doc{margin-top:52px; padding-top:16px; border-top:1px solid var(--border)
 <tr><td><code>[network_0]</code></td><td><code>ip_mode</code></td><td><code>staticIp</code></td><td>取值就是 <code>staticIp</code>，不要写 <code>udhcpc</code></td></tr>
 <tr><td><code>[network_0]</code></td><td><code>ip</code></td><td><code>192.168.1.64</code></td><td>板子固定 IP（按现场实际填）</td></tr>
 <tr><td><code>[network_0]</code></td><td><code>netmask</code></td><td><code>255.255.255.0</code></td><td>子网掩码</td></tr>
-<tr><td><code>[network_0]</code></td><td><code>gateway</code></td><td><code>192.168.1.2</code></td><td>网关</td></tr>
+<tr><td><code>[network_0]</code></td><td><code>gateway</code></td><td><code>192.168.1.1</code></td><td>网关</td></tr>
 <tr><td><code>[network_0]</code></td><td><code>dns</code></td><td><code>114.114.114.114</code></td><td>DNS 服务器</td></tr>
+<tr><td><code>[network_0]</code></td><td><code>mac_mode</code></td><td><code>fixed</code></td><td>MAC 用固定值，不要写成 <code>cpuid</code></td></tr>
+<tr><td><code>[network_0]</code></td><td><code>mac</code></td><td><code>2E:A2:9E:EF:43:43</code></td><td>MAC 地址，照原样保留</td></tr>
 <tr><td><code>[system]</code></td><td><code>network_num</code></td><td><code>1</code></td><td>启用 1 段网络配置</td></tr>
 </tbody>
 </table>
@@ -293,6 +295,8 @@ footer.doc{margin-top:52px; padding-top:16px; border-top:1px solid var(--border)
 
 <p>要接到别的网段，就改 <code>ip</code>、<code>netmask</code>、<code>gateway</code> 这三项，
 改完重启板子。<strong>IP 改了以后要用新地址访问</strong>（旧地址不再响应）。</p>
+
+<p><strong>MAC 也是固定的</strong>：出厂 MAC 为 <code>2E:A2:9E:EF:43:43</code>，由 <code>mac_mode=fixed</code> 生效。请不要把 <code>mac_mode</code> 改回 <code>cpuid</code>，也不要把 <code>mac</code> 留空。改完 <code>reboot</code> 后，用 <code>ip link show eth0</code> 看 <code>link/ether</code> 那一行核对。</p>
 
 <hr />
 

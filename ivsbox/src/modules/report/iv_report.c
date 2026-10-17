@@ -188,6 +188,16 @@ int iv_report_send_cmd(iv_report_t *rp, uint8_t cmd, const void *data,
     return iv_link_send(&rp->lk, cmd, data, len, (uint32_t)now_ms, NULL, NULL);
 }
 
+void iv_report_request_poll(iv_report_t *rp)
+{
+    if (rp == NULL || !rp->opened)
+        return;
+    /* 只拨时刻表，不在这里发帧：下发仍走 step() 的既有节拍。
+     * 刻意**不**判断"有没有 0xE1 在飞"—— `rep_poll()` 那条路径遇到 IV_EBUSY
+     * 只是本拍不发，下一拍会再试，不会丢状态。 */
+    rp->next_poll = rp->now_ms;
+}
+
 static void on_link_upstream(uint8_t cmd, const uint8_t *data, uint16_t len,
                              void *arg)
 {

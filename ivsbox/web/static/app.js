@@ -633,8 +633,14 @@
 
     var card2 = el('div', 'card');
     card2.appendChild(el('h3', null, '三路继电器'));
-    var grid2 = el('div', 'grid');
-    card2.appendChild(grid2);
+    /* 口径写在这里，不写进每个数值里：状态值 1=吸合 / 2=断开，与箱门 DS 相反。 */
+    card2.appendChild(el('p', 'hint',
+      '状态口径：吸合（开）=1，断开（关）=2（与箱门 DS 相反）。' +
+      '控制走 0xD1，第 N 路对应采集板电源口 port N-1；下发后自动回读一次状态。'));
+    var relayBox = el('div');
+    card2.appendChild(relayBox);
+    var relayMsg = el('p', 'hint', '');
+    card2.appendChild(relayMsg);
     root.appendChild(card2);
 
     var card3 = el('div', 'card');
@@ -660,10 +666,58 @@
       return (v === null || v === undefined) ? '—' : String(v);
     }
 
+    /* 继电器控制按钮：**只发一次动作**，不在这里做"等确认再发"的补偿 —— 0xD1 是
+     * 控制命令，重发可能让采集板重复动作（协议无事务号）。失败就把原因说清楚，
+     * 人再决定要不要点第二次。 */
+    var busy = false;
+
+    function relayBtn(ch, on) {
+      var b = el('button', 'ghost', on ? '吸合' : '断开');
+
+      b.type = 'button';
+      b.disabled = busy;
+      b.addEventListener('click', function () {
+        if (busy) return;
+        if (!window.confirm('确认' + (on ? '吸合' : '断开') + '第 ' + ch + ' 路继电器？\n' +
+            '（0xD1  port ' + (ch - 1) + '  status=' + (on ? 1 : 0) + '）')) return;
+        busy = true;
+        relayMsg.textContent = '下发中…';
+        api('/api/board/relay', { method: 'POST', body: { ch: ch, on: on } })
+          .then(function (res) {
+            busy = false;
+            if (!res.ok) {
+              relayMsg.textContent = '下发失败：' + (res.msg || ('错误 ' + res.e)) +
+                (res.e === -3 ? '（同命令在飞，稍后重试）' : '');
+              return;
+            }
+            var rd = res.d || {};
+            relayMsg.textContent = '已下发 ' + (rd.payload || '') + '，正在回读状态…';
+            /* `0xD1` 同命令只允许一笔在飞（应答窗口 2 s），故按钮一起冷却 2.2 s：
+             * 不放冷的话，人连着点两路必然收到"同命令在飞"，看起来像功能坏了。 */
+            setTimeout(function () {
+              load(); /* 后端发完已催一次 0xE1，这里回读确认动作真的生效 */
+            }, 2200);
+            /* **必须回读第二遍**：板端实测（2026-10-17）下发 ch=2 OFF 后 6 s 回读仍是
+             * 旧值 —— 那条 0xE1 应答是在采集板处理 0xD1 之前就发出去的，镜像落后一拍。
+             * 只回读一次会出现"按钮点了、表格没变"，看着像没生效。 */
+            setTimeout(function () {
+              busy = false;
+              load();
+              relayMsg.textContent = '已下发，状态已回读（采集板镜像可能滞后一拍）';
+            }, 5000);
+          })
+          .catch(function () {
+            busy = false;
+            relayMsg.textContent = '无法连接服务';
+          });
+      });
+      return b;
+    }
+
     function load() {
       api('/api/board').then(function (r) {
         grid.innerHTML = '';
-        grid2.innerHTML = '';
+        relayBox.innerHTML = '';
         grid3.innerHTML = '';
         grid4.innerHTML = '';
         if (!r.ok) {
@@ -706,18 +760,36 @@
         grid.appendChild(kv('输入电压状态 PV', raw(dd.PV)));
         grid.appendChild(kv('累计开门次数', raw(d.door_events)));
 
-        /* 三路继电器：状态与三路测量各有独立 valid 位，缺哪项就显示"—" */
+        /* 三路继电器：**每一项单独一列**（状态/电压/电流/功率/电量各自可读），
+         * 每行两个按钮直接下发 0xD1。状态与三路测量各有独立 valid 位，缺哪项就显示"—"。 */
         if (!rel.length) {
-          grid2.appendChild(kv('继电器', '尚未收到继电器数据', 'warn'));
+          relayBox.appendChild(el('p', 'hint', '尚未收到继电器数据（采集板未应答 0xE1）。'));
         } else {
+          var t = el('table');
+          var head = el('tr');
+          ['通道', '状态', '电压', '电流', '功率', '电量', '控制'].forEach(function (h) {
+            head.appendChild(el('th', null, h));
+          });
+          t.appendChild(head);
           for (var i = 0; i < rel.length; i++) {
             var x = rel[i] || {};
-            var stt = (x.state === null || x.state === undefined)
-              ? '状态未知' : (RELAY_TEXT[x.state] || ('未知（' + x.state + '）'));
-            grid2.appendChild(kv('第 ' + (i + 1) + ' 路',
-              stt + '　' + num(x.v, ' V', 1) + ' / ' + num(x.a, ' A', 2) +
-              '　功率 ' + num(x.power, ' W', 1) + '　电量 ' + num(x.elec, '', 2)));
+            var ch = i + 1;
+            var tr = el('tr');
+            tr.appendChild(el('td', null, '第 ' + ch + ' 路'));
+            tr.appendChild(el('td', null,
+              (x.state === null || x.state === undefined)
+                ? '未知' : (RELAY_TEXT[x.state] || ('未知（' + x.state + '）'))));
+            tr.appendChild(el('td', null, num(x.v, ' V', 1)));
+            tr.appendChild(el('td', null, num(x.a, ' A', 2)));
+            tr.appendChild(el('td', null, num(x.power, ' W', 1)));
+            tr.appendChild(el('td', null, num(x.elec, '', 2)));
+            var td = el('td');
+            td.appendChild(relayBtn(ch, true));
+            td.appendChild(relayBtn(ch, false));
+            tr.appendChild(td);
+            t.appendChild(tr);
           }
+          relayBox.appendChild(t);
         }
 
         grid3.appendChild(kv('电压上限 hv', raw(lim.hv)));
@@ -756,7 +828,7 @@
           (lk.queue_full ? '（队满丢弃 ' + lk.queue_full + '）' : '')));
       }).catch(function () {
         grid.innerHTML = '';
-        grid2.innerHTML = '';
+        relayBox.innerHTML = '';
         grid3.innerHTML = '';
         grid4.innerHTML = '';
         note.textContent = '';

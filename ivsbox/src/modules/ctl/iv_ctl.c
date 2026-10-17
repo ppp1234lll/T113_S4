@@ -42,6 +42,7 @@
 #include "ivsbox/iv_clock.h"
 #include "ivsbox/iv_ctl.h"
 #include "ivsbox/iv_media.h"
+#include "ivsbox/iv_recovery.h" /* 0xD1 载荷的唯一权威构造：iv_recovery_build_payload() */
 #include "ivsbox/iv_report.h"
 #include "ivsbox/iv_status.h"
 #include "ivsbox/iv_upd.h"
@@ -62,6 +63,7 @@ static const char *const k_methods[] = {
     "snmp.run",
     "gps.status",
     "board.status",
+    "relay.set",
     "camera.search",
     "system.time",
     "system.reboot",
@@ -1296,6 +1298,92 @@ static int m_board_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_t
     return rsp_data(d, out, cap, out_len);
 }
 
+/* ============================ relay.set（S2.6 继电器人工控制） ============================ */
+
+/* 人点一下按钮就把某路继电器吸合/断开。
+ *
+ * **协议口径（架构 §18.2，一处也不能自创）**：
+ *   - 动作帧 `0xD1`，data ＝ JSON `{"port":<0~7>,"status":<0 关/1 开/2 重启>}`，
+ *     由 `iv_recovery_build_payload()` **逐字**构造（与 S4.4 自愈下发同一份实现，
+ *     不另写一遍 —— 两处生成同一帧时，格式漂移会变成"人工能用、自愈不能用"）；
+ *   - **继电器编号 ＝ port ＋ 1**（本工程既定：继电器 1 ⇒ port 0（主网）、
+ *     继电器 2~8 ⇒ port 1~7（摄像机））。界面上说的是"第 N 路"，线上必须换算成
+ *     `N-1`，换算只在这一个地方做；
+ *   - `RELAY` 镜像的口径是 1=开 / 2=关（与 `DS` 相反），而 `0xD1` 的 `status`
+ *     是 0=关 / 1=开。**不要把镜像值直接当 status 发出去**。
+ *
+ * **只发一次、不重传**（`0xD1` 是控制命令，见 `iv_link.h`）；`IV_EBUSY`（同 cmd
+ * 有在飞）原样上抛，让调用方稍后重试，绝不在这里排队或丢弃。
+ *
+ * 发成功后**主动催一次 0xE1**：`0xD1` 的应答不进状态镜像，不催的话界面要等下一个
+ * 轮询周期（默认 30 s）才看得到结果 —— 一个人工去合闸的动作，回读必须快。 */
+static int m_relay_set(const iv_ctl_ctx_t *ctx, json_object *p,
+                       char *out, size_t cap, size_t *out_len)
+{
+    json_object *v = NULL;
+    json_object *d;
+    iv_report_t *rp;
+    char         payload[24];
+    int64_t      ch = 0;
+    int          on;
+    int          port;
+    int          plen;
+    int          rc;
+
+    if (ctx->agent == NULL)
+        return rsp_err(IV_ESTATE, "agent unavailable", out, cap, out_len);
+    if (param_i64(p, "ch", &ch) != IV_OK)
+        return rsp_err(IV_EINVAL, "missing ch", out, cap, out_len);
+    /* 镜像里只有 3 路带测量的继电器（RELAY1/2/3），故对外只开放 1~3。 */
+    if (ch < 1 || ch > 3)
+        return rsp_err(IV_EINVAL, "ch must be 1..3", out, cap, out_len);
+    if (!json_object_object_get_ex(p, "on", &v) || v == NULL)
+        return rsp_err(IV_EINVAL, "missing on", out, cap, out_len);
+    on = json_object_get_boolean(v) ? 1 : 0;
+
+    port = (int)ch - 1; /* 继电器 N ⇒ port N-1（见上面的口径） */
+    plen = iv_recovery_build_payload(port,
+                                     on ? (int)IV_RECOVERY_PWR_ON
+                                        : (int)IV_RECOVERY_PWR_OFF,
+                                     payload, sizeof payload);
+    if (plen < 0)
+        return rsp_err(plen, "payload build failed", out, cap, out_len);
+
+    rp = iv_agent_report(ctx->agent);
+    if (rp == NULL || iv_report_is_open(rp) != 1)
+        return rsp_err(IV_ESTATE, "board link not open", out, cap, out_len);
+
+    /* 时刻取 `rp->now_ms`（report 模块的时钟域），**不要**另取
+     * iv_clock_monotonic_ms()：iv_report 的口径是"时间一律由调用方以 now_ms
+     * 传入"，而清在飞事务的是 iv_report_step→iv_link_tick(rp->now_ms)。
+     * 两个时钟域混用会让 deadline 落在另一个域里 ⇒ 0xD1 永不超时，
+     * 后续 relay.set 全被 IV_EBUSY 挡住（集成用例给假时钟时必现）。 */
+    rc = iv_report_send_cmd(rp, IV_FRAME_CMD_POWER, payload, (uint16_t)plen,
+                            rp->now_ms);
+    if (rc != IV_OK)
+        return rsp_err(rc, "board link busy or down, retry later", out, cap, out_len);
+
+    /* 催一次全量查询：界面"下发→回读"之间不再空等一个轮询周期。 */
+    iv_report_request_poll(rp);
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "ch", json_object_new_int((int)ch));
+    json_object_object_add(d, "port", json_object_new_int(port));
+    json_object_object_add(d, "on", json_object_new_boolean(on));
+    /* 把真正发出去的 data 原样回显：现场对不上时，第一件事就是看这串字节。 */
+    json_object_object_add(d, "payload", json_object_new_string(payload));
+
+    if (ctx->store != NULL) {
+        char ad[40];
+
+        (void)snprintf(ad, sizeof ad, "ch=%d port=%d on=%d", (int)ch, port, on);
+        (void)iv_store_audit_add(ctx->store, "relay.set", ad, 0, (int64_t)time(NULL));
+    }
+    return rsp_data(d, out, cap, out_len);
+}
+
 /* ============================ gps.status（S2.5） ============================ */
 
 /* double 字段：NA（NAN）写成 JSON **null**。
@@ -1915,6 +2003,8 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_gps_status(ctx, out, out_cap, out_len);
     else if (strcmp(method, "board.status") == 0)
         rc = m_board_status(ctx, out, out_cap, out_len);
+    else if (strcmp(method, "relay.set") == 0)
+        rc = m_relay_set(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "camera.search") == 0)
         rc = m_camera_search(ctx, out, out_cap, out_len);
     else if (strcmp(method, "system.time") == 0)

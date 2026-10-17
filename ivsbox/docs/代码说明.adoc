@@ -2503,3 +2503,132 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
     重启后 4 个进程在线、`ttySAC5` fd 在位。
 * **未做（登记）**：浏览器里人工点选「控制板」页的观感复核（页面已可登录查看）；
   `0xD1`/`0xF1` 的下发与平台侧查询路径（本轮只做只读出口）。
+
+== 2026-10-17 15:08 继电器人工控制（`relay.set` ＋「控制板」页控制按钮）
+
+=== 为什么会有这一步
+
+上一小节（14:19）把控制板数据整块塞进一张表：看得清数字，但**没法动作** ——
+现场要断某一路摄像机电源，只能去动硬件接线。而且四类语义不同的数据（运行参数／
+三路继电器／9 项阈值／20 项链路统计）挤在同一个网格里，扫读很费劲。
+
+本步只做两件事：**参数按语义分四块** ＋ **打通 `0xD1` 写路径**。
+
+=== 继电器号 → 采集板端口
+
+|===
+|继电器 |`0xD1` 的 `port` |对应负载
+|1 |0 |主网电源（**断了板子会掉网**）
+|2 |1 |摄像机 1
+|3 |2 |摄像机 2
+
+|===
+换算只有一行：`port = ch - 1`。镜像里 3 路 `RELAY` 都有电压/电流测量，
+故对外只开放 1~3；`port` 4~7 的摄像机口镜像里没有反馈，本轮不开放
+（要开放得先有测量通道，否则"点了不知道成没成"）。
+
+=== 口径陷阱（三条，写错都看不出来）
+
+. **镜像值不能直接当 `status` 发。** 镜像 `RELAY` 是 1=开/2=关，
+  而 `0xD1` 的 `status` 是 0=关/1=开/2=重启。直接把 `state` 塞进 `status`
+  ⇒ 想"关"会发出 `status=2`，被采集板理解成**重启**。
+. **别照 `DS` 映射。** `DS` 是 1=关/2=开，与 `RELAY` **正好相反**；
+  两套映射分别写在前端各自的映射表里，不共用一个函数。
+. **载荷由 `iv_recovery_build_payload()` 生成，不另写一份。**
+  S4.4 自愈动作走的是同一个函数。两处各拼一遍 JSON 必然漂移，
+  漂移后的表现是"页面上人工控制能用、自愈不能用"——这种缺陷在实验室里
+  几乎不会自己冒出来。
+
+=== 时刻必须取 `rp->now_ms`，不能取 `iv_clock_monotonic_ms()`
+
+`iv_report` 的口径写在头文件里：**时间一律由调用方以 `now_ms` 传入**
+（单测给假时钟）。而清在飞事务的是：
+
+[source,c]
+----
+iv_report_step(rp, now_ms)  →  iv_link_tick(&rp->lk, now_ms)
+----
+
+`iv_link_send()` 用传进去的 `now_ms + timeout_ms` 当 `deadline`。
+若 handler 自己另外取 `iv_clock_monotonic_ms()`（真实单调时钟），
+`deadline` 就落在**另一个时钟域**里：
+
+* 生产环境两个时钟数值接近，看不出问题；
+* 集成用例给的是假时钟（1000 起步）⇒ `deadline` 在几百万毫秒之后
+  ⇒ **`0xD1` 永不超时 ⇒ 在飞事务永不释放 ⇒ 之后每一次 `relay.set`
+  都被 `IV_EBUSY` 挡死**。
+
+本轮就是这么抓到的：`FAIL: b06 relay.set off accepted`。修法只有一行，
+但根因是"混用时钟域"，不是"测试写得不对"。
+
+=== `0xD1` 的在飞约束与前端冷却
+
+`iv_link` 对**同一 cmd 只允许一笔在飞**（应答窗口 2 s）。所以：
+
+* 后端遇到 `IV_EBUSY` 明确回 `"board link busy or down, retry later"`，
+  **不做重试兜底** —— 控制命令只发一次、不重传是 `iv_link` 的既定语义
+  （重传一个"断电"动作，在应答丢失时会变成发两次）。
+* 前端下发成功后按钮**整体禁用 5 s**。不冷却的话，人连着点两路必然收到
+  "忙"，看起来像功能坏了。
+
+=== 回读要做两遍（板端实测教训）
+
+板端实测：`ch=2, on=false` 下发后 **6 s** 回读，`relay[1].state` 仍是 `1`（旧值）。
+原因不是没生效 —— 是采集板那条 `0xE1` 应答**在处理 `0xD1` 之前**就已经发出去了，
+镜像落后一拍。
+
+前端因此回读两次（2.2 s 与 5 s），并在提示里写明"采集板镜像可能滞后一拍"。
+只回读一次的观感是"按钮点了、表格没变"，用户会以为没生效然后重复点。
+
+=== 代码落点
+
+[source,c]
+----
+ivsbox/include/ivsbox/iv_report.h        void iv_report_request_poll(iv_report_t *);
+ivsbox/src/modules/report/iv_report.c    同实现：只把 next_poll 拨到 now_ms
+ivsbox/src/modules/ctl/iv_ctl.c          m_relay_set() ＋ 方法表 "relay.set"
+ivsbox/web/src/iv_web_api.c              POST /api/board/relay（非 POST ⇒ 405）
+ivsbox/web/static/app.js                 pageBoard 四块分区 ＋ relayBtn()
+ivsbox/tests/integration/test_agent_board.c  b06（原"关闭"组改名 b07）
+----
+
+`iv_report_request_poll()` 刻意**不判断"有没有 `0xE1` 在飞"**：`rep_poll()`
+那条路径遇到 `IV_EBUSY` 只是本拍不发、下一拍再试，不会丢状态。
+这样本函数不新增 fd／定时器／线程，也不打断在飞事务。
+
+=== 验证
+
+* **编译**：VM `make host` / `make arm` RC=0 零告警（`-Wall -Wextra -Werror`）。
+* **单测**：`make test` **39/39 passed、0 FAIL**。
+* **集成** `b06`：判据不看返回值，看**线上字节** ——
+  `ch=1,on=true` 必须与 `iv_frame_build(0xD1,"{\"port\":0,\"status\":1}")`
+  逐字节相同；`step(2500)` 推过 2 s 在飞窗口后再发 `ch=3,on=false`，
+  比对 `{"port":2,"status":0}`。
+  守卫段之前也放空一次串口 —— 否则 0xD1 还在窗口里时，"越界被拒"会先被
+  `IV_EBUSY` 挡成 `ok:false`，`ch=4` 那条断言就只证明了"忙"、没证明"守卫"。
+* **反向证伪 3 条**（编译干净、还原后 `iv_ctl.c` md5 `b8e6a0e7…` 一致、复绿）：
+  1. `port = (int)ch`（不做 `ch-1`）⇒ 3 行 FAIL（`relay 1 -> port 0` 与两条字节断言）；
+  2. `PWR_ON/PWR_OFF` 改成恒发 `PWR_ON` ⇒ `FAIL: b06 0xD1 bytes: relay3 -> port 2 status 0`；
+  3. 守卫去掉上界 `ch > 3` ⇒ `FAIL: b06 ch=4 rejected` ＋
+     `FAIL: b06 rejected requests send nothing on the wire`。
+
+  注：试过"删下界 `ch < 1`"，但它**是等价变异** —— `iv_recovery_build_payload()`
+  里的 `port_ok()` 会二次挡住 `port=-1`，用例照样过。等价变异不算证据，未采信。
+* **板端（192.168.2.120，真实采集板 ＋ 真实继电器）**：
+
+[source,text]
+----
+GET  /api/board/relay              → 405 {"ok":false,"msg":"POST required"}
+POST {"ch":9,"on":true}            → ch must be 1..3      （不发字节）
+POST {"ch":2}                      → missing on           （不发字节）
+
+基线                                relay = [1, 1, 1]
+POST {"ch":2,"on":false}           → {"port":1,"status":0}
+回读                                relay = [1, 2, 1]      ← 第 2 路已断开
+POST {"ch":2,"on":true}            → {"port":1,"status":1}
+回读                                relay = [1, 1, 1]      ← 复原
+tx_bytes                            每帧 +38 B
+----
+
+  第 1 路（主网口 `port 0`）**全程未触碰** —— 断了板子会掉网、SSH 直接失联。
+* **未做（登记）**：连续切换长稳、切换后掉电回滚仍挂 M7 真机项。

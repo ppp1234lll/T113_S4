@@ -30,6 +30,7 @@
  *   b03 `DS` 若按参考项目做 1↔2 映射 ⇒ `DS:2` 断言失败（本项目口径 1=关/2=开）。
  */
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,6 +121,33 @@ static void mcu_send(uint8_t cmd, const char *payload, uint16_t len)
     if (un <= 0)
         return;
     chk(write(g_master, up, (size_t)un) == un, "frame written to fake mcu");
+}
+
+/* 从 pty 主端收字节（主板发出来的下行帧都落在这里）。返回收到的字节数。 */
+static size_t drain(int fd, char *out, size_t cap, int ms)
+{
+    struct pollfd p;
+    size_t        n = 0;
+    int           rc;
+
+    p.fd     = fd;
+    p.events = POLLIN;
+    for (;;) {
+        rc = poll(&p, 1, ms);
+        if (rc <= 0)
+            break;
+        {
+            ssize_t got = read(fd, out + n, cap - n);
+
+            if (got <= 0)
+                break;
+            n += (size_t)got;
+            if (n >= cap)
+                break;
+        }
+        ms = 20; /* 后续用短超时把同一拍里的剩余字节一起收掉 */
+    }
+    return n;
 }
 
 static int agent_up(const char *slave)
@@ -261,13 +289,67 @@ int main(void)
         chk(rc != IV_OK, "b05 unknown method rejected");
     }
 
+    /* ---- b06 relay.set：继电器号 → 端口换算 ＋ 0xD1 下行字节黄金 ----
+     * 这条是本用例里唯一会**往采集板发动作**的路径，所以判据不看返回值，看**线上字节**：
+     * `{"port":N,"status":S}` 由 `iv_recovery_build_payload()` 逐字生成，与 S4.4 自愈
+     * 用的是同一份实现（两处漂移会变成"人工能用、自愈不能用"）。 */
+    {
+        const char *js;
+        static const char on1[]  = "{\"port\":0,\"status\":1}";
+        static const char off3[] = "{\"port\":2,\"status\":0}";
+        uint8_t           want[IV_FRAME_MAX];
+        char              got[96];
+        size_t            wn;
+        size_t            gn;
+
+        (void)drain(g_master, got, sizeof got, 20); /* 先把前面的 0xE1 轮询清掉 */
+
+        js = ctl("{\"m\":\"relay.set\",\"p\":{\"ch\":1,\"on\":true}}");
+        chk(strstr(js, "\"ok\":true") != NULL, "b06 relay.set accepted");
+        chk(strstr(js, "\"port\":0") != NULL, "b06 relay 1 -> port 0");
+        wn = (size_t)iv_frame_build(IV_FRAME_HEAD_DOWN, IV_FRAME_CMD_POWER, on1,
+                                    (uint16_t)(sizeof on1 - 1u), want, sizeof want);
+        gn = drain(g_master, got, sizeof got, 300);
+        chk(wn > 0u && gn == wn, "b06 0xD1 frame length for relay 1 ON");
+        chk(gn == wn && memcmp(got, want, wn) == 0, "b06 0xD1 bytes: relay1 -> port 0 status 1");
+
+        /* 第二条必须等第一条的 2 s 应答窗口过去：`iv_link` 同 cmd 只允许一笔在飞，
+         * 这是 0xD1 的既有约束（S4.4 用待发 FIFO 串行化整排 7 条正是为此），
+         * 不是新缺陷 —— 这里如实把它演一遍。 */
+        (void)drain(g_master, got, sizeof got, 20);
+        step(2500u); /* 推过 0xD1 的 2 s 超时窗口，在飞事务被清掉 */
+        (void)drain(g_master, got, sizeof got, 20);
+        js = ctl("{\"m\":\"relay.set\",\"p\":{\"ch\":3,\"on\":false}}");
+        chk(strstr(js, "\"ok\":true") != NULL, "b06 relay.set off accepted");
+        wn = (size_t)iv_frame_build(IV_FRAME_HEAD_DOWN, IV_FRAME_CMD_POWER, off3,
+                                    (uint16_t)(sizeof off3 - 1u), want, sizeof want);
+        gn = drain(g_master, got, sizeof got, 300);
+        chk(gn == wn && memcmp(got, want, wn) == 0, "b06 0xD1 bytes: relay3 -> port 2 status 0");
+
+        /* 守卫：路号越界、缺 on、没有 agent —— 都必须明确拒绝，且**不往线上发字节** */
+        /* 守卫段之前先把线放空。0xD1 还在 2 s 窗口里时，任何"该被拒"的请求都会
+         * 先被 iv_link 的 IV_EBUSY 挡成 ok:false —— 那样"越界被拒"与"忙被拒"
+         * 分不开，ch=4 这类断言就失去牙口（只证明了忙，没证明守卫）。 */
+        step(2500u);
+        (void)drain(g_master, got, sizeof got, 20);
+        chk(strstr(ctl("{\"m\":\"relay.set\",\"p\":{\"ch\":0,\"on\":true}}"), "\"ok\":false") != NULL,
+            "b06 ch=0 rejected");
+        chk(strstr(ctl("{\"m\":\"relay.set\",\"p\":{\"ch\":4,\"on\":true}}"), "\"ok\":false") != NULL,
+            "b06 ch=4 rejected");
+        chk(strstr(ctl("{\"m\":\"relay.set\",\"p\":{\"ch\":2}}"), "\"ok\":false") != NULL,
+            "b06 missing on rejected");
+        gn = drain(g_master, got, sizeof got, 120);
+        chk(gn == 0u, "b06 rejected requests send nothing on the wire");
+    }
+
+    /* ---- b07 关闭 ---- */
     iv_agent_close(&g_agent);
-    chk(iv_agent_is_open(&g_agent) == 0, "b06 closed");
+    chk(iv_agent_is_open(&g_agent) == 0, "b07 closed");
 
     (void)close(g_master);
     if (g_fail == 0)
         printf("test_agent_board passed (null semantics, 0xE1 decode, relay, limits, "
-               "0xC1/0xC2 events, guards)\n");
+               "0xC1/0xC2 events, relay.set 0xD1 bytes, guards)\n");
     else
         printf("test_agent_board FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

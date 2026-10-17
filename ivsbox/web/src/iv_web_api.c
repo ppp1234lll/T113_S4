@@ -513,6 +513,19 @@ int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
     /* S2.6 采集板（控制板）：只读，镜像与通信统计全在 ivsboxd 侧，本层仅透传。 */
     if (strcmp(req->path, "/api/board") == 0)
         return api_simple_call(ctx, "board.status", out, cap, out_len, rsp);
+    /* S2.6 继电器人工控制：**写**路径（下发 0xD1）。只收 POST —— 控制动作不能
+     * 靠一个 GET 被浏览器预取/缓存命中而误触发。 */
+    if (strcmp(req->path, "/api/board/relay") == 0) {
+        if (strcmp(req->method, "POST") != 0) {
+            *out_len = api_err(out, cap, IV_EINVAL, "POST required");
+            rsp->status = 405;
+            rsp->len = *out_len;
+            return IV_OK;
+        }
+        return api_p_call(ctx, "relay.set",
+                          (req->body != NULL) ? req->body : "{}",
+                          out, cap, out_len, rsp);
+    }
     if (strcmp(req->path, "/api/camera/search") == 0)
         return api_simple_call(ctx, "camera.search", out, cap, out_len, rsp);
     if (strcmp(req->path, "/api/system/time") == 0)

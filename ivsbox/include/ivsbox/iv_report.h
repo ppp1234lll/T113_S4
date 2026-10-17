@@ -266,6 +266,20 @@ int iv_report_send_cmd(iv_report_t *rp, uint8_t cmd, const void *data,
                        uint16_t len, uint64_t now_ms);
 
 /*
+ * 请求**立刻**下发一次 `0xE1` 全量查询（不等下一个 `poll_ms` 周期）。
+ *
+ * 用途：控制类动作（`0xD1` 电源/继电器）的应答**不进状态镜像**（口径见
+ * `iv_status.h`：0xF1/0xD1/0xD2 应答属应用层），所以发完动作后镜像仍是旧值，
+ * 要等下一个轮询周期才能看到"到底生效没有"。人工点一下按钮却要等 30 s 才知道
+ * 结果，在"这是个会断电的开关"的场合不能接受 ⇒ 动作成功后主动催一次查询。
+ *
+ * 实现上只把 `next_poll` 拨到当前时刻，**不直接发帧**：真正的下发仍由
+ * `iv_report_step()` 走在既有节拍上（不新增 fd/定时器/线程，也不打断在飞事务）。
+ * `rp == NULL` 或未 open 时**静默忽略**（这是"催一下"，不是业务动作）。
+ */
+void iv_report_request_poll(iv_report_t *rp);
+
+/*
  * 设置**下一次建连**使用的平台地址（**不主动断连**：在用连接原样保留，
  * 由 `iv_report_reconnect()` 关闭并按新址重开）。`host` 为空 / `port` 为 0
  * ⇒ 清空目标地址（此后 `iv_report_reconnect()` 返回 IV_ESTATE）。

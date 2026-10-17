@@ -381,57 +381,74 @@
   }
 
   /* ==================== 页面 ==================== */
+  /* ==================== 总览：设备基础信息 ====================
+   * 总览页只答一个问题："这台设备是谁"。
+   *   - 网络状态 / 主网1 / 主网2  → 「网络」页（链路判定）＋「当前生效」块（内核事实）
+   *   - 摄像机六路 CNS           → 「摄像机」页
+   *   - 采集板镜像（电压/温湿度/箱门/功率） → 「控制板」页
+   * 之前这些全堆在总览页，结果四类语义不同的数据挤在一起，而且采集板的 float 是
+   * 按 %.17g 直接打出来的（"40.40999984741211"）—— 控制板页早已用 %.2f 修过，
+   * 总览这块是另一条路径，搬走更省事。
+   *
+   * 后端约定：取不到的值是 JSON null（**不是空串**）。null 显示"—"；
+   * "空串"表示"读到了，但值是空的"，两者不能混。 */
+  var CD_MODE = { 1: 'PING', 2: '端口扫描', 3: 'RTSP OPTIONS' };
+
+  var NET_STATE = {
+    WIRELESS_UP: '无线已连接',
+    WIRELESS_DEGRADED: '无线信号差',
+    SWITCH_TO_WIRED: '正在切到有线',
+    WIRED_UP: '有线已连接',
+    SWITCH_TO_WIRELESS: '正在切到无线',
+    BOTH_DOWN: '双链路断开'
+  };
+
+  /* 构建时没注入 git 元数据，iv_version 会拼出 "1.0.0+gunknown"。
+   * 原样显示容易被当成版本号写错，这里点明是开发构建。 */
+  function fmtVer(v) {
+    if (!v) return '—';
+    if (v.indexOf('+gunknown') >= 0) return v.replace('+gunknown', '') + '（开发构建）';
+    return v;
+  }
+
+  function fmtWall(sec) {
+    if (!sec) return '—';
+    var d = new Date(Number(sec) * 1000);
+    if (!isFinite(d.getTime())) return '—';
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
+      ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  }
+
   function pageOverview() {
     var root = document.createDocumentFragment();
     root.appendChild(el('h2', 'page-title', '总览'));
 
     var card = el('div', 'card');
-    card.appendChild(el('h3', null, '设备状态'));
+    card.appendChild(el('h3', null, '设备信息'));
+    var hint = el('p', 'hint', '读取中…');
+    card.appendChild(hint);
     var grid = el('div', 'grid');
     card.appendChild(grid);
     root.appendChild(card);
 
-    var up = el('div', 'card');
-    up.appendChild(el('h3', null, '采集板镜像（0xE1）'));
-    var ugrid = el('div', 'grid');
-    up.appendChild(ugrid);
-    root.appendChild(up);
-
     api('/api/overview').then(function (r) {
-      if (!r.ok) { toast(r.msg || '总览读取失败', 'err'); return; }
-      var d = r.d;
+      if (!r.ok) { hint.textContent = r.msg || '总览读取失败'; return; }
+      var d = r.d || {};
+      var dv = d.device || {};
       st.version = d.version || '';
       $('#verLabel').textContent = st.version;
-      grid.appendChild(kv('软件版本', d.version));
+      hint.textContent = '设备身份与版本。实时状态请看「网络」「摄像机」「控制板」各页。';
+      grid.appendChild(kv('软件版本', fmtVer(dv.version || d.version)));
+      grid.appendChild(kv('硬件型号', dv.model || '—'));
+      grid.appendChild(kv('主控芯片', dv.soc || '—'));
+      grid.appendChild(kv('设备 SN', dv.sn || '—（工厂身份未写入）'));
+      grid.appendChild(kv('身份 MAC', dv.id_mac || '—'));
+      grid.appendChild(kv('网口 MAC（eth0）', dv.eth0_mac || '—'));
+      grid.appendChild(kv('主机名', dv.hostname || '—'));
+      grid.appendChild(kv('内核版本',
+        dv.kernel ? (dv.kernel + (dv.machine ? '（' + dv.machine + '）' : '')) : '—'));
+      grid.appendChild(kv('系统时间', fmtWall(dv.wall_sec)));
       grid.appendChild(kv('运行时长', fmtUptime(d.uptime_ms)));
-      grid.appendChild(kv('网络状态', (d.net && d.net.state) || '-'));
-      grid.appendChild(kv('活动出口', (d.net && d.net.active_wan === 'wired') ? '有线' : '无线'));
-      grid.appendChild(kv('发现设备', d.devices + ' 台'));
-      grid.appendChild(kv('门开事件', d.door_events + ' 次'));
-      if (d.net && d.net.mn) {
-        grid.appendChild(kv('主网1', MN_NAME[d.net.mn[0]] || '-'));
-        grid.appendChild(kv('主网2', MN_NAME[d.net.mn[1]] || '-'));
-      }
-      if (d.cameras && d.cameras.cns) {
-        for (var i = 0; i < d.cameras.cns.length; i++)
-          grid.appendChild(kv('摄像机' + (i + 1), CNS_NAME[d.cameras.cns[i]] || d.cameras.cns[i],
-            d.cameras.cns[i] === 1 ? 'ok' : (d.cameras.cns[i] === 2 ? 'err' : 'warn')));
-      }
-      if (d.snmp) {
-        grid.appendChild(kv('SNMP 摄像机', SNMP_STATE[d.snmp.cam] || d.snmp.cam));
-        grid.appendChild(kv('SNMP 交换机', SNMP_STATE[d.snmp.sw] || d.snmp.sw));
-      }
-      if (d.status) {
-        ugrid.appendChild(kv('电压', d.status.V === null ? '—' : d.status.V + ' V'));
-        ugrid.appendChild(kv('电流', d.status.A === null ? '—' : d.status.A + ' A'));
-        ugrid.appendChild(kv('温度', d.status.T === null ? '—' : d.status.T + ' ℃'));
-        ugrid.appendChild(kv('湿度', d.status.H === null ? '—' : d.status.H + ' %'));
-        ugrid.appendChild(kv('箱门', d.status.DS === null ? '—' : (d.status.DS === 2 ? '开' : '关')));
-      }
-      if (d.power) {
-        ugrid.appendChild(kv('总功率', d.power.APOWER || '—'));
-        ugrid.appendChild(kv('总电量', d.power.AKW || '—'));
-      }
     });
     return root;
   }
@@ -444,6 +461,17 @@
      * 交给系统网络配置决定"（本产品实际由天嵌 EmbedSkyProgress.ini 生效）。
      * 光看三个空框根本看不出设备现在是什么地址，所以单列一块**实际值**（只读，
      * 数据来自内核：/api/overview 的 d.net.link）。 */
+    /* 链路判定（网络状态／活动出口／主网1／主网2）与"当前生效地址"是两件事：
+     * 前者是 netmgr 的判定结果（带迟滞，会在 MAIN1/MAIN2 之间来回），后者是内核
+     * 当前事实。这两块原先都在总览页，现统一收到本页 —— 判断网络问题不用来回切。 */
+    var linkCard = el('div', 'card');
+    linkCard.appendChild(el('h3', null, '链路状态（只读）'));
+    var lHint = el('p', 'hint', '读取中…');
+    linkCard.appendChild(lHint);
+    var lGrid = el('div', 'grid');
+    linkCard.appendChild(lGrid);
+    root.appendChild(linkCard);
+
     var live = el('div', 'card');
     live.appendChild(el('h3', null, '当前生效（只读）'));
     var hint = el('p', 'hint', '读取中…');
@@ -453,7 +481,28 @@
     root.appendChild(live);
 
     api('/api/overview').then(function (r) {
-      var lk = (r && r.ok && r.d && r.d.net) ? r.d.net.link : null;
+      var ok = (r && r.ok && r.d);
+      var nt = ok ? (r.d.net || null) : null;
+      var lk = nt ? nt.link : null;
+
+      /* —— 链路状态：判定结果（迟滞后的），与下面的内核事实分开说 —— */
+      if (!nt) {
+        lHint.textContent = '未获取到链路状态（ivsboxd 未就绪或网络模块未装配）。';
+      } else {
+        lHint.textContent = '这是链路判定的结果（带迟滞）。当前内核里的真实地址见下一块。';
+        lGrid.appendChild(kv('网络状态',
+          NET_STATE[nt.state] || (nt.state === 'n/a' ? '未装配' : nt.state) || '—',
+          nt.state === 'BOTH_DOWN' ? 'err'
+            : (nt.state === 'WIRED_UP' || nt.state === 'WIRELESS_UP' ? 'ok' : 'warn')));
+        lGrid.appendChild(kv('活动出口', nt.active_wan === 'wired' ? '有线（eth0）' : '无线（usb0）'));
+        if (nt.mn && nt.mn.length) {
+          lGrid.appendChild(kv('主网1', MN_NAME[nt.mn[0]] || '—',
+            nt.mn[0] === 2 ? 'err' : (nt.mn[0] === 1 ? 'ok' : 'warn')));
+          lGrid.appendChild(kv('主网2', MN_NAME[nt.mn[1]] || '—',
+            nt.mn[1] === 2 ? 'err' : (nt.mn[1] === 1 ? 'ok' : 'warn')));
+        }
+      }
+
       hint.textContent = '以下是设备当前的真实地址（取自内核），与下方配置项里填的值无关。';
       if (!lk) { grid.appendChild(kv('状态', '未获取到网口信息', 'warn')); return; }
       var NAMES = { eth0: '有线网口 eth0', usb0: '无线网口 usb0' };
@@ -684,8 +733,11 @@
         relayMsg.textContent = '下发中…';
         api('/api/board/relay', { method: 'POST', body: { ch: ch, on: on } })
           .then(function (res) {
-            busy = false;
+            /* 注意：这里**不能**先把 busy 放回 false —— 否则下面 2.2 s / 5 s 的冷却
+             * 形同虚设，人连点两路立刻撞上 0xD1 的"同命令在飞"。只有失败分支和
+             * 5 s 定时器才解开。 */
             if (!res.ok) {
+              busy = false;
               relayMsg.textContent = '下发失败：' + (res.msg || ('错误 ' + res.e)) +
                 (res.e === -3 ? '（同命令在飞，稍后重试）' : '');
               return;
@@ -845,6 +897,33 @@
   function pageCamera() {
     var root = document.createDocumentFragment();
     root.appendChild(el('h2', 'page-title', '摄像机'));
+
+    /* 六路 CNS 与检测方式原先在总览页，现归本页：状态和"这一路配的是哪个 IP"
+     * 放在一起才有用 —— 看到"3 号故障"紧接着就能核对它的 IP/账号。
+     * CNS 口径：0 无IP / 1 正常 / 2 故障 / 4 延时 / 5 丢包（无 3）。 */
+    var card = el('div', 'card');
+    card.appendChild(el('h3', null, '摄像机状态（实时）'));
+    var hint = el('p', 'hint', '读取中…');
+    card.appendChild(hint);
+    var grid = el('div', 'grid');
+    card.appendChild(grid);
+    root.appendChild(card);
+
+    api('/api/overview').then(function (r) {
+      var cm = (r && r.ok && r.d) ? r.d.cameras : null;
+
+      if (!cm || !cm.cns || !cm.cns.length) {
+        hint.textContent = '未获取到摄像机状态（检测模块未装配或尚未开始检测）。';
+        return;
+      }
+      hint.textContent = '检测方式：' + (cm.mode ? (CD_MODE[cm.mode] || cm.mode) : '—') +
+        '　判定口径：0 无IP／1 正常／2 故障／4 延时／5 丢包。';
+      for (var i = 0; i < cm.cns.length; i++)
+        grid.appendChild(kv('摄像机' + (i + 1),
+          CNS_NAME[cm.cns[i]] === undefined ? cm.cns[i] : CNS_NAME[cm.cns[i]],
+          cm.cns[i] === 1 ? 'ok' : (cm.cns[i] === 2 ? 'err' : 'warn')));
+    });
+
     root.appendChild(configCard('摄像机参数与账号（camera.*）', ['camera'],
       '检测方式、6 路 IP/账号/端口，以及 SNMP OID 槽位（按机型填值）。'));
     return root;

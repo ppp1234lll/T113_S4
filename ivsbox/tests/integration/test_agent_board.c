@@ -342,6 +342,27 @@ int main(void)
         chk(gn == 0u, "b06 rejected requests send nothing on the wire");
     }
 
+    /* ---- b08 sys.overview 的 device 段（总览页只答"这台设备是谁"） ----
+     * 总览页原先堆的是网络/摄像机/采集板三家的实时数据，现在归各自页面；总览只留
+     * 身份与版本。这里钉住三件事：① device 段真的在；② 本机可得的（主机名/内核/
+     * 墙钟）都有值；③ **本机不可得的给 JSON null 而不是空串** —— 宿主机既没有
+     * device-tree 也没有工厂身份分区，正好是"取不到"的样本。空串会被前端当成
+     * "读到了但值是空的"，与"没有身份"是两件事。 */
+    {
+        const char *js = ctl("{\"m\":\"sys.overview\"}");
+
+        chk(strstr(js, "\"device\":{") != NULL, "b08 overview has device block");
+        chk(strstr(js, "\"version\":\"") != NULL, "b08 device.version present");
+        chk(strstr(js, "\"hostname\":\"") != NULL, "b08 device.hostname present");
+        chk(strstr(js, "\"kernel\":\"") != NULL, "b08 device.kernel present");
+        chk(strstr(js, "\"machine\":\"") != NULL, "b08 device.machine present");
+        chk(strstr(js, "\"wall_sec\":") != NULL, "b08 device.wall_sec present");
+        chk(strstr(js, "\"model\":null") != NULL, "b08 device.model is JSON null on host");
+        chk(strstr(js, "\"soc\":null") != NULL, "b08 device.soc is JSON null on host");
+        chk(strstr(js, "\"sn\":null") != NULL, "b08 device.sn is JSON null on host");
+        chk(strstr(js, "\"id_mac\":null") != NULL, "b08 device.id_mac is JSON null on host");
+    }
+
     /* ---- b07 关闭 ---- */
     iv_agent_close(&g_agent);
     chk(iv_agent_is_open(&g_agent) == 0, "b07 closed");
@@ -349,7 +370,7 @@ int main(void)
     (void)close(g_master);
     if (g_fail == 0)
         printf("test_agent_board passed (null semantics, 0xE1 decode, relay, limits, "
-               "0xC1/0xC2 events, relay.set 0xD1 bytes, guards)\n");
+               "0xC1/0xC2 events, relay.set 0xD1 bytes, guards, overview device block)\n");
     else
         printf("test_agent_board FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

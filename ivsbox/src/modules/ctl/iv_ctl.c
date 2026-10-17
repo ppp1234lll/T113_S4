@@ -34,7 +34,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/utsname.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <json-c/json.h>
 
@@ -42,6 +44,7 @@
 #include "ivsbox/iv_clock.h"
 #include "ivsbox/iv_ctl.h"
 #include "ivsbox/iv_media.h"
+#include "ivsbox/iv_provision.h" /* 设备 SN／身份 MAC：只读工厂身份分区 */
 #include "ivsbox/iv_recovery.h" /* 0xD1 载荷的唯一权威构造：iv_recovery_build_payload() */
 #include "ivsbox/iv_report.h"
 #include "ivsbox/iv_status.h"
@@ -533,6 +536,130 @@ static json_object *build_storage(const iv_ctl_ctx_t *ctx)
     return s;
 }
 
+/* ---------------------------------------------------------------------------
+ * 设备基础信息（总览页）
+ *
+ * ============================ 总览只答一个问题 ============================
+ * "**这台设备是谁**"。版本号、硬件型号、设备 SN、MAC、主机名这类"不随时间变"的
+ * 身份信息归它；网络状态归网络页、摄像机六路归摄像机页、采集板镜像（含箱门／
+ * 总功率）归控制板页 —— 各归各位，不再往总览页堆。
+ *
+ * ============================ 三个来源，各有各的坑 ============================
+ * 1. **硬件型号／SoC**：`/proc/device-tree/model` 是**带尾随 NUL 的定长串**（实测还
+ *    带尾随空格），`fread` 拿回来的长度不能用 `strlen` 算 —— 值域里真有 NUL。
+ *    `compatible` 更是 NUL 分隔的多段（`embedsky,tqt113-core\0arm,sun8iw20p1`），
+ *    取第一段即板级 compatible；C 字符串天然在第一个 NUL 处结束，不必额外截断。
+ * 2. **设备 SN／MAC**：读工厂身份分区。**分区存在 ≠ 已写入** —— 未写入时 magic 与
+ *    累加校验都不过，按"不存在"上报。此时给 JSON null（前端显示"—"），**不给空串**：
+ *    空串的语义是"读到了，但值是空的"，与"没有身份"是两件事。
+ *    身份只在产线写入、运行期不变（写入后需重启生效），故**只读一次就缓存**：
+ *    总览 5 s 刷一次，每次都去读 4 KiB 块设备没有意义。
+ * 3. **内核／主机名**：`uname()` 与 `gethostname()`，纯本机事实，不涉配置。
+ * ------------------------------------------------------------------------- */
+
+/* 读一个小文本文件并裁掉尾随的 NUL / 空白。读不到就留空串（调用方据此给 null）。 */
+static void read_dt_string(const char *path, char *out, size_t cap)
+{
+    FILE  *f;
+    size_t n;
+
+    if (out == NULL || cap < 2u)
+        return;
+    out[0] = '\0';
+    f = fopen(path, "rb");
+    if (f == NULL)
+        return;
+    n = fread(out, 1u, cap - 1u, f);
+    (void)fclose(f);
+    out[n] = '\0';
+    while (n > 0u) {
+        char c = out[n - 1u];
+
+        if (c == '\0' || c == '\n' || c == '\r' || c == ' ' || c == '\t')
+            out[--n] = '\0';
+        else
+            break;
+    }
+}
+
+typedef struct {
+    int  loaded;                  /* 只尝试一次：产线写入需重启，运行期重试无意义 */
+    char sn[IV_PROV_TID_MAX];     /* 空串＝没有身份（未写入工厂分区） */
+    char mac[IV_PROV_MAC_MAX];
+} dev_identity_t;
+
+static const dev_identity_t *device_identity(void)
+{
+    static dev_identity_t id;
+    iv_prov_id_t          raw;
+
+    if (id.loaded)
+        return &id;
+    id.loaded = 1;
+    if (iv_prov_private_read(NULL, &raw) == IV_OK) {
+        iv_prov_tid_from_u32(raw.devid, id.sn);
+        iv_prov_mac_format(raw.mac, id.mac);
+    }
+    return &id;
+}
+
+/* 一个字段：有值给字符串，没值给 JSON null（**不给空串**）。 */
+static void add_str_or_null(json_object *o, const char *k, const char *v)
+{
+    if (v != NULL && v[0] != '\0')
+        json_object_object_add(o, k, json_object_new_string(v));
+    else
+        json_object_object_add(o, k, NULL);
+}
+
+static void add_device_info(json_object *d)
+{
+    json_object          *dev = json_object_new_object();
+    const dev_identity_t *id  = device_identity();
+    struct utsname        u;
+    char                  model[64]  = "";
+    char                  soc[64]    = "";
+    char                  ethmac[20] = "";
+    char                  host[64]   = "";
+
+    if (dev == NULL)
+        return;
+
+    json_object_object_add(dev, "version", json_object_new_string(iv_version_string()));
+
+    read_dt_string("/proc/device-tree/model", model, sizeof model);
+    read_dt_string("/proc/device-tree/compatible", soc, sizeof soc);
+    add_str_or_null(dev, "model", model);
+    add_str_or_null(dev, "soc", soc);
+
+    /* SN 与 MAC 一起来自身份记录；记录没有就两个都给 null（不拿 eth0 的 MAC 顶替
+     * 身份 MAC —— 那是两件事：一个由产线分配，一个由网卡驱动决定）。 */
+    add_str_or_null(dev, "sn", id->sn);
+    add_str_or_null(dev, "id_mac", id->mac);
+
+    read_dt_string("/sys/class/net/eth0/address", ethmac, sizeof ethmac);
+    add_str_or_null(dev, "eth0_mac", ethmac);
+
+    if (gethostname(host, sizeof host) == 0) {
+        host[sizeof host - 1u] = '\0';
+        add_str_or_null(dev, "hostname", host);
+    } else {
+        add_str_or_null(dev, "hostname", "");
+    }
+
+    if (uname(&u) == 0) {
+        add_str_or_null(dev, "kernel", u.release);
+        add_str_or_null(dev, "machine", u.machine);
+    } else {
+        add_str_or_null(dev, "kernel", "");
+        add_str_or_null(dev, "machine", "");
+    }
+
+    /* 系统墙钟：现场核对"设备时间对不对"最直接的一眼（对时通道见 system.time）。 */
+    json_object_object_add(dev, "wall_sec", json_object_new_int64((int64_t)time(NULL)));
+    json_object_object_add(d, "device", dev);
+}
+
 static json_object *build_overview(const iv_ctl_ctx_t *ctx)
 {
     json_object *d   = json_object_new_object();
@@ -552,6 +679,8 @@ static json_object *build_overview(const iv_ctl_ctx_t *ctx)
     json_object_object_add(d, "version", json_object_new_string(iv_version_string()));
     json_object_object_add(d, "uptime_ms",
                            json_object_new_int64((int64_t)iv_clock_monotonic_ms()));
+    /* 总览页要的那一块（身份/型号/内核/主机名）。其余块留给各自的页面。 */
+    add_device_info(d);
 
     if (ctx->agent != NULL) {
         iv_netmgr_state_t st = iv_agent_netmgr_state(ctx->agent);

@@ -61,6 +61,7 @@ static const char *const k_methods[] = {
     "snmp.result",
     "snmp.run",
     "gps.status",
+    "board.status",
     "camera.search",
     "system.time",
     "system.reboot",
@@ -1126,6 +1127,175 @@ static int m_camera_search(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_
     return rsp_data(d, out, cap, out_len);
 }
 
+/* ============================ board.status（S2.6 采集板镜像出口） ============================ */
+
+/* 镜像字段的"未知"处理：`iv_status` 用 **valid 位图**区分"未填"与"真零"
+ * （电压电流不会真零，但温度/湿度允许 0，靠值本身判不出来）。这里如实转成
+ * JSON **null** —— 采集板没接时页面上必须是一排"—"，不能被读成"输入 0V"。 */
+static void add_f32_v(json_object *o, const char *k, int valid, float v)
+{
+    char txt[24];
+
+    if (valid == 0) {
+        add_or_null(o, k, 0, NULL); /* 未填 ⇒ JSON null（不是 0.00） */
+        return;
+    }
+    /* **自己给文本**：镜像里存的是 `float`，若直接 `json_object_new_double()`，
+     * json-c 0.13 按 `%.17g` 打印成 `234.16999816894531` —— 值没错，但在界面和抓包里
+     * 是一串噪声，看见就得怀疑"是不是解析错了"。采集板的测量精度本就到不了第 3 位
+     * 小数（电压 0.01 V、电流 0.01 A），故固定两位小数并把这串文本一起交给 json-c，
+     * 保证"数值仍是 number、文本干净"两件事同时成立。 */
+    (void)snprintf(txt, sizeof txt, "%.2f", (double)v);
+    add_or_null(o, k, 1, json_object_new_double_s((double)v, txt));
+}
+
+static void add_i32_v(json_object *o, const char *k, int valid, int32_t v)
+{
+    add_or_null(o, k, valid != 0, json_object_new_int(v));
+}
+
+/* 采集板（控制板）通信参数出口。
+ *
+ * 三块内容，对应现场三句不同的话：
+ *   `link`  —— "线接上了吗、它到底在不在说话"（串口状态 ＋ 成帧/CRC 统计 ＋ 数据年龄）；
+ *   `data`  —— "它在说什么"（0xE1 应答镜像的运行参数）；
+ *   `limit` / `relay` —— 阈值与三路继电器。
+ *
+ * **为什么要有 age_ms**：`frames == 0` 有两种完全不同的故障 ——
+ * 串口一个字节都没收到（线没接/没上电/波特率错），和收到了字节但没有一帧过校验
+ * （协议版本不符、CRC 范围不一致）。只看帧计数两种情况长得一模一样。 */
+static int m_board_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_t *out_len)
+{
+    const iv_report_t      *rp;
+    const iv_status_t      *st;
+    const iv_frame_stats_t *fs;
+    const char             *spath;
+    json_object            *d;
+    json_object            *o;
+    uint64_t                now;
+    int                     i;
+
+    if (ctx->agent == NULL)
+        return rsp_err(IV_ESTATE, "agent unavailable", out, cap, out_len);
+    rp = iv_agent_report(ctx->agent);
+    if (rp == NULL)
+        return rsp_err(IV_ESTATE, "board link unavailable", out, cap, out_len);
+
+    st = &rp->st;
+    fs = iv_framer_stats(&rp->lk.framer);
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+
+    /* ---- 链路与统计 ---- */
+    o = json_object_new_object();
+    if (o != NULL) {
+        spath = (rp->cfg.serial_path != NULL) ? rp->cfg.serial_path : "";
+        json_object_object_add(o, "path", json_object_new_string(spath));
+        json_object_object_add(o, "open", json_object_new_boolean(rp->serial_fd >= 0));
+        json_object_object_add(o, "up", json_object_new_int(rp->lk.link_up ? 1 : 0));
+        json_object_object_add(o, "rx_bytes",
+                               json_object_new_int64((int64_t)rp->serial_rx));
+        json_object_object_add(o, "tx_bytes",
+                               json_object_new_int64((int64_t)rp->serial_tx));
+        json_object_object_add(o, "serial_err",
+                               json_object_new_int64((int64_t)rp->serial_err));
+        json_object_object_add(o, "tx_drop",
+                               json_object_new_int64((int64_t)rp->tx_drop));
+        /* 成帧统计：frames 是"交付的完整帧"（CRC ＋ 帧尾都过） */
+        json_object_object_add(o, "frames", json_object_new_int((int)fs->frames));
+        json_object_object_add(o, "crc_err", json_object_new_int((int)fs->crc_err));
+        json_object_object_add(o, "tail_err", json_object_new_int((int)fs->tail_err));
+        json_object_object_add(o, "too_long", json_object_new_int((int)fs->too_long));
+        json_object_object_add(o, "noise", json_object_new_int((int)fs->noise));
+        json_object_object_add(o, "resets", json_object_new_int((int)fs->resets));
+        /* 事务侧：轮询下发次数与应答情况 */
+        json_object_object_add(o, "polls", json_object_new_int64((int64_t)rp->polls));
+        json_object_object_add(o, "reports",
+                               json_object_new_int64((int64_t)rp->reports));
+        json_object_object_add(o, "heartbeats",
+                               json_object_new_int64((int64_t)rp->heartbeats));
+        json_object_object_add(o, "query_rsp",
+                               json_object_new_int64((int64_t)rp->query_resp));
+        json_object_object_add(o, "queue", json_object_new_int((int)iv_report_queue_count(rp)));
+        json_object_object_add(o, "queue_full",
+                               json_object_new_int64((int64_t)iv_report_queue_full(rp)));
+        /* 数据年龄：只剩"多久没听到它说话了"这一个判据 */
+        now = iv_clock_monotonic_ms();
+        if (rp->last_rx_ms == 0u || now < rp->last_rx_ms)
+            json_object_object_add(o, "age_ms", NULL); /* 从未收到任何字节 */
+        else
+            json_object_object_add(o, "age_ms",
+                                   json_object_new_int64((int64_t)(now - rp->last_rx_ms)));
+        json_object_object_add(d, "link", o);
+    }
+
+    /* ---- 运行参数（0xE1 应答键名照搬，便于与《单片机通信》表逐项对照） ---- */
+    o = json_object_new_object();
+    if (o != NULL) {
+        add_f32_v(o, "V", st->valid.V, st->data.V);
+        add_f32_v(o, "A", st->valid.A, st->data.A);
+        add_f32_v(o, "H", st->valid.H, st->data.H);
+        add_f32_v(o, "T", st->valid.T, st->data.T);
+        add_i32_v(o, "DS", st->valid.DS, st->data.DS);   /* 1=关 / 2=开 */
+        add_i32_v(o, "P", st->valid.P, st->data.P);
+        add_i32_v(o, "SPD", st->valid.SPD, st->data.SPD); /* 防雷 1/2 */
+        add_i32_v(o, "PA", st->valid.PA, st->data.PA);
+        add_i32_v(o, "PV", st->valid.PV, st->data.PV);
+        /* APOWER/AKW 源端就是**字符串化的小数**（不是 JSON number），原样转发，
+         * 本层不做数值转换 —— 转了就会引入"0.00 变 0"与精度口径分歧。 */
+        add_or_null(o, "APOWER", st->data.APOWER[0] != '\0',
+                    json_object_new_string(st->data.APOWER));
+        add_or_null(o, "AKW", st->data.AKW[0] != '\0',
+                    json_object_new_string(st->data.AKW));
+        json_object_object_add(d, "data", o);
+    }
+
+    /* ---- 阈值（0xE1 ＋ 0xF1 共享同一批字段；`tl` 允许负） ---- */
+    o = json_object_new_object();
+    if (o != NULL) {
+        add_i32_v(o, "hv", st->valid.hv, st->data.hv);
+        add_i32_v(o, "lv", st->valid.lv, st->data.lv);
+        add_i32_v(o, "ov", st->valid.ov, st->data.ov);
+        add_i32_v(o, "tu", st->valid.tu, st->data.tu);
+        add_i32_v(o, "tl", st->valid.tl, st->data.tl);
+        add_i32_v(o, "hu", st->valid.hu, st->data.hu);
+        add_i32_v(o, "hl", st->valid.hl, st->data.hl);
+        add_i32_v(o, "sl", st->valid.sl, st->data.sl);
+        add_i32_v(o, "ld", st->valid.ld, st->data.ld);
+        json_object_object_add(d, "limit", o);
+    }
+
+    /* ---- 三路继电器：状态 1=开 / 2=关 ＋ 各自的电压/电流/功率/用电量 ---- */
+    o = json_object_new_array();
+    if (o != NULL) {
+        for (i = 0; i < 3; i++) {
+            json_object *r = json_object_new_object();
+
+            if (r == NULL)
+                continue;
+            /* 状态与三路测量各有独立 valid 位：某一路只报了状态没报测量时，
+             * 该路的 v/a/power/elec 是 null，而不是 0.0。 */
+            add_i32_v(r, "state", st->valid.RELAY, st->data.RELAY[i]);
+            add_f32_v(r, "v", st->valid.CHV, st->data.CHV[i]);
+            add_f32_v(r, "a", st->valid.CHA, st->data.CHA[i]);
+            add_f32_v(r, "power", st->valid.POWER, st->data.POWER[i]);
+            add_f32_v(r, "elec", st->valid.ELEC, st->data.ELEC[i]);
+            json_object_array_add(o, r);
+        }
+        json_object_object_add(d, "relay", o);
+    }
+
+    /* 门开事件累计（S4.5，来自 `0xC1`；与镜像里的 `DS` 是两回事：
+     * `DS` 是"现在开着没"，这个是"累计开过几次"）。 */
+    json_object_object_add(d, "door_events",
+                           json_object_new_int64(
+                               (int64_t)iv_agent_door_events(ctx->agent)));
+
+    return rsp_data(d, out, cap, out_len);
+}
+
 /* ============================ gps.status（S2.5） ============================ */
 
 /* double 字段：NA（NAN）写成 JSON **null**。
@@ -1743,6 +1913,8 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_snmp_run(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "gps.status") == 0)
         rc = m_gps_status(ctx, out, out_cap, out_len);
+    else if (strcmp(method, "board.status") == 0)
+        rc = m_board_status(ctx, out, out_cap, out_len);
     else if (strcmp(method, "camera.search") == 0)
         rc = m_camera_search(ctx, out, out_cap, out_len);
     else if (strcmp(method, "system.time") == 0)

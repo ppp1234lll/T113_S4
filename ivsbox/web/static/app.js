@@ -82,6 +82,7 @@
     { id: 'overview', name: '总览' },
     { id: 'net', name: '网络' },
     { id: 'gps', name: '定位' },
+    { id: 'board', name: '控制板' },
     { id: 'camera', name: '摄像机' },
     { id: 'devices', name: '设备档案' },
     { id: 'switch', name: '交换机' },
@@ -188,7 +189,8 @@
     var c = $('#content');
     c.innerHTML = '';
     var builder = {
-      overview: pageOverview, net: pageNet, gps: pageGps, camera: pageCamera,
+      overview: pageOverview, net: pageNet, gps: pageGps, board: pageBoard,
+      camera: pageCamera,
       devices: pageDevices, switch: pageSwitch, media: pageMedia,
       config: pageConfig, maint: pageMaint
     }[page] || pageOverview;
@@ -594,6 +596,169 @@
       }).catch(function () {
         grid.innerHTML = '';
         grid2.innerHTML = '';
+        note.textContent = '';
+        grid.appendChild(kv('状态', '无法连接服务', 'err'));
+      });
+    }
+
+    btn.addEventListener('click', load);
+    load();
+    st.timer = setInterval(load, 5000);  /* 5 s 自动刷新；切页时由 go() 收掉 */
+    return root;
+  }
+
+  /* 控制板（采集板）：数据来源 `GET /api/board` → ivsboxd 的 `board.status`。
+   * 后端把镜像里"未填"的字段一律给 JSON null（valid 位图为 0）—— 采集板没接时
+   * 页面上必须是一排"—"，不能被读成"输入电压 0V / 温度 0℃"。 */
+  var DS_TEXT = { 1: '关闭', 2: '打开' };
+  /* 继电器口径与门状态**相反**：RELAY 1=开 / 2=关（架构 §18.2，别套用 DS 的映射） */
+  var RELAY_TEXT = { 1: '吸合（开）', 2: '断开（关）' };
+
+  function pageBoard() {
+    var root = document.createDocumentFragment();
+    root.appendChild(el('h2', 'page-title', '控制板'));
+
+    var card = el('div', 'card');
+    card.appendChild(el('h3', null, '运行参数'));
+    var note = el('p', 'hint', '读取中…');
+    card.appendChild(note);
+    var grid = el('div', 'grid');
+    card.appendChild(grid);
+    var bar = el('div', 'actions');
+    var btn = el('button', 'ghost', '刷新');
+    btn.type = 'button';
+    bar.appendChild(btn);
+    card.appendChild(bar);
+    root.appendChild(card);
+
+    var card2 = el('div', 'card');
+    card2.appendChild(el('h3', null, '三路继电器'));
+    var grid2 = el('div', 'grid');
+    card2.appendChild(grid2);
+    root.appendChild(card2);
+
+    var card3 = el('div', 'card');
+    card3.appendChild(el('h3', null, '告警阈值'));
+    var hint3 = el('p', 'hint', '阈值随 0xE1 应答与 0xF1 下发共用同一批字段；温度下限可为负。');
+    card3.appendChild(hint3);
+    var grid3 = el('div', 'grid');
+    card3.appendChild(grid3);
+    root.appendChild(card3);
+
+    var card4 = el('div', 'card');
+    card4.appendChild(el('h3', null, '通信链路'));
+    var grid4 = el('div', 'grid');
+    card4.appendChild(grid4);
+    root.appendChild(card4);
+
+    function num(v, unit, digits) {
+      if (v === null || v === undefined) return '—';
+      return fmtNum(v, unit || '', digits === undefined ? 1 : digits);
+    }
+
+    function raw(v) {
+      return (v === null || v === undefined) ? '—' : String(v);
+    }
+
+    function load() {
+      api('/api/board').then(function (r) {
+        grid.innerHTML = '';
+        grid2.innerHTML = '';
+        grid3.innerHTML = '';
+        grid4.innerHTML = '';
+        if (!r.ok) {
+          note.textContent = '';
+          var why = (r.msg === 'agent unavailable' || r.msg === 'board link unavailable')
+            ? 'ivsboxd 未运行，或本机未装配采集板链路'
+            : (r.msg || '读取失败');
+          grid.appendChild(kv('状态', why, 'err'));
+          return;
+        }
+        var d = r.d || {}, lk = d.link || {}, dd = d.data || {};
+        var lim = d.limit || {}, rel = d.relay || [];
+
+        /* 一句话结论：把"没接"和"接了但一帧都不对"分开 —— 这两种情况帧计数都是 0，
+         * 现场只能靠"收到过字节没" + "数据年龄"区分，处置完全不同。 */
+        if (!lk.open) {
+          note.textContent = '采集板串口未打开：' + (lk.path || '（无路径）') +
+            ' 打不开，请检查接线与设备节点。';
+        } else if (!lk.rx_bytes) {
+          note.textContent = '串口已打开，但一个字节都没收到 —— 检查采集板供电、接线（TX/RX 是否交叉）、波特率 115200。';
+        } else if (!lk.frames) {
+          note.textContent = '收到 ' + lk.rx_bytes + ' 字节，但没有一帧通过校验 —— 检查 CRC 覆盖范围、帧尾与协议版本（见下方错误计数）。';
+        } else {
+          note.textContent = '已收到 ' + lk.frames + ' 帧完整报文，最近一次数据 ' + fmtAge(lk.age_ms) + '。';
+        }
+
+        /* 运行参数：键名照搬 0xE1 应答（便于对照《单片机通信》表），标签给中文 */
+        grid.appendChild(kv('输入电压 V', num(dd.V, ' V', 1)));
+        grid.appendChild(kv('输入电流 A', num(dd.A, ' A', 2)));
+        grid.appendChild(kv('箱内温度 T', num(dd.T, ' ℃', 1)));
+        grid.appendChild(kv('箱内湿度 H', num(dd.H, ' %', 1)));
+        grid.appendChild(kv('箱门 DS',
+          dd.DS === null || dd.DS === undefined ? '—' : (DS_TEXT[dd.DS] || ('未知（' + dd.DS + '）')),
+          dd.DS === 1 ? 'ok' : (dd.DS === 2 ? 'warn' : null)));
+        grid.appendChild(kv('总功率 APOWER', dd.APOWER === null || dd.APOWER === undefined ? '—' : dd.APOWER));
+        grid.appendChild(kv('总用电量 AKW', dd.AKW === null || dd.AKW === undefined ? '—' : dd.AKW));
+        grid.appendChild(kv('姿态 P', raw(dd.P)));
+        grid.appendChild(kv('防雷 SPD', raw(dd.SPD)));
+        grid.appendChild(kv('设备供电 PA', raw(dd.PA)));
+        grid.appendChild(kv('输入电压状态 PV', raw(dd.PV)));
+        grid.appendChild(kv('累计开门次数', raw(d.door_events)));
+
+        /* 三路继电器：状态与三路测量各有独立 valid 位，缺哪项就显示"—" */
+        if (!rel.length) {
+          grid2.appendChild(kv('继电器', '尚未收到继电器数据', 'warn'));
+        } else {
+          for (var i = 0; i < rel.length; i++) {
+            var x = rel[i] || {};
+            var stt = (x.state === null || x.state === undefined)
+              ? '状态未知' : (RELAY_TEXT[x.state] || ('未知（' + x.state + '）'));
+            grid2.appendChild(kv('第 ' + (i + 1) + ' 路',
+              stt + '　' + num(x.v, ' V', 1) + ' / ' + num(x.a, ' A', 2) +
+              '　功率 ' + num(x.power, ' W', 1) + '　电量 ' + num(x.elec, '', 2)));
+          }
+        }
+
+        grid3.appendChild(kv('电压上限 hv', raw(lim.hv)));
+        grid3.appendChild(kv('电压下限 lv', raw(lim.lv)));
+        grid3.appendChild(kv('过流 ov', raw(lim.ov)));
+        grid3.appendChild(kv('温度上限 tu', raw(lim.tu)));
+        grid3.appendChild(kv('温度下限 tl', raw(lim.tl)));
+        grid3.appendChild(kv('湿度上限 hu', raw(lim.hu)));
+        grid3.appendChild(kv('湿度下限 hl', raw(lim.hl)));
+        grid3.appendChild(kv('姿态 sl', raw(lim.sl)));
+        grid3.appendChild(kv('漏电流 ld', raw(lim.ld)));
+
+        grid4.appendChild(kv('串口', (lk.path || '—') + '　' + (lk.open ? '已打开' : '未打开'),
+          lk.open ? 'ok' : 'warn'));
+        grid4.appendChild(kv('链路状态', lk.up ? '已建立（收到过合法帧）' : '未建立',
+          lk.up ? 'ok' : 'warn'));
+        grid4.appendChild(kv('数据年龄', fmtAge(lk.age_ms),
+          (lk.age_ms === null || lk.age_ms === undefined) ? 'err'
+            : (lk.age_ms < 35000 ? 'ok' : 'warn')));
+        grid4.appendChild(kv('完整帧 / 复位',
+          raw(lk.frames) + ' / ' + raw(lk.resets)));
+        grid4.appendChild(kv('CRC 错 / 帧尾错',
+          raw(lk.crc_err) + ' / ' + raw(lk.tail_err),
+          (lk.crc_err || lk.tail_err) ? 'warn' : null));
+        grid4.appendChild(kv('超长丢弃 / 噪声字节',
+          raw(lk.too_long) + ' / ' + raw(lk.noise)));
+        grid4.appendChild(kv('收 / 发字节',
+          raw(lk.rx_bytes) + ' / ' + raw(lk.tx_bytes)));
+        grid4.appendChild(kv('串口错误 / 发送丢弃',
+          raw(lk.serial_err) + ' / ' + raw(lk.tx_drop),
+          lk.serial_err ? 'warn' : null));
+        grid4.appendChild(kv('下行轮询 / 上报 / 心跳',
+          raw(lk.polls) + ' / ' + raw(lk.reports) + ' / ' + raw(lk.heartbeats)));
+        grid4.appendChild(kv('查询应答 / 待发队列',
+          raw(lk.query_rsp) + ' / ' + raw(lk.queue) +
+          (lk.queue_full ? '（队满丢弃 ' + lk.queue_full + '）' : '')));
+      }).catch(function () {
+        grid.innerHTML = '';
+        grid2.innerHTML = '';
+        grid3.innerHTML = '';
+        grid4.innerHTML = '';
         note.textContent = '';
         grid.appendChild(kv('状态', '无法连接服务', 'err'));
       });

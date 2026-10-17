@@ -195,6 +195,10 @@ typedef struct {
     uint64_t serial_err;   /* 串口读/写错误次数 */
     uint64_t tx_drop;      /* 串口发送暂存溢出丢弃次数 */
     uint64_t polls;        /* 累计 0xE1 轮询下发次数 */
+    /* 最近一次从串口**真的读到字节**的单调时刻（0 = 从未收到）。
+     * Web 用它算"数据年龄"，用来区分"采集板没接/没上电"与"接了但一帧都不对"
+     * —— 只看帧计数时这两种情况都是 0，现场没法判。 */
+    uint64_t last_rx_ms;
     uint8_t  opened;
 } iv_report_t;
 

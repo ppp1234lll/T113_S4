@@ -140,6 +140,7 @@ static void serial_drain(iv_report_t *rp, uint64_t now_ms)
         if (got == 0)
             return;
         rp->serial_rx += (uint64_t)got;
+        rp->last_rx_ms = now_ms;   /* 最近一次"真的收到字节"的时刻（Web 用它算数据年龄） */
         iv_link_recv(&rp->lk, buf, got, (uint32_t)now_ms);
         if (rp->serial_fd < 0)
             return;

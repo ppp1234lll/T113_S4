@@ -67,6 +67,7 @@ static const char *const k_methods[] = {
     "gps.status",
     "board.status",
     "relay.set",
+    "device.identity.set",
     "camera.search",
     "system.time",
     "system.reboot",
@@ -582,25 +583,50 @@ static void read_dt_string(const char *path, char *out, size_t cap)
     }
 }
 
+/* 工厂身份分区未写入时的设备 SN 默认值（2026-10-17 用户定）。
+ * **只影响"显示/上报用的编号"，不影响隧道 secretKey 的取值** —— 隧道侧拿不到
+ * 身份就是拿不到，不会因为这里有个默认值就把通道打开。 */
+#define IV_CTL_SN_DEFAULT "1"
+
 typedef struct {
     int  loaded;                  /* 只尝试一次：产线写入需重启，运行期重试无意义 */
-    char sn[IV_PROV_TID_MAX];     /* 空串＝没有身份（未写入工厂分区） */
-    char mac[IV_PROV_MAC_MAX];
+    int  from_factory;            /* 1＝读过工厂分区；0＝用的是默认值 */
+    char sn[IV_PROV_TID_MAX];
+    char mac[IV_PROV_MAC_MAX];    /* 空串＝没有身份 MAC */
 } dev_identity_t;
+
+/* 身份缓存放**文件级**（不是函数内 static）：`device.identity.set` 写成功后要把
+ * 它整块失效，否则页面刷新还显示旧值，看起来像没写成。 */
+static dev_identity_t g_dev_id;
 
 static const dev_identity_t *device_identity(void)
 {
-    static dev_identity_t id;
-    iv_prov_id_t          raw;
+    iv_prov_id_t raw;
 
-    if (id.loaded)
-        return &id;
-    id.loaded = 1;
+    if (g_dev_id.loaded)
+        return &g_dev_id;
+    g_dev_id.loaded = 1;
     if (iv_prov_private_read(NULL, &raw) == IV_OK) {
-        iv_prov_tid_from_u32(raw.devid, id.sn);
-        iv_prov_mac_format(raw.mac, id.mac);
+        static const uint8_t zero_mac[6] = {0, 0, 0, 0, 0, 0};
+
+        iv_prov_tid_from_u32(raw.devid, g_dev_id.sn);
+        /* 全零 MAC 视为"没有身份 MAC"：只写 ID 不写 MAC 的记录会留下 6 个 0，
+         * 直接格式化会显示成 `00:00:00:00:00:00`，看着像真 MAC，比留空更误导。 */
+        if (memcmp(raw.mac, zero_mac, sizeof zero_mac) != 0)
+            iv_prov_mac_format(raw.mac, g_dev_id.mac);
+        g_dev_id.from_factory = 1;
+    } else {
+        /* 本板就是这状态：`/dev/by-name/private` 在，但 magic/校验不过。
+         * SN 取默认值让页面有个可读编号，但**必须把来源一起给出去**
+         * （`sn_source`），否则售后会把默认值当成产线写入的真 SN。 */
+        (void)snprintf(g_dev_id.sn, sizeof g_dev_id.sn, "%s", IV_CTL_SN_DEFAULT);
     }
-    return &id;
+    return &g_dev_id;
+}
+
+static void device_identity_invalidate(void)
+{
+    memset(&g_dev_id, 0, sizeof g_dev_id);
 }
 
 /* 一个字段：有值给字符串，没值给 JSON null（**不给空串**）。 */
@@ -632,9 +658,13 @@ static void add_device_info(json_object *d)
     add_str_or_null(dev, "model", model);
     add_str_or_null(dev, "soc", soc);
 
-    /* SN 与 MAC 一起来自身份记录；记录没有就两个都给 null（不拿 eth0 的 MAC 顶替
-     * 身份 MAC —— 那是两件事：一个由产线分配，一个由网卡驱动决定）。 */
+    /* SN 与 MAC 一起来自身份记录；SN 缺失时取默认值 "1"（见 IV_CTL_SN_DEFAULT），
+     * 但来源如实给出去：`sn_source` = factory / default。
+     * 身份 MAC 缺了就只能给 null —— 它没有默认值，也不能拿 eth0 的 MAC 顶替
+     * （一个是产线分配、一个是网卡驱动决定，两件事）。 */
     add_str_or_null(dev, "sn", id->sn);
+    json_object_object_add(dev, "sn_source",
+                           json_object_new_string(id->from_factory ? "factory" : "default"));
     add_str_or_null(dev, "id_mac", id->mac);
 
     read_dt_string("/sys/class/net/eth0/address", ethmac, sizeof ethmac);
@@ -1513,6 +1543,149 @@ static int m_relay_set(const iv_ctl_ctx_t *ctx, json_object *p,
     return rsp_data(d, out, cap, out_len);
 }
 
+/* ============================ device.identity.set ============================ */
+
+/*
+ * Web 配置「设备 ID」与「设备 MAC」（用户 2026-10-17 要求）。
+ *
+ * ============================ 为什么写身份分区，不新加配置键 ============================
+ * 设备身份的权威只有一处：工厂身份分区（S5.5）。再加 `sys.devid` / `sys.mac` 两个
+ * 配置键就成了**双源** —— 网卡实际用哪个、隧道算 secretKey 用哪个、界面显示哪个，
+ * 三处一旦不一致，现场根本排不出来（本项目已有"勿双源"的既定教训）。
+ * 所以 Web 配置**直接落到分区里**，读路径（`sys.overview` 的 device 段、隧道取 SN）
+ * 保持唯一权威不变。
+ *
+ * ============================ 五条硬约束 ============================
+ * 1. **任一字段可省，省＝不改**：只传 `devid` 就保留原 MAC，反之亦然；两个都省 ⇒
+ *    报文错。半个字段写进去比不写更糟。
+ * 2. **格式不合整条拒绝**：设备 ID 接受 1~6 位 HEX（≡ 数值，协议里 tid 是 6 位零
+ *    填充，现场习惯写 "1"），但 `000000` 是协议里的**广播占位**，写进去等于"没有
+ *    ID"，直接拒；MAC 必须 6 字节可解析。
+ * 3. **空分区只给 MAC 也拒**：没有记录时必须有 `devid`，否则会写进一条 devid=0 的
+ *    "存在但无效"记录 —— 比空分区更难查。
+ * 4. **写失败如实报错**（分区缺失/只读/短写都返回负码），不做"存起来了回头生效"。
+ * 5. **写完清本模块的身份缓存**，让页面立刻显示新值；但**隧道不跟着变** ——
+ *    `main.c` 的 `tunnel_read_sn()` 只在启动时读一次，返回里带 `restart_required`，
+ *    免得有人以为改完 SN 通道就换了钥匙。
+ *
+ * 另：**这里改的是"身份 MAC"，不是网卡 MAC**。网卡 MAC 由天嵌
+ * `EmbedSkyProgress.ini` 的 `mac_mode=fixed` + `mac=` 决定，两者互不影响 ——
+ * 界面上必须说清楚，否则会有人以为改完这里 `ip link` 就变了。
+ */
+
+/* 1~6 位 HEX → 数值。协议里 tid 是 6 位零填充，但现场习惯把 1 号机写成 "1"，
+ * 两者数值相同，故宽容输入、统一按数值存（回显时再补零）。 */
+static int parse_devid(const char *s, uint32_t *out)
+{
+    uint32_t v = 0;
+    size_t   n = 0;
+
+    if (s == NULL || out == NULL)
+        return IV_EINVAL;
+    while (s[n] != '\0') {
+        int d;
+
+        if (n >= 6u)
+            return IV_EINVAL;
+        if (s[n] >= '0' && s[n] <= '9')
+            d = s[n] - '0';
+        else if (s[n] >= 'a' && s[n] <= 'f')
+            d = s[n] - 'a' + 10;
+        else if (s[n] >= 'A' && s[n] <= 'F')
+            d = s[n] - 'A' + 10;
+        else
+            return IV_EINVAL;
+        v = (v << 4) | (uint32_t)d;
+        n++;
+    }
+    if (n == 0u)
+        return IV_EINVAL;
+    *out = v;
+    return IV_OK;
+}
+
+static int m_device_identity_set(const iv_ctl_ctx_t *ctx, json_object *p,
+                                 char *out, size_t cap, size_t *out_len)
+{
+    const char  *devid_s = param_str(p, "devid");
+    const char  *mac_s   = param_str(p, "mac");
+    iv_prov_id_t cur;
+    iv_prov_id_t next;
+    json_object *d;
+    char         tid[IV_PROV_TID_MAX];
+    char         mac[IV_PROV_MAC_MAX];
+    uint32_t     devid = 0;
+    int          have_id;
+    int          have_mac;
+    int          have_rec;
+    int          rc;
+
+    have_id  = (devid_s != NULL && devid_s[0] != '\0');
+    have_mac = (mac_s != NULL && mac_s[0] != '\0');
+    if (!have_id && !have_mac)
+        return rsp_err(IV_EINVAL, "devid or mac required", out, cap, out_len);
+
+    if (have_id) {
+        if (parse_devid(devid_s, &devid) != IV_OK)
+            return rsp_err(IV_EINVAL, "devid must be 1..6 hex digits", out, cap, out_len);
+        if (devid == 0u)
+            return rsp_err(IV_EINVAL, "devid 000000 is the broadcast placeholder",
+                           out, cap, out_len);
+    }
+
+    memset(&cur, 0, sizeof cur);
+    have_rec = (iv_prov_private_read(NULL, &cur) == IV_OK);
+    if (!have_rec && !have_id)
+        return rsp_err(IV_EINVAL, "devid required: identity partition is blank",
+                       out, cap, out_len);
+
+    memset(&next, 0, sizeof next);
+    if (have_rec)
+        next = cur; /* 保留 suite/server 与本次没改的字段 */
+    else
+        next.suite_id = 5u; /* 与产线工装（tools/provision）一致的默认套件 */
+    if (have_id)
+        next.devid = devid;
+    if (have_mac && iv_prov_mac_parse(mac_s, next.mac) != IV_OK)
+        return rsp_err(IV_EINVAL, "bad mac", out, cap, out_len);
+
+    rc = iv_prov_private_write(NULL, &next);
+    if (rc != IV_OK)
+        return rsp_err(rc, "identity partition write failed", out, cap, out_len);
+
+    /* 写成功才失效缓存：失败时留着旧缓存，界面显示的还是真实生效值。 */
+    device_identity_invalidate();
+
+    iv_prov_tid_from_u32(next.devid, tid);
+    iv_prov_mac_format(next.mac, mac);
+    /* 全零 MAC = 没有身份 MAC（见 device_identity 的同一判断）。回显要与
+     * `sys.overview` 一致：那边给 null，这里就不能回 `00:00:00:00:00:00`，
+     * 否则前端会把一串零填回输入框，看着像真有 MAC。 */
+    {
+        static const uint8_t zero_mac[6] = {0, 0, 0, 0, 0, 0};
+
+        if (memcmp(next.mac, zero_mac, sizeof zero_mac) == 0)
+            mac[0] = '\0';
+    }
+
+    if (ctx->store != NULL) {
+        char ad[48];
+
+        (void)snprintf(ad, sizeof ad, "devid=%s mac=%s", tid, mac);
+        (void)iv_store_audit_add(ctx->store, "device.identity.set", ad, 0,
+                                 (int64_t)time(NULL));
+    }
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "devid", json_object_new_string(tid));
+    add_str_or_null(d, "mac", mac); /* 没有身份 MAC 时给 null，与 sys.overview 一致 */
+    /* 隧道侧只在启动时读一次身份（main.c: tunnel_read_sn），所以这里必须明说。 */
+    json_object_object_add(d, "restart_required", json_object_new_boolean(1));
+    return rsp_data(d, out, cap, out_len);
+}
+
 /* ============================ gps.status（S2.5） ============================ */
 
 /* double 字段：NA（NAN）写成 JSON **null**。
@@ -2134,6 +2307,8 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_board_status(ctx, out, out_cap, out_len);
     else if (strcmp(method, "relay.set") == 0)
         rc = m_relay_set(ctx, params, out, out_cap, out_len);
+    else if (strcmp(method, "device.identity.set") == 0)
+        rc = m_device_identity_set(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "camera.search") == 0)
         rc = m_camera_search(ctx, out, out_cap, out_len);
     else if (strcmp(method, "system.time") == 0)

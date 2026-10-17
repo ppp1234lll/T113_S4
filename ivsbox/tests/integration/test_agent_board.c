@@ -345,9 +345,9 @@ int main(void)
     /* ---- b08 sys.overview 的 device 段（总览页只答"这台设备是谁"） ----
      * 总览页原先堆的是网络/摄像机/采集板三家的实时数据，现在归各自页面；总览只留
      * 身份与版本。这里钉住三件事：① device 段真的在；② 本机可得的（主机名/内核/
-     * 墙钟）都有值；③ **本机不可得的给 JSON null 而不是空串** —— 宿主机既没有
-     * device-tree 也没有工厂身份分区，正好是"取不到"的样本。空串会被前端当成
-     * "读到了但值是空的"，与"没有身份"是两件事。 */
+     * 墙钟）都有值；③ **本机不可得的分两种处置** —— 型号/SoC/身份 MAC 给 JSON null
+     * 而不是空串（空串会被前端当成"读到了但值是空的"，与"没有身份"是两件事）；
+     * 设备 SN 则取**默认值 "1"**，并把 `sn_source` 标成 `default`。 */
     {
         const char *js = ctl("{\"m\":\"sys.overview\"}");
 
@@ -359,8 +359,48 @@ int main(void)
         chk(strstr(js, "\"wall_sec\":") != NULL, "b08 device.wall_sec present");
         chk(strstr(js, "\"model\":null") != NULL, "b08 device.model is JSON null on host");
         chk(strstr(js, "\"soc\":null") != NULL, "b08 device.soc is JSON null on host");
-        chk(strstr(js, "\"sn\":null") != NULL, "b08 device.sn is JSON null on host");
+        /* SN 有默认值（"1"，2026-10-17 用户定），**不是 null 也不是空串**；
+         * 来源必须如实标成 default —— 否则默认值会被当成产线写入的真 SN。 */
+        chk(strstr(js, "\"sn\":\"1\"") != NULL, "b08 device.sn falls back to default 1");
+        chk(strstr(js, "\"sn_source\":\"default\"") != NULL, "b08 device.sn_source marks default");
         chk(strstr(js, "\"id_mac\":null") != NULL, "b08 device.id_mac is JSON null on host");
+    }
+
+    /* ---- b09 device.identity.set（Web 配置设备 ID / MAC，2026-10-17 用户要求）----
+     * 这是**唯一会写块设备**的 ctl 路径，判据分三层：
+     *   ① 参数校验必须在**写之前**拦住（格式错、缺字段、广播占位 000000）；
+     *   ② 空身份分区上只给 MAC ⇒ 必须拒（否则会写进一条 devid=0 的"存在但无效"记录，
+     *      比空分区更难查）；
+     *   ③ 分区不存在时写**必须如实失败**，不许"存起来了回头生效"。
+     * 宿主机没有 `/dev/by-name/private`，正好是 ③ 的样本；有该设备的机器上跳过 ③，
+     * 免得测试真去改一台设备的身份。 */
+    {
+        const char *js;
+
+        js = ctl("{\"m\":\"device.identity.set\",\"p\":{}}");
+        chk(strstr(js, "\"ok\":false") != NULL, "b09 empty request rejected");
+
+        js = ctl("{\"m\":\"device.identity.set\",\"p\":{\"devid\":\"zz\"}}");
+        chk(strstr(js, "devid must be 1..6 hex") != NULL, "b09 non-hex devid rejected");
+
+        js = ctl("{\"m\":\"device.identity.set\",\"p\":{\"devid\":\"1234567\"}}");
+        chk(strstr(js, "devid must be 1..6 hex") != NULL, "b09 over-long devid rejected");
+
+        js = ctl("{\"m\":\"device.identity.set\",\"p\":{\"devid\":\"000000\"}}");
+        chk(strstr(js, "broadcast placeholder") != NULL, "b09 broadcast devid rejected");
+
+        js = ctl("{\"m\":\"device.identity.set\",\"p\":{\"devid\":\"1\",\"mac\":\"zz:zz\"}}");
+        chk(strstr(js, "bad mac") != NULL, "b09 bad mac rejected");
+
+        if (access("/dev/by-name/private", F_OK) != 0) {
+            js = ctl("{\"m\":\"device.identity.set\",\"p\":{\"mac\":\"02:11:22:33:44:55\"}}");
+            chk(strstr(js, "identity partition is blank") != NULL,
+                "b09 mac-only on blank identity rejected");
+
+            js = ctl("{\"m\":\"device.identity.set\",\"p\":{\"devid\":\"1\"}}");
+            chk(strstr(js, "\"ok\":false") != NULL && strstr(js, "write failed") != NULL,
+                "b09 write to missing partition fails closed");
+        }
     }
 
     /* ---- b07 关闭 ---- */
@@ -370,7 +410,8 @@ int main(void)
     (void)close(g_master);
     if (g_fail == 0)
         printf("test_agent_board passed (null semantics, 0xE1 decode, relay, limits, "
-               "0xC1/0xC2 events, relay.set 0xD1 bytes, guards, overview device block)\n");
+               "0xC1/0xC2 events, relay.set 0xD1 bytes, guards, overview device block, "
+               "device identity guards)\n");
     else
         printf("test_agent_board FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

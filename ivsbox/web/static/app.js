@@ -431,25 +431,113 @@
     card.appendChild(grid);
     root.appendChild(card);
 
-    api('/api/overview').then(function (r) {
-      if (!r.ok) { hint.textContent = r.msg || '总览读取失败'; return; }
-      var d = r.d || {};
-      var dv = d.device || {};
-      st.version = d.version || '';
-      $('#verLabel').textContent = st.version;
-      hint.textContent = '设备身份与版本。实时状态请看「网络」「摄像机」「控制板」各页。';
-      grid.appendChild(kv('软件版本', fmtVer(dv.version || d.version)));
-      grid.appendChild(kv('硬件型号', dv.model || '—'));
-      grid.appendChild(kv('主控芯片', dv.soc || '—'));
-      grid.appendChild(kv('设备 SN', dv.sn || '—（工厂身份未写入）'));
-      grid.appendChild(kv('身份 MAC', dv.id_mac || '—'));
-      grid.appendChild(kv('网口 MAC（eth0）', dv.eth0_mac || '—'));
-      grid.appendChild(kv('主机名', dv.hostname || '—'));
-      grid.appendChild(kv('内核版本',
-        dv.kernel ? (dv.kernel + (dv.machine ? '（' + dv.machine + '）' : '')) : '—'));
-      grid.appendChild(kv('系统时间', fmtWall(dv.wall_sec)));
-      grid.appendChild(kv('运行时长', fmtUptime(d.uptime_ms)));
+    /* ---- 设备身份写入（用户 2026-10-17 要求：设备 ID / MAC 可 Web 配置）----
+     * 三件事必须在界面上说清楚，否则现场一定误判：
+     *   ① 改的是「身份 MAC」，**不是网口 MAC**（后者由天嵌 ini 的
+     *      mac_mode=fixed + mac= 决定，改这里 ip link 不会变）；
+     *   ② 只填一项则另一项保持不变（后端按字段合并，不是整份覆盖）；
+     *   ③ 写入后**需重启**才对远程通道生效 —— 隧道只在启动时读一次身份。 */
+    var idCard = el('div', 'card');
+    idCard.appendChild(el('h3', null, '设备身份（写入工厂分区）'));
+    idCard.appendChild(el('p', 'hint',
+      '设备 ID 与设备 MAC 存于工厂身份分区。只填一项则另一项保持不变。'
+      + '这里改的是「身份 MAC」，不是网口 MAC（网口 MAC 由系统网络配置的 mac_mode / mac 决定）。'
+      + '写入后需重启才影响远程通道 —— 隧道只在启动时读一次身份。'));
+    var idGrid = el('div', 'grid');
+
+    function textField(label, ph) {
+      var lab = el('label', 'field');
+
+      lab.appendChild(el('span', null, label));
+      var inp = document.createElement('input');
+      inp.type = 'text';
+      inp.placeholder = ph;
+      lab.appendChild(inp);
+      idGrid.appendChild(lab);
+      return inp;
+    }
+
+    var inId = textField('设备 ID（1~6 位 HEX）', '如 1 / 000001 / A120F');
+    var inMac = textField('设备 MAC', 'aa:bb:cc:dd:ee:ff');
+    idCard.appendChild(idGrid);
+
+    var idBar = el('div', 'actions');
+    var idSave = el('button', null, '写入身份');
+    idSave.type = 'button';
+    idBar.appendChild(idSave);
+    idCard.appendChild(idBar);
+    var idMsg = el('p', 'msg', '');
+    idCard.appendChild(idMsg);
+    root.appendChild(idCard);
+
+    function loadInfo() {
+      grid.innerHTML = '';
+      api('/api/overview').then(function (r) {
+        if (!r.ok) { hint.textContent = r.msg || '总览读取失败'; return; }
+        var d = r.d || {};
+        var dv = d.device || {};
+        st.version = d.version || '';
+        $('#verLabel').textContent = st.version;
+        hint.textContent = '设备身份与版本。设备 SN 未做工厂写入时取默认值 1（橙色即为默认值）。'
+          + '实时状态请看「网络」「摄像机」「控制板」各页。';
+        grid.appendChild(kv('软件版本', fmtVer(dv.version || d.version)));
+        grid.appendChild(kv('硬件型号', dv.model || '—'));
+        grid.appendChild(kv('主控芯片', dv.soc || '—'));
+        /* 设备 SN 缺省值＝1（2026-10-17 用户定）：工厂身份分区没写入时后端就回 "1"。
+         * 但来源要标出来（`sn_source`），否则售后会把默认值当成产线写入的真 SN ——
+         * 默认值用告警色，一眼能看出"这个 1 不是产线写的"。 */
+        grid.appendChild(kv('设备 SN', dv.sn || '—',
+          dv.sn_source === 'default' ? 'warn' : null));
+        grid.appendChild(kv('身份 MAC', dv.id_mac || '—'));
+        grid.appendChild(kv('网口 MAC（eth0）', dv.eth0_mac || '—'));
+        grid.appendChild(kv('主机名', dv.hostname || '—'));
+        grid.appendChild(kv('内核版本',
+          dv.kernel ? (dv.kernel + (dv.machine ? '（' + dv.machine + '）' : '')) : '—'));
+        grid.appendChild(kv('系统时间', fmtWall(dv.wall_sec)));
+        grid.appendChild(kv('运行时长', fmtUptime(d.uptime_ms)));
+        /* 输入框预填当前值。默认值（"1"）也一起填进去，否则用户得自己猜现在是什么。 */
+        if (!inId.dataset.touched) inId.value = dv.sn || '';
+        if (!inMac.dataset.touched) inMac.value = dv.id_mac || '';
+      });
+    }
+
+    inId.addEventListener('input', function () { inId.dataset.touched = '1'; });
+    inMac.addEventListener('input', function () { inMac.dataset.touched = '1'; });
+
+    idSave.addEventListener('click', function () {
+      var dev = inId.value.trim();
+      var mac = inMac.value.trim();
+
+      if (!dev && !mac) { idMsg.textContent = '设备 ID 与 MAC 至少填一项'; return; }
+      if (!window.confirm('确认写入设备身份？\n'
+          + '设备 ID：' + (dev || '（不改）') + '\n'
+          + '设备 MAC：' + (mac || '（不改）') + '\n'
+          + '写入工厂身份分区，之后需重启才对远程通道生效。')) return;
+      idSave.disabled = true;
+      idMsg.textContent = '写入中…';
+      api('/api/device/identity', { method: 'POST', body: { devid: dev, mac: mac } })
+        .then(function (r) {
+          idSave.disabled = false;
+          if (!r.ok) {
+            idMsg.textContent = '写入失败：' + (r.msg || ('错误 ' + r.e));
+            return;
+          }
+          var rd = r.d || {};
+          idMsg.textContent = '已写入设备 ID ' + rd.devid + '、MAC ' + (rd.mac || '（未设置）')
+            + '。重启后对远程通道生效。';
+          inId.dataset.touched = '';
+          inMac.dataset.touched = '';
+          inId.value = rd.devid || '';
+          inMac.value = rd.mac || '';
+          loadInfo(); /* 回读：区里的真实值以读回来的为准，不以本次输入为准 */
+        })
+        .catch(function () {
+          idSave.disabled = false;
+          idMsg.textContent = '无法连接服务';
+        });
     });
+
+    loadInfo();
     return root;
   }
 

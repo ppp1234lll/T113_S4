@@ -526,6 +526,19 @@ int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
                           (req->body != NULL) ? req->body : "{}",
                           out, cap, out_len, rsp);
     }
+    /* 设备身份配置：**写**路径（落工厂身份分区）。同样只收 POST ——
+     * 身份写坏会让设备"变成另一台"，绝不能靠 GET 预取误触发。 */
+    if (strcmp(req->path, "/api/device/identity") == 0) {
+        if (strcmp(req->method, "POST") != 0) {
+            *out_len = api_err(out, cap, IV_EINVAL, "POST required");
+            rsp->status = 405;
+            rsp->len = *out_len;
+            return IV_OK;
+        }
+        return api_p_call(ctx, "device.identity.set",
+                          (req->body != NULL) ? req->body : "{}",
+                          out, cap, out_len, rsp);
+    }
     if (strcmp(req->path, "/api/camera/search") == 0)
         return api_simple_call(ctx, "camera.search", out, cap, out_len, rsp);
     if (strcmp(req->path, "/api/system/time") == 0)

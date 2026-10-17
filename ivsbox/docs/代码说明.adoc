@@ -2750,3 +2750,130 @@ tx_bytes                            每帧 +38 B
   `sn`/`id_mac` 为 null（本板身份分区未写入，界面显示"—（工厂身份未写入）"），
   `wall_sec` 与当时本机时间一致。
 * **未做（登记）**：浏览器里逐页观感复核；`sn` 在"身份已写入"板子上的实测。
+
+== 2026-10-17 15:50 设备 SN 默认值 1 ＋ 设备身份（ID/MAC）Web 配置
+
+用户两条要求：设备 SN 要有默认值 `1`；设备 ID 与设备 MAC 要能从 Web 写进去。
+
+前一条是一行默认值，后一条是**新增一条写入路径**，而这条路径选落在哪儿，
+决定了后面所有一致性问题的形状，先说清楚。
+
+=== 为什么要写工厂身份分区，而不是新增配置键
+
+最省事的做法是加两个配置键 `sys.devid` / `sys.mac`，写进 `ivsbox.ini` 就完事。
+但设备身份原本只有**一个**权威来源：工厂身份分区
+（`/dev/by-name/private`，`iv_prov_private_read/write`）。
+隧道算 `secretKey` 时用的 SN 就是从它派生（`iv_prov_tid_from_u32` → `md5(sn+token+svc)`）。
+
+再加配置键就成了**双源**：网卡按哪个、隧道算钥匙按哪个、界面显示哪个。
+三处一旦不一致，故障现象是"网页显示对的、远程连不上"，现场根本排不出来
+（本项目已有"勿双源"的既定教训，见 `control.db` 与 `net.ip` 的处理）。
+
+所以 Web 配置**直接写分区**，读路径（`sys.overview`、隧道取 SN）完全不动，
+权威仍然只有一份。
+
+=== SN 默认值与来源标记
+
+身份读不到时 `g_dev_id.sn` 取 `IV_CTL_SN_DEFAULT`（`"1"`）。
+同时必须多给一个字段 `sn_source`（`factory` / `default`）：
+
+[source,c]
+----
+add_str_or_null(dev, "sn", id->sn);
+json_object_object_add(dev, "sn_source",
+                       json_object_new_string(id->from_factory ? "factory" : "default"));
+----
+
+只给 `sn` 不给来源，售后会把默认值当成产线真写入的 SN，
+拿着 `1` 去平台查设备、查不到再回来问，来回损耗。
+前端对 `default` 用**告警色**显示，把"这是默认值"摆在脸上。
+
+**默认值只影响显示与上报编号，不影响隧道 `secretKey` 推导** ——
+隧道侧拿不到身份就是拿不到，不会因为这里有个默认值就把通道打开。
+`main.c` 的 `tunnel_read_sn()` 是独立读分区的。
+
+=== `device.identity.set` 的五条硬约束
+
+[source,c]
+----
+device.identity.set  p = {"devid":"1~6 位 HEX", "mac":"aa:bb:cc:dd:ee:ff"}
+POST /api/device/identity     （只收 POST，其余 405）
+----
+
+1. **两个字段都省 ⇒ 报文错**。`"devid or mac required"`。
+   什么都不给就进来的请求，通常是前端表单没取到值，静默成功比报错更坏。
+2. **格式不合整条拒绝**。设备 ID 接 1~6 位 HEX（宽容输入，按数值存、回显补零到 6 位）；
+   MAC 必须是六段冒号分隔。不做"能解析多少算多少"的部分写入。
+3. **`000000` 是协议里的广播占位，直接拒**。写进去等于"没有 ID"，
+   但分区里会留下一条"存在且校验通过"的记录，比空分区更难诊断。
+4. **空分区只给 MAC 也拒**（`"devid required: identity partition is blank"`）。
+   合并语义是"没给的字段保留原值"，而空分区没有原值可用 ——
+   照合并写下去会落一条 `devid = 0` 的记录，正好踩中第 3 条的坑。
+5. **写失败如实报错**（`"identity partition write failed"`）。
+   `iv_prov_private_write()` 刻意**不带 `O_CREAT`**：分区不存在时
+   `open()` 直接失败，而不是在 `/dev/` 下造一个同名普通文件把故障藏起来。
+   写完 `fsync`。
+
+=== 写后失效缓存与 `restart_required`
+
+`device_identity()` 的缓存从函数内 `static` 提到文件级 `g_dev_id`，
+并配一个 `device_identity_invalidate()`：写成功后清空，下一次 `sys.overview`
+重新读分区。不清的话总览页会在写成功后继续显示旧值，
+看着像"写没生效"。
+
+响应固定带 `restart_required: true`：`main.c` 的 `tunnel_read_sn()`
+**只在进程启动时读一次身份**，改 SN 对远程通道不重启不生效。
+这条不写进响应里，用户改完 SN 一定会问"为什么远程还是旧编号"。
+
+=== 全零 MAC 按"没有 MAC"处理
+
+`iv_prov_id_t` 里 MAC 是定长 6 字节，只写 ID 不写 MAC 时会留下 6 个 0。
+直接 `iv_prov_mac_format()` 出来就是 `00:00:00:00:00:00`，
+**看着像一个真 MAC**，而且和"没写"分不开。
+
+读路径与写接口回显处用**同一个判断**（`memcmp` 对全零数组），
+命中就当没有 MAC：`mac[0] = '\0'`，再走 `add_str_or_null()` 给 `null`。
+前端对 `null` 显示"（未设置）"。
+
+这个不一致是板端实测才发现的：写入回显给 `"00:00:00:00:00:00"`，
+而概览给 `null`，同一条记录两个接口两个答案。
+两处判断必须同源，否则改一处漏一处。
+
+=== 总览页「设备身份（写入工厂分区）」卡
+
+两个输入框（设备 ID / 设备 MAC）＋ 写入按钮 ＋ 二次确认。
+
+* 输入框用 `dataset.touched` 标记：`loadInfo()` 定时回读时
+  **不覆盖用户正在输入的内容**，只填没被碰过的框。
+* 提示文字写明三件事：改的是**身份 MAC 不是网口 MAC**
+  （后者由天嵌 `EmbedSkyProgress.ini` 的 `mac_mode=fixed` + `mac=` 决定）；
+  只填一项另一项不变；写完需重启才对远程通道生效。
+* 写成功提示带上服务端回显的规范化值，随后 `loadInfo()` 回读，
+  以分区里的实际内容为准，不用本地输入值糊弄。
+
+=== 验证
+
+* **编译**：VM `make host` / `make arm` RC=0 零告警（`-Werror` 下干净）。
+* **单测**：`make test` **39/39 passed**。
+* **集成**：`test_agent_board` 新增 b09（7 条）—— 五条校验**全部在写之前**被拒
+  （空请求 / 非 HEX / 超 6 位 / `000000` 广播占位 / 坏 MAC），
+  再按 `access("/dev/by-name/private", F_OK)` 分支验
+  "空分区只给 MAC 被拒"与"无分区时写失败 fail-closed"。
+  b08 相应改为断言 `"sn":"1"` ＋ `"sn_source":"default"`，
+  `model/soc/id_mac` 仍必须为 `null`。
+* **反向证伪 3 条**（均编译干净、还原后 `iv_ctl.c` md5 `1abf5db0…` 一致、复绿）：
+  1. 摘掉广播占位检查 ⇒ 1 行 FAIL；
+  2. 摘掉空分区守卫（允许只写 MAC）⇒ 1 行 FAIL；
+  3. **写失败假装成功**（忽略 `iv_prov_private_write()` 返回值）⇒
+     `b09 write to missing partition fails closed` FAIL。
+     这条最关键：写不进分区却回 `ok:true`，用户会以为配好了。
+  这三条是在**全零 MAC 统一判断落地之后**重做的 —— 那处改动动的正是
+  `m_device_identity_set()` 同一段，源码 md5 变了，之前的结论就不作数。
+  重做后三条各自精确命中上面那三条断言，`test_agent_board FAILED (1)` 各一次。
+* **板端（192.168.2.120）**：五条守卫全部命中且**分区内容未变**（写之前就拦住了）；
+  真实写入 `{"devid":"1"}` ⇒ 响应 `{"devid":"000001","mac":null,"restart_required":true}`，
+  概览 `sn` 由 `"1"`/`default` 变 `"000001"`/`factory`，`id_mac` 仍 `null`、
+  `eth0_mac`（`2e:a2:9e:ef:43:43`）未变 —— 印证**身份 MAC ≠ 网口 MAC**；
+  幂等再写一次结果相同。
+* **未做（登记）**：不替设备编造 MAC（板端只验了"只写 ID"这条路径）；
+  重启后隧道取到新 SN 的效果（隧道仍缺 token / frps，属 M8 卡用户项）。

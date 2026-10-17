@@ -164,12 +164,21 @@ static const cfg_default_t s_defaults[] = {
     D_STR(IV_CFG_CLS_NET, "net.ip", "本机 IP 地址（空＝由 DHCP 分配）", "", NULL),
     D_STR(IV_CFG_CLS_NET, "net.mask", "子网掩码（空＝由 DHCP 分配）", "", NULL),
     D_STR(IV_CFG_CLS_NET, "net.gateway", "网关 IP（空＝由 DHCP 分配）", "", NULL),
-    D_STR(IV_CFG_CLS_NET, "net.server.wired.host", "有线平台服务器地址", "", NULL),
-    D_INT(IV_CFG_CLS_NET, "net.server.wired.port", "有线平台服务器端口", 0, 0, 65535),
-    D_STR(IV_CFG_CLS_NET, "net.server.wireless.host", "无线平台服务器地址", "", NULL),
-    D_INT(IV_CFG_CLS_NET, "net.server.wireless.port", "无线平台服务器端口", 0, 0, 65535),
-    D_STR(IV_CFG_CLS_NET, "net.server.upgrade.host", "升级服务器地址", "", NULL),
-    D_INT(IV_CFG_CLS_NET, "net.server.upgrade.port", "升级服务器端口", 0, 0, 65535),
+    /* 平台 / 升级服务器地址。默认值取自现网 GD32F460 主控工程
+     * （`General_Version/main/APP/User/inc/save.h`）：
+     *   DEFALUT_LWIP_PLATFORM_URL/PORT  ＝ 47.104.250.225:6012（有线/内网）
+     *   DEFALUT_GSM_PLATFORM_URL/PORT   ＝ 47.104.250.225:6012（无线/4G 外网）
+     *   DEFALUT_OTA_IP0..3 / DEFALUT_OTA_PORT ＝ 47.104.98.214:8989（升级）
+     * 这里**不能套 `net.ip` 那套"空＝不指定"的口径**：本机 IP 空着还有 DHCP 兜底，
+     * 平台地址空着等于"两条都为空 ⇒ 不启平台链路"（main.c: agent_setup），
+     * 设备永远不上报、现场只会看到报文一直积压在 queue 里。
+     * 换平台时由 Web 改这两组，**不要改这里**（改了固件就把老现场一起带走了）。 */
+    D_STR(IV_CFG_CLS_NET, "net.server.wired.host", "有线平台服务器地址", "47.104.250.225", NULL),
+    D_INT(IV_CFG_CLS_NET, "net.server.wired.port", "有线平台服务器端口", 6012, 0, 65535),
+    D_STR(IV_CFG_CLS_NET, "net.server.wireless.host", "无线平台服务器地址", "47.104.250.225", NULL),
+    D_INT(IV_CFG_CLS_NET, "net.server.wireless.port", "无线平台服务器端口", 6012, 0, 65535),
+    D_STR(IV_CFG_CLS_NET, "net.server.upgrade.host", "升级服务器地址", "47.104.98.214", NULL),
+    D_INT(IV_CFG_CLS_NET, "net.server.upgrade.port", "升级服务器端口", 8989, 0, 65535),
     D_STR(IV_CFG_CLS_NET, "net.server.log.host", "日志上报服务器地址", "", NULL),
     D_INT(IV_CFG_CLS_NET, "net.server.log.port", "日志上报服务器端口", 0, 0, 65535),
 

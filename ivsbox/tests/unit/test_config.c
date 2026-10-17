@@ -238,6 +238,26 @@ static void case_defaults_startup(void)
         "c1: camera.rec.debounce_ms default 60000");
     chk(iv_config_get_int(c, "netthr.reboot_max", &iv) == IV_OK && iv == 0,
         "c1: netthr.reboot_max default 0 (self-heal off, 2026-10-14)");
+    /* 平台/升级服务器出厂地址（2026-10-17 用户要求；取自现网 GD32F460 主控工程
+     * `General_Version/main/APP/User/inc/save.h` 的 DEFALUT_*_PLATFORM_* 与 DEFALUT_OTA_*）。
+     * 钉住这六条的理由：地址一旦被改回空串，设备照样启动、界面照样能开，
+     * 只是**报文永远发不出去**（main.c 两条都空 ⇒ 平台链路 idle），现场表现是
+     * "数据显示正常、平台一直没数据"，最难查。 */
+    chk(iv_config_get_str(c, "net.server.wired.host", &s) == IV_OK &&
+            strcmp(s, "47.104.250.225") == 0,
+        "c1: net.server.wired.host default 47.104.250.225");
+    chk(iv_config_get_int(c, "net.server.wired.port", &iv) == IV_OK && iv == 6012,
+        "c1: net.server.wired.port default 6012");
+    chk(iv_config_get_str(c, "net.server.wireless.host", &s) == IV_OK &&
+            strcmp(s, "47.104.250.225") == 0,
+        "c1: net.server.wireless.host default 47.104.250.225");
+    chk(iv_config_get_int(c, "net.server.wireless.port", &iv) == IV_OK && iv == 6012,
+        "c1: net.server.wireless.port default 6012");
+    chk(iv_config_get_str(c, "net.server.upgrade.host", &s) == IV_OK &&
+            strcmp(s, "47.104.98.214") == 0,
+        "c1: net.server.upgrade.host default 47.104.98.214");
+    chk(iv_config_get_int(c, "net.server.upgrade.port", &iv) == IV_OK && iv == 8989,
+        "c1: net.server.upgrade.port default 8989");
     /* 8 路槽位（**录像侧**口径）：第 8 路在默认表里，第 9 路不在 */
     chk(iv_config_default_get(IV_CFG_NAME, "camera.ch.7.url", NULL, NULL, 0u) == IV_OK,
         "c1: slot 7 (the 8th camera) has a default template");

@@ -2877,3 +2877,100 @@ POST /api/device/identity     （只收 POST，其余 405）
   幂等再写一次结果相同。
 * **未做（登记）**：不替设备编造 MAC（板端只验了"只写 ID"这条路径）；
   重启后隧道取到新 SN 的效果（隧道仍缺 token / frps，属 M8 卡用户项）。
+
+== 2026-10-17 16:43 平台/升级服务器出厂默认值（47.104.250.225:6012、47.104.98.214:8989）
+
+用户问：Web 上「升级服务器」「有线平台服务器」「无线平台服务器」的地址为什么都是空的、端口都是 0。
+然后把现网 GD32F460 主控工程的参数给过来，要求写入默认值。
+
+=== 为什么当初是空的（这是个错误的类比，不是漏填）
+
+`net.ip` / `net.mask` / `net.gateway` 三项默认空串是**对的**：空＝"不在此处指定"，
+实际由天嵌 `EmbedSkyProgress.ini` 的 `ip_mode=staticIp` 生效（见「出厂镜像」那节）。
+
+`net.server.*` 三类键当初照抄了这个口径，语义却完全不同：
+
+[source,c]
+----
+main.c: agent_setup()
+    ac.srv_host[IV_WAN_WIRELESS] = cfg_str("net.server.wireless.host");
+    ...
+    /* 两条都为空 ⇒ 不启平台链路（iv_report 内部 idle）。 */
+----
+
+本机 IP 空着还有 DHCP / ini 兜底；**平台地址空着就是链路永不开启**。
+现象极难查：设备正常启动、界面正常打开、采集板数值照常在刷，
+只有报文一个字节都没发出去，队列一直涨。
+
+=== 取值（照现网 GD32F460 主控工程）
+
+参考 `General_Version/main/APP/User/inc/save.h`：
+
+[cols="2,2,4",options="header"]
+|===
+|键 |默认值 |参考宏
+
+|`net.server.wired.host/port`
+|`47.104.250.225` / `6012`
+|`DEFALUT_LWIP_PLATFORM_URL` / `DEFALUT_LWIP_PLATFORM_PORT`（有线、内网口）
+
+|`net.server.wireless.host/port`
+|`47.104.250.225` / `6012`
+|`DEFALUT_GSM_PLATFORM_URL` / `DEFALUT_GSM_PLATFORM_PORT`（无线 / 4G 外网口）
+
+|`net.server.upgrade.host/port`
+|`47.104.98.214` / `8989`
+|`DEFALUT_OTA_IP0..3` / `DEFALUT_OTA_PORT`（HTTP 升级）
+|===
+
+两套平台地址在参考工程里**是同一个 IP 同一个端口**（有线的注释叫"内网地址"、
+无线的叫"外网地址"，指同一台服务器的两个入口）。这里照抄，不做区分。
+
+`net.server.log.*` 保持空：参考工程没有日志服务器，且目前**没有消费者**。
+`net.server.upgrade.*` 同样还没有消费者（OTA 走独立的 Ed25519 流程），
+先按现网参数填上，将来接 HTTP 升级时直接用。
+
+源码里留了注释写明取值来源，以及**"换平台改 Web、不要改固件"** ——
+固件默认值一改，下一次烧机就把所有老现场的地址一起带走了。
+
+=== 验证
+
+* **编译**：VM `make host` / `make arm` RC=0，`warning:` / `error:` 各 0 条。
+* **单测**：`make test` **39 项全 passed、0 FAIL**；`test_config` 新增 6 条断言
+  钉住三组默认值（`c1: net.server.* default ...`）。
+* **反向证伪 2 条**（编译干净、还原后 `iv_config.c` md5 `980ce52b…` 一致、
+  `test_config passed`）：
+  1. 有线平台地址改回空串 ⇒ 只 FAIL `c1: net.server.wired.host default 47.104.250.225`；
+  2. 升级端口改回 0 ⇒ 只 FAIL `c1: net.server.upgrade.port default 8989`。
+* **板端（192.168.2.120）**：换 `ivsboxd`（`3fbdc59a…`）后启动，日志由
+  `agent up: … server=(none):0` 变为 **`server=47.104.250.225:6012`** —— 默认值确实生效。
+
+=== 顺带发现的缺口：报文没走 4G（未修，已登记）
+
+投递完再看连接，情况不对：
+
+[source,c]
+----
+# netstat（板端）
+tcp  0  1  192.168.2.120:35078  47.104.250.225:6012  SYN_SENT
+# 分口探测
+ping -I usb0 47.104.250.225  → 2/2 收到，RTT 215~300 ms
+ping -I eth0 47.104.250.225  → 2 发 0 收，100% 丢包
+----
+
+源地址 `192.168.2.120` 是 **eth0** 的地址。也就是：4G（`usb0`，`10.167.59.193`）
+明明是通的，报文却从 eth0 出去了，而 eth0 到平台根本不通，于是永远 `SYN_SENT`，
+队列积压 **68 条**（10:43 起每 300 s 一条）。
+
+两条原因，都不是这一轮引入的：
+
+. `iv_transport_io_t` 只有 `sock_open/connect/write/read/error/close`，
+  **没有绑定出口的能力**（既不 `SO_BINDTODEVICE`，也不 bind 到 WAN 的源地址）⇒
+  双 WAN 时出口完全由内核默认路由决定，"按活动出口选服务器地址"只解决了**连哪儿**，
+  没解决**从哪儿出**。
+. `probe.target1/2` 默认空 ⇒ 探活无目标 ⇒ netmgr 判不出哪条 WAN 更好，
+  默认路由一直停在 eth0（metric 0，usb0 是 208）。
+
+修法（另开一步，本轮不动）：传输层加一个出口绑定接口（`SO_BINDTODEVICE`
+或 connect 前 bind 源地址），`iv_agent` 在活动 WAN 切换时重建连接；
+同时给出 `probe.target1/2` 的合理默认值（或改用"能否与平台建连"作为探活判据）。

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 180" role="img" aria-label="暂无数据插画">
+  <defs>
+    <linearGradient id="es-g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#dbe7fa"/>
+      <stop offset="1" stop-color="#f2f6fd"/>
+    </linearGradient>
+  </defs>
+  <!-- 背景圆 -->
+  <circle cx="120" cy="88" r="62" fill="url(#es-g)"/>
+  <!-- 打开的盒子 -->
+  <g stroke="#1f6feb" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="#ffffff">
+    <path d="M78 96l42-20 42 20v34l-42 20-42-20z"/>
+    <path d="M78 96l42 20 42-20" fill="none"/>
+    <path d="M120 116v34" fill="none"/>
+    <path d="M78 96L58 84l42-20 20 12" fill="#eaf1fd"/>
+  </g>
+  <!-- 上升的小点：表示"暂无内容" -->
+  <g fill="#1f6feb">
+    <circle cx="70" cy="52" r="4" fill-opacity=".45"/>
+    <circle cx="176" cy="46" r="5" fill-opacity=".35"/>
+    <circle cx="150" cy="30" r="3.5" fill-opacity=".4"/>
+  </g>
+  <!-- 底部投影 -->
+  <ellipse cx="120" cy="160" rx="56" ry="7" fill="#1f6feb" fill-opacity=".08"/>
+</svg>

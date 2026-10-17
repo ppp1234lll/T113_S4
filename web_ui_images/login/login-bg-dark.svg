@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid slice" role="img" aria-label="深色科技登录背景">
+  <defs>
+    <linearGradient id="bg-d" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a1730"/>
+      <stop offset=".55" stop-color="#10264d"/>
+      <stop offset="1" stop-color="#0c2f5e"/>
+    </linearGradient>
+    <radialGradient id="glow" cx=".28" cy=".22" r=".75">
+      <stop offset="0" stop-color="#2f7bff" stop-opacity=".35"/>
+      <stop offset=".5" stop-color="#2f7bff" stop-opacity=".08"/>
+      <stop offset="1" stop-color="#2f7bff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx=".85" cy=".9" r=".6">
+      <stop offset="0" stop-color="#19c37d" stop-opacity=".14"/>
+      <stop offset="1" stop-color="#19c37d" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0V48" fill="none" stroke="#7fb2ff" stroke-opacity=".07" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="1600" height="900" fill="url(#bg-d)"/>
+  <rect width="1600" height="900" fill="url(#grid)"/>
+  <rect width="1600" height="900" fill="url(#glow)"/>
+  <rect width="1600" height="900" fill="url(#glow2)"/>
+
+  <!-- 网络拓扑：节点与连线（左上区域，低透明度装饰） -->
+  <g stroke="#6ea8ff" stroke-opacity=".28" stroke-width="1.6" fill="none">
+    <path d="M150 210 L340 130 L560 220 L760 120"/>
+    <path d="M340 130 L420 320 L150 210"/>
+    <path d="M420 320 L640 420 L560 220"/>
+    <path d="M1180 640 L1330 560 L1500 660"/>
+    <path d="M1330 560 L1420 400 L1240 330"/>
+    <path d="M1240 330 L1180 640"/>
+  </g>
+  <g fill="#8ab6ff">
+    <circle cx="150" cy="210" r="5" fill-opacity=".55"/>
+    <circle cx="340" cy="130" r="7" fill-opacity=".7"/>
+    <circle cx="560" cy="220" r="5" fill-opacity=".5"/>
+    <circle cx="760" cy="120" r="4" fill-opacity=".45"/>
+    <circle cx="420" cy="320" r="6" fill-opacity=".6"/>
+    <circle cx="640" cy="420" r="4" fill-opacity=".4"/>
+    <circle cx="1180" cy="640" r="6" fill-opacity=".55"/>
+    <circle cx="1330" cy="560" r="5" fill-opacity=".5"/>
+    <circle cx="1500" cy="660" r="4" fill-opacity=".45"/>
+    <circle cx="1420" cy="400" r="6" fill-opacity=".6"/>
+    <circle cx="1240" cy="330" r="4" fill-opacity=".45"/>
+  </g>
+
+  <!-- 视频监控取景角标（右上，低透明度） -->
+  <g stroke="#9cc4ff" stroke-opacity=".35" stroke-width="4" stroke-linecap="round" fill="none">
+    <path d="M1300 120v-22a10 10 0 0 1 10-10h22"/>
+    <path d="M1420 120v-22a10 10 0 0 0-10-10h-22"/>
+    <path d="M1300 190v22a10 10 0 0 0 10 10h22"/>
+    <path d="M1420 190v22a10 10 0 0 1-10 10h-22"/>
+  </g>
+  <circle cx="1360" cy="155" r="26" fill="none" stroke="#9cc4ff" stroke-opacity=".35" stroke-width="4"/>
+  <circle cx="1360" cy="155" r="8" fill="#9cc4ff" fill-opacity=".3"/>
+
+  <!-- 底部信号波纹 -->
+  <g fill="none" stroke="#6ea8ff" stroke-opacity=".16" stroke-width="2">
+    <path d="M-40 830 Q 200 780 440 830 T 920 830 T 1400 830 T 1880 830"/>
+    <path d="M-40 860 Q 200 815 440 860 T 920 860 T 1400 860 T 1880 860"/>
+    <path d="M-40 890 Q 200 850 440 890 T 920 890 T 1400 890 T 1880 890"/>
+  </g>
+</svg>

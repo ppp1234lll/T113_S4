@@ -137,6 +137,7 @@ extern "C" {
 #define IV_CFG_SUBS_MAX   8u   /* 订阅者上限 */
 #define IV_CFG_HANDLES    4u   /* 同时打开的配置份数上限（静态池大小） */
 #define IV_CFG_DETAIL_MAX 128u /* save() 出错说明的建议缓冲长度 */
+#define IV_CFG_DESC_MAX   256u /* 键中文说明上限，含结尾 NUL（默认值表 desc 字段；实测最长 106 B） */
 #define IV_CFG_CLASS_N    8u   /* 一级分类个数（架构 §10.2） */
 
 /* 唯一的配置名（§S8.1 单文件口径）。调用方传这个。 */
@@ -368,6 +369,18 @@ int iv_config_subscribe(iv_config_t *c, uint32_t class_mask, iv_cfg_notify_fn fn
  * ------------------------------------------------------------------------- */
 int iv_config_default_get(const char *name, const char *key, iv_cfg_type_t *out_type,
                           char *out_text, size_t cap);
+
+/* ---------------------------------------------------------------------------
+ * 取一个键的**中文说明**（默认值表里的 `desc` 字段，与配置文件里的行注释同源）
+ *
+ * 为什么需要：Web 配置页原先拿键名当标签，界面上全是 `net.server.wired.host`
+ * 这类英文键 —— 现场人员看不懂。键的中文说明本来就在默认值表里（写配置文件
+ * 注释用的那份），直接取出来当标签即可，**不必在前端另抄一张对照表**
+ * （抄一份就多一处会过期的地方：后端加键、前端忘改，界面就露出裸键名）。
+ *
+ * 未知键返回 IV_ENOENT；`out` 为 NULL 或 cap 为 0 时只判存在性。
+ * ------------------------------------------------------------------------- */
+int iv_config_default_desc(const char *name, const char *key, char *out, size_t cap);
 
 /* ---------------------------------------------------------------------------
  * 遍历内存中的键（M5-S5.1 配置页需要"列出这个分类下有哪些键"）

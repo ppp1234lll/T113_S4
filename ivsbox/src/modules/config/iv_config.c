@@ -2821,3 +2821,18 @@ int iv_config_default_get(const char *name, const char *key, iv_cfg_type_t *out_
     }
     return IV_OK;
 }
+
+int iv_config_default_desc(const char *name, const char *key, char *out, size_t cap)
+{
+    const cfg_default_t *d;
+
+    (void)name; /* 同 default_get：name 只作接口兼容 */
+    if (name == NULL || key == NULL)
+        return IV_EINVAL;
+    d = default_find(key);
+    if (d == NULL)
+        return IV_ENOENT;
+    if (out != NULL && cap > 0u)
+        str_copy(out, cap, (d->desc != NULL) ? d->desc : "");
+    return IV_OK;
+}

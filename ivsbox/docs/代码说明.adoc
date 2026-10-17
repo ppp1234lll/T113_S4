@@ -49,7 +49,9 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M8-S8.3 装配接线（身份/令牌来源 ＋ resolver 落本机代理 ＋ `sys.tunnel.*` ＋ `iv_ctl` 三方法 ＋ 到期兜底） | 已实现（配置键 7 条 ＋ `tunnel.status/enable/disable` ＋ `main.c` 装配/热更新作废/退出即关 ＋ 标记写到期时刻、脚本独立判过期 ＋ 单测新增 8 组 ＋ 集成 test_tunnel_e2e 真拉起 ivsboxd ＋ 反向证伪 5/5；`camera:N` 待 S8.5、真连通待 frps） | 2026-10-15 10:21 | SN＝身份分区 `devid`（fail-closed）；令牌＝`<secure>/tunnel.token`（**不进配置**，防 `config.all` 导出）；resolver 一律 `127.0.0.1`，`camera:N` 在 S8.5 前恒报不可达；标记文件内容＝到期时刻 ⇒ `frp.sh`/`monitor.sh` 独立判过期（有效期不依赖主控存活）。详见本文件 2026-10-15 10:21 节。 |
 | S9 延伸：control.db 表结构与落盘（iv_store 四表 ＋ 四生产者接线） | 已实现（`iv_store` 模块 ＋ `iv_db_handle()` ＋ main.c 2b 步装配 ＋ test_store 9 组 ＋ 集成 m09/k04/c11a-c11b ＋ VM 全量验证 ＋ 反向证伪 7/7 含接线层 2 条；**Web 展示方法按需后补、板端实测随板端复跑组**） | 2026-10-15 12:20 | 新增 `include/ivsbox/iv_store.h` ＋ `src/modules/store/iv_store.c`：四张表（device 主键 MAC/first_seen 保留/上限 64；snmp_latest 最近值 ok=0 不乱填；audit 上限 512 detail 不含口令；net_event 上限 512）＋ schema 版本门（user_version >1 ⇒ IV_EPROTO 不降级）＋ 全 prepared statement ＋ 表名白名单 ＋ fail-open。`iv_db` 增 `iv_db_handle()`。四生产者接线（装配层）：`on_dev_found`→device_upsert、`on_snmp_done`→逐槽位 snmp_put、`iv_ctl` 三方法成功路径→audit（绝不记键值）、`agent_reconnect`→net_event；main.c 第 2b 步 open、关停先 store 后 db。**单测当场抓出 2 个真缺陷**：trim_table 对 device 引用不存在的 id 列（⇒键列/排序列按表参数化）；audit/net_event 占位符绑定错位 ⇒ result 列落错（⇒拆成一一对应的两个 insert）。**集成断言纠偏（登记）**：m09 初版断言 device==0 被环境证伪——ifname 不存在 ⇒ if_nametoindex()==0 ⇒ AF_PACKET 不绑定 ⇒ 测试机收到宿主机真实流量（环境产物非缺陷）；未配槽位也落 ok=0 行（15=cam 9+sw 6）。改为环境无关不变量（store 行数==档案条数、行数=已配槽位总数）。详见本文件 2026-10-15 12:20 节。 |
 | M8-S8.5 摄像机 Web 受控代理（专用环回监听 ＋ `/cam/<N>` 反代 ＋ URL/Location/Cookie 重写） | 已实现（`iv_web_cam.c` ＋ main.c 第二监听接线 ＋ 集成 test_web_cam_e2e 自包含 14 组 ＋ 反向证伪 6/6（含装配层 1 条）；**真机浏览器兼容性不承诺、端到端待 frps 就位**） | 2026-10-15 11:30 | 新增 `web/src/iv_web_cam.c`：只绑 `127.0.0.1` 的专用监听口（`--cam-port`，默认 8081 与 `sys.tunnel.cam.port` 同源），只认 `/cam/<N>/...`（N 0..7、禁前导零），目标 IP 只经本地通道查 `camera.ch.<N>.ip`、上游端口只有 `--cam-upstream` 一个 ⇒ "禁止任意 ip:port"是物理事实；环回护栏拒自指；凭据零下发（SM4 密文 Web 读都不读）。**集成用例当场抓出 2 个真缺陷**（绝对 URL 重写吞掉路径分隔符 `/`；纯 Set-Cookie 响应因 `has_extra` 未置位被整段丢弃）。详见本文件 2026-10-15 11:30 节。 |
+| M5-S5.5 Web 网络页：配置项中文化 ＋ 「当前生效」只读网口状态 | 已实现（新增 `iv_config_default_desc()`；`config.defaults` 每项加可选 `d`；`sys.overview` 加 `net.link`；前端标签改用键说明 ＋ `pageNet` 加「当前生效」卡片；**板端 `eth0 192.168.2.120/24`、网关 `192.168.2.1`、MAC 与 `ip -4 addr` 逐项一致**） | 2026-10-17 11:02 | 详见本文件文末 2026-10-17 11:02 节。 |
 |===
+
 
 == 2026-10-15 10:21 M8-S8.3 受控远程通道装配接线
 
@@ -2203,3 +2205,96 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
   `out/t113_s4/evb1_auto/buildroot/t113_s4_linux_evb1_auto_uart0.img`。
 * **未做（登记）**：真机刷机与板端确认（板子仍不在线）—— 待确认 eth0 只有一个地址
   （没有第二个 DHCP 租约）、主机名 `t113`、浏览器进管理页首登被强制改密。
+
+== 2026-10-17 11:02 Web 网络页：配置项中文化 ＋「当前生效」只读网口状态
+
+=== 干了什么事
+
+* `include/ivsbox/iv_config.h`：新增 `iv_config_default_desc()` 声明 ＋ 宏
+  `IV_CFG_DESC_MAX 256u`（实测最长说明 106 B）。
+* `src/modules/config/iv_config.c`：实现 `iv_config_default_desc()` —— 走既有
+  `default_find()` 查到默认值表条目后拷 `desc`，未知键 `IV_ENOENT`、`out` 为
+  NULL 时只判存在性。**与 `iv_config_default_get()` 并列，同一张表、同一份文字**
+  （那份 `desc` 本来就是渲染配置文件行注释用的）。
+* `src/modules/ctl/iv_ctl.c`：
+  **① 中文标签随响应下发** —— `m_config_defaults()` 给每个键多一个可选字段
+  `"d"`（取不到就不给），既有 `t` / `v` 一字未动。
+  **② `sys.overview` 新增 `net.link`** —— 新增三个静态函数：
+  `default_route_of()`（读 `/proc/net/route`，取 `Destination==0` 且 `RTF_UP`
+  那条的出口与网关）、`add_iface_link()`（`getifaddrs()` 取指定网口的
+  `present/up/ip/mask/mac`）、`build_link_view()`（拼成
+  `{gateway, gateway_if, ifaces[]}`，恒返回对象）。`build_overview()` 在挂
+  `net` 之前插一块 `link`。
+* `web/static/app.js`：
+  **① `loadDescs()`** —— 拉一次 `GET /api/config?defaults=1` 缓存成 `descMap`
+  （`descLoading` 去重，失败也缓存空对象，不会每次点页面都重拉）；
+  `configCard.load()` 把 `loadDescs()` 塞进同一个 `Promise.all`，渲染前就有标签；
+  `fieldFor(key, val, desc)` 用 `desc || key` 当标签、原键名进 `title`。
+  **② `GROUP_NAME`** —— 已知分组给中文（`net` / `net.server.wired` /
+  `camera.snmp.oid` …），未知分组回落裸键名。
+  **③ `pageNet()`** 顶部加「当前生效（只读）」卡片，读 `/api/overview` 的
+  `d.net.link` 渲染两条 WAN 的状态/IP/掩码/MAC ＋ 默认网关；配置卡片说明加一句
+  "留空表示不在此处指定，实际生效值见上方"。
+* `web/src/*`：**一行未改** —— `/api/overview` 路由本来就存在，新字段直接透传。
+
+=== 解决什么问题
+
+* **网络参数一片空白**：`net.ip` / `net.mask` / `net.gateway` 出厂默认**就是空串**，
+  语义是"不在此处指定、交由系统网络配置决定"（本产品实际由天嵌
+  `EmbedSkyProgress.ini` 的 `ip_mode=staticIp` 生效）。所以页面上"空"是**语义正确
+  但零信息量** —— 现场打开这一页第一件要看的是"现在到底是什么地址"。缺的**不是
+  赋值，是一份实际生效值**。`net.link` 补的就是它，且**只读**：不发 netlink 请求、
+  不改地址/路由、不参与判定（判定归 `iv_netmgr`）。
+* **界面不是中文**：标签原来直接拿点分键名当标题。中文说明本来就在默认值表里，
+  只是没往 Web 送。**刻意不在前端抄一张"键→中文"对照表** —— 抄一份就多一处会
+  过期的地方（后端加键、前端忘改 ⇒ 界面又露裸键名）；从后端下发则永远同源。
+* **`/proc/net/route` 的字节序坑**：内核把 `s_addr` 的**内存小端值**按 `%08X`
+  打印，故 `strtoul(hex)` 的结果**直接赋给 `s_addr`** 才是网络序字节
+  （`0102A8C0` → 192.168.2.1）。**套 `htonl`/`ntohl` 会得到 `0.1.2.192`** ——
+  多字节地址上很难一眼看出，代码里已就地注明。
+
+=== 影响范围
+
+* **只增字段、不改既有语义**：`config.defaults` 多一个可选的 `"d"`、
+  `overview.net` 多一个 `link` 对象。旧前端忽略新字段照常工作；`config.defaults`
+  的另一处消费者（`pageConfig` 的「出厂默认值对照」表）只读 `t` / `v`，不受影响。
+* **不新增 ctl 方法**：`net.link` 挂在 `sys.overview` 里，方法表 22 项不变，
+  `iv_web_api.c` 的 `/api/overview` 路由直接透传 ⇒ **Web 服务端零改动**。
+* **`net.ip/mask/gateway` 仍是"只显示不生效"**：本工程**没有**把配置里的地址写入
+  网卡的代码路径（改地址仍归天嵌 `EmbedSkyProgress.ini` / `tq_progress`）。本次
+  **没有**把它们接成可写生效 —— 页面文案已明确"留空＝不在此处指定"，不制造
+  "改了就会生效"的错觉。要真正生效需另开一步（netmgr 加地址配置路径），属未做项。
+* **只报两条 WAN**：`eth0` / `usb0`（架构 §18.3）。`wlan0` 是给摄像机用的 AP、
+  不是 WAN，列进来会被读成"第三条外网"，故不列。
+* 未覆盖风险：`getifaddrs()` 在极端情况下可能拿到过期快照（内核一致性由内核保证，
+  本函数不做重试）；`GROUP_NAME` 需随后端新分组补充（不补只是标题显英文，不影响渲染）。
+
+=== 怎么验证的
+
+* **编译**：VM（`ssh tqt113`，隔离目录 `/tmp/wb-cfg`）`make arm` **RC=0 零告警**
+  （`-Wall -Wextra -Werror`）；`make test` 全量单测**全绿**（既有 1 个基线 SKIP 未变，
+  `grep -Ei "fail|error"` 仅命中 `test_health` 故意打的反向路径日志，无 FAIL 行）。
+* **JSON 形状（host 侧一次性探针，`iv_ctl_handle()` 直调，用后即删）**：
+  * `sys.overview` ⇒ `"link":{"gateway":"192.168.2.1","gateway_if":"ens33",
+    "ifaces":[{"name":"eth0","present":false,"up":false,"ip":"","mask":"","mac":""},
+    {"name":"usb0",...}]}` —— VM 上没有这两块网卡，`present:false` ＋ 空串**符合
+    预期**（也证明"取不到不编造"这条成立）。
+  * `config.defaults` 的 `net.ip` ⇒ `{"t":"str","d":"本机 IP 地址（空＝由 DHCP 分配）","v":""}`
+    ⇒ 中文说明已随响应下发，且 `t`/`v` 未变。
+* **板端实测（同一份代码编到 armv7l，探针跑完即删）**：
+  `"link":{"gateway":"192.168.2.1","gateway_if":"eth0","ifaces":[
+  {"name":"eth0","present":true,"up":true,"ip":"192.168.2.120","mask":"255.255.255.0",
+   "mac":"2e:a2:9e:ef:43:43"},
+  {"name":"usb0","present":true,"up":true,"ip":"10.161.129.12","mask":"255.255.255.0",
+   "mac":"02:4b:b3:b9:eb:e5"}]}`
+  ⇒ 与板上 `ip -4 addr` / 默认路由**逐项一致**（`eth0=192.168.2.120/24`、
+  网关 `192.168.2.1`、MAC `2e:a2:9e:ef:43:43`；4G `usb0` 另有 `10.161.129.12`）。
+* **板端部署与回归**：只替换 `ivsboxd`（md5 `085b9acdbbdaeeaf1f918dfc8d90b9e5`）
+  与 `web/static/app.js`（md5 `13a1dd9e258909977832ce1ae09b26ac`；`ivsbox-web`
+  二进制未变，无需替换）。`S65ivsboxd stop` 走干净停机（日志有
+  `signal 15 received, stopping` ⇒ `iv_watchdog_disable()` 已执行，**板子未被复位**）
+  → 换文件 → `S65`/`S66 start`。重启后 `ivsboxd`(5068) ＋ `ivsbox-web`(5076) 在线、
+  `:80` LISTEN、`wget -qO- http://127.0.0.1/app.js` 命中新代码（含 `loadDescs`、
+  「当前生效」），**lighttpd 未抢占 80**。
+* **未做（登记）**：浏览器侧人工点选复核 —— 用户已改过登录口令，我不能代登，
+  需用户自己打开页面确认观感；`net.ip/mask/gateway` 的"可写生效"未做（原因见影响范围）。

@@ -27,6 +27,9 @@
  *   而不是留下一半新一半旧的中间态。
  */
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netpacket/packet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -330,6 +333,156 @@ static void add_status_view(json_object *d, const iv_report_t *rp)
 }
 
 /* ---------------------------------------------------------------------------
+ * 本机网口"当前生效"状态（M5-S5.5 网络页）
+ *
+ * ============================ 为什么非要有这一块 ============================
+ * `net.ip` / `net.mask` / `net.gateway` 三个键的出厂默认是**空串**，语义是
+ * "不在此处指定、交由系统网络配置决定"（本产品实际由天嵌
+ * `EmbedSkyProgress.ini` 的 `ip_mode=staticIp` 生效）。于是网络页上这三个
+ * 输入框天然是空的 —— 而现场打开这一页第一件要看的事恰恰是"现在到底是什么
+ * 地址"。**把空串当成"值丢了"去查代码是死路**：缺的不是赋值，而是一份
+ * "实际生效值"的只读展示。这里补的就是它。
+ *
+ * ============================ 口径 ============================
+ * **只读**：不发 netlink 请求、不改地址/路由、不参与任何判定（判定归
+ * netmgr）。取的纯粹是内核当前事实，与 `ip -4 addr` / `ip route` 同源。
+ * 取不到的字段给**空串**（前端显示"未获取"），绝不编造一个看起来合理的值。
+ *
+ * ============================ 默认网关的一个坑 ============================
+ * `/proc/net/route` 把 `s_addr` 的**内存小端值**按 `%08X` 打印，故
+ * `strtoul(hex)` 的结果**直接赋给 `s_addr`** 就是网络序字节
+ * （`0102A8C0` → 192.168.2.1）。**不要套 htonl/ntohl** —— 套了就变成
+ * `0.1.2.192` 这类反向地址，且在多字节地址上很难一眼看出。
+ * ------------------------------------------------------------------------- */
+static void add_iface_link(json_object *arr, const char *want)
+{
+    struct ifaddrs *head = NULL;
+    struct ifaddrs *ifa;
+    json_object    *o;
+    char            ip[INET_ADDRSTRLEN]   = "";
+    char            mask[INET_ADDRSTRLEN] = "";
+    char            mac[20]               = "";
+    int             present = 0;
+    int             up      = 0;
+
+    if (getifaddrs(&head) != 0)
+        return;
+    for (ifa = head; ifa != NULL; ifa = ifa->ifa_next) {
+        const struct sockaddr *sa;
+
+        if (ifa->ifa_name == NULL || strcmp(ifa->ifa_name, want) != 0)
+            continue;
+        present = 1;
+        up      = (ifa->ifa_flags & IFF_UP) ? 1 : 0;
+        sa      = ifa->ifa_addr;
+        if (sa == NULL)
+            continue;
+        if (sa->sa_family == AF_INET && ip[0] == '\0') {
+            const struct sockaddr_in *sin =
+                (const struct sockaddr_in *)(const void *)sa;
+
+            if (inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip)) != NULL &&
+                ifa->ifa_netmask != NULL) {
+                const struct sockaddr_in *nm =
+                    (const struct sockaddr_in *)(const void *)ifa->ifa_netmask;
+
+                (void)inet_ntop(AF_INET, &nm->sin_addr, mask, sizeof(mask));
+            }
+        } else if (sa->sa_family == AF_PACKET && mac[0] == '\0') {
+            const struct sockaddr_ll *sll =
+                (const struct sockaddr_ll *)(const void *)sa;
+
+            if (sll->sll_halen == 6u)
+                (void)snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                               sll->sll_addr[0], sll->sll_addr[1], sll->sll_addr[2],
+                               sll->sll_addr[3], sll->sll_addr[4], sll->sll_addr[5]);
+        }
+    }
+    freeifaddrs(head);
+
+    o = json_object_new_object();
+    if (o == NULL)
+        return;
+    json_object_object_add(o, "name", json_object_new_string(want));
+    json_object_object_add(o, "present", json_object_new_boolean(present));
+    json_object_object_add(o, "up", json_object_new_boolean(up));
+    json_object_object_add(o, "ip", json_object_new_string(ip));
+    json_object_object_add(o, "mask", json_object_new_string(mask));
+    json_object_object_add(o, "mac", json_object_new_string(mac));
+    json_object_array_add(arr, o);
+}
+
+/* 取默认路由的出口与网关（见上面"默认网关的一个坑"）。取不到给空串/0。 */
+static void default_route_of(char *ifout, size_t ifcap, char *gwout, size_t gwcap)
+{
+    FILE *f;
+
+    if (ifout != NULL && ifcap > 0u)
+        ifout[0] = '\0';
+    if (gwout != NULL && gwcap > 0u)
+        gwout[0] = '\0';
+    f = fopen("/proc/net/route", "r");
+    if (f == NULL)
+        return;
+    {
+        char line[256];
+
+        if (fgets(line, sizeof(line), f) == NULL) {
+            (void)fclose(f); /* 连表头都没有：空表 */
+            return;
+        }
+        while (fgets(line, sizeof(line), f) != NULL) {
+            char          ifname[32];
+            unsigned long dst = 0ul;
+            unsigned long g   = 0ul;
+            unsigned long fl  = 0ul;
+            struct in_addr a;
+
+            if (sscanf(line, "%31s %lx %lx %lx", ifname, &dst, &g, &fl) != 4)
+                continue;
+            if (dst != 0ul || (fl & 0x1ul) == 0ul) /* 非默认路由 / 未启用 */
+                continue;
+            a.s_addr = (uint32_t)g;
+            if (ifout != NULL && ifcap > 0u)
+                (void)snprintf(ifout, ifcap, "%s", ifname);
+            if (gwout != NULL && gwcap > 0u &&
+                inet_ntop(AF_INET, &a, gwout, (socklen_t)gwcap) == NULL)
+                gwout[0] = '\0';
+            break;
+        }
+    }
+    (void)fclose(f);
+}
+
+/* 恒返回一个对象（取不到也返回，只是各字段为空/0），前端据此统一渲染。 */
+static json_object *build_link_view(void)
+{
+    json_object *l   = json_object_new_object();
+    json_object *arr = json_object_new_array();
+    char         gwif[32];
+    char         gw[INET_ADDRSTRLEN];
+
+    if (l == NULL || arr == NULL) {
+        if (l != NULL)
+            json_object_put(l);
+        if (arr != NULL)
+            json_object_put(arr);
+        return NULL;
+    }
+
+    default_route_of(gwif, sizeof(gwif), gw, sizeof(gw));
+    json_object_object_add(l, "gateway", json_object_new_string(gw));
+    json_object_object_add(l, "gateway_if", json_object_new_string(gwif));
+
+    /* 只报两条 WAN（架构 §18.3：无线＝usb0、有线＝eth0）。
+     * `wlan0` 是给摄像机用的 AP，不是 WAN，故不列 —— 列进来会被读成"第三条外网"。*/
+    add_iface_link(arr, "eth0");
+    add_iface_link(arr, "usb0");
+    json_object_object_add(l, "ifaces", arr);
+    return l;
+}
+
+/* ---------------------------------------------------------------------------
  * S6.5 存储视图（架构 §9.1：总览页列"SD 卡"，媒体页列"存储水位"）
  *
  * **它是 SD 异常唯一的对外出口**：在本次改动之前，`iv_storage` 的故障/告警
@@ -449,6 +602,14 @@ static json_object *build_overview(const iv_ctl_ctx_t *ctx)
         json_object_object_add(d, "devices", json_object_new_int(0));
         json_object_object_add(d, "door_events", json_object_new_int64(0));
     }
+    /* M5-S5.5：网络页要的"当前生效"（IP/掩码/网关/MAC）。**只读**，与 netmgr
+     * 的判定无关；配置里的 `net.ip` 为空时前端就用这块补位，见 build_link_view()。 */
+    {
+        json_object *lv = build_link_view();
+
+        if (lv != NULL)
+            json_object_object_add(net, "link", lv);
+    }
     json_object_object_add(d, "net", net);
 
     if (ctx->cfg != NULL)
@@ -565,6 +726,7 @@ static int m_config_defaults(const iv_ctl_ctx_t *ctx, char *out, size_t cap, siz
     for (i = 0; iv_config_item_at(ctx->cfg, i, &k, &t) == IV_OK; i++) {
         iv_cfg_type_t dt = IV_CFG_T_STR;
         char          txt[IV_CFG_STR_MAX];
+        char          dsc[IV_CFG_DESC_MAX];
         json_object  *e;
 
         if (iv_config_default_get(IV_CFG_NAME, k, &dt, txt, sizeof(txt)) != IV_OK)
@@ -573,6 +735,11 @@ static int m_config_defaults(const iv_ctl_ctx_t *ctx, char *out, size_t cap, siz
         if (e == NULL)
             continue;
         json_object_object_add(e, "t", json_object_new_string(cfg_type_name(dt)));
+        /* 中文说明：前端拿它当字段标签（否则界面上全是 `net.server.wired.host`
+         * 这类英文键，现场人员看不懂）。取不到就不给 `d`，前端回落成键名。 */
+        dsc[0] = '\0';
+        if (iv_config_default_desc(IV_CFG_NAME, k, dsc, sizeof(dsc)) == IV_OK && dsc[0] != '\0')
+            json_object_object_add(e, "d", json_object_new_string(dsc));
         switch (dt) {
         case IV_CFG_T_INT:
             json_object_object_add(e, "v", json_object_new_int64(strtoll(txt, NULL, 10)));

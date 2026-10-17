@@ -199,13 +199,52 @@
     return (i < 0) ? key : key.slice(0, i);
   }
 
-  function fieldFor(key, val) {
+  /* ==================== 中文标签（键说明） ==================== */
+  /* 来源：后端 `GET /api/config?defaults=1` 里每个键的 `d` 字段
+   * ＝ 默认值表的 desc，**与配置文件里的行注释同源**。
+   * 前端**不另抄一张"键→中文"对照表**：抄一份就多一处会过期的地方 ——
+   * 后端加一个键、前端忘了改，界面又露出 `net.server.wired.host` 这种裸键名。
+   * 只拉一次并缓存；拿不到就回落成键名（宁可露裸键名，也不要空白标签）。 */
+  var descMap = null;
+  var descLoading = null;
+
+  function loadDescs() {
+    if (descMap !== null) return Promise.resolve(descMap);
+    if (descLoading !== null) return descLoading;
+    descLoading = api('/api/config?defaults=1').then(function (r) {
+      descMap = {};
+      if (r && r.ok && r.d && r.d.items) {
+        Object.keys(r.d.items).forEach(function (k) {
+          var e = r.d.items[k];
+          if (e && e.d) descMap[k] = e.d;
+        });
+      }
+      return descMap;
+    }).catch(function () { descMap = {}; return descMap; });
+    return descLoading;
+  }
+
+  /* 分组标题的中文。**只覆盖已知分组，未知分组自动回落成裸键名** ——
+   * 后端加了新分组也不会漏渲染，只是那一组标题暂时是英文键。 */
+  var GROUP_NAME = {
+    sys: '基础参数', net: '本机网络', probe: '检测探活', camera: '摄像机',
+    switch: '交换机', elec: '电阈值', netthr: '网络阈值', sensor: '传感器阈值',
+    'sys.tunnel': '远程运维通道',
+    'net.server': '平台服务器', 'net.server.wired': '有线平台服务器',
+    'net.server.wireless': '无线平台服务器', 'net.server.upgrade': '升级服务器',
+    'net.server.log': '日志服务器',
+    'camera.ch': '摄像机通道', 'camera.detect': '摄像机检测',
+    'camera.snmp': '摄像机 SNMP', 'camera.snmp.oid': '摄像机 OID 槽位',
+    'switch.snmp': '交换机 SNMP', 'switch.snmp.oid': '交换机 OID 槽位'
+  };
+
+  function fieldFor(key, val, desc) {
     var lab = el('label', 'field');
     var isBool = (typeof val === 'boolean');
 
     if (isBool) lab.className = 'field chk';
-    lab.appendChild(el('span', null, key));
-    lab.title = key;
+    lab.appendChild(el('span', null, desc || key));
+    lab.title = key;   /* 悬停显示配置键：运维查配置/改 JSON 时要能对上号 */
 
     var inp;
     if (isBool) {
@@ -295,7 +334,9 @@
     function load() {
       body.innerHTML = '';
       var reqs = classes.map(function (c) { return api('/api/config?cls=' + c); });
+      reqs.push(loadDescs());          /* 中文标签与配置一起等，避免先闪一屏裸键名 */
       Promise.all(reqs).then(function (rs) {
+        var descs = rs.pop() || {};
         var items = {}, ver = 0, bad = null;
         rs.forEach(function (r) {
           if (!r.ok) { bad = r.msg || '配置不可用'; return; }
@@ -312,9 +353,11 @@
         Object.keys(groups).sort().forEach(function (g) {
           var sec = el('div', 'card');
           sec.style.marginBottom = '12px';
-          sec.appendChild(el('h3', null, g));
+          var h = el('h3', null, GROUP_NAME[g] || g);
+          h.title = g;
+          sec.appendChild(h);
           var grid = el('div', 'grid');
-          groups[g].forEach(function (k) { grid.appendChild(fieldFor(k, items[k])); });
+          groups[g].forEach(function (k) { grid.appendChild(fieldFor(k, items[k], descs[k])); });
           sec.appendChild(grid);
           body.appendChild(sec);
         });
@@ -390,8 +433,42 @@
   function pageNet() {
     var root = document.createDocumentFragment();
     root.appendChild(el('h2', 'page-title', '网络配置'));
+
+    /* 「当前生效」：配置里的 net.ip / net.mask / net.gateway 留空＝"不在此指定，
+     * 交给系统网络配置决定"（本产品实际由天嵌 EmbedSkyProgress.ini 生效）。
+     * 光看三个空框根本看不出设备现在是什么地址，所以单列一块**实际值**（只读，
+     * 数据来自内核：/api/overview 的 d.net.link）。 */
+    var live = el('div', 'card');
+    live.appendChild(el('h3', null, '当前生效（只读）'));
+    var hint = el('p', 'hint', '读取中…');
+    live.appendChild(hint);
+    var grid = el('div', 'grid');
+    live.appendChild(grid);
+    root.appendChild(live);
+
+    api('/api/overview').then(function (r) {
+      var lk = (r && r.ok && r.d && r.d.net) ? r.d.net.link : null;
+      hint.textContent = '以下是设备当前的真实地址（取自内核），与下方配置项里填的值无关。';
+      if (!lk) { grid.appendChild(kv('状态', '未获取到网口信息', 'warn')); return; }
+      var NAMES = { eth0: '有线网口 eth0', usb0: '无线网口 usb0' };
+      (lk.ifaces || []).forEach(function (f) {
+        var nm = NAMES[f.name] || f.name;
+        var st, cls;
+        if (!f.present) { st = '未检测到'; cls = 'warn'; }
+        else if (!f.up) { st = '未启用'; cls = 'warn'; }
+        else if (!f.ip) { st = '已启用，无 IPv4 地址'; cls = 'warn'; }
+        else { st = '已连接'; cls = 'ok'; }
+        grid.appendChild(kv(nm, st + (f.ip ? '　' + f.ip : ''), cls));
+        grid.appendChild(kv(nm + ' · 子网掩码', f.mask || '—'));
+        grid.appendChild(kv(nm + ' · MAC', f.mac || '—'));
+      });
+      grid.appendChild(kv('默认网关',
+        (lk.gateway || '无') + (lk.gateway_if ? '（' + lk.gateway_if + '）' : '')));
+    });
+
     root.appendChild(configCard('网络参数（net.*）', ['net', 'sys'],
-      '含内外网平台地址、无线/有线网口与传输模式。'));
+      '含内外网平台地址、无线/有线网口与传输模式。' +
+      '本机 IP / 掩码 / 网关留空表示"不在此处指定"，实际生效值见上方「当前生效」。'));
     return root;
   }
 

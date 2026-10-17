@@ -507,6 +507,9 @@ int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
         return api_p_call(ctx, "snmp.run",
                           (req->body != NULL) ? req->body : "{}",
                           out, cap, out_len, rsp);
+    /* S2.5 GPS：只读。定位/统计都由 ivsboxd 侧解析，本层仅透传。 */
+    if (strcmp(req->path, "/api/gps") == 0)
+        return api_simple_call(ctx, "gps.status", out, cap, out_len, rsp);
     if (strcmp(req->path, "/api/camera/search") == 0)
         return api_simple_call(ctx, "camera.search", out, cap, out_len, rsp);
     if (strcmp(req->path, "/api/system/time") == 0)

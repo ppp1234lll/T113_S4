@@ -14,6 +14,7 @@
 #include "ivsbox/iv_proto.h"
 #include "ivsbox/iv_clock.h"
 #include "ivsbox/iv_log.h"
+#include "ivsbox/iv_serial.h"
 #include "ivsbox/iv_snmp.h"
 #include "ivsbox/iv_version.h"
 
@@ -24,6 +25,8 @@
  * ------------------------------------------------------------------------- */
 static void on_nl_evt(const iv_netlink_evt_t *e, void *arg);
 static void on_nl_fd(int fd, uint32_t events, void *arg);
+static void on_gps_fd(int fd, uint32_t events, void *arg);
+static void gps_link_drop(iv_agent_t *a);
 static void on_pb_timer(void *arg);
 static void on_nm_timer(void *arg);
 static int  agent_reconnect(void *arg, int new_ifindex);
@@ -102,6 +105,10 @@ void iv_agent_cfg_default(iv_agent_cfg_t *cfg)
     (void)snprintf(cfg->wan_name[IV_WAN_WIRELESS], IV_AGENT_WAN_NAME_MAX, "%s", "usb0");
     (void)snprintf(cfg->wan_name[IV_WAN_WIRED], IV_AGENT_WAN_NAME_MAX, "%s", "eth0");
     cfg->mode = IV_NETMGR_MODE_AUTO;
+    /* S2.5：GPS 走 UART1 的固定节点；波特率是编译期常量（IV_GPS_UART_BAUD）。
+     * 校时**默认关**（只解析、不碰系统时钟），要开得由调用方显式置 1。 */
+    cfg->gps_path      = IV_AGENT_GPS_PATH_DEFAULT;
+    cfg->gps_sync_time = 0;
 }
 
 void iv_agent_init(iv_agent_t *a)
@@ -455,6 +462,63 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
         }
     }
 
+    /* ---- 5d. S2.5 GPS / NMEA（UART1，9600 8N1）----
+     * **解析器恒初始化**（零系统调用、零 malloc，栈/静态区重建都安全），所以
+     * 即便串口没开出来，`iv_agent_gps()` 与 `iv_agent_gps_feed()` 依然可用。
+     *
+     * **串口只在 Reactor 模式下打开**：本模块的字节来源只有"Reactor 可读事件"，
+     * `r == NULL`（调用方按节拍推进 / 单测）时没有读驱动，硬开一个 fd 只会白占
+     * 资源、且永远读不到东西 —— 那种模式下由调用方用 `iv_agent_gps_feed()` 灌。
+     * 这与 camdet/recovery 的"两种模式都装"不冲突：那两个是纯相位机，本项不是。
+     *
+     * 打不开**不致命**：没插天线、设备树没启用 UART1（曾经就是这状态）都只会
+     * 让 GPS 不可用，不能因此拖死主控。 */
+    {
+        iv_gps_cfg_t gcfg;
+        const char  *gpath;
+
+        iv_gps_cfg_default(&gcfg);
+        /* 校时改整机时间（影响日志时间线与 OTA 判定）⇒ 默认关，需显式打开。 */
+        gcfg.sync_system_time = (cfg->gps_sync_time != 0) ? 1 : 0;
+        iv_gps_init(&a->gps, &gcfg);
+        a->gps_fd      = -1;
+        a->gps_open_rc = IV_ENOTSUP;
+
+        gpath = (cfg->gps_path != NULL) ? cfg->gps_path : IV_AGENT_GPS_PATH_DEFAULT;
+        if (gpath[0] == '\0') {
+            IV_LOG_I(AG_MOD, "gps: serial disabled by config (parser only)");
+        } else if (r == NULL) {
+            IV_LOG_I(AG_MOD, "gps: no reactor, serial not opened (feed by caller)");
+        } else {
+            iv_serial_cfg_t scfg;
+            int             gfd;
+
+            /* ⚠ 必须覆盖波特率：`iv_serial_cfg_default()` 给的是采集板的 115200，
+             * 而 GPS 是 9600。配错的症状是"一条数据都收不到"，看着像没上电。 */
+            iv_serial_cfg_default(&scfg);
+            scfg.baud = IV_GPS_UART_BAUD;
+            gfd = iv_serial_open(gpath, &scfg);
+            if (gfd < 0) {
+                a->gps_open_rc = gfd;
+                IV_LOG_W(AG_MOD, "gps: serial open failed (%d): %s", gfd, gpath);
+            } else {
+                a->gps_fd = gfd;
+                a->gps_ev = iv_reactor_add(r, gfd, IV_EV_READ, on_gps_fd, a);
+                if (a->gps_ev == NULL) {
+                    IV_LOG_W(AG_MOD, "gps: fd add to reactor failed");
+                    (void)iv_serial_close(gfd);
+                    a->gps_fd      = -1;
+                    a->gps_open_rc = IV_ESTATE;
+                } else {
+                    a->gps_open_rc = 0;
+                    IV_LOG_I(AG_MOD, "gps: %s up, %u 8N1 (time sync %s)",
+                             gpath, (unsigned)IV_GPS_UART_BAUD,
+                             (gcfg.sync_system_time != 0) ? "on" : "off");
+                }
+            }
+        }
+    }
+
     /* ---- 6. 本层定时器（仅 Reactor 模式；r == NULL 时由调用方按节拍推进）---- */
     if (r != NULL) {
         a->pb_timer = iv_timer_add(r, IV_AGENT_PROBE_TICK_MS, on_pb_timer, a);
@@ -518,6 +582,7 @@ void iv_agent_close(iv_agent_t *a)
         }
     }
 
+    gps_link_drop(a); /* S2.5：摘 GPS 读事件并关串口（未开时幂等） */
     iv_camdet_close(&a->cd);  /* 停在飞 socket + 关引擎（未开时幂等） */
     iv_device_close(&a->dev); /* 关 UDP / AF_PACKET 两个 socket（未开时幂等） */
     iv_recovery_close(&a->rec);
@@ -1244,4 +1309,105 @@ int iv_agent_snmp_get(const iv_agent_t *a, int which, int i,
             rows[k] = s->row[k];
     }
     return IV_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * S2.5 GPS / NMEA
+ * ------------------------------------------------------------------------- */
+
+/* 摘读事件 + 关串口。**幂等**：重复调用无副作用（关停路径与"读出错"共用）。 */
+static void gps_link_drop(iv_agent_t *a)
+{
+    if (a == NULL)
+        return;
+    if (a->gps_ev != NULL && a->r != NULL) {
+        (void)iv_reactor_del(a->r, a->gps_ev);
+        a->gps_ev = NULL;
+    } else {
+        a->gps_ev = NULL;
+    }
+    if (a->gps_fd >= 0) {
+        (void)iv_serial_close(a->gps_fd);
+        a->gps_fd = -1;
+    }
+}
+
+/* 串口可读：把字节全部灌进解析器。
+ * **一次读干（循环到 EAGAIN）**：GPS 每秒吐十几种语句、每批几十字节，只读一轮
+ * 会让内核缓冲越积越多，表现成"定位更新慢半拍"。 */
+static void on_gps_fd(int fd, uint32_t events, void *arg)
+{
+    iv_agent_t *a = arg;
+    char        buf[512];
+
+    if (a == NULL)
+        return;
+    if ((events & (IV_EV_ERR | IV_EV_HUP | IV_EV_RDHUP)) != 0u) {
+        IV_LOG_W(AG_MOD, "gps: serial error/hup, link dropped");
+        gps_link_drop(a);
+        return;
+    }
+    for (;;) {
+        size_t got = 0u;
+        int    rc  = iv_serial_read(fd, buf, sizeof(buf), &got);
+
+        if (rc == IV_EAGAIN)
+            return;
+        if (rc != IV_OK) {
+            IV_LOG_W(AG_MOD, "gps: read failed (%d), link dropped", rc);
+            gps_link_drop(a);
+            return;
+        }
+        (void)iv_agent_gps_feed(a, buf, got);
+        if (got < sizeof(buf))
+            return; /* 没读满 ⇒ 缓冲已空，不必再试 */
+    }
+}
+
+int iv_agent_gps_feed(iv_agent_t *a, const char *buf, size_t len)
+{
+    int n;
+
+    if (a == NULL || buf == NULL || len == 0u)
+        return IV_EINVAL;
+    n = iv_gps_feed(&a->gps, buf, len);
+    if (n < 0)
+        return n;
+    a->gps_rx_bytes += (uint64_t)len;
+    if (n > 0) {
+        /* 只记一次："串口通了、字节能解析成 NMEA"。现场看日志就能把
+         * "没接线/波特率错"（永远没有这一行）与"有数据但不定位"分开。 */
+        if (a->gps_last_parse_ms == 0u)
+            IV_LOG_I(AG_MOD, "gps: NMEA stream up (first sentence parsed)");
+        a->gps_last_parse_ms = iv_clock_monotonic_ms();
+    }
+    return n;
+}
+
+const iv_gps_t *iv_agent_gps(const iv_agent_t *a)
+{
+    return (a != NULL) ? &a->gps : NULL;
+}
+
+int iv_agent_gps_link(const iv_agent_t *a, const char **path, int *fd)
+{
+    if (a == NULL)
+        return IV_EINVAL;
+    if (path != NULL)
+        *path = (a->cfg.gps_path != NULL && a->cfg.gps_path[0] != '\0')
+                    ? a->cfg.gps_path
+                    : IV_AGENT_GPS_PATH_DEFAULT;
+    if (fd != NULL)
+        *fd = a->gps_fd;
+    return a->gps_open_rc;
+}
+
+uint64_t iv_agent_gps_rx_bytes(const iv_agent_t *a)
+{
+    return (a != NULL) ? a->gps_rx_bytes : 0u;
+}
+
+uint64_t iv_agent_gps_last_parse_ms(const iv_agent_t *a)
+{
+    return (a != NULL) ? a->gps_last_parse_ms : 0u;
 }

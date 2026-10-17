@@ -88,6 +88,7 @@
 
 #include "ivsbox/iv_camdet.h"
 #include "ivsbox/iv_device.h"
+#include "ivsbox/iv_gps.h"
 #include "ivsbox/iv_media.h"
 #include "ivsbox/iv_netlink.h"
 #include "ivsbox/iv_netmgr.h"
@@ -118,6 +119,10 @@ extern "C" {
 
 /* 单目标最多槽位＝交换机 12 槽（摄像机 9 槽是它的子集） */
 #define IV_AGENT_SNMP_SLOT_MAX IV_SNMP_SW_SLOT_N
+
+/* GPS 串口默认设备节点（UART1；板端设备树启用后才有这个节点）。
+ * 波特率见 `IV_GPS_UART_BAUD`（9600，外部事实，不进配置）。 */
+#define IV_AGENT_GPS_PATH_DEFAULT "/dev/ttySAC1"
 /* 表列 GETNEXT 结果**留存行数**上限（装配层只留前 N 行，避免结果表过大；
  * 完整遍历上限由 iv_snmp_target_t::max_rows 管） */
 #define IV_AGENT_SNMP_ROWS_MAX 4
@@ -265,6 +270,19 @@ typedef struct {
      * 这是有意行为，不是 bug。 */
     int      storage_enable;
     char     storage_root[IV_STORAGE_PATH_MAX];
+
+    /* ---- S2.5 GPS / NMEA（UART1，9600 8N1）----
+     * `gps_path`：NULL → 默认 `IV_AGENT_GPS_PATH_DEFAULT`（`/dev/ttySAC1`）；
+     *   空串 → **不打开串口**（解析器仍然初始化，调用方可用
+     *   `iv_agent_gps_feed()` 自行灌字节，测试/回放用）。
+     * ⚠ 波特率**不在这里**：它是 `IV_GPS_UART_BAUD`（9600）这条外部事实，
+     *   装配层直接用常量，**绝不能**用 `iv_serial_cfg_default()` 的 115200
+     *   —— 那是采集板链路的参数，配错的症状是"收不到任何数据"，看起来像没上电。
+     * `gps_sync_time`：1 = 允许按 GPS 校时（`iv_gps_sync_time()`）；
+     *   **默认 0（只解析、不碰系统时钟）**。校时会改整机时间、继而影响日志
+     *   时间线与 OTA 判定，属"改行为"的动作，需显式打开。 */
+    const char *gps_path;
+    int         gps_sync_time;
 } iv_agent_cfg_t;
 
 /* ---------------------------------------------------------------------------
@@ -288,6 +306,15 @@ typedef struct {
     iv_media_t   media;
     iv_recctl_t  recm;
     iv_storage_t stg;  /* S6.5 SD 卡策略（每拍 step；只读 statfs＋有界扫描，无 fd 常驻） */
+
+    /* S2.5 GPS 链路。**解析器恒初始化**（`r == NULL` 或串口没开出来时同样可用），
+     * 串口打不开只降级、不致命 —— GPS 是辅助信息，不能因为没插天线就拖死主控。 */
+    iv_gps_t     gps;
+    int          gps_fd;            /* -1 = 串口未打开 */
+    iv_event_t  *gps_ev;            /* Reactor 注册句柄；r == NULL 时恒 NULL */
+    uint64_t     gps_rx_bytes;      /* 累计收到的字节数（0 ⇒ 线没接 / 波特率错 / 没上电） */
+    uint64_t     gps_last_parse_ms; /* 最近一次成功解析出语句的单调时刻；0 = 从未 */
+    int          gps_open_rc;       /* 最近一次开串口的结果：0 = 已打开，负 = 错误码，IV_ENOTSUP = 配置为不开 */
 
     /* netmgr 的事务执行点：switch_route 复用默认（netlink 改路由），reconnect
      * 接本层 → iv_report_reconnect。ops.arg 指向本结构，故不能是静态常量。 */
@@ -417,6 +444,29 @@ int iv_agent_snmp_state(const iv_agent_t *a, int which);
 int iv_agent_snmp_get(const iv_agent_t *a, int which, int i,
                       const char **slot_name, const char **oid, int *n_rows,
                       iv_agent_snmp_row_t *rows, int rowcap);
+
+/* ---------------------------------------------------------------------------
+ * S2.5 GPS / NMEA
+ * ------------------------------------------------------------------------- */
+
+/* 最近的定位快照（指针指向本层内部，**只读、随下一批字节变化**）。
+ * 从未收到任何语句时返回的是"全 NA ＋ valid=0"的快照（不是 NULL，也不用查空）。 */
+const iv_gps_t *iv_agent_gps(const iv_agent_t *a);
+
+/* 链路状态（给 Web / 诊断用）：`*path` 出参指向本层实际的设备节点（永不为 NULL），
+ * `*fd` 出参为串口 fd（-1 = 没开），返回值为最近一次开串口的结果
+ * （0 = 已打开；负 = 错误码；`IV_ENOTSUP` = 配置为空串、本层刻意不开）。 */
+int iv_agent_gps_link(const iv_agent_t *a, const char **path, int *fd);
+
+/* 灌入一段字节（**给非 Reactor 驱动与回放用**：`r == NULL` 的测试、或调用方
+ * 从别处拿到了 NMEA 字节流）。返回成功解析的语句条数。
+ * Reactor 模式下串口的字节由本层自己读，调用方通常不需要碰这个口子。 */
+int iv_agent_gps_feed(iv_agent_t *a, const char *buf, size_t len);
+
+/* 累计收字节／最近一次解析时刻（单调毫秒，0 = 从未解析出语句）。
+ * Web 用它算"数据 N 秒前"，现场用它区分"没数据"和"有数据但不定位"。 */
+uint64_t iv_agent_gps_rx_bytes(const iv_agent_t *a);
+uint64_t iv_agent_gps_last_parse_ms(const iv_agent_t *a);
 
 #ifdef __cplusplus
 }

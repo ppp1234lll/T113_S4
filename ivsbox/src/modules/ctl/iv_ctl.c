@@ -28,6 +28,7 @@
  */
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#include <math.h>
 #include <net/if.h>
 #include <netpacket/packet.h>
 #include <stdio.h>
@@ -59,6 +60,7 @@ static const char *const k_methods[] = {
     "device.list",
     "snmp.result",
     "snmp.run",
+    "gps.status",
     "camera.search",
     "system.time",
     "system.reboot",
@@ -1124,6 +1126,118 @@ static int m_camera_search(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_
     return rsp_data(d, out, cap, out_len);
 }
 
+/* ============================ gps.status（S2.5） ============================ */
+
+/* double 字段：NA（NAN）写成 JSON **null**。
+ * **不能拿 0 顶替** —— 纬度 0 / 经度 0 是几内亚湾里的一个真实位置，"未知"与
+ * "在赤道"在界面上必须分得开（这也是 `iv_gps.h` 用 NAN 做哨兵的原因）。
+ * 另：json-c 序列化 NAN 会产出非法 JSON（`NaN`），所以只在有效时才建对象。 */
+static void add_dbl_or_null(json_object *o, const char *k, double v)
+{
+    add_or_null(o, k, !isnan(v), json_object_new_double(v));
+}
+
+static int m_gps_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_t *out_len)
+{
+    const iv_gps_t *g;
+    iv_gps_fix_t    f;
+    json_object    *d;
+    json_object    *link;
+    json_object    *fx;
+    json_object    *tm;
+    json_object    *st;
+    const char     *path = NULL;
+    int             fd   = -1;
+    uint64_t        last;
+    uint64_t        now;
+
+    if (ctx->agent == NULL)
+        return rsp_err(IV_ESTATE, "agent unavailable", out, cap, out_len);
+    g = iv_agent_gps(ctx->agent);
+    if (g == NULL || iv_gps_fix(g, &f) != IV_OK)
+        return rsp_err(IV_ESTATE, "gps unavailable", out, cap, out_len);
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+
+    /* 链路：串口开没开、收了多少字节、多久之前解析出过语句。
+     * 现场第一眼要看的正是这三个数：`rx_bytes == 0` 是线/波特率问题，
+     * 有字节但 `valid == false` 是天线/遮蔽问题，两者处置完全不同。 */
+    link = json_object_new_object();
+    if (link != NULL) {
+        int lrc = iv_agent_gps_link(ctx->agent, &path, &fd);
+
+        json_object_object_add(link, "path",
+                               json_object_new_string((path != NULL) ? path : ""));
+        json_object_object_add(link, "open", json_object_new_boolean(fd >= 0));
+        json_object_object_add(link, "rc", json_object_new_int(lrc));
+        json_object_object_add(link, "rx_bytes",
+                               json_object_new_int64(
+                                   (int64_t)iv_agent_gps_rx_bytes(ctx->agent)));
+        last = iv_agent_gps_last_parse_ms(ctx->agent);
+        now  = iv_clock_monotonic_ms();
+        if (last == 0u || now < last)
+            json_object_object_add(link, "age_ms", NULL); /* 从未解析出语句 */
+        else
+            json_object_object_add(link, "age_ms",
+                                   json_object_new_int64((int64_t)(now - last)));
+        json_object_object_add(d, "link", link);
+    }
+
+    fx = json_object_new_object();
+    if (fx != NULL) {
+        json_object_object_add(fx, "valid", json_object_new_boolean(f.valid != 0));
+        add_dbl_or_null(fx, "lat", f.latitude);
+        add_dbl_or_null(fx, "lon", f.longitude);
+        add_dbl_or_null(fx, "alt", f.altitude_m);
+        add_dbl_or_null(fx, "speed_kph", f.speed_kph);
+        add_dbl_or_null(fx, "course_deg", f.course_deg);
+        add_dbl_or_null(fx, "hdop", f.hdop);
+        json_object_object_add(fx, "fix_quality", json_object_new_int(f.fix_quality));
+        json_object_object_add(fx, "satellites", json_object_new_int(f.satellites));
+        json_object_object_add(d, "fix", fx);
+    }
+
+    /* UTC（来自 RMC/ZDA/GGA 的合并结果；`have=0` 时下面各字段无意义，前端不显示） */
+    tm = json_object_new_object();
+    if (tm != NULL) {
+        json_object_object_add(tm, "have", json_object_new_boolean(f.have_time != 0));
+        json_object_object_add(tm, "year", json_object_new_int(f.year));
+        json_object_object_add(tm, "month", json_object_new_int(f.month));
+        json_object_object_add(tm, "day", json_object_new_int(f.day));
+        json_object_object_add(tm, "hour", json_object_new_int(f.hour));
+        json_object_object_add(tm, "minute", json_object_new_int(f.minute));
+        json_object_object_add(tm, "second", json_object_new_int(f.second));
+        json_object_object_add(tm, "usec", json_object_new_int64((int64_t)f.usec));
+        json_object_object_add(d, "utc", tm);
+    }
+
+    /* 解析统计：把"没数据"和"数据来了但解析不了"分开（校验错 ≠ 没收到） */
+    st = json_object_new_object();
+    if (st != NULL) {
+        json_object_object_add(st, "sentences_ok",
+                               json_object_new_int64((int64_t)g->stats.sentences_ok));
+        json_object_object_add(st, "checksum_bad",
+                               json_object_new_int64((int64_t)g->stats.checksum_bad));
+        json_object_object_add(st, "malformed",
+                               json_object_new_int64((int64_t)g->stats.malformed));
+        json_object_object_add(st, "too_long",
+                               json_object_new_int64((int64_t)g->stats.too_long));
+        json_object_object_add(st, "noise_bytes",
+                               json_object_new_int64((int64_t)g->stats.noise_bytes));
+        json_object_object_add(st, "fix_updates",
+                               json_object_new_int64((int64_t)g->stats.fix_updates));
+        json_object_object_add(st, "time_sync_ok",
+                               json_object_new_int64((int64_t)g->stats.time_sync_ok));
+        json_object_object_add(st, "time_sync_rejected",
+                               json_object_new_int64(
+                                   (int64_t)g->stats.time_sync_rejected));
+        json_object_object_add(d, "stats", st);
+    }
+    return rsp_data(d, out, cap, out_len);
+}
+
 /* ============================ system.time / system.reboot ============================ */
 
 static int m_system_time(const iv_ctl_ctx_t *ctx, json_object *p,
@@ -1627,6 +1741,8 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_snmp_result(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "snmp.run") == 0)
         rc = m_snmp_run(ctx, params, out, out_cap, out_len);
+    else if (strcmp(method, "gps.status") == 0)
+        rc = m_gps_status(ctx, out, out_cap, out_len);
     else if (strcmp(method, "camera.search") == 0)
         rc = m_camera_search(ctx, out, out_cap, out_len);
     else if (strcmp(method, "system.time") == 0)

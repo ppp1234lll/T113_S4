@@ -907,6 +907,15 @@ static int agent_setup(void)
     ac.storage_enable = 1;
     ac.storage_root[0] = '\0';
 
+    /* GPS（S2.5）：默认 /dev/ttySAC1、9600 8N1，解析器恒装、**不校时**。
+     * 环境变量只为联调/回放留口子（与 IVSBOX_SD_ROOT 同口径，产线不设）。 */
+    {
+        const char *gdev = getenv("IVSBOX_GPS_DEV");
+
+        if (gdev != NULL)
+            ac.gps_path = gdev;
+    }
+
     ac.devid = 0u;
 
     if (iv_agent_open(&g_agent, &ac, g_reactor, iv_clock_monotonic_ms()) != IV_OK) {

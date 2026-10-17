@@ -81,6 +81,7 @@
   var PAGES = [
     { id: 'overview', name: '总览' },
     { id: 'net', name: '网络' },
+    { id: 'gps', name: '定位' },
     { id: 'camera', name: '摄像机' },
     { id: 'devices', name: '设备档案' },
     { id: 'switch', name: '交换机' },
@@ -182,11 +183,14 @@
   function go(page) {
     st.page = page;
     markNav();
+    /* 定位页会挂一个自动刷新定时器；切页必须先收掉，否则后台一直打接口 */
+    if (st.timer) { clearInterval(st.timer); st.timer = null; }
     var c = $('#content');
     c.innerHTML = '';
     var builder = {
-      overview: pageOverview, net: pageNet, camera: pageCamera, devices: pageDevices,
-      switch: pageSwitch, media: pageMedia, config: pageConfig, maint: pageMaint
+      overview: pageOverview, net: pageNet, gps: pageGps, camera: pageCamera,
+      devices: pageDevices, switch: pageSwitch, media: pageMedia,
+      config: pageConfig, maint: pageMaint
     }[page] || pageOverview;
     c.appendChild(builder());
   }
@@ -469,6 +473,135 @@
     root.appendChild(configCard('网络参数（net.*）', ['net', 'sys'],
       '含内外网平台地址、无线/有线网口与传输模式。' +
       '本机 IP / 掩码 / 网关留空表示"不在此处指定"，实际生效值见上方「当前生效」。'));
+    return root;
+  }
+
+  /* ==================== 定位（GPS / NMEA，M2-S2.5） ==================== */
+  /* 数据来源 `GET /api/gps` → ivsboxd 的 `gps.status`。后端把"未知"一律给
+   * JSON null（不是 0）—— 经纬度 0 是几内亚湾里的真实位置，拿 0 顶替"未知"
+   * 会让人以为设备在赤道。所以下面每个格式化函数都必须**先判 null**。 */
+  var GPS_QUALITY = {
+    0: '无效（未定位）', 1: 'GPS 定位', 2: '差分定位（DGPS）',
+    3: 'PPS 定位', 4: 'RTK 固定', 5: 'RTK 浮动'
+  };
+
+  function fmtNum(v, unit, digits) {
+    if (v === null || v === undefined) return '—';
+    var n = Number(v);
+    if (!isFinite(n)) return '—';
+    return n.toFixed(digits === undefined ? 1 : digits) + (unit || '');
+  }
+
+  function fmtCoord(v, pos, neg) {
+    if (v === null || v === undefined) return '—';
+    var n = Number(v);
+    if (!isFinite(n)) return '—';
+    return Math.abs(n).toFixed(6) + '° ' + (n >= 0 ? pos : neg);
+  }
+
+  function fmtAge(ms) {
+    if (ms === null || ms === undefined) return '从未收到语句';
+    var s = Math.floor(Number(ms) / 1000);
+    if (!isFinite(s)) return '—';
+    if (s < 1) return '刚刚';
+    if (s < 60) return s + ' 秒前';
+    if (s < 3600) return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒前';
+    return Math.floor(s / 3600) + ' 小时前';
+  }
+
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  function pageGps() {
+    var root = document.createDocumentFragment();
+    root.appendChild(el('h2', 'page-title', '定位（GPS）'));
+
+    var card = el('div', 'card');
+    card.appendChild(el('h3', null, '定位状态'));
+    var note = el('p', 'hint', '读取中…');
+    card.appendChild(note);
+    var grid = el('div', 'grid');
+    card.appendChild(grid);
+    var bar = el('div', 'actions');
+    var btn = el('button', 'ghost', '刷新');
+    btn.type = 'button';
+    bar.appendChild(btn);
+    card.appendChild(bar);
+    root.appendChild(card);
+
+    var card2 = el('div', 'card');
+    card2.appendChild(el('h3', null, '链路与解析统计'));
+    var grid2 = el('div', 'grid');
+    card2.appendChild(grid2);
+    root.appendChild(card2);
+
+    function load() {
+      api('/api/gps').then(function (r) {
+        grid.innerHTML = '';
+        grid2.innerHTML = '';
+        if (!r.ok) {
+          note.textContent = '';
+          var why = (r.msg === 'agent unavailable' || r.msg === 'gps unavailable')
+            ? 'ivsboxd 未运行，或本机未装配 GPS'
+            : (r.msg || '读取失败');
+          grid.appendChild(kv('状态', why, 'err'));
+          return;
+        }
+        var d = r.d || {}, f = d.fix || {}, utc = d.utc || {};
+        var lk = d.link || {}, s = d.stats || {};
+
+        note.textContent = f.valid
+          ? '已定位（' + (GPS_QUALITY[f.fix_quality] || ('质量 ' + f.fix_quality)) + '）'
+          : '尚未定位 —— 已收到卫星信号但还没有定位解算结果，请检查天线位置与天空视野。';
+
+        /* 坐标只在 valid 时显示：定位丢失后**经纬度仍保留上一次有效值**
+         * （`on_gga` 的刻意行为，现场要能看"最后定在哪"），但把旧坐标当成
+         * 当前位置显示就是错的 —— 一律以 valid 为闸门。 */
+        grid.appendChild(kv('定位状态', f.valid ? '有效' : '未定位', f.valid ? 'ok' : 'warn'));
+        grid.appendChild(kv('经度', f.valid ? fmtCoord(f.lon, 'E', 'W') : '—'));
+        grid.appendChild(kv('纬度', f.valid ? fmtCoord(f.lat, 'N', 'S') : '—'));
+        grid.appendChild(kv('海拔', f.valid ? fmtNum(f.alt, ' m', 1) : '—'));
+        grid.appendChild(kv('地面速度', f.valid ? fmtNum(f.speed_kph, ' km/h', 1) : '—'));
+        grid.appendChild(kv('航向', f.valid ? fmtNum(f.course_deg, '°', 1) : '—'));
+        grid.appendChild(kv('卫星数（参与定位）', (f.satellites === undefined ? '—' : f.satellites)));
+        grid.appendChild(kv('水平精度 HDOP', fmtNum(f.hdop, '', 1)));
+        grid.appendChild(kv('定位质量',
+          GPS_QUALITY[f.fix_quality] || ('未知（' + f.fix_quality + '）')));
+        grid.appendChild(kv('UTC 时间', utc.have
+          ? (utc.year + '-' + pad2(utc.month) + '-' + pad2(utc.day) + ' ' +
+             pad2(utc.hour) + ':' + pad2(utc.minute) + ':' + pad2(utc.second))
+          : '—'));
+        grid.appendChild(kv('数据时延', fmtAge(lk.age_ms),
+          (lk.age_ms === null || lk.age_ms === undefined) ? 'err'
+            : (lk.age_ms < 5000 ? 'ok' : 'warn')));
+
+        /* 链路：串口开没开、收没收到字节。现场排障的两个分叉点 ——
+         * rx_bytes=0 是线/波特率/设备树问题；有字节但不定位是天线/遮蔽问题。 */
+        grid2.appendChild(kv('串口', (lk.path || '—') + '　' + (lk.open ? '已打开' : '未打开'),
+          lk.open ? 'ok' : 'warn'));
+        grid2.appendChild(kv('累计收到字节', (lk.rx_bytes === undefined ? '—' : lk.rx_bytes),
+          (lk.rx_bytes ? 'ok' : 'warn')));
+        grid2.appendChild(kv('解析成功语句', s.sentences_ok === undefined ? '—' : s.sentences_ok));
+        grid2.appendChild(kv('有效定位更新', s.fix_updates === undefined ? '—' : s.fix_updates));
+        grid2.appendChild(kv('校验错 / 结构错',
+          (s.checksum_bad === undefined ? '—' : s.checksum_bad) + ' / ' +
+          (s.malformed === undefined ? '—' : s.malformed)));
+        grid2.appendChild(kv('超长丢弃 / 噪声字节',
+          (s.too_long === undefined ? '—' : s.too_long) + ' / ' +
+          (s.noise_bytes === undefined ? '—' : s.noise_bytes)));
+        grid2.appendChild(kv('校时（成功 / 被拒）',
+          (s.time_sync_ok === undefined ? '—' : s.time_sync_ok) + ' / ' +
+          (s.time_sync_rejected === undefined ? '—' : s.time_sync_rejected)));
+      }).catch(function () {
+        grid.innerHTML = '';
+        grid2.innerHTML = '';
+        note.textContent = '';
+        grid.appendChild(kv('状态', '无法连接服务', 'err'));
+      });
+    }
+
+    btn.addEventListener('click', load);
+    load();
+    st.timer = setInterval(load, 5000);  /* 5 s 自动刷新；切页时由 go() 收掉 */
     return root;
   }
 

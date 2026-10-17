@@ -2298,3 +2298,115 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
   「当前生效」），**lighttpd 未抢占 80**。
 * **未做（登记）**：浏览器侧人工点选复核 —— 用户已改过登录口令，我不能代登，
   需用户自己打开页面确认观感；`net.ip/mask/gateway` 的"可写生效"未做（原因见影响范围）。
+
+== 2026-10-17 13:37 GPS 参数读取并显示在 Web（装配 S2.5 ＋ 新增「定位」页）
+
+=== 干了什么事
+
+* `include/ivsbox/iv_agent.h`：`#include "ivsbox/iv_gps.h"`；新增
+  `IV_AGENT_GPS_PATH_DEFAULT "/dev/ttySAC1"`；`iv_agent_cfg_t` **尾部追加**
+  `gps_path`（NULL → 默认；**空串 → 只装解析器、不开串口**）与 `gps_sync_time`
+  （默认 0：只解析、**不碰系统时钟**）；`iv_agent_t` 追加 GPS 状态
+  （`iv_gps_t gps`、`gps_fd`、`gps_ev`、`gps_rx_bytes`、`gps_last_parse_ms`、
+  `gps_open_rc`）与 5 个只读接口（`iv_agent_gps` / `..._gps_link` /
+  `..._gps_feed` / `..._gps_rx_bytes` / `..._gps_last_parse_ms`）。
+* `src/modules/agent/iv_agent.c`：`iv_agent_open()` 新增 "5d. S2.5 GPS" 段 ——
+  `iv_gps_init()` **恒执行**；路径为空 ⇒ 到此为止；`r == NULL`（降级模式，没有
+  Reactor 读驱动）⇒ **不打开串口**；否则 `iv_serial_cfg_default()` →
+  `baud = IV_GPS_UART_BAUD` → `iv_serial_open()` → `iv_reactor_add()`，
+  回调 `on_gps_fd()` 循环读到 `EAGAIN` 后逐块喂 `iv_gps_feed()`。
+  `iv_agent_close()` 调 `gps_link_drop()`；`on_gps_fd()` / 首次解析成功的
+  `"gps: NMEA stream up"` 日志各一处。`iv_agent_gps_feed()` 是给"不经串口"的
+  场景（回放/管道/单测）用的同一入口。
+* `src/app/main.c`：`IVSBOX_GPS_DEV` 环境变量可覆盖串口路径（缺省不设）。
+* `src/modules/ctl/iv_ctl.c`：方法表加 `gps.status`；新增 `add_dbl_or_null()`
+  与 `m_gps_status()`，响应
+  `{link:{path,open,rc,rx_bytes,age_ms}, fix:{valid,lat,lon,alt,speed_kph,
+  course_deg,hdop,fix_quality,satellites}, utc:{have,year..usec},
+  stats:{sentences_ok,checksum_bad,malformed,too_long,noise_bytes,
+  fix_updates,time_sync_ok,time_sync_rejected}}`。**纯读**：不写配置、不改时钟。
+* `web/src/iv_web_api.c`：`/api/gps` → `api_simple_call(ctx, "gps.status", ...)`，
+  一行透传，**不加新口子**（沿用既有会话鉴权与出厂口令闸门）。
+* `web/static/app.js`：`PAGES` 加「定位」（排「网络」之后）；新增
+  `pageGps()` ＋ `GPS_QUALITY` 质量码映射 ＋ `fmtNum` / `fmtCoord` / `fmtAge` /
+  `pad2`；两张卡片（定位状态 / 链路与解析统计）＋ 手动刷新 ＋ `5 s` 自动刷新；
+  `go()` 开头先 `clearInterval` 旧定时器（否则每切一次页就多一条定时器链）。
+* `include/ivsbox/iv_gps.h`：**注释订正**（不改代码）—— 原写"设备树 UART1
+  `status = "disabled"`、没有 `/dev/ttySAC1`、只能灌样本"，已按 2026-10-17
+  板端实测改为"串口可用"，并保留"订正"字样。
+
+=== 解决什么问题
+
+* **模块写了、链路没接**：`iv_gps`（＋vendored minmea）2026-09-30 就完成并有单测，
+  但 `ivsboxd` 里**没有一行代码打开串口、喂字节、或把结果送出去**。用户要的
+  "GPS 参数读取并显示"因此不是"再写一个解析器"，而是**把已有那一节接成通路**。
+* **波特率不是默认值**：`iv_serial_cfg_default()` 给的是采集板的 **115200**，
+  GPS 模块是 **9600 8N1**。装配时必须显式覆盖成 `IV_GPS_UART_BAUD`，否则
+  串口能开、字节全是乱的（表现为 `noise_bytes` 一直涨、`sentences_ok` 不动）。
+* **NA 不能当 0 显示**：`iv_gps_fix_t` 用 `NAN` 表示"不知道"。若直接下发，
+  json-c 会产出 **非法 JSON**（字面量 `NaN`），前端 `JSON.parse` 直接抛错；
+  若改成 0，纬度 0 / 经度 0 是几内亚湾的真实坐标 ⇒ **在页面上编出一个位置**。
+  故统一走 `add_dbl_or_null()`：`isnan` ⇒ `null`，前端渲染成 `—`。
+* **`valid` 是唯一的显示闸门**：`on_gga` 的 else 分支在**定位丢失时保留上一次有效
+  经纬度**、只把 `valid` 置 0（刻意行为，便于"最后一次已知位置"排查）。所以任何
+  显示都必须先看 `valid`，否则天线拔掉后界面仍会显示一个看似正常的坐标。
+* **`fix_updates` 的口径**：GGA 与 RMC **各带一份定位信息、各计一次**，两句话
+  进来计数 +2。这不是重复计数，是模块既有定义（本轮单测一开始就按"1"断言而失败，
+  核对后确认是理解错、不是缺陷）。
+* **无读驱动时不要硬开 fd**：`r == NULL` 的降级装配里没有任何东西会去 `read()`
+  这个 fd，打开只会白占一个描述符并让 `link.open` 撒谎。故"开了"只表示
+  "Reactor 模式下确实拿到了 fd"。
+
+=== 影响范围
+
+* **只增不改**：`iv_agent_cfg_t` 的两个字段追加在**结构体尾部**（既有使用方按字段名
+  赋值，不受影响）；`iv_agent_t` 只是变大（`≈35 KB`，测试里必须放静态区）；
+  ctl 方法表 22 → 23 项；`/api/gps` 是新增路由。
+* **fail-open**：串口打不开只把 `gps_open_rc` 记成负值、`link.open=false`，
+  **不影响任何其它链路**（守护进程照常跑，Web 照常服务）。
+* **不动系统时钟**：`gps_sync_time` 默认 0。校时会 `adjtime`/`settimeofday`，
+  属"能改全机时间线"的动作，需单独决定后再开。
+* 未覆盖风险：`gps.status` 里 `age_ms` 来自 `gps_last_parse_ms`（单调时钟），
+  跨进程不可比、只在本进程内有意义；`utc` 未做闰秒处理（minmea 直接给字段）。
+
+=== 怎么验证的
+
+* **编译**：VM `make arm` **RC=0 零告警**（`-Wall -Wextra -Werror`）；
+  `make test` 全量单测**全绿**。
+* **集成**：新增 `tests/integration/test_agent_gps.c` 六组用例 —— g01 降级装配
+  （`r == NULL` 不开 fd、解析器可用）、g02 NMEA 解码（含 `fix_updates == 2` 的
+  口径断言）、g03 `gps.status` JSON 形状、g04 **未知量是 `null`**、
+  g05 参数守卫、g06 关闭幂等。`make itest` 下 `test_agent_gps passed`；同批
+  `test_agent_m4` / `test_agent_switch` / `test_cfg_media_e2e` passed。
+  唯一 FAIL 是 `test_ctl_snapshot`（需要 `build/host/ivsboxd` 在跑）——
+  **在 main 基线跑同一批同样 FAIL，既有基线、非本次引入**。
+* **反向证伪（1 条）**：把 `add_dbl_or_null()` 的 `!isnan(v)` 改成恒真 `1`
+  （变异后**编译干净**，不是被 `-Werror` 拦下的假证伪），`test_agent_gps`
+  抓到 `FAIL: g04 unknown latitude is JSON null` ＋
+  `FAIL: g04 unknown longitude is JSON null` **两行**；还原后源码 md5 一致、
+  用例复绿。
+* **板端（192.168.2.120，真实串口）**：
+  * 日志两行：`[agent] gps: /dev/ttySAC1 up, 9600 8N1 (time sync off)`、
+    `[agent] gps: NMEA stream up (first sentence parsed)`；
+    `/proc/<ivsboxd pid>/fd` 里有 `18 -> /dev/ttySAC1`。
+  * **无定位**（室内）：`valid:false`、`lat/lon/alt:null`、`hdop:25.5`、
+    `satellites:0`，而 `utc` 有值（`2026-10-17 03:37:42`，本地 11:37 CST）
+    ⇒ **NA→null 与时间解析均按设计工作**。
+  * **有定位**（两小时后，同一进程）：`valid:true`、`lat:36.680477`、
+    `lon:117.110328`、`alt:8.1`、`speed_kph:1.0`、`course_deg:184.8`、
+    `hdop:1.5`、`fix_quality:1`、`satellites:7`、`utc:2026-10-17 05:36:16`
+    （本地 13:36）；`stats` 累计 `sentences_ok:87393`、`checksum_bad:0`、
+    `malformed:0`、`too_long:0`、`noise_bytes:27`、`fix_updates:12311`
+    ⇒ 近 9 万句 NMEA **零校验错**。
+  * **Web 端到端**：`GET /api/gps` 未带会话 ⇒ **401**；登录后 ⇒ **200** 且返回
+    上述 JSON；`GET /app.js` 的 md5 与投递文件一致（`dafb47af…`，含 `pageGps`
+    与「定位」页签名）。
+  * **板端部署**：替换 `ivsboxd`（md5 `3f174c27…`）、`ivsbox-web`
+    （md5 `706bcb39…`）、`web/static/app.js`（md5 `dafb47af…`）；`S66`/`S65 stop`
+    干净停机（`monitor` 先停，`ivsboxd` 收 `TERM` 走 `iv_watchdog_disable()`，
+    **板子未被复位**）→ 换文件 → `S65` → `S66` start。
+  * **板端状态变更**：`/mnt/UDISK/ivsbox/secure/web.passwd` 里原摘要的明文未知，
+    为完成 Web 侧验证移到 `web.passwd.bak-wbgps`（回出厂默认 `admin`/`88888888`），
+    再走"首登强制改密"设为 `Abcd1234`；**旧摘要文件未删除**。
+* **未做（登记）**：浏览器里人工点选「定位」页的观感复核（页面已可登录查看）；
+  `gps_sync_time` 未开；6 条组播指令等既有遗留不变。

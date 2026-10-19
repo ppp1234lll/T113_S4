@@ -3088,16 +3088,34 @@ c.server_port = cfg->server_port;
 
 `ping -I usb0 47.104.250.225` 2/2、RTT 22.7 ms。
 
-=== 登记缺口：4G 拨号没人负责
+=== 登记缺口：4G 掉线不会自动重拨（原判断已更正）
 
-`usb0` 能不能起来，直接决定"4G 恢复后切回"这条能不能成立。现状：
+`usb0` 能不能起来，直接决定"4G 恢复后切回"这条能不能成立。现网实际机制：
 
-* 镜像里**没有拨号脚本**（`/etc/init.d` 只有 `S40network`、`S50telnet`，无 `quectel-CM`、无 ppp 拨号）；
-* `ivsboxd` 也不管拨号（`env.csq` 恒 `-1`，没有 AT 通道）；
-* 本次是手工 `AT+QNETDEVCTL=1,1,1` 把 PDP 拉起来的（模块 `Quectel EC200G`，ECM 模式，
-  AT 口在本板是 **`/dev/ttyUSB0`**，`ttyUSB2` 不回话）。
+[cols="2,5",options="header"]
+|===
+|环节 |现状
 
-也就是说：模块掉线后**重拨**目前没有任何一方负责。
-是否由 `ivsboxd` 接管（AT 拨号 ＋ 掉线重拨 ＋ `udhcpc`）需要用户拍板后再做，
-不在本步范围内。
+|拨号脚本
+|`/usr/bin/usb-{EC200G,SLM320,SLM750,N720}-inserted.sh`，**出厂镜像自带**。
+EC200G 那份做的是：`stty` 原始模式 → `AT+QCFG="usbnet"` 确认 ECM（不是 1 就改成 1 再 `AT+RESET`）
+→ `AT+CPIN?` 等 `READY` → `AT+QNETDEVCTL` 拨号 → `udhcpc -i usb0`。
+`/tmp/usb-log.txt` 是它自己的调试日志。
+
+|触发方式
+|`/etc/udev/rules.d/11-usb-autodial.rules`，`ACTION=="add"` ＋ VID/PID 匹配
+（EC200G ＝ `2c7c:0904`，EC200U ＝ `2c7c:0901`）。`udevd` 常驻（pid 1414）。
+|===
+
+**缺口在触发条件上**：规则是 `ACTION=="add"` —— **只在 USB 插入那一刻拨一次**。
+之后 PDP 掉了、模块掉网、`usb0` 变 `NO-CARRIER`，**没有任何一方重拨**：
+那个脚本是一次性的，`ivsboxd` 也不管（`env.csq` 恒 `-1`，没有 AT 通道）。
+
+这直接影响"4G 恢复后切回 4G"：只要 `usb0` 自己起不来，netmgr 就一直停在 eth0。
+本板这次上电后 `usb0` 一直是 `NO-CARRIER`（09:16 实测），报文走 4G 是靠手工
+`AT+QNETDEVCTL=1,1,1` ＋ `udhcpc -i usb0` 拉起来的
+（模块 `Quectel EC200G`，ECM 模式，AT 口在本板是 `/dev/ttyUSB0`，`ttyUSB2` 不回话）。
+
+要补的是**掉线重拨**（监听 `usb0` carrier／`AT+QNETDEVSTATUS` 为 0 就重拨），
+落点可以放 udev 脚本外面、也可以由 `ivsboxd` 接管；采用哪种要用户拍板，不在本步范围内。
 

@@ -925,6 +925,15 @@ static int agent_setup(void)
         if (cdev != NULL)
             ac.cell_path = cdev;
     }
+    /* 自动重拨用的出厂脚本。空串 = 关闭自动重拨；不配 = 默认
+     * `/usr/bin/usb-EC200G-inserted.sh`。与上面同口径：只为联调/换模组留口子，
+     * 不进配置键 —— 现场不需要改它，需要改就是脚本路径本身不对。 */
+    {
+        const char *dcmd = getenv("IVSBOX_DIAL_CMD");
+
+        if (dcmd != NULL)
+            ac.cell_dial_cmd = dcmd;
+    }
 
     ac.devid = 0u;
 

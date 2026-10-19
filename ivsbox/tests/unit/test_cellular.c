@@ -365,6 +365,91 @@ static void c09_readonly(void)
     }
 }
 
+/* 10) 自动重拨判定：四个事实条件只差"地址"才拨，且带节奏限制。
+ * 这一段是纯函数，输入是快照 —— 所以能把"卡没插也去拨号"这种事故先拦在单测里。 */
+static void c10_redial(void)
+{
+    iv_cell_snap_t   s;
+    iv_cell_redial_t r;
+    uint64_t         now = 1000000u;
+    int              wan = 0;   /* 无线 WAN 接口此刻没有 IPv4（默认按"没地址"注入） */
+
+    memset(&s, 0, sizeof s);
+    s.valid       = 1;
+    s.sim_present = 1;
+    s.cereg_stat  = 1;
+    s.attached    = 1;
+    s.pdp_active  = 0;
+
+    iv_cell_redial_init(&r);
+    chk(iv_cell_redial_due(&s, &r, wan, now) == 1, "c10 ready but no PDP => dial");
+
+    /* 前置条件：少一条都不拨 */
+    {
+        iv_cell_snap_t t;
+
+        t = s; t.valid = 0;
+        chk(iv_cell_redial_due(&t, &r, wan, now) == 0, "c10 no finished round => no dial");
+        t = s; t.sim_present = 0;
+        chk(iv_cell_redial_due(&t, &r, wan, now) == 0, "c10 SIM absent => no dial");
+        t = s; t.sim_present = -1;
+        chk(iv_cell_redial_due(&t, &r, wan, now) == 0, "c10 SIM unknown => no dial");
+        t = s; t.cereg_stat = 2;
+        chk(iv_cell_redial_due(&t, &r, wan, now) == 0, "c10 not registered => no dial");
+        t = s; t.cereg_stat = 5;
+        chk(iv_cell_redial_due(&t, &r, wan, now) == 1, "c10 roaming registered => dial");
+        t = s; t.attached = 0;
+        chk(iv_cell_redial_due(&t, &r, wan, now) == 0, "c10 not attached => no dial");
+        t = s; t.attached = -1;
+        chk(iv_cell_redial_due(&t, &r, wan, now) == 0, "c10 attach unknown => no dial");
+
+        /* 数据面两条腿：模组侧 PDP 与内核侧接口地址，任一缺失都算"没有地址"。
+         * 这是本板真实踩过的两种假象：模组清了上下文但 usb0 留着残留 IP；
+         * 反过来 PDP 还在、usb0 掉了载波（地址被摘）。 */
+        t = s; t.pdp_active = 1;
+        (void)strcpy(t.pdp_ip, "10.28.61.123");
+        chk(iv_cell_redial_due(&t, &r, 1, now) == 0, "c10 PDP ip + wan ip => no dial");
+        chk(iv_cell_redial_due(&t, &r, 0, now) == 1, "c10 PDP ip but wan no ip => dial");
+        t = s;
+        chk(iv_cell_redial_due(&t, &r, 1, now) == 1, "c10 wan ip but no PDP => dial");
+        chk(iv_cell_redial_due(&t, &r, 0, now) == 1, "c10 PDP without ip => dial");
+    }
+
+    /* 节奏一：最小间隔 120 s */
+    iv_cell_redial_init(&r);
+    iv_cell_redial_mark(&r, now);
+    chk(r.tries == 1 && r.last_try_ms == now, "c10 mark records try");
+    chk(iv_cell_redial_due(&s, &r, wan, now + 1u) == 0, "c10 no redial 1s later");
+    chk(iv_cell_redial_due(&s, &r, wan, now + 119000u) == 0, "c10 no redial at 119s");
+    chk(iv_cell_redial_due(&s, &r, wan, now + 120000u) == 1, "c10 redial allowed at 120s");
+
+    /* 节奏二：1 h 窗口内最多 5 次，到顶停手；窗口过期再放开 */
+    iv_cell_redial_init(&r);
+    {
+        unsigned i;
+
+        for (i = 0; i < IV_CELL_REDIAL_MAX_TRIES; i++)
+            iv_cell_redial_mark(&r, now + (uint64_t)i * 200000u);
+    }
+    chk(r.tries == IV_CELL_REDIAL_MAX_TRIES, "c10 tries counted");
+    chk(iv_cell_redial_due(&s, &r, wan, now + 2000000u) == 0, "c10 stops after max tries");
+    chk(iv_cell_redial_due(&s, &r, wan, now + IV_CELL_REDIAL_WINDOW_MS + 1u) == 1,
+        "c10 window expiry re-allows");
+    iv_cell_redial_mark(&r, now + IV_CELL_REDIAL_WINDOW_MS + 1u);
+    chk(r.tries == 1, "c10 mark resets counter in new window");
+
+    /* 时钟回拨：now < last_try 时按"没拨过"处理 —— 否则时钟一跳就再也不拨 */
+    iv_cell_redial_init(&r);
+    iv_cell_redial_mark(&r, now + 500000u);
+    chk(iv_cell_redial_due(&s, &r, wan, now) == 1, "c10 clock going back still dials");
+
+    /* 空指针不崩 */
+    chk(iv_cell_redial_due(NULL, &r, wan, now) == 0, "c10 NULL snap => 0");
+    chk(iv_cell_redial_due(&s, NULL, wan, now) == 0, "c10 NULL state => 0");
+    iv_cell_redial_init(NULL);
+    iv_cell_redial_mark(NULL, now);
+}
+
 int main(void)
 {
     c01_init_unknown();
@@ -376,12 +461,13 @@ int main(void)
     c07_level();
     c08_cmd_table();
     c09_readonly();
+    c10_redial();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_cellular: %d check(s) FAILED\n", g_fail);
         return 1;
     }
     printf("test_cellular passed (live no-sim sample, usable path, timeout skip, "
-           "round reset, qeng guard, read-only discipline)\n");
+           "round reset, qeng guard, read-only discipline, redial policy)\n");
     return 0;
 }

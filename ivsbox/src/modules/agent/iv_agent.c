@@ -5,10 +5,15 @@
  * 不含业务逻辑（策略都在 iv_probe / iv_netmgr / iv_report 内）。
  */
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <ifaddrs.h>
 #include <net/if.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "ivsbox/iv_agent.h"
 #include "ivsbox/iv_proto.h"
@@ -30,7 +35,10 @@ static void gps_link_drop(iv_agent_t *a);
 static void on_cell_fd(int fd, uint32_t events, void *arg);
 static void on_cell_timer(void *arg);
 static void cell_link_drop(iv_agent_t *a);
+static int  cell_link_open(iv_agent_t *a);
 static void cell_drive(iv_agent_t *a, uint64_t now_ms);
+static void cell_redial_tick(iv_agent_t *a, uint64_t now_ms);
+static int  cell_spawn_dial(iv_agent_t *a);
 static void on_pb_timer(void *arg);
 static void on_nm_timer(void *arg);
 static int  agent_reconnect(void *arg, int new_ifindex);
@@ -115,6 +123,7 @@ void iv_agent_cfg_default(iv_agent_cfg_t *cfg)
     cfg->gps_sync_time = 0;
     cfg->cell_path     = IV_AGENT_CELL_PATH_DEFAULT;
     cfg->cell_period_ms = 0;   /* 0 => IV_CELL_PERIOD_MS (30s) */
+    cfg->cell_dial_cmd  = NULL; /* NULL => IV_AGENT_CELL_DIAL_DEFAULT（空串=关闭） */
 }
 
 void iv_agent_init(iv_agent_t *a)
@@ -544,45 +553,20 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
      * 串口用 `iv_serial_open`，它会 `flock` 独占 —— 只防"我方两个实例抢口"，
      * 挡不住外部脚本（拨号脚本不加锁）。所以真正的保护是"不发写命令"。 */
     {
-        const char *cpath;
-
         iv_cell_init(&a->cell, cfg->cell_period_ms);
-        a->cell_fd       = -1;
-        a->cell_ev       = NULL;
-        a->cell_timer    = NULL;
-        a->cell_rx_bytes = 0;
-        a->cell_open_rc  = IV_ENOTSUP;
+        a->cell_fd        = -1;
+        a->cell_ev        = NULL;
+        a->cell_timer     = NULL;
+        a->cell_rx_bytes  = 0;
+        a->cell_open_rc   = IV_ENOTSUP;
+        a->cell_reopen_ms = 0;
+        iv_cell_redial_init(&a->cell_redial);
+        a->cell_dial_pid  = -1;
+        a->cell_dial_ms   = 0;
+        a->cell_dials     = 0;
 
-        cpath = (cfg->cell_path != NULL) ? cfg->cell_path : IV_AGENT_CELL_PATH_DEFAULT;
-        if (cpath[0] == '\0') {
-            IV_LOG_I(AG_MOD, "cell: AT port disabled by config");
-        } else if (r == NULL) {
-            IV_LOG_I(AG_MOD, "cell: no reactor, AT port not opened (feed by caller)");
-        } else {
-            iv_serial_cfg_t scfg;
-            int             cfd;
-
-            iv_serial_cfg_default(&scfg);
-            scfg.baud = IV_CELL_AT_BAUD;  /* 显式写：默认值将来若变，这里不能跟着变 */
-            cfd = iv_serial_open(cpath, &scfg);
-            if (cfd < 0) {
-                a->cell_open_rc = cfd;
-                IV_LOG_W(AG_MOD, "cell: AT open failed (%d): %s", cfd, cpath);
-            } else {
-                a->cell_fd = cfd;
-                a->cell_ev = iv_reactor_add(r, cfd, IV_EV_READ, on_cell_fd, a);
-                if (a->cell_ev == NULL) {
-                    IV_LOG_W(AG_MOD, "cell: fd add to reactor failed");
-                    (void)iv_serial_close(cfd);
-                    a->cell_fd      = -1;
-                    a->cell_open_rc = IV_ESTATE;
-                } else {
-                    a->cell_open_rc = 0;
-                    IV_LOG_I(AG_MOD, "cell: %s up, %u 8N1 (read-only AT)",
-                             cpath, (unsigned)IV_CELL_AT_BAUD);
-                }
-            }
-        }
+        /* 装配期与"重拨后重开"走同一个入口，避免两处开串口逻辑分叉。 */
+        (void)cell_link_open(a);
     }
 
     /* ---- 6. 本层定时器（仅 Reactor 模式；r == NULL 时由调用方按节拍推进）---- */
@@ -634,6 +618,7 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
     (void)iv_report_step(&a->rp, now_ms);
     if (a->cell_fd >= 0)
         cell_drive(a, now_ms);   /* 4G 查询状态机：与定时器同一入口，重复驱动无害 */
+    cell_redial_tick(a, now_ms); /* 4G 自愈：掉线且"只差地址"时跑一次出厂拨号脚本 */
     return IV_OK;
 }
 
@@ -662,6 +647,13 @@ void iv_agent_close(iv_agent_t *a)
     }
 
     gps_link_drop(a); /* S2.5：摘 GPS 读事件并关串口（未开时幂等） */
+    /* 4G 重拨脚本若还在跑：先掐死再关 AT 口 —— 否则它会继续占着 /dev/ttyUSB0，
+     * 而且留下一个孤儿进程在下一次启动后被 waitpid 不到。 */
+    if (a->cell_dial_pid > 0) {
+        (void)kill((pid_t)a->cell_dial_pid, SIGTERM);
+        (void)waitpid((pid_t)a->cell_dial_pid, NULL, 0);
+        a->cell_dial_pid = -1;
+    }
     cell_link_drop(a); /* 4G：摘 AT 口读事件并关串口（未开时幂等） */
     iv_camdet_close(&a->cd);  /* 停在飞 socket + 关引擎（未开时幂等） */
     iv_device_close(&a->dev); /* 关 UDP / AF_PACKET 两个 socket（未开时幂等） */
@@ -1530,6 +1522,198 @@ uint64_t iv_agent_gps_last_parse_ms(const iv_agent_t *a)
 
 /* 摘读事件 + 关串口 + 复位状态机。**幂等**：重复调用无副作用。
  * 注意复位的是状态机，**快照保留** —— 串口抖一下不该让页面上的信号值瞬间归零。 */
+/* 打开 AT 口并挂 reactor。
+ * 装配期与"重拨脚本跑完之后"共用这一个入口 —— 两处各写一遍必然分叉
+ * （一处改了波特率、另一处忘了改，症状是"重拨后模块再也不回话"）。
+ * 返回 0 = 已打开；负值 = 错误码；IV_ENOTSUP = 配置为不开。 */
+static int cell_link_open(iv_agent_t *a)
+{
+    const char     *cpath;
+    iv_serial_cfg_t scfg;
+    int             cfd;
+
+    if (a == NULL)
+        return IV_EINVAL;
+
+    cpath = (a->cfg.cell_path != NULL) ? a->cfg.cell_path : IV_AGENT_CELL_PATH_DEFAULT;
+    if (cpath[0] == '\0') {
+        a->cell_open_rc = IV_ENOTSUP;
+        IV_LOG_I(AG_MOD, "cell: AT port disabled by config");
+        return IV_ENOTSUP;
+    }
+    if (a->r == NULL) {
+        a->cell_open_rc = IV_ENOTSUP;
+        IV_LOG_I(AG_MOD, "cell: no reactor, AT port not opened (feed by caller)");
+        return IV_ENOTSUP;
+    }
+    if (a->cell_fd >= 0)   /* 已经开着：幂等 */
+        return 0;
+
+    iv_serial_cfg_default(&scfg);
+    scfg.baud = IV_CELL_AT_BAUD;   /* 显式写：默认值将来若变，这里不能跟着变 */
+    cfd = iv_serial_open(cpath, &scfg);
+    if (cfd < 0) {
+        a->cell_open_rc = cfd;
+        IV_LOG_W(AG_MOD, "cell: AT open failed (%d): %s", cfd, cpath);
+        return cfd;
+    }
+    a->cell_fd = cfd;
+    a->cell_ev = iv_reactor_add(a->r, cfd, IV_EV_READ, on_cell_fd, a);
+    if (a->cell_ev == NULL) {
+        IV_LOG_W(AG_MOD, "cell: fd add to reactor failed");
+        (void)iv_serial_close(cfd);
+        a->cell_fd      = -1;
+        a->cell_open_rc = IV_ESTATE;
+        return IV_ESTATE;
+    }
+    a->cell_open_rc = 0;
+    IV_LOG_I(AG_MOD, "cell: %s up, %u 8N1 (read-only AT)",
+             cpath, (unsigned)IV_CELL_AT_BAUD);
+    return 0;
+}
+
+/* 起一次拨号。
+ * 为什么要先把 AT 口让出去：拨号序列自己也读写 `/dev/ttyUSB0`，两个读者同时等
+ * 同一行 `OK` ⇒ 两边都可能超时。让出 fd 是唯一可靠的做法。
+ * 子进程的 stdout/stderr 丢 `/dev/null`：序列里 `timeout 3 cat` 会打一堆 AT 回显，
+ * 进日志只会淹掉主控日志。 */
+static int cell_spawn_dial(iv_agent_t *a)
+{
+    const char *cmd;
+    const char *tty;
+    const char *ifname;
+    pid_t       pid;
+
+    if (a == NULL)
+        return IV_EINVAL;
+    cmd = a->cfg.cell_dial_cmd;
+    if (cmd == NULL)
+        cmd = IV_AGENT_CELL_DIAL_DEFAULT;
+    if (cmd[0] == '\0')
+        return IV_ENOTSUP;   /* 配置为关闭 */
+    tty    = (a->cfg.cell_path != NULL) ? a->cfg.cell_path : IV_AGENT_CELL_PATH_DEFAULT;
+    ifname = a->cfg.wan_name[IV_WAN_WIRELESS];
+
+    cell_link_drop(a);   /* 让出 AT 口（顺带 iv_cell_reset 丢掉半条命令） */
+
+    pid = fork();
+    if (pid < 0) {
+        IV_LOG_W(AG_MOD, "cell: redial fork failed (%d)", (int)pid);
+        (void)cell_link_open(a);
+        return IV_EFAIL;
+    }
+    if (pid == 0) {
+        int dn = open("/dev/null", O_RDWR);
+
+        if (dn >= 0) {
+            (void)dup2(dn, STDOUT_FILENO);
+            (void)dup2(dn, STDERR_FILENO);
+            if (dn > STDERR_FILENO)
+                (void)close(dn);
+        }
+        /* 用 `sh -c` 而不是直接 exec：动作是多步序列，且 `$0`/`$1` 传参
+         * 省掉了把路径与网卡名拼进命令文本（拼字符串就会踩引号与空格）。 */
+        execl("/bin/sh", "sh", "-c", cmd, tty, ifname, (char *)NULL);
+        _exit(127);
+    }
+    a->cell_dial_pid = (int)pid;
+    a->cell_dial_ms  = iv_clock_monotonic_ms();
+    a->cell_dials++;
+    IV_LOG_I(AG_MOD, "cell: redial #%u started (pid %d, if=%s)",
+             a->cell_dials, (int)pid, ifname);
+    return 0;
+}
+
+/* 无线 WAN 是否"真的能用"：有 IPv4 **且** 有载波。
+ * 只看地址会被残留地址骗（本板 usb0 `NO-CARRIER` 却还挂着 `10.158.0.108`）；
+ * 只看载波又会被"没拿到 DHCP"骗。两个都要。
+ * 拿不到接口表时按"不可用"处理 —— 多拨一次的代价远小于 4G 挂着不动。 */
+static int wan_iface_ready(const char *name)
+{
+    struct ifaddrs *ifa = NULL;
+    struct ifaddrs *p;
+    int             has_addr    = 0;
+    int             has_carrier = 0;
+
+    if (name == NULL || name[0] == '\0')
+        return 0;
+    if (getifaddrs(&ifa) != 0)
+        return 0;
+    for (p = ifa; p != NULL; p = p->ifa_next) {
+        if (p->ifa_name == NULL || strcmp(p->ifa_name, name) != 0)
+            continue;
+        if ((p->ifa_flags & IFF_UP) != 0 && (p->ifa_flags & IFF_RUNNING) != 0)
+            has_carrier = 1;
+        if (p->ifa_addr != NULL && p->ifa_addr->sa_family == AF_INET)
+            has_addr = 1;
+    }
+    freeifaddrs(ifa);
+    return (has_addr && has_carrier) ? 1 : 0;
+}
+
+/* 重拨驱动器：有孩子在跑就收尸，否则按判定条件决定要不要起一个。
+ * 每拍调用，代价是一次 waitpid(WNOHANG) ＋（通常）一次快照比较。 */
+static void cell_redial_tick(iv_agent_t *a, uint64_t now_ms)
+{
+    iv_cell_snap_t s;
+
+    if (a == NULL)
+        return;
+
+    if (a->cell_dial_pid > 0) {
+        int   st = 0;
+        pid_t w  = waitpid((pid_t)a->cell_dial_pid, &st, WNOHANG);
+
+        if (w == 0) {
+            /* 还在跑：判硬超时。**这一条是必需的**——出厂脚本卡死那次证明
+             * "子进程不退"会把整条 AT 轮询一起冻住（页面所有 4G 数据定格）。
+             * 超时就 SIGKILL，收尸后照常重开 AT 口，下一轮再看情况。 */
+            if (a->cell_dial_ms != 0 && now_ms >= a->cell_dial_ms &&
+                now_ms - a->cell_dial_ms > IV_AGENT_CELL_DIAL_TIMEOUT_MS) {
+                IV_LOG_W(AG_MOD, "cell: redial timeout after %llu ms, killing pid %d",
+                         (unsigned long long)(now_ms - a->cell_dial_ms),
+                         a->cell_dial_pid);
+                (void)kill((pid_t)a->cell_dial_pid, SIGKILL);
+                (void)waitpid((pid_t)a->cell_dial_pid, &st, 0);
+                a->cell_dial_pid  = -1;
+                a->cell_reopen_ms = 0;
+                (void)cell_link_open(a);
+            }
+            return;
+        }
+        if (w == (pid_t)a->cell_dial_pid) {
+            if (WIFEXITED(st))
+                IV_LOG_I(AG_MOD, "cell: redial done, rc=%d", WEXITSTATUS(st));
+            else
+                IV_LOG_W(AG_MOD, "cell: redial aborted (status 0x%x)", (unsigned)st);
+            a->cell_dial_pid = -1;
+            a->cell_reopen_ms = 0;      /* 立刻允许重开，不必等节流 */
+            (void)cell_link_open(a);
+        } else if (w < 0) {
+            a->cell_dial_pid = -1;      /* 收尸失败（已被回收）：别卡死在这里 */
+            (void)cell_link_open(a);
+        }
+        return;   /* 孩子没退之前不做新判定 */
+    }
+
+    /* AT 口没打开时先试图重开（模块重新枚举后设备节点可能变，也可能只是短暂失败）。
+     * 5 s 一次，避免每 100 ms 一次 open()。 */
+    if (a->cell_fd < 0) {
+        if (a->cell_reopen_ms == 0 || now_ms >= a->cell_reopen_ms + 5000u) {
+            a->cell_reopen_ms = now_ms;
+            (void)cell_link_open(a);
+        }
+    }
+
+    iv_cell_snapshot(&a->cell, &s);
+    if (!iv_cell_redial_due(&s, &a->cell_redial,
+                            wan_iface_ready(a->cfg.wan_name[IV_WAN_WIRELESS]),
+                            now_ms))
+        return;
+    iv_cell_redial_mark(&a->cell_redial, now_ms);
+    (void)cell_spawn_dial(a);
+}
+
 static void cell_link_drop(iv_agent_t *a)
 {
     if (a == NULL)
@@ -1611,10 +1795,16 @@ static void on_cell_fd(int fd, uint32_t events, void *arg)
 static void on_cell_timer(void *arg)
 {
     iv_agent_t *a = arg;
+    uint64_t    now;
 
     if (a == NULL || !a->opened)
         return;
-    cell_drive(a, iv_clock_monotonic_ms());
+    now = iv_clock_monotonic_ms();
+    cell_drive(a, now);
+    /* Reactor 模式下 `iv_agent_step` 不会被调用（驱动来自各定时器），所以自愈
+     * 必须挂在这条节拍上 —— 否则判定函数写对了也永远没人调用它。
+     * `cell_redial_tick` 内部有 waitpid(WNOHANG)，重复调用无害。 */
+    cell_redial_tick(a, now);
     if (a->r != NULL) {
         a->cell_timer = iv_timer_add(a->r, IV_AGENT_CELL_TICK_MS, on_cell_timer, a);
         if (a->cell_timer == NULL)

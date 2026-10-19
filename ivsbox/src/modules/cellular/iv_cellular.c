@@ -858,3 +858,72 @@ void iv_cell_snapshot(const iv_cell_t *c, iv_cell_snap_t *out)
     }
     *out = c->snap;
 }
+
+/* ===========================================================================
+ * 自动重拨判定
+ *
+ * 为什么是纯函数：真正的"拨"要 fork 一个出厂脚本、要先让出 AT 口、要等它退，
+ * 这些都没法在单测里跑；而"什么时候该拨"才是容易写错的部分（漏一个前置条件
+ * 就会对着没插卡的模组每两分钟跑一次脚本）。所以把判定抽出来，用真机快照当输入。
+ * =========================================================================== */
+
+void iv_cell_redial_init(iv_cell_redial_t *r)
+{
+    if (r == NULL)
+        return;
+    r->last_try_ms     = 0;
+    r->window_start_ms = 0;
+    r->tries           = 0;
+}
+
+int iv_cell_redial_due(const iv_cell_snap_t *s, const iv_cell_redial_t *r,
+                       int wan_has_ipv4, uint64_t now_ms)
+{
+    int pdp_ok;
+
+    if (s == NULL || r == NULL)
+        return 0;
+    /* 一轮都没跑完 ⇒ 不知道模组什么情况，别乱拨（`valid` 是"至少完成过一轮"）。 */
+    if (!s->valid)
+        return 0;
+    /* 事实条件：少一条都不该拨。 */
+    if (s->sim_present != 1)
+        return 0;
+    if (s->cereg_stat != 1 && s->cereg_stat != 5)
+        return 0;
+    if (s->attached != 1)
+        return 0;
+    /* 数据面两条腿：PDP 地址（模组侧）与接口地址（内核侧）。
+     * 两边都有地址才算"通"，否则就是该拨 —— 偏偏这两个方向会各骗一次：
+     * 模组清了上下文但内核还留着残留 IP（本板 10.158.0.108 那例），
+     * 或者模组上下文还在但 usb0 掉了载波。 */
+    pdp_ok = (s->pdp_active == 1 && s->pdp_ip[0] != '\0');
+    if (pdp_ok && wan_has_ipv4)
+        return 0;
+
+    /* 节奏条件一：最小间隔。时钟回拨（now < last）按"没拨过"处理。 */
+    if (r->last_try_ms != 0 && now_ms >= r->last_try_ms &&
+        now_ms - r->last_try_ms < IV_CELL_REDIAL_GAP_MS)
+        return 0;
+
+    /* 节奏条件二：窗口内次数上限。窗口过期由 mark 重置，这里只管"还在窗口内"。 */
+    if (r->window_start_ms != 0 && now_ms >= r->window_start_ms &&
+        now_ms - r->window_start_ms < IV_CELL_REDIAL_WINDOW_MS &&
+        r->tries >= IV_CELL_REDIAL_MAX_TRIES)
+        return 0;
+
+    return 1;
+}
+
+void iv_cell_redial_mark(iv_cell_redial_t *r, uint64_t now_ms)
+{
+    if (r == NULL)
+        return;
+    if (r->window_start_ms == 0 || now_ms < r->window_start_ms ||
+        now_ms - r->window_start_ms >= IV_CELL_REDIAL_WINDOW_MS) {
+        r->window_start_ms = now_ms;
+        r->tries           = 0;
+    }
+    r->tries++;
+    r->last_try_ms = now_ms;
+}

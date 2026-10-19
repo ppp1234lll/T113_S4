@@ -197,6 +197,40 @@ void iv_cell_tick(iv_cell_t *c, uint64_t now_ms);
  * 下一个周期就自愈 —— 为此引入互斥不划算，而且与 reactor 单线程模型不符）。 */
 void iv_cell_snapshot(const iv_cell_t *c, iv_cell_snap_t *out);
 
+/* ---- 自动重拨判定 -------------------------------------------------------
+ * 为什么判定放这里：它是**纯函数**（快照 ＋ 时刻 → 该不该拨），不碰串口、不建进程，
+ * 因此可以拿真机快照做单测。真正起进程的动作在 `iv_agent`。
+ *
+ * 触发条件是"四个要素只差最后一个"：卡就绪、已注册、已附着，但**没有 PDP 地址**。
+ * 少任何一条都不拨 —— 卡没插时拨号脚本只会白跑，还会把共用 AT 口占掉几十秒。
+ *
+ * 为什么管这件事：出厂 udev 脚本只在 USB `add` 时拨一次，掉线不重拨（遗留 ⑧）。
+ * 4G 是首选出口，挂了没人管就等于整条链路只能等人工。
+ */
+#define IV_CELL_REDIAL_GAP_MS    ((uint64_t)120000u) /* 两次尝试最小间隔 */
+#define IV_CELL_REDIAL_WINDOW_MS ((uint64_t)3600000u)/* 限速窗口 */
+#define IV_CELL_REDIAL_MAX_TRIES 5u                  /* 窗口内最多尝试次数 */
+
+typedef struct {
+    uint64_t last_try_ms;     /* 上次尝试的单调时刻；0 = 从未 */
+    uint64_t window_start_ms; /* 当前限速窗口起点；0 = 未开始 */
+    unsigned tries;           /* 窗口内已尝试次数 */
+} iv_cell_redial_t;
+
+void iv_cell_redial_init(iv_cell_redial_t *r);
+
+/* 返回 1 = 现在该拨，0 = 不该。
+ * `wan_has_ipv4`：无线 WAN 接口**此刻有没有 IPv4 地址**（由装配层 getifaddrs 得到）。
+ * 为什么要这一维：只看 PDP 会漏掉最常见的一种掉线 —— 模组认为上下文还在，
+ * 但 usb0 已经掉了载波、地址被内核摘掉（`NO-CARRIER`），报文其实一个都发不出去。
+ * 反过来 PDP 已经被模组清掉、接口地址还留着（残留 IP）也是同一类假象。
+ * 两个来源任一"没有地址"就说明数据面不可用，都够格重拨。 */
+int iv_cell_redial_due(const iv_cell_snap_t *s, const iv_cell_redial_t *r,
+                       int wan_has_ipv4, uint64_t now_ms);
+
+/* 记一次尝试（由调用方在真正发起后调用，窗口内计数 ＋1）。 */
+void iv_cell_redial_mark(iv_cell_redial_t *r, uint64_t now_ms);
+
 /* 命令编号 → 命令行文本（给测试与诊断用）；IDLE/越界返回空串。 */
 const char *iv_cell_cmd_text(iv_cell_cmd_id_t id);
 

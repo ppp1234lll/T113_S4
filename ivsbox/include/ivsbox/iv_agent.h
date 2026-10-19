@@ -130,6 +130,25 @@ extern "C" {
  * 状态或断网的命令。实测 EC200G 的 AT 口是 `/dev/ttyUSB0`（ttyUSB1=NMEA，
  * ttyUSB2 不回话，ttyUSB3 是数据口）。 */
 #define IV_AGENT_CELL_PATH_DEFAULT "/dev/ttyUSB0"
+/* 自动重拨用的**拨号动作**：一段由 `/bin/sh -c` 执行的短序列，`$0` = AT 口路径、
+ * `$1` = 无线网卡名。默认值就是本板手工验证过的那三步（见下），**不调出厂
+ * `usb-EC200G-inserted.sh`** —— 那个脚本在本板会卡在 `timeout 1 cat /dev/ttyUSB0`
+ * 上不返回（16:40/16:47 两次实测），而且它 `flock -n` 只在没被 udhcpc 继承锁时能跑。
+ *
+ * 三步：起口 → 让模组重新拨号（`AT+QNETDEVCTL=1,1,1`）→ 要地址。
+ * ⚠ 这是**全工程唯一一处向共用 AT 口发非查询命令**的地方：只在判定"该重拨"时执行，
+ * 且执行前会把本进程的 AT fd 关掉（`cell_link_drop`），避免两边抢同一个口。
+ * 空串 = 关闭自动重拨。 */
+#define IV_AGENT_CELL_DIAL_DEFAULT \
+    "ip link set \"$1\" up; " \
+    "killall udhcpc 2>/dev/null; " \
+    "( sleep 1; printf 'AT+QNETDEVCTL=1,1,1\\r' > \"$0\" ) >/dev/null 2>&1 & " \
+    "timeout 3 cat \"$0\" >/dev/null 2>&1; " \
+    "udhcpc -i \"$1\" -n -q >/dev/null 2>&1"
+/* 拨号子进程的硬超时：超过这个时间还没退就 SIGKILL。
+ * 出厂脚本卡死那次暴露的问题不是"拨不上"，而是**守护进程一直等它** ——
+ * AT 轮询跟着停，页面上的所有 4G 数据 freeze。 */
+#define IV_AGENT_CELL_DIAL_TIMEOUT_MS ((uint64_t)45000u)
 /* AT 轮询驱动节拍。必须远小于 `IV_CELL_CMD_TIMEOUT_MS`（800 ms），
  * 否则节拍本身会把"发一条、等一条"的节奏拖成龟速。 */
 #define IV_AGENT_CELL_TICK_MS 100u
@@ -300,6 +319,9 @@ typedef struct {
      * `cell_period_ms`：0 → 用 `IV_CELL_PERIOD_MS`（30 s）。 */
     const char *cell_path;
     uint32_t    cell_period_ms;
+    /* 自动重拨：`cell_dial_cmd` 为空串 = 关闭；NULL = 用 `IV_AGENT_CELL_DIAL_DEFAULT`。
+     * 参数按出场脚本的固定形态给（vid pid 网卡名），不开放成配置细节。 */
+    const char *cell_dial_cmd;
 } iv_agent_cfg_t;
 
 /* ---------------------------------------------------------------------------
@@ -342,6 +364,13 @@ typedef struct {
     iv_timer_t  *cell_timer;        /* 查询驱动定时器；r == NULL 时恒 NULL */
     uint64_t     cell_rx_bytes;     /* 累计读到的字节（0 且 fd 已开 ⇒ 模块不回话） */
     int          cell_open_rc;      /* 最近一次开 AT 口的结果：0 = 已打开 */
+    /* 自动重拨（遗留 ⑧：出厂 udev 脚本只在插入时拨一次，掉线不重拨）。
+     * 判定在 iv_cellular（纯函数），这里只负责"让出 AT 口 → 起脚本 → 收尸 → 重开"。 */
+    iv_cell_redial_t cell_redial;
+    int          cell_dial_pid;     /* >0 = 拨号序列在跑；-1 = 空闲 */
+    uint64_t     cell_dial_ms;      /* 本次拨号开始的时刻（判硬超时用） */
+    uint32_t     cell_dials;        /* 累计发起次数（给日志/诊断） */
+    uint64_t     cell_reopen_ms;    /* 上次尝试重开 AT 口的时刻；防每拍 open() */
 
     /* netmgr 的事务执行点：switch_route 复用默认（netlink 改路由），reconnect
      * 接本层 → iv_report_reconnect。ops.arg 指向本结构，故不能是静态常量。 */

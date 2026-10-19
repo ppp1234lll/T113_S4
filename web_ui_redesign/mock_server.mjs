@@ -48,6 +48,12 @@ const overview = () => ({
   },
   net: {
     state: 'WIRED_UP', active_wan: 'wired', mn: [1, 1],
+    /* net.wan：10dfbf1 新增的「平台通信（只读）」卡数据源（判定与事实分开给） */
+    wan: {
+      ifname: 'eth0', kind: 'wired', ifindex: 2, switches: 3, txn_fail: 0,
+      bound: 'eth0', bound_ok: true, transport: 'up',
+      server: '47.104.250.225', port: 6012, queue: 0, bind_fail: 0, bind_errno: 0,
+    },
     link: {
       gateway: '192.168.2.1', gateway_if: 'eth0',
       ifaces: [

@@ -301,6 +301,41 @@ int main(void)
         iv_report_close(&rp);
     }
 
+    /* ---- 10) 运行期改址必须真落到传输层（2026-10-19 现场缺陷的库层回归） ----
+     * iv_report 在 open 时把平台地址拷成**自己的副本**（srv_host/srv_port），
+     * 传输层又再拷一次（tr.host/tr.port）。只改配置、不动这两处 ⇒ 报文照旧发往
+     * 旧地址，现象是"Web 上改了端口、保存也成功，平台那边一直等不到设备"。
+     * 装配层现在的动作＝set_server(新址) → set_bind_if → reconnect，本用例锁这条链：
+     *   - set_server 只改本层副本，**不动**在用连接（否则一次设置就断流）；
+     *   - 必须再走 reconnect，tr.host/tr.port 才会变成新址。 */
+    {
+        static iv_report_t rp;
+        iv_report_cfg_t    cfg;
+
+        iv_report_cfg_default(&cfg);
+        cfg.server_host = "127.0.0.1";
+        cfg.server_port = 1u;
+        cfg.serial_path = "/dev/null";
+
+        chk(iv_report_open(&rp, &cfg, NULL, 0u) == IV_OK, "c10 open ok");
+        chk(strcmp(rp.tr.host, "127.0.0.1") == 0 && rp.tr.port == 1u,
+            "c10 initial target comes from open");
+
+        chk(iv_report_set_server(&rp, "127.0.0.2", 2u) == IV_OK, "c10 set_server ok");
+        chk(strcmp(rp.tr.host, "127.0.0.2") != 0,
+            "c10 set_server alone does NOT touch the live transport");
+
+        chk(iv_report_reconnect(&rp, 0u) == IV_OK, "c10 reconnect ok");
+        chk(strcmp(rp.tr.host, "127.0.0.2") == 0 && rp.tr.port == 2u,
+            "c10 reconnect targets the NEW address");
+
+        /* 清空：两路地址都没配时不建链（装配层把地址全清掉的语义） */
+        chk(iv_report_set_server(&rp, "", 0u) == IV_OK, "c10 clear ok");
+        chk(iv_report_reconnect(&rp, 0u) == IV_ESTATE, "c10 cleared -> no reconnect");
+
+        iv_report_close(&rp);
+    }
+
     if (g_fail == 0)
         printf("test_report passed (seg/frame/query-crc/json/env/set-server/bind-if)\n");
     else

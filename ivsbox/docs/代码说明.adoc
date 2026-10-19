@@ -3625,3 +3625,96 @@ usb0          up=true  (无 carrier)               up=true  carrier=false
 （`iv_agent` 的 `wan_iface_ready()`），两者不冲突但也不要互相替代。
 
 
+== 2026-10-19 18:30 平台改址热重载 ＋ 上报 `devid` 接工厂身份
+
+现场两条现象同一天暴露：网络配置页把平台端口从 6012 改成 6013，保存成功、页面
+也显示新值，**设备却没重连**，平台一直等不到数据；同时平台门户的「设备通信信息」
+表里始终没有这台设备，而板上 `netstat` 明明 `ESTABLISHED`。**这是两个互不相干的
+缺陷**，只是碰巧一起报出来。
+
+=== 缺陷一：改了地址不重连
+
+不是配置层的问题——配置写进去了，`config.apply` 也返回 `version` 递增。问题在
+上报链拿不到更新：
+
+----
+iv_report_open()     server_host/server_port 拷成自己的副本
+agent_setup()        ac.srv_host[]/srv_port[] 只读一次
+netmgr 换出口         才经 agent_reconnect 重推一次   <- 唯一的更新时机
+----
+
+配置层的 F7 事务通知其实早就实现了：`iv_config_subscribe(c, class_mask, fn, user)`，
+`iv_config_save()`（`config.apply` 走这条）与 `iv_config_watch_poll()`（文件被外部
+改写）两条路径都会 `notify_subscribers()`。**问题是零订阅者**——机制齐备、编译通过、
+单测全绿、界面一切正常，就是没有一处代码去订阅它。这类"实现了但没接线"的缺陷读
+代码很难发现，只有真机上"改了没反应"才暴露出来。
+
+=== 做法
+
+* 装配层订阅 `IV_CFG_CLS_NET`，回调里**比对上次推送的地址/端口**，真变了才动作。
+  `net` 分类下还有 `net.ip`/`net.mask`/`net.gateway` 这些与平台无关的键，只要分类
+  里有一个值变了通知就会来；不比对的话"改个静态 IP"也会把平台连接拆一次。
+* `iv_agent_reload_server()`：按**当前活动出口**重取地址（本口没配则回退另一口），
+  推给上报链，**顺带刷新出口网卡绑定**，最后 `iv_report_reconnect()` 一次。
+  地址与绑定必须成对刷新——只换地址不换绑定，报文会继续从旧网卡出去。
+* **字符串与端口不是一回事**：配置的字符串存在 `union{char s[IV_CFG_STR_MAX]}`
+  定长缓冲里，原地改写、指针一直有效，所以 `srv_host[i]` 直接沿用配置内部指针；
+  而 `srv_port` 是值类型（agent 存的是拷贝），**必须重写**。
+* 启动时先以 `force=0` 对齐一次缓存、不重连：那时 agent 刚按同一份配置 open 过，
+  再重连一次纯属多余。
+* 地址与原来一致时仍会重连一次——代价是几秒重建，换来"装配层不必记住哪些键需要
+  重启"，这比省那几秒重要。
+
+=== 缺陷二：平台看不到设备（`devid` 恒为 0）
+
+`agent_setup()` 里 `ac.devid = 0u;` 是**硬编码**，从来没读过工厂身份分区。于是
+每一条上报报文的 `devid` 都是 `0`，平台按设备 ID 归档时自然对不上这台机器——
+链路 ESTABLISHED、报文也在发，平台侧就是没有这台设备。
+
+改成 `iv_prov_private_read()` 取 `pid.devid`：它与 `sys.overview.device.sn` 读的是
+同一条记录（`iv_prov_tid_from_u32(devid)` 就是页面上那个 `0B2CC1`），两处必须同源。
+读不到仍给 `0` 并打 `W`——平台会当作"未登记设备"，这比编一个看起来合法的假 ID
+更容易查。
+
+=== 验证（板端真机，全程不重启主控）
+
+----
+18:12:34 INFO [agent]  server addr reloaded -> 47.104.250.225:6012 (wan=usb0, bind=usb0)
+18:12:34 INFO [report] transport reconnect on route switch: 47.104.250.225:6012
+18:13:15 INFO [agent]  server addr reloaded -> 47.104.250.225:6013 (wan=usb0, bind=usb0)
+18:15:48 INFO [report] report layer up: devid=b2cc1 devtype=0400 server=47.104.250.225:6013
+----
+
+`config.apply` 6013→6012→6013 两次都即时生效（`version` 3→4→5），连接端点跟着变；
+`devid` 由 `0` 变成 `b2cc1`，与页面 SN `0B2CC1` 同源。
+
+=== 反向证伪（板端，两处变异同时做）
+
+`(void)agent_sync_server_cfg(1)` → `(void)0`，`ac.devid = pid.devid` → `pid.devid & 0u`，
+`make arm` 编译干净（md5 `89e0c6142ffbe0c815b91cfc2b0f3859`），投板后：
+
+* `report layer up: devid=0`（正向同一行是 `devid=b2cc1`）；
+* `config.apply` 端口 6013→6012 返回 `version 4` 成功，但连接**仍停在 6013**，
+  日志里没有 `server addr reloaded`，只有 `reloaded 80 keys … version=4`。
+
+还原源码后 `grep -c MUTATION` 为 0、重编 md5 回到 `c544ca070f24bb5762976dccbf67ab5d`
+与基线**逐字节一致**，投回板端复绿（`devid=b2cc1` ＋ 热更新再次生效）。
+
+=== 单测
+
+`test_report.c` 新增 c10（7 条断言）锁住改址链的语义：
+
+* `set_server` 只改本层副本、**不动**在用连接（否则一次设置就断流）；
+* 必须再走 `reconnect`，`tr.host`/`tr.port` 才会变成新址；
+* 地址清空后 `reconnect` 返回 `IV_ESTATE`，不建链。
+
+`iv_agent_reload_server()` 本体没有 host 单测——它要 open 才能真正走到重连，
+而装配层接线（订阅是否挂上）单测本来也抓不到，只能靠真机进程验证。
+
+=== 还没做的
+
+* 平台门户侧人工复核：需用户确认「设备通信信息」里是否已出现 `0B2CC1`。
+* SIM 卡插入检测（`AT+QSIMDET: 0,0` 导致弹卡再插不重读）**按用户指示不处理**，
+  现场遇到就重启板子。
+
+

@@ -488,6 +488,68 @@ static uint16_t cfg_port(const char *key)
 }
 
 /* ---------------------------------------------------------------------------
+ * 平台地址热重载（2026-10-19）
+ *
+ * ============================ 解决什么 ============================
+ * Web 上改了「有线/无线平台服务器」地址后，配置确实落盘了、界面也显示新值，
+ * **但报文还发往旧地址**，一直到重启主控为止。原因不在配置层：`iv_report`
+ * 在 open 时就把地址拷成自己的副本，之后只有 netmgr 换出口才重推一次。
+ * 现场表现就是"改了端口，平台那边一直等不到这台设备"。
+ *
+ * ============================ 为什么缓存一份 ============================
+ * `net` 分类下还有 `net.ip` / `net.mask` / `net.gateway` 这些与平台**无关**的键。
+ * 只要分类里有一个值变了通知就会来，不比对的话"改个静态 IP"也会把平台连接
+ * 拆一次。所以这里存一份上次推送的值，只有地址或端口真的变了才重连。
+ * ------------------------------------------------------------------------- */
+static char     s_srv_host[IV_WAN_N][64];
+static uint16_t s_srv_port[IV_WAN_N];
+
+/* 返回 1 = 地址/端口有变化。`force`=0 时只对齐缓存、不重连（启动时用：
+ * 那时 agent 刚按同一份配置 open 过，再重连一次纯属多余）。 */
+static int agent_sync_server_cfg(int force)
+{
+    const char *host;
+    const char *raw;
+    uint16_t    port;
+    int         i;
+    int         changed = 0;
+
+    for (i = 0; i < IV_WAN_N; i++) {
+        raw  = (i == IV_WAN_WIRELESS) ? cfg_str("net.server.wireless.host")
+                                      : cfg_str("net.server.wired.host");
+        port = (i == IV_WAN_WIRELESS) ? cfg_port("net.server.wireless.port")
+                                      : cfg_port("net.server.wired.port");
+        host = (raw != NULL) ? raw : "";
+        if (strcmp(s_srv_host[i], host) != 0 || s_srv_port[i] != port)
+            changed = 1;
+        (void)snprintf(s_srv_host[i], sizeof(s_srv_host[i]), "%s", host);
+        s_srv_port[i] = port;
+        /* host 直接沿用配置内部指针：配置的字符串存在定长缓冲里（`union{char s[]}`），
+         * 原地改写、指针一直有效。**端口是值类型，必须重写**（agent 存的是拷贝）。 */
+        g_agent.cfg.srv_host[i] = raw;
+        g_agent.cfg.srv_port[i] = port;
+    }
+    if (changed && force != 0) {
+        int rc = iv_agent_reload_server(&g_agent);
+
+        IV_LOG_I(APP_MOD, "net.server.* changed -> reload rc=%d", rc);
+    }
+    return changed;
+}
+
+/* 配置事务通知（F7）。只认 `net` 分类：其余分类的热更新各有归属
+ * （`sys.*` 由 tunnel 那边处理，见 on_config_event）。 */
+static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, void *user)
+{
+    (void)c;
+    (void)name;
+    (void)user;
+    if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_NET)) == 0u)
+        return;
+    (void)agent_sync_server_cfg(1);
+}
+
+/* ---------------------------------------------------------------------------
  * M8-S8.3 受控远程通道的装配（模块本体见 src/modules/tunnel/iv_tunnel.c）
  * ---------------------------------------------------------------------------
  * 这一层只做"只有装配层才知道的事"，四件：
@@ -935,7 +997,23 @@ static int agent_setup(void)
             ac.cell_dial_cmd = dcmd;
     }
 
+    /* 设备 ID（TID）＝工厂身份分区里的 `devid`，**不进配置**（架构 §10.2）。
+     *
+     * 2026-10-19 修：这里原先硬编码 `0`，于是每一条上报报文里的 devid 都是 0，
+     * 平台按设备 ID 归档时自然对不上这台机器 —— 现场看到的现象就是"链路明明
+     * ESTABLISHED，平台侧却一直是未接入"。`iv_prov_private_read()` 与
+     * `sys.overview.device.sn` 读的是同一条记录（`iv_prov_tid_from_u32(devid)`
+     * 就是页面上那个 SN），两处必须同源。
+     * 读不到就给 0：平台会当作"未登记设备"，这比编一个看起来合法的假 ID 更容易查。 */
     ac.devid = 0u;
+    {
+        iv_prov_id_t pid;
+
+        if (iv_prov_private_read(NULL, &pid) == IV_OK)
+            ac.devid = pid.devid;
+        else
+            IV_LOG_W(APP_MOD, "no factory identity; reporting devid=0 (platform cannot match)");
+    }
 
     if (iv_agent_open(&g_agent, &ac, g_reactor, iv_clock_monotonic_ms()) != IV_OK) {
         IV_LOG_E(APP_MOD, "agent open failed");
@@ -1068,7 +1146,17 @@ static int app_init(void)
     g_ctl_ctx.media     = &s_media_ops;
     g_ctl_ctx.media_arg = &g_agent;
 
-    /* 9c. M8-S8.3 受控远程通道装配（身份/令牌/服务端/落点/巡检定时器）。
+    /* 9c. 平台地址热重载（2026-10-19）：Web 改 `net.server.*` 后不必重启主控。
+     * 走配置层的 F7 事务通知 —— `config.apply`（内存提交）与文件被外部改写
+     * （inotify 重载）两条路径都会回调；只挂 inotify 会漏掉前者（提交时内存
+     * 已是新值，重载比对等于"没变化"，压根不会触发）。
+     * 先 force=0 对齐一次缓存，避免刚装配完就白重连一次。 */
+    (void)agent_sync_server_cfg(0);
+    if (iv_config_subscribe(g_cfg, IV_CFG_CLASS_MASK(IV_CFG_CLS_NET),
+                            on_cfg_committed, NULL) != IV_OK)
+        IV_LOG_W(APP_MOD, "subscribe(net) failed -- server addr change needs a restart");
+
+    /* 9d. M8-S8.3 受控远程通道装配（身份/令牌/服务端/落点/巡检定时器）。
      *    在 9b 之后：与 agent 装配同级，都在 reactor 建好之后。 */
     tunnel_setup();
 

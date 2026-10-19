@@ -1244,6 +1244,43 @@ const char *iv_agent_active_wan_name(const iv_agent_t *a)
     return a->cfg.wan_name[w];
 }
 
+int iv_agent_reload_server(iv_agent_t *a)
+{
+    iv_wan_t    w;
+    const char *h;
+    const char *bind;
+    uint16_t    port = 0u;
+
+    if (a == NULL)
+        return IV_EINVAL;
+    if (!a->opened)
+        return IV_ESTATE;
+
+    /* 出口取 netmgr 的判定结果；状态机还没定出口时按"无线优先"取，
+     * 与 agent_initial_wan() 的初始选址同口径。 */
+    w = iv_netmgr_active_wan(&a->nm);
+    if ((int)w < 0 || (int)w >= IV_WAN_N)
+        w = IV_WAN_WIRELESS;
+
+    h    = agent_pick_host(&a->cfg, (int)w, &port);
+    bind = (a->wan_ifindex[w] != 0 && a->cfg.wan_name[w] != NULL)
+               ? a->cfg.wan_name[w]
+               : NULL;
+    if (iv_report_set_server(&a->rp, h, port) != IV_OK)
+        return IV_EFAIL;
+
+    /* 地址与出口网卡**成对**刷新：只换地址不换绑定，报文会继续从旧网卡出去
+     * （2026-10-19 板上实测过：地址已指到 4G 的平台，SYN 却是从 eth0 发的）。 */
+    (void)iv_report_set_bind_if(&a->rp, bind);
+
+    IV_LOG_I(AG_MOD, "server addr reloaded -> %s:%u (wan=%s, bind=%s)",
+             (h != NULL && h[0] != '\0') ? h : "(none)", (unsigned)port,
+             (a->cfg.wan_name[w] != NULL) ? a->cfg.wan_name[w] : "-",
+             (bind != NULL) ? bind : "-");
+
+    return iv_report_reconnect(&a->rp, iv_clock_monotonic_ms());
+}
+
 uint64_t iv_agent_netmgr_switches(const iv_agent_t *a)
 {
     return (a != NULL) ? iv_netmgr_switches(&a->nm) : 0u;

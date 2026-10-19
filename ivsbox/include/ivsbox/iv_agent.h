@@ -391,6 +391,13 @@ int               iv_agent_is_open(const iv_agent_t *a);
 iv_netmgr_state_t iv_agent_netmgr_state(const iv_agent_t *a);
 iv_wan_t          iv_agent_active_wan(const iv_agent_t *a);
 int               iv_agent_active_ifindex(const iv_agent_t *a);
+/* 活动出口的**接口名**（配置 `net.wan.*.name` 里的值，如 "usb0"/"eth0"）。
+ * Web 要显示"当前通信网口"就得拿这个名字 —— 只给 wired/wireless 现场没法对照
+ * `ip addr`。未装配 / 该 WAN 没配名字 ⇒ 返回空串（不是 NULL，调用方不必判空）。 */
+const char       *iv_agent_active_wan_name(const iv_agent_t *a);
+/* 累计成功切换次数 / 累计事务失败次数（netmgr 读数；未装配给 0）。 */
+uint64_t          iv_agent_netmgr_switches(const iv_agent_t *a);
+uint64_t          iv_agent_netmgr_txn_fail(const iv_agent_t *a);
 iv_report_t      *iv_agent_report(iv_agent_t *a); /* 读上报链统计/状态用 */
 uint64_t          iv_agent_door_events(const iv_agent_t *a); /* S4.5 门开事件计数 */
 

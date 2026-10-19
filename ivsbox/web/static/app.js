@@ -560,6 +560,17 @@
     linkCard.appendChild(lGrid);
     root.appendChild(linkCard);
 
+    /* 「平台通信」：回答"现在到底哪个网口在跟平台通信"。判定（netmgr 的活动出口）
+     * 与事实（传输层实际绑定的网卡）分开显示 —— 两者不一致时报文其实是从另一条
+     * 链路出去的，只看活动出口看不出来（2026-10-19 就出过这事）。 */
+    var wanCard = el('div', 'card');
+    wanCard.appendChild(el('h3', null, '平台通信（只读）'));
+    var wHint = el('p', 'hint', '读取中…');
+    wanCard.appendChild(wHint);
+    var wGrid = el('div', 'grid');
+    wanCard.appendChild(wGrid);
+    root.appendChild(wanCard);
+
     var live = el('div', 'card');
     live.appendChild(el('h3', null, '当前生效（只读）'));
     var hint = el('p', 'hint', '读取中…');
@@ -567,7 +578,6 @@
     var grid = el('div', 'grid');
     live.appendChild(grid);
     root.appendChild(live);
-
     api('/api/overview').then(function (r) {
       var ok = (r && r.ok && r.d);
       var nt = ok ? (r.d.net || null) : null;
@@ -582,12 +592,46 @@
           NET_STATE[nt.state] || (nt.state === 'n/a' ? '未装配' : nt.state) || '—',
           nt.state === 'BOTH_DOWN' ? 'err'
             : (nt.state === 'WIRED_UP' || nt.state === 'WIRELESS_UP' ? 'ok' : 'warn')));
-        lGrid.appendChild(kv('活动出口', nt.active_wan === 'wired' ? '有线（eth0）' : '无线（usb0）'));
+        /* 活动出口挪到下面「平台通信」块（那边带网口名，比 wired/wireless 更有用） */
         if (nt.mn && nt.mn.length) {
           lGrid.appendChild(kv('主网1', MN_NAME[nt.mn[0]] || '—',
             nt.mn[0] === 2 ? 'err' : (nt.mn[0] === 1 ? 'ok' : 'warn')));
           lGrid.appendChild(kv('主网2', MN_NAME[nt.mn[1]] || '—',
             nt.mn[1] === 2 ? 'err' : (nt.mn[1] === 1 ? 'ok' : 'warn')));
+        }
+      }
+
+      /* —— 平台通信：当前通信网口（判定）＋ 传输层实际绑定（事实） —— */
+      var wv = nt ? nt.wan : null;
+      if (!nt || nt.state === 'n/a' || !wv) {
+        wHint.textContent = '未获取到平台通信状态（ivsboxd 未就绪或网络模块未装配）。';
+      } else {
+        var KIND = { wireless: '无线（4G）', wired: '有线' };
+        var TRN = {
+          up: '已连接', connecting: '建连中…',
+          down: '未连接（等待重试）', closed: '未启动', unknown: '未知'
+        };
+        wHint.textContent = '「通信网口」是链路判定结果；「实际绑定」是传输层真正使用的网卡，' +
+          '两者不一致说明报文其实从另一条链路出去。';
+        wGrid.appendChild(kv('当前通信网口',
+          (wv.ifname || '未配置网口名') + (KIND[wv.kind] ? '　' + KIND[wv.kind] : ''),
+          wv.ifname ? 'ok' : 'warn'));
+        wGrid.appendChild(kv('平台连接', TRN[wv.transport] || wv.transport || '—',
+          wv.transport === 'up' ? 'ok' : 'warn'));
+        wGrid.appendChild(kv('传输层实际绑定',
+          wv.bound_ok ? (wv.bound || '—')
+            : (wv.bound ? wv.bound + '（与通信网口不一致）' : '未绑定，走内核默认路由'),
+          wv.bound_ok ? 'ok' : (wv.bound ? 'err' : 'warn')));
+        wGrid.appendChild(kv('平台地址',
+          wv.server ? wv.server + ':' + wv.port : '未配置', wv.server ? null : 'warn'));
+        wGrid.appendChild(kv('待发送队列', (wv.queue || 0) + ' 条',
+          wv.queue > 0 ? 'warn' : 'ok'));
+        wGrid.appendChild(kv('累计出口切换',
+          (wv.switches || 0) + ' 次' + (wv.txn_fail ? '　失败 ' + wv.txn_fail + ' 次' : ''),
+          wv.txn_fail ? 'warn' : null));
+        if (wv.bind_fail) {
+          wGrid.appendChild(kv('绑定失败',
+            wv.bind_fail + ' 次（errno=' + wv.bind_errno + '）', 'err'));
         }
       }
 

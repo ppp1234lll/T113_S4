@@ -364,6 +364,20 @@ int main(void)
         chk(strstr(js, "\"sn\":\"1\"") != NULL, "b08 device.sn falls back to default 1");
         chk(strstr(js, "\"sn_source\":\"default\"") != NULL, "b08 device.sn_source marks default");
         chk(strstr(js, "\"id_mac\":null") != NULL, "b08 device.id_mac is JSON null on host");
+
+        /* net.wan：**当前通信网口**（2026-10-19 用户要求 Web 展示）。
+         * 宿主机上没有 usb0/eth0 这两个接口，所以**不校验 bound 的值**
+         * （会是空串＝"未绑定"，这是宿主机上的正确结果）；只钉三件能钉的：
+         * 块在、网口名取自配置（不是硬编码）、默认判定口径是 wireless。 */
+        chk(strstr(js, "\"wan\":{") != NULL, "b08 overview has net.wan block");
+        chk(strstr(js, "\"ifname\":\"usb0\"") != NULL,
+            "b08 net.wan.ifname comes from configured wan_name");
+        chk(strstr(js, "\"kind\":\"wireless\"") != NULL,
+            "b08 net.wan.kind starts as wireless (AUTO 无线优先)");
+        chk(strstr(js, "\"bound_ok\":") != NULL, "b08 net.wan.bound_ok present");
+        chk(strstr(js, "\"transport\":\"") != NULL, "b08 net.wan.transport present");
+        chk(strstr(js, "\"queue\":") != NULL, "b08 net.wan.queue present");
+        chk(strstr(js, "\"switches\":") != NULL, "b08 net.wan.switches present");
     }
 
     /* ---- b09 device.identity.set（Web 配置设备 ID / MAC，2026-10-17 用户要求）----
@@ -411,7 +425,7 @@ int main(void)
     if (g_fail == 0)
         printf("test_agent_board passed (null semantics, 0xE1 decode, relay, limits, "
                "0xC1/0xC2 events, relay.set 0xD1 bytes, guards, overview device block, "
-               "device identity guards)\n");
+               "overview wan block, device identity guards)\n");
     else
         printf("test_agent_board FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

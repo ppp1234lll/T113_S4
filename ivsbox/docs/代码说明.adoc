@@ -3299,3 +3299,108 @@ EC200G 那份做的是：`stty` 原始模式 → `AT+QCFG="usbnet"` 确认 ECM�
 
 合并后的真实 `app.js` 在 mock 下渲染出平台通信卡（现状 03 可见 7 行）；
 设计稿 03 含状态徽标布局；`node --check mock_server.mjs` 通过。
+
+== 2026-10-19 15:39 4G 模块状态页（`cellular.status` ＋ 独立页「4G 模块」）
+
+=== 为什么要新写一个采集模块，而不是让 `netmgr` 顺手报
+
+`netmgr` 知道的是"链路起没起、IP 有没有"，它看不见模组自己的说法：
+有没有插卡、注没注册、附没附着、服务小区是哪一个。现场"4G 上不去"至少分四种
+（没卡／有卡没注册／注册了没附着／附着了没拨号），只看 `usb0` 的 `NO-CARRIER`
+四种长得一模一样。所以状态必须去问模组，而问模组要一个**独占串口、自己解析**的模块。
+
+=== 硬约束：只发查询命令
+
+AT 口 `/dev/ttyUSB0` 与出厂镜像自带的 `/usr/bin/usb-EC200G-inserted.sh` 是**同一个口**。
+那些会改变模组状态的命令（`AT+CFUN`、`AT+QCFG`、`AT+QNETDEVCTL`）一旦从我们这个方向发出去，
+就可能把拨号流程打断，或者让模组停在半配置状态。因此本模块的命令表**只有 12 条查询**：
+`ATI`、`AT+CGMR`、`AT+CPIN?`、`AT+QSIMSTAT?`、`AT+QCCID`、`AT+CIMI`、`AT+CSQ`、
+`AT+COPS?`、`AT+CEREG?`、`AT+CGATT?`、`AT+QENG="servingcell"`、`AT+CGCONTRDP`。
+单测 `c09` 直接断言这张表里**不出现** `CFUN`／`QCFG`／`QNETDEVCTL`／`CPIN=` ——
+这条纪律不能靠"写代码的人记得"，得让编译期之后的测试兜住。
+
+另外本模块**不做 IO、不管拨号、不重连**：打开串口的是 `iv_agent`（`iv_serial_open`），
+收字节的是 Reactor 回调，模块只提供"下一条该问什么 / 喂进来一行怎么解 / 超时怎么走"。
+
+=== 一条一条发，不是一次全发
+
+`iv_cell_next_cmd()` → 写一条 → `iv_cell_feed()` 收行 → `OK`/`ERROR`/`+CME ERROR:` 终结
+→ 再取下一条。单条 800 ms 超时**只跳过这一条**继续下一条，不整轮放弃：
+一轮里 12 条命令，若因为第 3 条不应答就整轮作废，那每次都在同一个位置失败、
+界面永远是上一轮的值。整轮 30 s 一次，和模组侧的变化速度相称。
+
+=== 未知量给哨兵、不给 0
+
+`IV_CELL_UNKNOWN`（-32768）一路带到出口转 `null`。理由与 GPS 那段一样：
+`csq=0` 与"没读到"在界面上完全是两个意思（前者是"信号极差"），
+0 是合法值，不能兼作"未知"。`iv_cell_init(&a->cell, 0)` 显式把未知量预置成哨兵，
+避免 `memset` 出来的 0 被显示成"信号强度 0"。
+
+=== 两个来源必分叉：`TAC`/`CellID` 只认 `AT+QENG`
+
+`AT+CEREG?` 也带 TAC 与 CellID，但它是 **HEX**（`0x149D`），`AT+QENG` 给的是十进制（`5277`）。
+两条命令都在命令表里，QENG 后发，于是同一字段会被后发的那个覆盖 —— 界面上就是
+"同一条记录两个接口两个答案"。所以 `parse_cereg()` 只解 `stat`，TAC/CellID 一律由 QENG 提供。
+
+同理 `parse_qeng()` 有一条硬闸：**字段数 < 18 整体不采信**。位置一旦错开，
+报出来的是"另一个量的值"（把 srxlev 当 RSRP 显示），比报未知危险得多。
+
+=== `SINR` 为什么只给原始值
+
+本板实测：`AT+QENG` 第 16 位＝58，而 `AT+QCSQ` 第 4 位＝−11，两个命令对同一件事说法不一致，
+而 Quectel 文档给的 SINR 范围是 −20…+30 dB。既然定不了单位（0.2 dB 步进／0.5 dB 步进／
+就是 srxlev），就不替它换算：字段名与前端标签都写"原始值"。宁可少一个指标，
+不要一个看着像 dB 的错数。RSRP／RSRQ／RSSI／CSQ 四项与 `+CSQ` 交叉验过，可放心当 dBm 用。
+
+=== `usable` 与 `reason`
+
+`usable` ＝ SIM READY ∧ `CEREG stat ∈ {1,5}` ∧ `CGATT=1` ∧ 有 PDP 地址，四层与。
+它不是"能不能上网"的通用结论，只回答"从模组自己的角度看，链路要素是否齐了"。
+`reason` 写**第一处断点**（`SIM 卡未插入` / `未注册到网络` / 未附着 / 未取得地址），
+界面直接把这句话顶在结论卡上 —— 比让使用者自己对着六个格子推理快得多。
+
+=== 挂载方式与可覆盖路径
+
+照 `iv_gps` 的做法嵌进 `iv_agent`（`iv_cell_t` 直接是结构体成员，不是指针），
+`cell_path` 默认 `/dev/ttyUSB0`，`IVSBOX_CELL_DEV` 环境变量可覆盖，
+**不新增配置键**：这不是现场要调的东西，路径错了是镜像/驱动的问题，不该让使用者改配置。
+周期 30 s（`IV_CELL_PERIOD_MS`），定时器每 100 ms 推一次 `iv_cell_tick()`。
+
+=== 页面分工：为什么是独立一页
+
+总览页只答"这台设备是谁"，网络页答"报文从哪出去"。4G 的十几个量塞进网络页会把
+"当前通信网口"这条一等信息淹掉，所以单开一页「4G 模块」（`PAGES` 里紧跟网络页）：
+结论卡（可用／为什么不可用）＋ 模组／SIM／信号／注册／服务小区／数据连接／AT 链路 六张卡。
+`D()` 把 `null` 一律显示成 `"—"`，`B()` 把三态布尔显示成 是／否／—，
+`mnc2()` 补零（`1` → `01`，否则 `4601` 会被读成别的 PLMN）。
+
+=== 验证
+
+VM：`make host`／`make arm` RC=0 零告警（ARM `0cf61438…`）；`make test` **40 passed / 0 FAIL / 1 SKIP**
+（新增 `test_cellular` 9 组：未知哨兵、实测无卡样本、可用路径、超时跳过、QENG 截断、
+轮次复位保留静态字段、信号格边界、命令表、只读纪律）。
+反向证伪：删掉 `to_int()` 里跳过前导空白的 3 行（AT 应答冒号后带空格，`+CSQ: 27`），
+精确命中 8 条断言；还原后 md5 `b7019dbd…` 复绿。
+
+板端（`/opt/ivsbox` 实机）：`GET /api/cell` → 200，`ok_rounds` 8→41 递增、
+`fail_rounds=0`、`cmd_timeouts=0`；`EC200G` / `EC200GCNLER01A13M04`；
+`sim.present=false`、`state=NOT INSERTED`；`csq 27~29`、`dbm −55~−59`、`level 5`、
+`rsrp −86~−87`、`rsrq −9~−11`；`reg.status=2`（未注册、正在搜网）、`act=LTE`、`460/01`；
+`tac 5277`、`cell_id 9435290`、`pci 394`、`band 1`、`earfcn 300`；
+`data.attached=false`；`usable=false`、`reason="SIM 卡未插入"`。
+与直接抓的原始应答 `+QENG: "servingcell","LIMSRV","LTE","FDD",460,01,9435290,394,300,1,5,5,5277,-87,-9,-60,58,28`
+逐字段对齐。前端：`GET /app.js` 66647 B、md5 `239a175a…`，与工作树一致。
+
+=== 布板时踩到的两件事（已写进操作口径）
+
+一是 `/api/cell` 由 **`ivsbox-web`** 提供，只换 `ivsboxd` 会回 `{"ok":false,"e":-10,"msg":"no such api"}`；
+二是 `S66ivsboxweb stop` **不会停 `monitor-web.sh`**，它会在 1 s 内把 `ivsbox-web` 重新拉起来
+（本次实测 pid 21850 → 19670），必须**先 kill `monitor-web.sh`、再 kill `ivsbox-web`**，
+与 `S65`/`monitor.sh` 是同一套路。
+
+=== 缺口（登记未做）
+
+4G 掉线不重拨仍在 `ivsboxd` 之外（出厂 udev 脚本只在插入时拨一次）；
+本板 SIM 未插入，所以"注册 → 附着 → 拨号"整条成功路径在真机上还没有样本，
+`usable=true` 分支目前只有单测覆盖。
+

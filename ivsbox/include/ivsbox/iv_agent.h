@@ -87,6 +87,7 @@
 #include <stdint.h>
 
 #include "ivsbox/iv_camdet.h"
+#include "ivsbox/iv_cellular.h"
 #include "ivsbox/iv_device.h"
 #include "ivsbox/iv_gps.h"
 #include "ivsbox/iv_media.h"
@@ -123,6 +124,15 @@ extern "C" {
 /* GPS 串口默认设备节点（UART1；板端设备树启用后才有这个节点）。
  * 波特率见 `IV_GPS_UART_BAUD`（9600，外部事实，不进配置）。 */
 #define IV_AGENT_GPS_PATH_DEFAULT "/dev/ttySAC1"
+
+/* 4G 模组 AT 口（只读状态查询，见 iv_cellular.h）。
+ * **与出厂镜像的拨号脚本共用同一个口**：本层只发查询命令，不发任何会改模块
+ * 状态或断网的命令。实测 EC200G 的 AT 口是 `/dev/ttyUSB0`（ttyUSB1=NMEA，
+ * ttyUSB2 不回话，ttyUSB3 是数据口）。 */
+#define IV_AGENT_CELL_PATH_DEFAULT "/dev/ttyUSB0"
+/* AT 轮询驱动节拍。必须远小于 `IV_CELL_CMD_TIMEOUT_MS`（800 ms），
+ * 否则节拍本身会把"发一条、等一条"的节奏拖成龟速。 */
+#define IV_AGENT_CELL_TICK_MS 100u
 /* 表列 GETNEXT 结果**留存行数**上限（装配层只留前 N 行，避免结果表过大；
  * 完整遍历上限由 iv_snmp_target_t::max_rows 管） */
 #define IV_AGENT_SNMP_ROWS_MAX 4
@@ -283,6 +293,13 @@ typedef struct {
      *   时间线与 OTA 判定，属"改行为"的动作，需显式打开。 */
     const char *gps_path;
     int         gps_sync_time;
+
+    /* 4G 模组状态查询（只读）。`cell_path`：NULL → 默认 `/dev/ttyUSB0`；
+     * **空串 = 不打开 AT 口**（页面显示"未启用"，而不是一堆未知值 ——
+     * "没开"和"开了但读不到"是两件事，不能混成一个空表）。
+     * `cell_period_ms`：0 → 用 `IV_CELL_PERIOD_MS`（30 s）。 */
+    const char *cell_path;
+    uint32_t    cell_period_ms;
 } iv_agent_cfg_t;
 
 /* ---------------------------------------------------------------------------
@@ -315,6 +332,16 @@ typedef struct {
     uint64_t     gps_rx_bytes;      /* 累计收到的字节数（0 ⇒ 线没接 / 波特率错 / 没上电） */
     uint64_t     gps_last_parse_ms; /* 最近一次成功解析出语句的单调时刻；0 = 从未 */
     int          gps_open_rc;       /* 最近一次开串口的结果：0 = 已打开，负 = 错误码，IV_ENOTSUP = 配置为不开 */
+
+    /* 4G 模组状态（只读）。与 GPS 同一套装配方式：串口 + Reactor 可读事件
+     * ＋ 一个周期定时器驱动查询状态机。**打开失败只降级不致命** ——
+     * 没插模块不该影响主控，页面显示"AT 口打不开"即可。 */
+    iv_cell_t    cell;
+    int          cell_fd;           /* -1 = AT 口未打开 */
+    iv_event_t  *cell_ev;           /* Reactor 读事件；r == NULL 时恒 NULL */
+    iv_timer_t  *cell_timer;        /* 查询驱动定时器；r == NULL 时恒 NULL */
+    uint64_t     cell_rx_bytes;     /* 累计读到的字节（0 且 fd 已开 ⇒ 模块不回话） */
+    int          cell_open_rc;      /* 最近一次开 AT 口的结果：0 = 已打开 */
 
     /* netmgr 的事务执行点：switch_route 复用默认（netlink 改路由），reconnect
      * 接本层 → iv_report_reconnect。ops.arg 指向本结构，故不能是静态常量。 */
@@ -464,6 +491,20 @@ const iv_gps_t *iv_agent_gps(const iv_agent_t *a);
  * `*fd` 出参为串口 fd（-1 = 没开），返回值为最近一次开串口的结果
  * （0 = 已打开；负 = 错误码；`IV_ENOTSUP` = 配置为空串、本层刻意不开）。 */
 int iv_agent_gps_link(const iv_agent_t *a, const char **path, int *fd);
+
+/* ---------------------------------------------------------------------------
+ * 4G 模组状态（Quectel EC200G，只读 AT 查询）
+ * ------------------------------------------------------------------------- */
+
+/* 最近一次查询得到的快照（指针指向本层内部，**只读**）。
+ * 从未完成过任何一轮时返回的是"全未知 ＋ valid=0"的快照（不是 NULL）。 */
+const iv_cell_t *iv_agent_cell(const iv_agent_t *a);
+
+/* 链路状态（给页面与诊断用）：`*path` 出参指向实际设备节点（永不为 NULL），
+ * `*fd` 为 AT 口 fd（-1 = 没开），`*rx_bytes` 为累计收字节，
+ * 返回最近一次开 AT 口的结果（0 = 已打开；负 = 错误码；IV_ENOTSUP = 配置为空串）。 */
+int iv_agent_cell_link(const iv_agent_t *a, const char **path, int *fd,
+                       uint64_t *rx_bytes);
 
 /* 灌入一段字节（**给非 Reactor 驱动与回放用**：`r == NULL` 的测试、或调用方
  * 从别处拿到了 NMEA 字节流）。返回成功解析的语句条数。

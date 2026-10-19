@@ -27,6 +27,10 @@ static void on_nl_evt(const iv_netlink_evt_t *e, void *arg);
 static void on_nl_fd(int fd, uint32_t events, void *arg);
 static void on_gps_fd(int fd, uint32_t events, void *arg);
 static void gps_link_drop(iv_agent_t *a);
+static void on_cell_fd(int fd, uint32_t events, void *arg);
+static void on_cell_timer(void *arg);
+static void cell_link_drop(iv_agent_t *a);
+static void cell_drive(iv_agent_t *a, uint64_t now_ms);
 static void on_pb_timer(void *arg);
 static void on_nm_timer(void *arg);
 static int  agent_reconnect(void *arg, int new_ifindex);
@@ -109,6 +113,8 @@ void iv_agent_cfg_default(iv_agent_cfg_t *cfg)
      * 校时**默认关**（只解析、不碰系统时钟），要开得由调用方显式置 1。 */
     cfg->gps_path      = IV_AGENT_GPS_PATH_DEFAULT;
     cfg->gps_sync_time = 0;
+    cfg->cell_path     = IV_AGENT_CELL_PATH_DEFAULT;
+    cfg->cell_period_ms = 0;   /* 0 => IV_CELL_PERIOD_MS (30s) */
 }
 
 void iv_agent_init(iv_agent_t *a)
@@ -119,6 +125,9 @@ void iv_agent_init(iv_agent_t *a)
         return;
     memset(a, 0, sizeof(*a));
     iv_report_init(&a->rp);
+    /* 4G 状态机先按默认周期建好：未 open 时 ctl 读到的也必须是"全未知"，
+     * 而不是 memset 出来的 0（`csq=0` 会被界面显示成"信号极差"）。 */
+    iv_cell_init(&a->cell, 0);
     for (w = 0; w < IV_WAN_N; w++)
         a->wan_probe_idx[w] = -1;
     a->opened = 0;
@@ -527,11 +536,61 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
         }
     }
 
+    /* ---- 5e. 4G 模组状态（AT 口，115200 8N1，**只读查询**）----
+     * 与 GPS 同一套纪律：解析器恒初始化、串口只在有 Reactor 时打开、打不开只降级。
+     * 额外一条：**这个口与出厂镜像的拨号脚本共用**，所以本层只发 `AT+CSQ` 这类
+     * 查询命令，绝不发会改模块状态或断网的命令（见 iv_cellular.h）。
+     *
+     * 串口用 `iv_serial_open`，它会 `flock` 独占 —— 只防"我方两个实例抢口"，
+     * 挡不住外部脚本（拨号脚本不加锁）。所以真正的保护是"不发写命令"。 */
+    {
+        const char *cpath;
+
+        iv_cell_init(&a->cell, cfg->cell_period_ms);
+        a->cell_fd       = -1;
+        a->cell_ev       = NULL;
+        a->cell_timer    = NULL;
+        a->cell_rx_bytes = 0;
+        a->cell_open_rc  = IV_ENOTSUP;
+
+        cpath = (cfg->cell_path != NULL) ? cfg->cell_path : IV_AGENT_CELL_PATH_DEFAULT;
+        if (cpath[0] == '\0') {
+            IV_LOG_I(AG_MOD, "cell: AT port disabled by config");
+        } else if (r == NULL) {
+            IV_LOG_I(AG_MOD, "cell: no reactor, AT port not opened (feed by caller)");
+        } else {
+            iv_serial_cfg_t scfg;
+            int             cfd;
+
+            iv_serial_cfg_default(&scfg);
+            scfg.baud = IV_CELL_AT_BAUD;  /* 显式写：默认值将来若变，这里不能跟着变 */
+            cfd = iv_serial_open(cpath, &scfg);
+            if (cfd < 0) {
+                a->cell_open_rc = cfd;
+                IV_LOG_W(AG_MOD, "cell: AT open failed (%d): %s", cfd, cpath);
+            } else {
+                a->cell_fd = cfd;
+                a->cell_ev = iv_reactor_add(r, cfd, IV_EV_READ, on_cell_fd, a);
+                if (a->cell_ev == NULL) {
+                    IV_LOG_W(AG_MOD, "cell: fd add to reactor failed");
+                    (void)iv_serial_close(cfd);
+                    a->cell_fd      = -1;
+                    a->cell_open_rc = IV_ESTATE;
+                } else {
+                    a->cell_open_rc = 0;
+                    IV_LOG_I(AG_MOD, "cell: %s up, %u 8N1 (read-only AT)",
+                             cpath, (unsigned)IV_CELL_AT_BAUD);
+                }
+            }
+        }
+    }
+
     /* ---- 6. 本层定时器（仅 Reactor 模式；r == NULL 时由调用方按节拍推进）---- */
     if (r != NULL) {
-        a->pb_timer = iv_timer_add(r, IV_AGENT_PROBE_TICK_MS, on_pb_timer, a);
-        a->nm_timer = iv_timer_add(r, IV_AGENT_NETMGR_TICK_MS, on_nm_timer, a);
-        if (a->pb_timer == NULL || a->nm_timer == NULL)
+        a->pb_timer   = iv_timer_add(r, IV_AGENT_PROBE_TICK_MS, on_pb_timer, a);
+        a->nm_timer   = iv_timer_add(r, IV_AGENT_NETMGR_TICK_MS, on_nm_timer, a);
+        a->cell_timer = iv_timer_add(r, IV_AGENT_CELL_TICK_MS, on_cell_timer, a);
+        if (a->pb_timer == NULL || a->nm_timer == NULL || a->cell_timer == NULL)
             IV_LOG_W(AG_MOD, "agent timer add failed");
     }
 
@@ -573,6 +632,8 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
     storage_drive(a, now_ms); /* M6-S6.5：SD 水位闸门（先于 rec_drive，同拍生效） */
     rec_drive(a, now_ms); /* M6-S6.3：断网录像状态机（每拍喂判据） */
     (void)iv_report_step(&a->rp, now_ms);
+    if (a->cell_fd >= 0)
+        cell_drive(a, now_ms);   /* 4G 查询状态机：与定时器同一入口，重复驱动无害 */
     return IV_OK;
 }
 
@@ -590,6 +651,10 @@ void iv_agent_close(iv_agent_t *a)
             (void)iv_timer_cancel(a->r, a->pb_timer);
             a->pb_timer = NULL;
         }
+        if (a->cell_timer != NULL) {
+            (void)iv_timer_cancel(a->r, a->cell_timer);
+            a->cell_timer = NULL;
+        }
         if (a->nl_ev != NULL) {
             (void)iv_reactor_del(a->r, a->nl_ev);
             a->nl_ev = NULL;
@@ -597,6 +662,7 @@ void iv_agent_close(iv_agent_t *a)
     }
 
     gps_link_drop(a); /* S2.5：摘 GPS 读事件并关串口（未开时幂等） */
+    cell_link_drop(a); /* 4G：摘 AT 口读事件并关串口（未开时幂等） */
     iv_camdet_close(&a->cd);  /* 停在飞 socket + 关引擎（未开时幂等） */
     iv_device_close(&a->dev); /* 关 UDP / AF_PACKET 两个 socket（未开时幂等） */
     iv_recovery_close(&a->rec);
@@ -1455,4 +1521,122 @@ uint64_t iv_agent_gps_rx_bytes(const iv_agent_t *a)
 uint64_t iv_agent_gps_last_parse_ms(const iv_agent_t *a)
 {
     return (a != NULL) ? a->gps_last_parse_ms : 0u;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 4G 模组状态（只读 AT 查询）
+ * ------------------------------------------------------------------------- */
+
+/* 摘读事件 + 关串口 + 复位状态机。**幂等**：重复调用无副作用。
+ * 注意复位的是状态机，**快照保留** —— 串口抖一下不该让页面上的信号值瞬间归零。 */
+static void cell_link_drop(iv_agent_t *a)
+{
+    if (a == NULL)
+        return;
+    if (a->cell_ev != NULL && a->r != NULL) {
+        (void)iv_reactor_del(a->r, a->cell_ev);
+        a->cell_ev = NULL;
+    } else {
+        a->cell_ev = NULL;
+    }
+    if (a->cell_fd >= 0) {
+        (void)iv_serial_close(a->cell_fd);
+        a->cell_fd = -1;
+    }
+    iv_cell_reset(&a->cell);
+}
+
+/* 推进状态机并把"下一条该问的"写出去。
+ * **一拍只发一条**：AT 是严格的请求-响应，连发会把响应搅在一起，
+ * 解析器看到的是"上一条的答案配这一条的字段"，比查不到更糟。 */
+static void cell_drive(iv_agent_t *a, uint64_t now_ms)
+{
+    char cmd[64];
+    int  n;
+
+    if (a == NULL)
+        return;
+    iv_cell_tick(&a->cell, now_ms);
+    if (a->cell_fd < 0)
+        return;
+
+    n = iv_cell_next_cmd(&a->cell, cmd, sizeof(cmd), now_ms);
+    if (n <= 0)
+        return;
+    {
+        int w = iv_serial_write(a->cell_fd, cmd, (size_t)n);
+
+        if (w != n) {
+            /* 非阻塞 fd 可能只写进去一部分；AT 命令都很短，出现即异常。
+             * 不重试：状态机会在超时后跳下一条，重试反而可能把半条命令
+             * 与下一条拼成一条非法命令。 */
+            IV_LOG_W(AG_MOD, "cell: AT write short (%d/%d)", w, n);
+        }
+    }
+}
+
+/* AT 口可读：把字节全部灌进解析器（读干到 EAGAIN）。 */
+static void on_cell_fd(int fd, uint32_t events, void *arg)
+{
+    iv_agent_t *a = arg;
+    char        buf[256];
+
+    if (a == NULL)
+        return;
+    if ((events & (IV_EV_ERR | IV_EV_HUP | IV_EV_RDHUP)) != 0u) {
+        IV_LOG_W(AG_MOD, "cell: AT port error/hup, link dropped");
+        cell_link_drop(a);
+        return;
+    }
+    for (;;) {
+        size_t got = 0u;
+        int    rc  = iv_serial_read(fd, buf, sizeof(buf), &got);
+
+        if (rc == IV_EAGAIN)
+            return;
+        if (rc != IV_OK) {
+            IV_LOG_W(AG_MOD, "cell: AT read failed (%d), link dropped", rc);
+            cell_link_drop(a);
+            return;
+        }
+        a->cell_rx_bytes += got;
+        (void)iv_cell_feed(&a->cell, buf, got, iv_clock_monotonic_ms());
+        if (got < sizeof(buf))
+            return;
+    }
+}
+
+/* 查询驱动节拍。周期重装（iv_timer_add 是一次性定时器）。 */
+static void on_cell_timer(void *arg)
+{
+    iv_agent_t *a = arg;
+
+    if (a == NULL || !a->opened)
+        return;
+    cell_drive(a, iv_clock_monotonic_ms());
+    if (a->r != NULL) {
+        a->cell_timer = iv_timer_add(a->r, IV_AGENT_CELL_TICK_MS, on_cell_timer, a);
+        if (a->cell_timer == NULL)
+            IV_LOG_W(AG_MOD, "cell: timer re-arm failed, AT polling stops");
+    }
+}
+
+const iv_cell_t *iv_agent_cell(const iv_agent_t *a)
+{
+    return (a != NULL) ? &a->cell : NULL;
+}
+
+int iv_agent_cell_link(const iv_agent_t *a, const char **path, int *fd,
+                       uint64_t *rx_bytes)
+{
+    if (path != NULL)
+        *path = (a != NULL && a->cfg.cell_path != NULL)
+                    ? a->cfg.cell_path
+                    : IV_AGENT_CELL_PATH_DEFAULT;
+    if (fd != NULL)
+        *fd = (a != NULL) ? a->cell_fd : -1;
+    if (rx_bytes != NULL)
+        *rx_bytes = (a != NULL) ? a->cell_rx_bytes : 0u;
+    return (a != NULL) ? a->cell_open_rc : IV_EINVAL;
 }

@@ -916,6 +916,16 @@ static int agent_setup(void)
             ac.gps_path = gdev;
     }
 
+    /* 4G 模组 AT 口：默认 `/dev/ttyUSB0`（出厂镜像固定），**不接配置键** ——
+     * 与 GPS 同口径：AT 口是硬件事实，配错的症状是"一条命令都不回"，
+     * 与"模块没插"长得一模一样，属现场最难查的一类。环境变量只为联调留口子。 */
+    {
+        const char *cdev = getenv("IVSBOX_CELL_DEV");
+
+        if (cdev != NULL)
+            ac.cell_path = cdev;
+    }
+
     ac.devid = 0u;
 
     if (iv_agent_open(&g_agent, &ac, g_reactor, iv_clock_monotonic_ms()) != IV_OK) {

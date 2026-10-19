@@ -81,6 +81,7 @@
   var PAGES = [
     { id: 'overview', name: '总览' },
     { id: 'net', name: '网络' },
+    { id: 'cell', name: '4G 模块' },
     { id: 'gps', name: '定位' },
     { id: 'board', name: '控制板' },
     { id: 'camera', name: '摄像机' },
@@ -162,6 +163,178 @@
       }).catch(function () { $('#chpassMsg').textContent = '无法连接服务'; });
   }
 
+  /* ==================== 4G 模块页 ==================== */
+
+  /* 注册状态（3GPP 27.007 的 +CEREG stat）。后端已经给了一份中文 text，
+   * 这里只留表给"text 缺失"时兜底 —— 两处都写全等于给自己制造漂移。 */
+  var CELL_REG_FALLBACK = {
+    0: '未注册，未在搜网', 1: '已注册（本地网）', 2: '未注册，正在搜网',
+    3: '注册被拒绝', 4: '未知原因', 5: '已注册（漫游）'
+  };
+
+  function pageCell() {
+    var root = document.createDocumentFragment();
+    root.appendChild(el('h2', 'page-title', '4G 模块'));
+
+    /* 结论卡放最前：现场打开这一页想知道的是"到底能不能用、卡在哪一层"，
+     * 而不是先看 20 个字段自己去推。 */
+    var top = el('div', 'card');
+    top.appendChild(el('h3', null, '可用性'));
+    var note = el('p', 'hint', '读取中…');
+    top.appendChild(note);
+    var gTop = el('div', 'grid');
+    top.appendChild(gTop);
+    var bar = el('div', 'actions');
+    var btn = el('button', 'ghost', '刷新');
+    btn.type = 'button';
+    bar.appendChild(btn);
+    top.appendChild(bar);
+    root.appendChild(top);
+
+    function mkCard(title) {
+      var c = el('div', 'card');
+      c.appendChild(el('h3', null, title));
+      var g = el('div', 'grid');
+      c.appendChild(g);
+      root.appendChild(c);
+      return g;
+    }
+    var gModule = mkCard('模组信息');
+    var gSim    = mkCard('SIM 卡');
+    var gSig    = mkCard('信号');
+    var gReg    = mkCard('网络注册');
+    var gCell   = mkCard('服务小区');
+    var gData   = mkCard('数据连接');
+    var gLink   = mkCard('AT 链路');
+
+    /* null / 空串一律显示 "—"：后端把"读不到"统一给 null，
+     * 前端不该把 null 显示成 0 或 "undefined"。 */
+    function D(v, unit) {
+      if (v === null || v === undefined || v === '') return '—';
+      return (unit ? (v + unit) : ('' + v));
+    }
+    function B(v) {
+      if (v === true) return '是';
+      if (v === false) return '否';
+      return '—';
+    }
+    function mnc2(v) {
+      if (v === null || v === undefined) return '—';
+      return (v < 10) ? ('0' + v) : ('' + v);
+    }
+
+    function load() {
+      api('/api/cell').then(function (r) {
+        gTop.innerHTML = '';
+        if (!r.ok) {
+          note.textContent = '';
+          var why = (r.msg === 'agent unavailable' || r.msg === 'cellular unavailable')
+            ? 'ivsboxd 未运行，或本机未装配 4G 查询模块'
+            : (r.msg || '读取失败');
+          gTop.appendChild(kv('状态', why, 'err'));
+          return;
+        }
+        var d = r.d || {};
+        var lk = d.link || {}, mod = d.module || {}, sim = d.sim || {}
+          , sig = d.signal || {}, reg = d.reg || {}, cl = d.cell || {}, dt = d.data || {};
+
+        /* ---- 结论 ---- */
+        note.textContent = d.usable
+          ? '4G 可用：SIM 就绪、已注册、PS 已附着、已取得 IP。'
+          : ('4G 不可用：' + (d.reason || '原因未知（可能 AT 口未打开）'));
+
+        gTop.appendChild(kv('可用性', d.usable ? '可用' : '不可用',
+                            d.usable ? 'ok' : 'err'));
+        gTop.appendChild(kv('当前断点', D(d.reason, ''), d.usable ? 'ok' : 'warn'));
+        gTop.appendChild(kv('最近成功', (lk.age_ms === null || lk.age_ms === undefined)
+                            ? '从未' : (Math.round(lk.age_ms / 1000) + ' 秒前')));
+
+        /* ---- 模组 ---- */
+        gModule.innerHTML = '';
+        gModule.appendChild(kv('型号', D(mod.model)));
+        gModule.appendChild(kv('固件', D(mod.firmware)));
+        gModule.appendChild(kv('轮询周期', '30 秒'));
+        gModule.appendChild(kv('完成轮数', D(lk.ok_rounds)));
+        gModule.appendChild(kv('失败轮数', D(lk.fail_rounds),
+                              (lk.fail_rounds > 0) ? 'warn' : null));
+
+        /* ---- SIM ---- */
+        gSim.innerHTML = '';
+        gSim.appendChild(kv('是否插入', B(sim.present),
+                            sim.present === false ? 'err' : null));
+        gSim.appendChild(kv('卡状态', D(sim.state),
+                            (sim.state === 'READY') ? 'ok' : 'warn'));
+        gSim.appendChild(kv('ICCID', D(sim.iccid)));
+        gSim.appendChild(kv('IMSI', D(sim.imsi)));
+
+        /* ---- 信号 ---- */
+        gSig.innerHTML = '';
+        /* CSQ 0..31 是模块原始值，dBm 才是现场熟悉的量；两个都给，
+         * 因为对表时两边都可能被引用（AT 手册看 CSQ、现场看 dBm）。 */
+        gSig.appendChild(kv('信号格', (sig.level === null || sig.level === undefined)
+                            ? '—' : (sig.level + ' / 5')));
+        gSig.appendChild(kv('CSQ', D(sig.csq, '')));
+        gSig.appendChild(kv('接收电平', D(sig.dbm, ' dBm')));
+        gSig.appendChild(kv('RSRP', D(sig.rsrp, ' dBm')));
+        gSig.appendChild(kv('RSRQ', D(sig.rsrq, ' dB')));
+        /* SINR 是模块原始值：不同固件单位不一致，不替它换算 */
+        gSig.appendChild(kv('SINR（原始）', D(sig.sinr)));
+
+        /* ---- 注册 ---- */
+        gReg.innerHTML = '';
+        var regText = reg.text || CELL_REG_FALLBACK[reg.status] || '—';
+        gReg.appendChild(kv('注册状态', regText,
+                            (reg.status === 1 || reg.status === 5) ? 'ok' : 'warn'));
+        gReg.appendChild(kv('运营商', D(reg.operator)));
+        gReg.appendChild(kv('制式', D(reg.act)));
+        gReg.appendChild(kv('MCC / MNC',
+                            (reg.mcc === null || reg.mcc === undefined)
+                              ? '—' : (reg.mcc + ' / ' + mnc2(reg.mnc))));
+
+        /* ---- 小区 ---- */
+        gCell.innerHTML = '';
+        gCell.appendChild(kv('TAC', D(cl.tac)));
+        gCell.appendChild(kv('Cell ID', D(cl.cell_id)));
+        gCell.appendChild(kv('PCI', D(cl.pci)));
+        gCell.appendChild(kv('频段', D(cl.band)));
+        gCell.appendChild(kv('EARFCN', D(cl.earfcn)));
+
+        /* ---- 数据连接 ---- */
+        gData.innerHTML = '';
+        gData.appendChild(kv('PS 附着', B(dt.attached),
+                             dt.attached === false ? 'warn' : null));
+        gData.appendChild(kv('PDP 上下文', dt.active ? '已建立' : '无',
+                             dt.active ? 'ok' : 'warn'));
+        gData.appendChild(kv('本机 IP', D(dt.ip)));
+        gData.appendChild(kv('APN', D(dt.apn)));
+        gData.appendChild(kv('DNS', (dt.dns1 || dt.dns2)
+                            ? (D(dt.dns1) + ' / ' + D(dt.dns2)) : '—'));
+
+        /* ---- AT 链路 ---- */
+        gLink.innerHTML = '';
+        gLink.appendChild(kv('设备节点', D(lk.path)));
+        gLink.appendChild(kv('打开状态', lk.open ? '已打开' : '未打开',
+                             lk.open ? 'ok' : 'err'));
+        gLink.appendChild(kv('收字节', D(lk.rx_bytes)));
+        gLink.appendChild(kv('命令超时', D(lk.cmd_timeouts),
+                             (lk.cmd_timeouts > 0) ? 'warn' : null));
+        gLink.appendChild(kv('最近错误码', (lk.at_err === 0) ? '无' : D(lk.at_err),
+                             (lk.at_err === 0) ? null : 'warn'));
+      }).catch(function () {
+        note.textContent = '';
+        gTop.innerHTML = '';
+        gTop.appendChild(kv('状态', '无法连接服务', 'err'));
+      });
+    }
+
+    btn.addEventListener('click', load);
+    load();
+    /* 10 s 刷新：后端 30 s 才查一轮 AT，这里只是读快照，开销可忽略。
+     * 切页时由 go() 统一 clearInterval。 */
+    st.timer = setInterval(load, 10000);
+    return root;
+  }
+
   /* ==================== 导航 ==================== */
   function buildNav() {
     var list = $('#navList');
@@ -189,7 +362,8 @@
     var c = $('#content');
     c.innerHTML = '';
     var builder = {
-      overview: pageOverview, net: pageNet, gps: pageGps, board: pageBoard,
+      overview: pageOverview, net: pageNet, cell: pageCell, gps: pageGps,
+      board: pageBoard,
       camera: pageCamera,
       devices: pageDevices, switch: pageSwitch, media: pageMedia,
       config: pageConfig, maint: pageMaint

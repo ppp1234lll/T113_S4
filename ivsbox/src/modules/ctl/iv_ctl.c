@@ -1889,6 +1889,172 @@ static int m_gps_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_t *
     return rsp_data(d, out, cap, out_len);
 }
 
+/* ============================ cellular.status ============================ */
+
+/* 数值 + "未知值"哨兵 → JSON。未知就输出 **null**，不输出哨兵数值也不输出 0：
+ * 前端的"—"只应该来自 null；把 -32768 或 99 透给页面，迟早被当成真值显示。 */
+static void add_int_or_null(json_object *o, const char *k, int v, int unknown)
+{
+    if (o == NULL || k == NULL)
+        return;
+    if (v == unknown) {
+        json_object_object_add(o, k, NULL);
+        return;
+    }
+    json_object_object_add(o, k, json_object_new_int(v));
+}
+
+/* 三态布尔：1/0 之外的任何值（含 -1 "未知"）都输出 null。 */
+static void add_tri_or_null(json_object *o, const char *k, int v)
+{
+    if (o == NULL || k == NULL)
+        return;
+    if (v == 1)
+        json_object_object_add(o, k, json_object_new_boolean(1));
+    else if (v == 0)
+        json_object_object_add(o, k, json_object_new_boolean(0));
+    else
+        json_object_object_add(o, k, NULL);
+}
+
+/* 4G 模组状态（只读）。
+ *
+ * 输出分块的理由：现场排查的顺序就是**从链路到业务**——
+ *   link（AT 口通不通）→ module（是什么模块）→ sim（卡在不在）
+ *   → signal（有没有信号）→ reg（注册上没有）→ cell（驻留在哪个小区）
+ *   → data（有没有 IP），最后 usable + reason 给结论。
+ * 这七层**任何一层都可能是断点**，挤成一个平表就分不清"没信号"与"没插卡"
+ * （2026-10-19 板端实测正是后者：有信号、模块正常、SIM 没插）。
+ *
+ * `usable` 与 `reason` 由 iv_cellular 算好（四层与），本层只搬运 ——
+ * 判定只允许有一处实现。
+ */
+static int m_cell_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap,
+                         size_t *out_len)
+{
+    const iv_cell_t *c;
+    iv_cell_snap_t   s;
+    json_object     *d;
+    json_object     *link;
+    json_object     *mod;
+    json_object     *sim;
+    json_object     *sig;
+    json_object     *reg;
+    json_object     *cell;
+    json_object     *data;
+    const char      *path = NULL;
+    int              fd   = -1;
+    uint64_t         rx   = 0;
+    int              lrc;
+    uint64_t         now;
+
+    if (ctx->agent == NULL)
+        return rsp_err(IV_ESTATE, "agent unavailable", out, cap, out_len);
+    c = iv_agent_cell(ctx->agent);
+    if (c == NULL)
+        return rsp_err(IV_ESTATE, "cellular unavailable", out, cap, out_len);
+    iv_cell_snapshot(c, &s);
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+
+    link = json_object_new_object();
+    if (link != NULL) {
+        lrc = iv_agent_cell_link(ctx->agent, &path, &fd, &rx);
+        json_object_object_add(link, "path",
+                               json_object_new_string((path != NULL) ? path : ""));
+        json_object_object_add(link, "open", json_object_new_boolean(fd >= 0));
+        json_object_object_add(link, "rc", json_object_new_int(lrc));
+        json_object_object_add(link, "rx_bytes", json_object_new_int64((int64_t)rx));
+        json_object_object_add(link, "valid", json_object_new_boolean(s.valid != 0));
+        json_object_object_add(link, "ok_rounds",
+                               json_object_new_int((int32_t)s.ok_rounds));
+        json_object_object_add(link, "fail_rounds",
+                               json_object_new_int((int32_t)s.fail_rounds));
+        json_object_object_add(link, "cmd_timeouts",
+                               json_object_new_int((int32_t)s.cmd_timeouts));
+        json_object_object_add(link, "at_err", json_object_new_int(s.at_err));
+        now = iv_clock_monotonic_ms();
+        if (s.last_ok_ms == 0u || now < s.last_ok_ms)
+            json_object_object_add(link, "age_ms", NULL); /* 从未成功过 */
+        else
+            json_object_object_add(link, "age_ms",
+                                   json_object_new_int64((int64_t)(now - s.last_ok_ms)));
+        json_object_object_add(d, "link", link);
+    }
+
+    mod = json_object_new_object();
+    if (mod != NULL) {
+        add_str_or_null(mod, "model", (s.model[0] != '\0') ? s.model : NULL);
+        add_str_or_null(mod, "firmware", (s.firmware[0] != '\0') ? s.firmware : NULL);
+        json_object_object_add(d, "module", mod);
+    }
+
+    sim = json_object_new_object();
+    if (sim != NULL) {
+        add_tri_or_null(sim, "present", s.sim_present);
+        add_str_or_null(sim, "state", (s.sim_state[0] != '\0') ? s.sim_state : NULL);
+        add_str_or_null(sim, "iccid", (s.iccid[0] != '\0') ? s.iccid : NULL);
+        add_str_or_null(sim, "imsi", (s.imsi[0] != '\0') ? s.imsi : NULL);
+        json_object_object_add(d, "sim", sim);
+    }
+
+    sig = json_object_new_object();
+    if (sig != NULL) {
+        add_int_or_null(sig, "csq", s.csq, 99);
+        add_int_or_null(sig, "dbm", s.dbm, IV_CELL_UNKNOWN);
+        add_int_or_null(sig, "level", s.level, -1);
+        add_int_or_null(sig, "rsrp", s.rsrp, IV_CELL_UNKNOWN);
+        add_int_or_null(sig, "rsrq", s.rsrq, IV_CELL_UNKNOWN);
+        add_int_or_null(sig, "sinr", s.sinr, IV_CELL_UNKNOWN);
+        json_object_object_add(d, "signal", sig);
+    }
+
+    reg = json_object_new_object();
+    if (reg != NULL) {
+        add_int_or_null(reg, "status", s.cereg_stat, -1);
+        add_str_or_null(reg, "text", (s.reg_text[0] != '\0') ? s.reg_text : NULL);
+        add_str_or_null(reg, "operator",
+                        (s.operator_name[0] != '\0') ? s.operator_name : NULL);
+        add_str_or_null(reg, "act", (s.act[0] != '\0') ? s.act : NULL);
+        add_int_or_null(reg, "mcc", s.mcc, IV_CELL_UNKNOWN);
+        add_int_or_null(reg, "mnc", s.mnc, IV_CELL_UNKNOWN);
+        json_object_object_add(d, "reg", reg);
+    }
+
+    cell = json_object_new_object();
+    if (cell != NULL) {
+        add_int_or_null(cell, "tac", s.tac, IV_CELL_UNKNOWN);
+        if (s.cell_id == 0u)
+            json_object_object_add(cell, "cell_id", NULL);
+        else
+            json_object_object_add(cell, "cell_id",
+                                   json_object_new_int64((int64_t)s.cell_id));
+        add_int_or_null(cell, "pci", s.pci, IV_CELL_UNKNOWN);
+        add_int_or_null(cell, "band", s.band, IV_CELL_UNKNOWN);
+        add_int_or_null(cell, "earfcn", s.earfcn, IV_CELL_UNKNOWN);
+        json_object_object_add(d, "cell", cell);
+    }
+
+    data = json_object_new_object();
+    if (data != NULL) {
+        add_tri_or_null(data, "attached", s.attached);
+        json_object_object_add(data, "active",
+                               json_object_new_boolean(s.pdp_active != 0));
+        add_str_or_null(data, "ip", (s.pdp_ip[0] != '\0') ? s.pdp_ip : NULL);
+        add_str_or_null(data, "apn", (s.apn[0] != '\0') ? s.apn : NULL);
+        add_str_or_null(data, "dns1", (s.dns1[0] != '\0') ? s.dns1 : NULL);
+        add_str_or_null(data, "dns2", (s.dns2[0] != '\0') ? s.dns2 : NULL);
+        json_object_object_add(d, "data", data);
+    }
+
+    json_object_object_add(d, "usable", json_object_new_boolean(s.usable != 0));
+    add_str_or_null(d, "reason", (s.reason[0] != '\0') ? s.reason : NULL);
+
+    return rsp_data(d, out, cap, out_len);
+}
+
 /* ============================ system.time / system.reboot ============================ */
 
 static int m_system_time(const iv_ctl_ctx_t *ctx, json_object *p,
@@ -2394,6 +2560,8 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_snmp_run(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "gps.status") == 0)
         rc = m_gps_status(ctx, out, out_cap, out_len);
+    else if (strcmp(method, "cellular.status") == 0)
+        rc = m_cell_status(ctx, out, out_cap, out_len);
     else if (strcmp(method, "board.status") == 0)
         rc = m_board_status(ctx, out, out_cap, out_len);
     else if (strcmp(method, "relay.set") == 0)

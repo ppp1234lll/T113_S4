@@ -510,6 +510,10 @@ int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
     /* S2.5 GPS：只读。定位/统计都由 ivsboxd 侧解析，本层仅透传。 */
     if (strcmp(req->path, "/api/gps") == 0)
         return api_simple_call(ctx, "gps.status", out, cap, out_len, rsp);
+    /* 4G 模组状态：只读。AT 查询在 ivsboxd 侧跑（与拨号脚本共用 AT 口，
+     * 只发查询命令），本层只转发，不碰串口。 */
+    if (strcmp(req->path, "/api/cell") == 0)
+        return api_simple_call(ctx, "cellular.status", out, cap, out_len, rsp);
     /* S2.6 采集板（控制板）：只读，镜像与通信统计全在 ivsboxd 侧，本层仅透传。 */
     if (strcmp(req->path, "/api/board") == 0)
         return api_simple_call(ctx, "board.status", out, cap, out_len, rsp);

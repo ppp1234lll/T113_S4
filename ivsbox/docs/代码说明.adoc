@@ -3119,3 +3119,40 @@ EC200G 那份做的是：`stty` 原始模式 → `AT+QCFG="usbnet"` 确认 ECM�
 要补的是**掉线重拨**（监听 `usb0` carrier／`AT+QNETDEVSTATUS` 为 0 就重拨），
 落点可以放 udev 脚本外面、也可以由 `ivsboxd` 接管；采用哪种要用户拍板，不在本步范围内。
 
+
+== 2026-10-19 11:11 Web 界面重设计交付（现状截图 ＋ 交互原型 ＋ 设计稿 ＋ 方案文档）
+
+=== 干了什么事
+
+**未改 `ivsbox/web/static/` 任何产品代码**；新增交付目录 `web_ui_redesign/`：
+
+* `mock_server.mjs`（约 300 行，Node ≥ 18 零依赖 ESM）：按 `static/app.js` 实际调用的 12 个 REST 形状
+  （`/api/login|logout|passwd|overview|gps|board|devices|snmp|config(±defaults)|config/apply|system/*|board/relay|device/identity`）
+  伪造演示数据；配置键与中文说明**同源抄自 `src/modules/config/iv_config.c` 的 `s_defaults[]`**；
+  会话用 Cookie 模拟真机 401/登录行为。静态服务直出真实 `static/` 文件（原型文件单独路由）。
+* `prototype.html`（单文件自包含）：重设计交互原型，11 页哈希路由（`#/login #/overview … #/maint`）；
+  Design Tokens 集中 `:root`（深色侧栏 `#0e1b30` ＋ 主色 `#2f6bff` ＋ 四态徽标色板）；数据内置与 mock 同源；
+  图标内联 Lucide v0.462.0（与仓库 `web_ui_images/icons/` 同款，ISC）。
+* `Web界面重设计方案.md`：共性问题 10 条 ＋ 逐页问题/设计说明 11 节 ＋ **§6 工程落地约束 9 条** ＋ 验收清单。
+* `现状截图/`、`设计稿/` 各 11 屏 PNG（1440×900）。
+
+=== 解决什么问题
+
+用户反馈现网 Web 界面难看：无品牌/图标、数据全部等权灰块无层级、状态只靠文字颜色、
+原生控件与原生 `confirm()`、配置分组裸键名、危险操作不隔离。本交付把"长什么样、怎么改、
+哪些行为不能动"一次说清并给出可运行的视觉基准，供其他 AI/人执行界面实现。
+
+=== 影响范围
+
+* **产品代码零改动**；`static/` 的重做以后续任务落地，落地时必须遵守方案 §6 的 9 条约束
+  （口令提示与服务端同源、强制改密流、继电器 0xD1 冷却 2.2s＋5s 双回读、null≠0≠空串、
+  配置中文标签来自 `defaults=1` 的 `d` 字段、只读/可写分离、5s 轮询保留、图标许可头保留、无框架）。
+* `mock_server.mjs` 含出厂默认账号 `admin/88888888`（同 `iv_web.h` 公开常量），无新增敏感信息。
+* `AGENTS.md` 关联文档表已登记本目录；`readme.txt` 已按目录说明惯例补齐。
+
+=== 验证方式与结果
+
+* mock 接口自检：未登录 `/api/overview` 返回 401；`admin/88888888` 登录返回 token；
+  `/`、`/style.css`、`/app.js` 均 200。
+* 22 张截图均为浏览器（1440×900）对**真实渲染结果**截取并逐张过目核对页头防错页。
+* 原型双击本地打开可跑（无外部依赖）；`node --check mock_server.mjs` 语法通过。

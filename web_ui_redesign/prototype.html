@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IVSBox 运维终端 · 界面重设计原型</title>
+<style>
+/* ==========================================================================
+   IVSBox Web 界面重设计 —— 设计稿原型（单文件、自包含、内置演示数据）
+   --------------------------------------------------------------------------
+   定位：给界面实现者（人或 AI）看的**视觉与交互基准**，不是产品代码。
+   · 数据全部内置（与 mock_server.mjs 同一套演示值），双击本文件即可打开。
+   · 哈希路由切换页面：#/login #/overview #/net #/gps #/board #/camera
+                       #/devices #/switch #/media #/config #/maint
+   · 设计令牌（Design Tokens）集中在 :root，改主题只动这一处。
+   ========================================================================== */
+:root {
+  /* ---- 色板 ---- */
+  --bg: #f3f5f9;             /* 内容区底色 */
+  --panel: #ffffff;          /* 卡片 */
+  --line: #e6eaf2;           /* 常规描边 */
+  --line-strong: #d5dbe6;
+  --text: #1c2b3a;           /* 主文字 */
+  --text-2: #5b6b7f;         /* 次级文字 */
+  --text-3: #8a97a8;         /* 弱文字/占位 */
+  --pri: #2f6bff;            /* 主色 */
+  --pri-dark: #2456d6;
+  --pri-soft: #ecf2ff;       /* 主色浅底 */
+  --side: #0e1b30;           /* 侧栏深色 */
+  --side-2: #16263f;         /* 侧栏悬停 */
+  --ok: #16a34a;  --ok-bg: #e8f7ee;
+  --warn: #d97706; --warn-bg: #fdf3e3;
+  --err: #dc2626;  --err-bg: #fdecec;
+  --info: #0284c7; --info-bg: #e6f4fb;
+  /* ---- 形状与层级 ---- */
+  --r-card: 12px;
+  --r-ctl: 8px;
+  --shadow: 0 1px 2px rgba(15, 28, 46, .05), 0 1px 6px rgba(15, 28, 46, .04);
+  --shadow-pop: 0 12px 40px rgba(9, 20, 38, .22);
+  --mono: "Consolas", "JetBrains Mono", monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  font: 14px/1.6 "PingFang SC", "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+.num { font-variant-numeric: tabular-nums; }
+.mono { font-family: var(--mono); font-size: 13px; }
+.hidden { display: none !important; }
+
+/* ================= 通用元件 ================= */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 36px; padding: 0 18px;
+  border: 1px solid transparent; border-radius: var(--r-ctl);
+  background: var(--pri); color: #fff; cursor: pointer;
+  font: inherit; font-weight: 500; transition: background .15s;
+}
+.btn:hover { background: var(--pri-dark); }
+.btn.secondary { background: #fff; border-color: var(--line-strong); color: var(--text); }
+.btn.secondary:hover { border-color: var(--pri); color: var(--pri); background: var(--pri-soft); }
+.btn.danger { background: var(--err); }
+.btn.danger:hover { background: #b91c1c; }
+.btn.small { height: 30px; padding: 0 12px; font-size: 13px; }
+
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 22px; padding: 0 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 500; white-space: nowrap;
+}
+.pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.pill.ok   { color: var(--ok);   background: var(--ok-bg); }
+.pill.warn { color: var(--warn); background: var(--warn-bg); }
+.pill.err  { color: var(--err);  background: var(--err-bg); }
+.pill.info { color: var(--info); background: var(--info-bg); }
+.pill.dim  { color: var(--text-2); background: #eef1f6; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow);
+  padding: 20px;
+}
+.card > h3 {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 6px; font-size: 15px; font-weight: 600;
+}
+.card > h3 .bar { width: 3px; height: 14px; border-radius: 2px; background: var(--pri); }
+.card > .sub { margin: 0 0 16px; font-size: 12px; color: var(--text-3); }
+
+/* 指标卡：标签 + 大数 + 单位 */
+.metric { padding: 16px 18px; }
+.metric .k { font-size: 12px; color: var(--text-2); display: flex; align-items: center; gap: 6px; }
+.metric .v { margin-top: 6px; font-size: 26px; font-weight: 700; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.metric .v small { font-size: 13px; font-weight: 500; color: var(--text-2); margin-left: 3px; }
+.metric .v.ok { color: var(--ok); } .metric .v.warn { color: var(--warn); } .metric .v.err { color: var(--err); }
+.metric .foot { margin-top: 8px; font-size: 12px; color: var(--text-3); }
+
+/* 描述列表（键值对，非卡片阵列） */
+.desc-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 32px; margin: 0; }
+.desc-list > div { display: flex; justify-content: space-between; gap: 16px; padding: 9px 0; border-bottom: 1px dashed var(--line); }
+.desc-list > div:nth-last-child(-n+2) { border-bottom: 0; }
+.desc-list dt { color: var(--text-2); font-size: 13px; white-space: nowrap; }
+.desc-list dd { margin: 0; text-align: right; word-break: break-all; }
+
+/* 表格 */
+.tbl-wrap { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.tbl th { background: #f7f9fc; color: var(--text-2); font-weight: 600; text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.tbl td { padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.tbl tr:last-child td { border-bottom: 0; }
+.tbl tbody tr:hover { background: #f7faff; }
+
+/* 表单 */
+.field { display: block; }
+.field > span { display: block; font-size: 12px; color: var(--text-2); margin-bottom: 5px; }
+.field .ctl, input[type=text], input[type=number], input[type=password], select {
+  width: 100%; height: 36px; padding: 0 10px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-ctl);
+  font: inherit; color: var(--text); background: #fff; transition: border-color .15s, box-shadow .15s;
+}
+input:focus, select:focus { outline: none; border-color: var(--pri); box-shadow: 0 0 0 3px rgba(47,107,255,.13); }
+.field.chk { display: flex; align-items: center; gap: 8px; }
+.field.chk > span { margin: 0; }
+input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--pri); }
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(240px, 1fr)); gap: 14px 20px; }
+.group { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px 16px; }
+.group > h4 { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; font-size: 13px; color: var(--text); }
+.group > h4::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: var(--pri); }
+.group > h4 .key { font-family: var(--mono); font-size: 11px; color: var(--text-3); font-weight: 400; margin-left: auto; }
+
+/* 卡片底部操作条 */
+.actionbar {
+  position: sticky; bottom: 0; margin-top: 16px;
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px; border: 1px solid var(--line); border-radius: 10px;
+  background: #fff; box-shadow: 0 -4px 16px rgba(15,28,46,.06);
+}
+.actionbar .dirty { color: var(--warn); font-size: 13px; margin-right: auto; }
+.actionbar .ver { color: var(--text-3); font-size: 12px; }
+
+/* ================= 登录页 ================= */
+.login-stage {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px;
+  background:
+    radial-gradient(720px 420px at 82% -10%, rgba(47,107,255,.28), transparent 60%),
+    radial-gradient(560px 380px at -8% 108%, rgba(2,132,199,.20), transparent 60%),
+    linear-gradient(158deg, #0b1830 0%, #0f2748 58%, #123a6b 100%);
+  position: relative; overflow: hidden;
+}
+.login-stage::before {   /* 网格纹理 */
+  content: ""; position: absolute; inset: 0;
+  background:
+    repeating-linear-gradient(0deg, rgba(255,255,255,.045) 0 1px, transparent 1px 72px),
+    repeating-linear-gradient(90deg, rgba(255,255,255,.045) 0 1px, transparent 1px 72px);
+  mask-image: radial-gradient(900px 600px at 50% 40%, #000 30%, transparent 100%);
+}
+.login-card {
+  position: relative; width: 860px; max-width: 100%;
+  display: grid; grid-template-columns: 1.05fr 1fr;
+  background: #fff; border-radius: 16px; box-shadow: var(--shadow-pop); overflow: hidden;
+}
+.login-brand { padding: 44px 40px; color: #fff; background: linear-gradient(155deg, #17305c 0%, #101f3d 60%, #0d1830 100%); }
+.login-brand .row { display: flex; align-items: center; gap: 12px; }
+.login-brand h1 { margin: 0; font-size: 22px; letter-spacing: .5px; }
+.login-brand .en { font-size: 12px; color: #9db4d8; letter-spacing: 2px; margin-top: 2px; }
+.login-brand p.lead { margin: 26px 0 30px; font-size: 13px; line-height: 1.9; color: #c6d4ea; }
+.login-brand ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
+.login-brand li { display: flex; gap: 10px; font-size: 13px; color: #dbe6f7; }
+.login-brand li::before { content: ""; width: 6px; height: 6px; margin-top: 8px; border-radius: 50%; background: #4d82ff; box-shadow: 0 0 8px #4d82ff; }
+.login-brand .foot { margin-top: 34px; font-size: 11px; color: #7e93b5; }
+.login-form { padding: 44px 40px; }
+.login-form h2 { margin: 0 0 4px; font-size: 20px; }
+.login-form .sub { margin: 0 0 26px; font-size: 12px; color: var(--text-3); }
+.login-form .field { margin-bottom: 16px; }
+.login-form .btn { width: 100%; height: 40px; margin-top: 6px; font-size: 15px; }
+.login-form .hint { margin: 14px 0 0; font-size: 12px; color: var(--text-3); text-align: center; }
+
+/* ================= 应用布局 ================= */
+.app { display: flex; min-height: 100vh; }
+.side {
+  width: 224px; flex: 0 0 224px; display: flex; flex-direction: column;
+  background: var(--side); color: #c9d5e8;
+}
+.side .brand { display: flex; align-items: center; gap: 10px; padding: 18px 20px 16px; }
+.side .brand .name { color: #fff; font-size: 16px; font-weight: 700; letter-spacing: .5px; line-height: 1.2; }
+.side .brand .en { display: block; font-size: 10px; font-weight: 400; color: #7e93b5; letter-spacing: 1.5px; }
+.nav-list { flex: 1; padding: 6px 10px; display: grid; gap: 2px; align-content: start; }
+.nav-list button {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; height: 40px; padding: 0 12px;
+  border: 0; border-left: 3px solid transparent; border-radius: 8px;
+  background: none; color: #b9c7dd; cursor: pointer; font: inherit; text-align: left;
+}
+.nav-list button svg { width: 17px; height: 17px; flex: none; opacity: .85; }
+.nav-list button:hover { background: var(--side-2); color: #fff; }
+.nav-list button.active { background: rgba(47,107,255,.20); border-left-color: var(--pri); color: #fff; font-weight: 600; }
+.side .foot { padding: 12px 16px 14px; border-top: 1px solid rgba(255,255,255,.08); font-size: 12px; }
+.side .foot .ver { display: flex; justify-content: space-between; color: #7e93b5; margin-bottom: 8px; }
+.side .foot .ops { display: flex; gap: 8px; }
+.side .foot .ops button {
+  flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+  height: 30px; border: 1px solid rgba(255,255,255,.14); border-radius: 7px;
+  background: none; color: #b9c7dd; cursor: pointer; font: inherit; font-size: 12px;
+}
+.side .foot .ops button:hover { background: var(--side-2); color: #fff; }
+.side .foot .ops svg { width: 13px; height: 13px; }
+
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.topbar {
+  display: flex; align-items: center; gap: 16px;
+  min-height: 64px; padding: 0 28px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 5;
+}
+.topbar .tt h1 { margin: 0; font-size: 18px; font-weight: 700; }
+.topbar .tt .sub { font-size: 12px; color: var(--text-3); margin-top: 1px; }
+.topbar .right { margin-left: auto; display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--text-2); }
+.topbar .right .dot { color: var(--text-3); }
+.switch { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; user-select: none; }
+.switch input { display: none; }
+.switch .tk { width: 32px; height: 18px; border-radius: 999px; background: #cfd7e3; position: relative; transition: background .15s; }
+.switch .tk::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 2px rgba(0,0,0,.2); }
+.switch input:checked + .tk { background: var(--pri); }
+.switch input:checked + .tk::after { left: 16px; }
+
+.content { flex: 1; padding: 22px 28px 32px; max-width: 1400px; width: 100%; margin: 0 auto; }
+.grid { display: grid; gap: 16px; }
+.g4 { grid-template-columns: repeat(4, 1fr); }
+.g3 { grid-template-columns: repeat(3, 1fr); }
+.g2 { grid-template-columns: repeat(2, 1fr); }
+.row-flex { display: flex; gap: 16px; align-items: stretch; }
+.mt16 { margin-top: 16px; }
+
+/* 页脚水印 */
+.proto-mark { margin: 28px 0 0; text-align: center; font-size: 11px; color: var(--text-3); }
+
+/* 空态 */
+.empty { text-align: center; padding: 56px 20px; }
+.empty .ico {
+  width: 84px; height: 84px; margin: 0 auto 18px; border-radius: 50%;
+  background: var(--pri-soft); display: flex; align-items: center; justify-content: center; color: var(--pri);
+}
+.empty .ico svg { width: 36px; height: 36px; }
+.empty h3 { margin: 0 0 6px; font-size: 16px; }
+.empty p { margin: 0 0 16px; font-size: 13px; color: var(--text-2); }
+
+/* 通道卡（继电器/摄像机） */
+.chan { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; background: #fbfcfe; }
+.chan .hd { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.chan .hd .nm { font-weight: 600; font-size: 13px; }
+.chan .rows { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 18px; font-size: 13px; margin-bottom: 12px; }
+.chan .rows div { display: flex; justify-content: space-between; }
+.chan .rows span { color: var(--text-2); }
+.chan .ops { display: flex; gap: 8px; }
+.chan .ops .btn { flex: 1; height: 30px; font-size: 12.5px; padding: 0; }
+
+/* 统计小格 */
+.stat { padding: 10px 0; border-bottom: 1px dashed var(--line); display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
+.stat:last-child { border-bottom: 0; }
+.stat span { color: var(--text-2); }
+
+/* 配置页分类 tabs */
+.cats { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+.cats button {
+  height: 32px; padding: 0 16px; border-radius: 999px; cursor: pointer; font: inherit; font-size: 13px;
+  border: 1px solid var(--line-strong); background: #fff; color: var(--text-2);
+}
+.cats button.active { background: var(--pri); border-color: var(--pri); color: #fff; font-weight: 600; }
+
+@media (max-width: 1100px) {
+  .g4 { grid-template-columns: repeat(2, 1fr); }
+  .g3 { grid-template-columns: repeat(2, 1fr); }
+  .row-flex { flex-direction: column; }
+}
+</style>
+</head>
+<body>
+<!-- 全局渐变 defs：logo 在登录页与侧栏两处引用 -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#3b8bff"/><stop offset="1" stop-color="#1f6feb"/>
+  </linearGradient>
+</defs></svg>
+
+
+<!-- ==================== P0 登录（#/login） ==================== -->
+<section id="p-login" class="login-stage hidden">
+  <div class="login-card">
+    <div class="login-brand">
+      <div class="row">
+        <svg width="46" height="46" viewBox="0 0 64 64" aria-hidden="true">
+          <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#lg)"/>
+          <path d="M21 27v-3.5A3.5 3.5 0 0 1 24.5 20H28" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/>
+          <path d="M43 27v-3.5A3.5 3.5 0 0 0 39.5 20H36" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/>
+          <path d="M21 37v3.5A3.5 3.5 0 0 0 24.5 44H28" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/>
+          <path d="M43 37v3.5A3.5 3.5 0 0 1 39.5 44H36" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/>
+          <circle cx="32" cy="32" r="7.5" fill="none" stroke="#fff" stroke-width="3.6"/>
+          <circle cx="32" cy="32" r="2.6" fill="#fff"/>
+          <circle cx="47.5" cy="47.5" r="3" fill="#5ad8a6" stroke="#fff" stroke-width="1.4"/>
+        </svg>
+        <div>
+          <h1>IVSBox 运维终端</h1>
+          <div class="en">IVSBOX · FIELD MAINTENANCE CONSOLE</div>
+        </div>
+      </div>
+      <p class="lead">面向户外柜体的一体化运维设备：网络双链路、六路摄像机巡检、采集板电气量监测与远程运维通道，登录后一站查看。</p>
+      <ul>
+        <li>有线 / 无线双链路自动切换，链路状态实时可视</li>
+        <li>六路摄像机 PING / RTSP 巡检与 SNMP 采集</li>
+        <li>采集板电压、温湿度、箱门与三路继电器远控</li>
+        <li>GPS 定位与 NMEA 链路质量诊断</li>
+      </ul>
+      <div class="foot">TQ113-S4 · 固件 v1.4.0 · 出厂默认口令首次登录后须修改</div>
+    </div>
+    <form class="login-form" onsubmit="return false">
+      <h2>登录</h2>
+      <p class="sub">请使用运维账号登录设备管理界面</p>
+      <label class="field"><span>账号</span><input type="text" value="admin"></label>
+      <label class="field"><span>密码</span><input type="password" value="88888888"></label>
+      <button class="btn" type="submit">登 录</button>
+      <p class="hint">连续输错 5 次将锁定 10 分钟 · 忘记口令请联系维护人员</p>
+    </form>
+  </div>
+</section>
+
+<!-- ==================== 应用布局（其余页面） ==================== -->
+<div id="p-app" class="app hidden">
+  <aside class="side">
+    <div class="brand">
+      <svg width="30" height="30" viewBox="0 0 64 64" aria-hidden="true">
+        <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#lg)"/>
+        <path d="M21 27v-3.5A3.5 3.5 0 0 1 24.5 20H28" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/>
+        <path d="M43 27v-3.5A3.5 3.5 0 0 0 39.5 20H36" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/>
+        <path d="M21 37v3.5A3.5 3.5 0 0 0 24.5 44H28" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/>
+        <path d="M43 37v3.5A3.5 3.5 0 0 1 39.5 44H36" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/>
+        <circle cx="32" cy="32" r="7.5" fill="none" stroke="#fff" stroke-width="3.6"/>
+        <circle cx="32" cy="32" r="2.6" fill="#fff"/>
+      </svg>
+      <div class="name">IVSBox<span class="en">运维终端</span></div>
+    </div>
+    <nav class="nav-list" id="nav"></nav>
+    <div class="foot">
+      <div class="ver"><span>v1.4.0</span><span>admin</span></div>
+      <div class="ops">
+        <button type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/></svg>改密</button>
+        <button type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/></svg>退出</button>
+      </div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="tt"><h1 id="tt-name">总览</h1><div class="sub" id="tt-sub"></div></div>
+      <div class="right">
+        <span id="tb-link" class="pill ok">有线已连接</span>
+        <span class="dot">|</span>
+        <label class="switch"><input type="checkbox" checked><i class="tk"></i>自动刷新 5s</label>
+        <span class="dot">|</span>
+        <span class="num">更新于 <b id="tb-time">10:51:54</b></span>
+      </div>
+    </header>
+    <main class="content" id="view"></main>
+  </div>
+</div>
+
+<script>
+/* ================= 图标（Lucide v0.462.0，ISC） ================= */
+var I = function (inner) {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>';
+};
+var ICONS = {
+  overview: '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
+  net: '<rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/>',
+  gps: '<path d="M20 10c0 4.993-5.539 10.193-7.399 11.799a1 1 0 0 1-1.202 0C9.539 20.193 4 14.993 4 10a8 8 0 0 1 16 0"/><circle cx="12" cy="10" r="3"/>',
+  board: '<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/>',
+  camera: '<path d="M16.75 12h3.632a1 1 0 0 1 .894 1.447l-2.034 4.069a1 1 0 0 1-1.708.134l-2.124-2.97"/><path d="M17.106 9.053a1 1 0 0 1 .447 1.341l-3.106 6.211a1 1 0 0 1-1.342.447L3.61 12.3a2.92 2.92 0 0 1-1.3-3.91L3.69 5.6a2.92 2.92 0 0 1 3.92-1.3z"/><path d="M2 19h3.76a2 2 0 0 0 1.8-1.1L9 15"/><path d="M2 21v-4"/><path d="M7 9h.01"/>',
+  devices: '<rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>',
+  sw: '<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>',
+  media: '<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',
+  config: '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
+  maint: '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>'
+};
+
+/* ================= 导航与页头 ================= */
+var PAGES = [
+  { id: 'overview', name: '总览',   icon: 'overview', sub: '设备身份与版本 · 实时状态见各专项页' },
+  { id: 'net',      name: '网络',   icon: 'net',      sub: '链路判定、实际地址与平台服务器配置' },
+  { id: 'gps',      name: '定位',   icon: 'gps',      sub: 'GPS 定位结果与 NMEA 链路质量' },
+  { id: 'board',    name: '控制板', icon: 'board',    sub: '电气量监测与三路继电器远控' },
+  { id: 'camera',   name: '摄像机', icon: 'camera',   sub: '六路在线状态与检测 / 账号配置' },
+  { id: 'devices',  name: '设备档案', icon: 'devices', sub: '局域网 discovered 摄像机档案' },
+  { id: 'switch',   name: '交换机', icon: 'sw',       sub: '交换机参数、OID 槽位与 SNMP 采集' },
+  { id: 'media',    name: '媒体',   icon: 'media',    sub: '抓图 / 录像 / 视频读取（规划中）' },
+  { id: 'config',   name: '配置',   icon: 'config',   sub: '全量配置项与出厂默认值对照' },
+  { id: 'maint',    name: '运维',   icon: 'maint',    sub: '系统操作、检测自愈与阈值配置' }
+];
+
+/* ================= 演示数据（与 mock_server.mjs 同源） ================= */
+var DATA = {
+  link: { pill: 'ok', text: '有线已连接' },
+  overview: {
+    ver: '1.4.0', model: 'TQ113-S4 EVB1', soc: 'Allwinner T113-S4', sn: '1', snDefault: true,
+    idMac: '02:1c:6b:8a:33:d0', ethMac: '0e:2a:5f:44:c1:08', host: 'TQ113',
+    kernel: '5.4.61（armv7l）', up: '3 天 2 小时', time: '2026-10-19 10:51:54'
+  },
+  net: {
+    state: { text: '有线已连接', cls: 'ok' }, exit: '有线（eth0）',
+    mn1: { text: '正常', cls: 'ok' }, mn2: { text: '正常', cls: 'ok' },
+    eth0: { ip: '192.168.2.120', mask: '255.255.255.0', mac: '0e:2a:5f:44:c1:08' },
+    usb0: { ip: '10.47.158.22', mask: '255.255.255.248', mac: '1a:2b:3c:4d:5e:6f' },
+    gw: '192.168.2.1（eth0）'
+  },
+  gps: {
+    lon: '114.057868° E', lat: '22.543099° N', alt: '58.3 m', spd: '12.4 km/h',
+    crs: '273.5°', sat: '11', hdop: '0.9', utc: '2026-10-19 02:52:47',
+    age: '1 秒前', port: '/dev/ttyS1 · 已打开', rx: '1,246,860',
+    ok: '41,233', fix: '12,045', bad: '2 / 0', long: '0 / 341', sync: '1,180 / 3'
+  },
+  board: {
+    v: '23.6', a: '1.42', t: '32.5', h: '46.8',
+    relay: [
+      { n: 1, on: true,  v: '23.6 V', a: '0.82 A', p: '19.4 W', e: '48.20' },
+      { n: 2, on: false, v: '—',      a: '—',      p: '—',      e: '51.70' },
+      { n: 3, on: true,  v: '23.5 V', a: '0.31 A', p: '7.3 W',  e: '26.50' }
+    ],
+    ds: { text: '打开', cls: 'warn' }, apower: '33.5 W', akw: '126.4 kWh',
+    p: '-1', spd: '0', pa: '1', pv: '1', doors: '7',
+    lim: [['电压上限 hv', '260 V'], ['电压下限 lv', '180 V'], ['过流 ov', '10 A'],
+          ['温度上限 tu', '60 ℃'], ['温度下限 tl', '-10 ℃'], ['湿度上限 hu', '90 %'],
+          ['湿度下限 hl', '20 %'], ['姿态 sl', '30 °'], ['漏电流 ld', '5 mA']],
+    link: [['串口', '/dev/ttyS2 · 已打开'], ['数据年龄', '2 秒前'], ['完整帧 / 复位', '18,234 / 1'],
+           ['收 / 发字节', '1,246,800 / 98,234'], ['CRC 错 / 帧尾错', '2 / 0'],
+           ['下行轮询 / 上报 / 心跳', '9,102 / 1,440 / 2,880'], ['查询应答 / 队列', '5,220 / 0']]
+  },
+  cams: [
+    { n: 1, s: '正常', cls: 'ok', ip: '192.168.2.201' }, { n: 2, s: '正常', cls: 'ok', ip: '192.168.2.202' },
+    { n: 3, s: '故障', cls: 'err', ip: '192.168.2.203' }, { n: 4, s: '正常', cls: 'ok', ip: '192.168.2.204' },
+    { n: 5, s: '延时', cls: 'warn', ip: '192.168.2.205' }, { n: 6, s: '正常', cls: 'ok', ip: '192.168.2.206' }
+  ],
+  devices: [
+    { b: 'Hikvision', ip: '192.168.2.201', mac: '44:47:cc:11:22:33', m: 'DS-2CD3T46WD', s: 'D72135482', p: '554', f: 'ONVIF' },
+    { b: 'Hikvision', ip: '192.168.2.202', mac: '44:47:cc:11:22:44', m: 'DS-2DE4223IW', s: 'D72135483', p: '554', f: 'ONVIF' },
+    { b: 'Dahua', ip: '192.168.2.203', mac: '3c:ef:8c:aa:bb:55', m: 'DH-IPC-HFW2449M', s: '4L08C9PAG', p: '554', f: '端口扫描' }
+  ],
+  snmp: [
+    ['sysDescr', '系统描述', 'IPC_HX5X 4.0.build 211116'],
+    ['sysUpTime', '运行时长', '18 天 4:32:11'],
+    ['cpuPercent', 'CPU 使用率', '23 %'],
+    ['memUsed', '内存已用', '41 %']
+  ]
+};
+
+/* ================= 小工具 ================= */
+function h(html) { document.getElementById('view').innerHTML = html; }
+function metric(k, v, unit, cls, foot) {
+  return '<div class="card metric"><div class="k">' + k + '</div><div class="v num ' + (cls || '') + '">' +
+         v + (unit ? '<small>' + unit + '</small>' : '') + '</div>' + (foot || '') + '</div>';
+}
+function pill(cls, text) { return '<span class="pill ' + cls + '">' + text + '</span>'; }
+function dlist(pairs) {
+  return '<dl class="desc-list">' + pairs.map(function (p) {
+    return '<div><dt>' + p[0] + '</dt><dd class="num">' + p[1] + '</dd></div>';
+  }).join('') + '</dl>';
+}
+function group(title, key, fields) {
+  return '<div class="group"><h4>' + title + (key ? '<span class="key">' + key + '</span>' : '') +
+         '</h4><div class="form-grid">' + fields + '</div></div>';
+}
+function fld(label, val, type) {
+  return '<label class="field"><span>' + label + '</span><input type="' + (type || 'text') + '" value="' + val + '"></label>';
+}
+function chk(label, on) {
+  return '<label class="field chk"><input type="checkbox"' + (on ? ' checked' : '') + '><span>' + label + '</span></label>';
+}
+function actionbar(dirty, ver) {
+  return '<div class="actionbar"><span class="dirty">' + (dirty || '暂无改动') + '</span>' +
+         '<span class="ver">' + ver + '</span>' +
+         '<button class="btn secondary small" type="button">重新载入</button>' +
+         '<button class="btn small" type="button">保存修改</button></div>';
+}
+
+/* ================= 各页面 ================= */
+var VIEWS = {
+
+overview: function () {
+  var o = DATA.overview;
+  h(
+    '<div class="grid g4">' +
+      metric('软件版本', o.ver, '', '', '<div class="foot">' + o.model + '</div>') +
+      metric('运行时长', o.up, '', '', '<div class="foot">自 2026-10-16 08:49 起</div>') +
+      metric('系统时间', '<span style="font-size:20px">' + o.time + '</span>', '', '', '<div class="foot">与浏览器同步于 10:51</div>') +
+      metric('设备 SN', o.sn, '', 'warn', '<div class="foot"><span class="pill warn">出厂默认值 · 未做工厂写入</span></div>') +
+    '</div>' +
+    '<div class="grid g2 mt16">' +
+      '<div class="card"><h3><span class="bar"></span>设备身份</h3><p class="sub">读取自工厂身份分区与系统</p>' +
+        dlist([['硬件型号', o.model], ['主控芯片', o.soc], ['身份 MAC', '<span class="mono">' + o.idMac + '</span>'],
+               ['网口 MAC（eth0）', '<span class="mono">' + o.ethMac + '</span>'], ['主机名', o.host], ['内核版本', o.kernel]]) +
+      '</div>' +
+      '<div class="card"><h3><span class="bar"></span>写入设备身份</h3>' +
+        '<p class="sub">⚠ 改的是「身份 MAC」，不是网口 MAC；只填一项则另一项不变；写入后需重启才对远程通道生效。</p>' +
+        '<div class="form-grid">' + fld('设备 ID（1~6 位 HEX）', o.sn, 'text') + fld('设备 MAC', o.idMac) + '</div>' +
+        '<div class="actionbar"><span class="dirty" style="color:var(--text-3)">写入工厂身份分区</span>' +
+        '<button class="btn small" type="button">写入身份</button></div>' +
+      '</div>' +
+    '</div>' +
+    '<p class="proto-mark">重设计原型 · 总览 —— 演示数据，非真实设备</p>'
+  );
+},
+
+net: function () {
+  var n = DATA.net;
+  h(
+    '<div class="grid g4">' +
+      metric('网络状态', '<span style="font-size:18px">' + n.state.text + '</span>', '', '', '<div class="foot">' + pill(n.state.cls, '链路判定 · 带迟滞') + '</div>') +
+      metric('活动出口', '<span style="font-size:18px">' + n.exit + '</span>', '', '', '<div class="foot">出口绑定：传输层 SO_BINDTODEVICE</div>') +
+      metric('主网1', '<span style="font-size:18px">' + n.mn1.text + '</span>', '', '', '<div class="foot">' + pill(n.mn1.cls, '探测 ' + '47.104.250.225') + '</div>') +
+      metric('主网2', '<span style="font-size:18px">' + n.mn2.text + '</span>', '', '', '<div class="foot">' + pill(n.mn2.cls, '探测 114.114.114.114') + '</div>') +
+    '</div>' +
+    '<div class="grid g2 mt16">' +
+      '<div class="card"><h3><span class="bar"></span>有线网口 eth0</h3><p class="sub">内核实际地址 · 与下方配置无关</p>' +
+        dlist([['状态', pill('ok', '已连接')], ['IPv4 地址', '<span class="mono">' + n.eth0.ip + '</span>'],
+               ['子网掩码', '<span class="mono">' + n.eth0.mask + '</span>'], ['MAC', '<span class="mono">' + n.eth0.mac + '</span>']]) +
+      '</div>' +
+      '<div class="card"><h3><span class="bar"></span>无线网口 usb0（4G）</h3><p class="sub">内核实际地址</p>' +
+        dlist([['状态', pill('ok', '已连接')], ['IPv4 地址', '<span class="mono">' + n.usb0.ip + '</span>'],
+               ['子网掩码', '<span class="mono">' + n.usb0.mask + '</span>'], ['MAC', '<span class="mono">' + n.usb0.mac + '</span>']]) +
+      '</div>' +
+    '</div>' +
+    '<div class="card mt16"><h3><span class="bar"></span>网络参数</h3>' +
+      '<p class="sub">本机 IP / 掩码 / 网关留空＝不在此指定（由系统网络配置决定），实际生效值见上方网口卡片。</p>' +
+      group('本机网络', 'net.*', fld('本机 IP 地址（空＝DHCP）', '') + fld('子网掩码（空＝DHCP）', '') + fld('网关 IP（空＝DHCP）', '') + fld('传输模式', '4')) +
+      '<div class="mt16"></div>' +
+      group('平台服务器', 'net.server.*',
+        fld('有线平台地址', '47.104.250.225') + fld('有线平台端口', '6012', 'number') +
+        fld('无线平台地址', '47.104.250.225') + fld('无线平台端口', '6012', 'number') +
+        fld('升级服务器地址', '47.104.98.214') + fld('升级服务器端口', '8989', 'number')) +
+      actionbar('已改动 1 项', '共 14 项 · 版本 42') +
+    '</div>' +
+    '<p class="proto-mark">重设计原型 · 网络 —— 演示数据，非真实设备</p>'
+  );
+},
+
+gps: function () {
+  var g = DATA.gps;
+  h(
+    '<div class="row-flex">' +
+      '<div class="card" style="flex:1.2"><h3><span class="bar"></span>定位结果</h3><p class="sub">' + pill('ok', '已定位 · GPS') + '　' + pill('info', '数据时延 ' + g.age) + '</p>' +
+        '<div style="display:flex;gap:28px;margin:6px 0 14px">' +
+          '<div><div class="k" style="font-size:12px;color:var(--text-2)">纬度</div><div class="num mono" style="font-size:24px;font-weight:700">' + g.lat + '</div></div>' +
+          '<div><div class="k" style="font-size:12px;color:var(--text-2)">经度</div><div class="num mono" style="font-size:24px;font-weight:700">' + g.lon + '</div></div>' +
+        '</div>' +
+        dlist([['海拔', g.alt], ['地面速度', g.spd], ['航向', g.crs], ['UTC 时间', g.utc]]) +
+      '</div>' +
+      '<div class="card" style="flex:1"><h3><span class="bar"></span>信号与链路</h3><p class="sub">串口 ' + g.port + '</p>' +
+        '<div class="grid g3" style="gap:10px">' +
+          metric('卫星数', g.sat, '', '', '') + metric('HDOP', g.hdop, '', '', '') + metric('时延', g.age, '', 'ok', '') +
+        '</div>' +
+        '<div class="mt16"></div>' +
+        dlist([['累计收到字节', g.rx], ['定位更新', g.fix]]) +
+      '</div>' +
+    '</div>' +
+    '<div class="card mt16"><h3><span class="bar"></span>链路与解析统计</h3><p class="sub">累计计数 · 用于现场排障（收不到字节＝线/波特率；有字节不定位＝天线/遮蔽）</p>' +
+      '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>解析成功语句</th><th>校验错 / 结构错</th><th>超长丢弃 / 噪声字节</th><th>校时（成功 / 被拒）</th></tr></thead>' +
+      '<tbody><tr class="num"><td>' + g.ok + '</td><td>' + g.bad + '</td><td>' + g.long + '</td><td>' + g.sync + '</td></tr></tbody></table></div>' +
+    '</div>' +
+    '<p class="proto-mark">重设计原型 · 定位 —— 演示数据，非真实设备</p>'
+  );
+},
+
+board: function () {
+  var b = DATA.board;
+  var rel = b.relay.map(function (r) {
+    return '<div class="chan"><div class="hd"><span class="nm">第 ' + r.n + ' 路 · 电源口 port ' + (r.n - 1) + '</span>' +
+      (r.on ? pill('ok', '吸合（开）') : pill('dim', '断开（关）')) + '</div>' +
+      '<div class="rows num"><div><span>电压</span><b>' + r.v + '</b></div><div><span>电流</span><b>' + r.a + '</b></div>' +
+      '<div><span>功率</span><b>' + r.p + '</b></div><div><span>电量</span><b>' + r.e + '</b></div></div>' +
+      '<div class="ops"><button class="btn small" type="button">吸合</button>' +
+      '<button class="btn secondary small" type="button">断开</button></div></div>';
+  }).join('');
+  h(
+    '<div class="grid g4">' +
+      metric('输入电压 V', b.v, 'V') + metric('输入电流 A', b.a, 'A') +
+      metric('箱内温度 T', b.t, '℃') + metric('箱内湿度 H', b.h, '%') +
+    '</div>' +
+    '<div class="card mt16"><h3><span class="bar"></span>三路继电器</h3>' +
+      '<p class="sub">状态口径：吸合＝1 / 断开＝2（与箱门 DS 相反）· 控制走 0xD1 · 下发后自动回读（采集板镜像可能滞后一拍）</p>' +
+      '<div class="grid g3">' + rel + '</div></div>' +
+    '<div class="grid g2 mt16">' +
+      '<div class="card"><h3><span class="bar"></span>运行参数</h3><p class="sub">键名照搬 0xE1 应答，便于对照《单片机通信》</p>' +
+        dlist([['箱门 DS', pill(b.ds.cls, b.ds.text)], ['总功率 APOWER', b.apower], ['总用电量 AKW', b.akw],
+               ['姿态 P', b.p], ['防雷 SPD', b.spd], ['设备供电 PA', b.pa],
+               ['输入电压状态 PV', b.pv], ['累计开门次数', b.doors]]) +
+      '</div>' +
+      '<div class="card"><h3><span class="bar"></span>通信链路</h3><p class="sub">0xF1 链路质量与协议计数</p>' +
+        dlist(b.link.map(function (r) { return [r[0], r[1]]; })) +
+      '</div>' +
+    '</div>' +
+    '<div class="card mt16"><h3><span class="bar"></span>告警阈值</h3><p class="sub">随 0xE1 应答与 0xF1 下发共用同一批字段 · 修改请到「运维」页</p>' +
+      '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>阈值项</th><th>当前值</th><th>阈值项</th><th>当前值</th></tr></thead><tbody class="num">' +
+      (function () { var s = ''; for (var i = 0; i < 5; i++) { var a = b.lim[i], c = b.lim[i + 5]; if (!a) break; s += '<tr><td>' + a[0] + '</td><td>' + a[1] + '</td><td>' + (c ? c[0] : '') + '</td><td>' + (c ? c[1] : '') + '</td></tr>'; } return s; })() +
+      '</tbody></table></div></div>' +
+    '<p class="proto-mark">重设计原型 · 控制板 —— 演示数据，非真实设备</p>'
+  );
+},
+
+camera: function () {
+  var cards = DATA.cams.map(function (c) {
+    return '<div class="chan" style="text-align:left"><div class="hd"><span class="nm">摄像机 ' + c.n + '</span>' + pill(c.cls, c.s) + '</div>' +
+           '<div class="rows" style="grid-template-columns:1fr"><div><span>IP</span><b class="mono">' + c.ip + '</b></div></div></div>';
+  }).join('');
+  h(
+    '<div class="card"><h3><span class="bar"></span>六路实时状态</h3><p class="sub">检测方式 PING · 判定口径：0 无IP / 1 正常 / 2 故障 / 4 延时 / 5 丢包</p>' +
+      '<div class="grid g3">' + cards + '</div></div>' +
+    '<div class="card mt16"><h3><span class="bar"></span>检测与账号配置</h3>' +
+      '<p class="sub">改动后统一保存（带版本号提交）· 口令字段存 SM4 密文</p>' +
+      group('检测方式', 'camera.detect.*', fld('检测方式', '1（PING）') + fld('延时判定阈值（毫秒）', '200', 'number')) +
+      '<div class="mt16"></div>' +
+      group('摄像机 SNMP', 'camera.snmp.*', chk('SNMP 采集开关', true) + fld('团体字（读）', 'public') + fld('事务超时（毫秒）', '1500', 'number') + fld('重试次数', '1', 'number')) +
+      '<div class="mt16"></div>' +
+      group('通道 · 第 1 路', 'camera.ch.0',
+        fld('厂商', 'Hikvision') + fld('IP', '192.168.2.201') + fld('MAC', '44:47:cc:11:22:33') + fld('用户名', 'admin') +
+        fld('口令（SM4 密文）', '', 'password') + chk('是否录像', true) + fld('码流类型', 'main') + fld('拉流地址', '')) +
+      actionbar('已改动 1 项', '共 78 项 · 版本 42') +
+    '</div>' +
+    '<p class="proto-mark">重设计原型 · 摄像机 —— 演示数据，非真实设备</p>'
+  );
+},
+
+devices: function () {
+  var rows = DATA.devices.map(function (d) {
+    return '<tr><td>' + pill('info', d.b) + '</td><td class="mono">' + d.ip + '</td><td class="mono">' + d.mac + '</td>' +
+           '<td>' + d.m + '</td><td class="num">' + d.s + '</td><td class="num">' + d.p + '</td><td>' + pill('dim', d.f) + '</td></tr>';
+  }).join('');
+  h(
+    '<div class="card"><div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">' +
+      '<h3 style="margin:0"><span class="bar"></span>已发现设备</h3><span class="pill dim">3 台</span>' +
+      '<span style="margin-left:auto"></span>' +
+      '<button class="btn small" type="button">重新搜索摄像机</button></div>' +
+      '<p class="sub">由 ONVIF 探测与端口扫描发现 · 点击「重新搜索」后稍等片刻再刷新</p>' +
+      '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>品牌</th><th>IP</th><th>MAC</th><th>型号</th><th>序列号</th><th>端口</th><th>发现方式</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table></div></div>' +
+    '<p class="proto-mark">重设计原型 · 设备档案 —— 演示数据，非真实设备</p>'
+  );
+},
+
+switch: function () {
+  var oidRows = [['sysDescr', '系统描述', '1.3.6.1.2.1.1.1.0'], ['sysUpTime', '运行时长', '1.3.6.1.2.1.1.3.0'],
+    ['ifDescr', '端口描述（表列）', '1.3.6.1.2.1.2.2.1.2'], ['ifSpeed', '端口速率（表列）', '1.3.6.1.2.1.2.2.1.5'],
+    ['ifOperStatus', '端口物理态（表列）', '1.3.6.1.2.1.2.2.1.8'], ['ifInOctets', '端口入字节（表列）', '1.3.6.1.2.1.2.2.1.10'],
+    ['ifOutOctets', '端口出字节（表列）', '1.3.6.1.2.1.2.2.1.16']]
+    .map(function (r) { return '<tr><td class="mono">' + r[0] + '</td><td>' + r[1] + '</td><td class="mono">' + r[2] + '</td></tr>'; }).join('');
+  var snmpRows = DATA.snmp.map(function (r) {
+    return '<tr><td class="mono">' + r[0] + '</td><td>' + r[1] + '</td><td class="num">' + r[2] + '</td></tr>';
+  }).join('');
+  h(
+    '<div class="card"><h3><span class="bar"></span>交换机参数</h3>' +
+      group('基础信息', 'switch.*', fld('交换机 IP', '192.168.2.2') + fld('品牌', 'H3C') + fld('型号', 'S5130S-28P')) +
+      '<div class="mt16"></div>' +
+      group('SNMP 采集', 'switch.snmp.*', chk('采集开关', true) + fld('端口', '161', 'number') + fld('团体字（读）', 'public') + fld('事务超时（毫秒）', '1500', 'number') + fld('重试次数', '1', 'number')) +
+      '<div class="mt16"></div>' +
+      '<h3><span class="bar"></span>OID 槽位</h3><p class="sub">槽位名即语义（厂家中立）· 值按实际机型填 · 值不带末尾 .0 的为表列，按端口遍历展开</p>' +
+      '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>槽位</th><th>含义</th><th>OID</th></tr></thead><tbody>' + oidRows + '</tbody></table></div>' +
+      actionbar('暂无改动', '共 18 项 · 版本 42') +
+    '</div>' +
+    '<div class="card mt16"><h3><span class="bar"></span>SNMP 采集结果</h3>' +
+      '<p class="sub">' + pill('info', '状态：就绪') + '　最近采集 10:48:22</p>' +
+      '<div style="display:flex;gap:10px;margin-bottom:14px"><button class="btn small" type="button">采集摄像机</button>' +
+      '<button class="btn secondary small" type="button">采集交换机</button></div>' +
+      '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>槽位</th><th>含义</th><th>取值</th></tr></thead><tbody>' + snmpRows + '</tbody></table></div></div>' +
+    '<p class="proto-mark">重设计原型 · 交换机 —— 演示数据，非真实设备</p>'
+  );
+},
+
+media: function () {
+  h(
+    '<div class="card"><div class="empty">' +
+      '<div class="ico">' + I(ICONS.media) + '</div>' +
+      '<h3>媒体功能尚未启用</h3><p>抓图 / 录像 / 视频读取属 M6 阶段交付，当前版本未装配。启用后可在此查看与调取媒体资源。</p>' +
+      '<span class="pill dim">规划：M6</span></div></div>' +
+    '<p class="proto-mark">重设计原型 · 媒体 —— 空态设计</p>'
+  );
+},
+
+config: function () {
+  var cats = ['sys 基础参数', 'net 本机网络', 'probe 检测探活', 'camera 摄像机', 'switch 交换机', 'elec 电阈值', 'netthr 网络阈值', 'sensor 传感器'];
+  var chips = cats.map(function (c, i) {
+    return '<button type="button" class="' + (i === 3 ? 'active' : '') + '">' + c + '</button>';
+  }).join('');
+  var defs = [['camera.detect.mode', 'int', '1'], ['camera.detect.rtt_ms', 'int', '200'], ['camera.snmp.enable', 'bool', 'false'],
+    ['camera.snmp.community', 'str', 'public'], ['camera.ch.0.vendor', 'str', ''], ['camera.ch.0.record', 'bool', 'false'],
+    ['camera.rec.hold_ms', 'int', '10000'], ['camera.rec.debounce_ms', 'int', '60000']]
+    .map(function (r) { return '<tr><td class="mono">' + r[0] + '</td><td>' + r[1] + '</td><td class="num">' + (r[2] || '""') + '</td></tr>'; }).join('');
+  h(
+    '<div class="card">' +
+      '<div class="cats">' + chips + '</div>' +
+      '<p class="sub">原始视图：所选分类下的全部配置键 · 改动后保存会带版本号提交（版本冲突时提示刷新）· 悬停输入框可见配置键名</p>' +
+      group('摄像机检测', 'camera.detect.*', fld('检测方式（1=PING 2=端口扫描 3=RTSP）', '1', 'number') + fld('延时判定阈值（毫秒）', '200', 'number')) +
+      '<div class="mt16"></div>' +
+      group('断网录像（全局时间参数）', 'camera.rec.*', fld('断网开录保持（毫秒）', '10000', 'number') + fld('复网停录去抖（毫秒）', '60000', 'number')) +
+      '<div class="mt16"></div>' +
+      group('通道 · 第 1 路', 'camera.ch.0',
+        fld('厂商', 'Hikvision') + fld('IP', '192.168.2.201') + fld('用户名', 'admin') + chk('是否录像', true)) +
+      actionbar('已改动 1 项', '摄像机 78 项 / 全部 194 项 · 版本 42') +
+    '</div>' +
+    '<div class="card mt16"><h3><span class="bar"></span>出厂默认值对照</h3><p class="sub">与配置文件注释同源 · 用于核对现场是否被改过</p>' +
+      '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>配置键</th><th>类型</th><th>出厂默认</th></tr></thead><tbody>' + defs + '</tbody></table></div></div>' +
+    '<p class="proto-mark">重设计原型 · 配置 —— 演示数据，非真实设备</p>'
+  );
+},
+
+maint: function () {
+  h(
+    '<div class="grid g3">' +
+      '<div class="card metric"><div class="k">同步本机时间</div><p class="sub" style="margin:8px 0 14px">把浏览器时间写入设备（NTP 不可用时的兜底）</p><button class="btn secondary small" type="button">立即同步</button></div>' +
+      '<div class="card metric"><div class="k">搜索摄像机</div><p class="sub" style="margin:8px 0 14px">触发一轮 ONVIF / 端口扫描发现</p><button class="btn secondary small" type="button">开始搜索</button></div>' +
+      '<div class="card metric" style="border-color:#f3c2c2;background:#fffbfb"><div class="k" style="color:var(--err)">重启设备</div><p class="sub" style="margin:8px 0 14px">现场业务会中断，需二次确认</p><button class="btn danger small" type="button">重启…</button></div>' +
+    '</div>' +
+    '<div class="card mt16"><h3><span class="bar"></span>检测与自愈</h3>' +
+      group('网络阈值', 'netthr.*', fld('网络超时时间（毫秒）', '2000', 'number') + fld('丢包次数上限', '3', 'number') + fld('自愈重启次数上限（0＝禁用）', '0', 'number') + fld('重启最短间隔（秒）', '60', 'number')) +
+      '<div class="mt16"></div>' +
+      group('检测探活', 'probe.*', fld('主网检测 IP 1', '47.104.250.225') + fld('主网检测 IP 2', '114.114.114.114') + fld('探测周期（毫秒）', '5000', 'number') + fld('单次超时（毫秒）', '2000', 'number') + fld('连续失败上限', '3', 'number')) +
+      actionbar('暂无改动', '共 9 项 · 版本 42') +
+    '</div>' +
+    '<div class="card mt16"><h3><span class="bar"></span>电阈值与传感器</h3>' +
+      group('电阈值', 'elec.*', fld('电压上限（V）', '260', 'number') + fld('电压下限（V）', '180', 'number') + fld('过流阈值（A）', '10', 'number') + fld('漏电流阈值（mA）', '5', 'number') + fld('功率阈值（W）', '100', 'number')) +
+      '<div class="mt16"></div>' +
+      group('传感器阈值', 'sensor.*', fld('倾斜度（度）', '30', 'number') + fld('温度上限（℃）', '60', 'number') + fld('温度下限（℃）', '-10', 'number') + fld('湿度上限（%）', '90', 'number') + fld('湿度下限（%）', '20', 'number')) +
+      actionbar('暂无改动', '共 10 项 · 版本 42') +
+    '</div>' +
+    '<p class="proto-mark">重设计原型 · 运维 —— 演示数据，非真实设备</p>'
+  );
+}
+};
+
+/* ================= 路由 ================= */
+function buildNav() {
+  document.getElementById('nav').innerHTML = PAGES.map(function (p) {
+    return '<button type="button" data-p="' + p.id + '" class="' + '">' + I(ICONS[p.icon]) + '<span>' + p.name + '</span></button>';
+  }).join('');
+  document.getElementById('nav').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (b) location.hash = '#/' + b.dataset.p;
+  });
+}
+function route() {
+  var id = (location.hash || '#/login').replace('#/', '');
+  var page = PAGES.find(function (p) { return p.id === id; });
+  document.getElementById('p-login').classList.toggle('hidden', !!page);
+  document.getElementById('p-app').classList.toggle('hidden', !page);
+  if (!page) return;
+  document.querySelectorAll('#nav button').forEach(function (b) {
+    b.classList.toggle('active', b.dataset.p === id);
+  });
+  document.getElementById('tt-name').textContent = page.name;
+  document.getElementById('tt-sub').textContent = page.sub;
+  document.getElementById('tb-link').className = 'pill ' + DATA.link.pill;
+  document.getElementById('tb-link').textContent = DATA.link.text;
+  document.getElementById('tb-time').textContent = new Date().toTimeString().slice(0, 8);
+  VIEWS[id]();
+}
+buildNav();
+window.addEventListener('hashchange', route);
+route();
+</script>
+</body>
+</html>

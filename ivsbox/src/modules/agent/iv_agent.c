@@ -1171,6 +1171,31 @@ int iv_agent_active_ifindex(const iv_agent_t *a)
     return (a != NULL) ? iv_netmgr_active_ifindex(&a->nm) : 0;
 }
 
+/* 活动出口的**接口名**（"usb0"/"eth0"，来自配置 `net.wan.*.name`）。
+ * 只给 "wired"/"wireless" 不够用：Web 要直接显示"当前通信网口"，现场看的是网口名。
+ * 名字是配置里的值，不是内核枚举出来的，所以空串＝该 WAN 没配名字。 */
+const char *iv_agent_active_wan_name(const iv_agent_t *a)
+{
+    iv_wan_t w;
+
+    if (a == NULL || !a->opened)
+        return "";
+    w = iv_netmgr_active_wan(&a->nm);
+    if ((int)w < 0 || (int)w >= IV_WAN_N)
+        return "";
+    return a->cfg.wan_name[w];
+}
+
+uint64_t iv_agent_netmgr_switches(const iv_agent_t *a)
+{
+    return (a != NULL) ? iv_netmgr_switches(&a->nm) : 0u;
+}
+
+uint64_t iv_agent_netmgr_txn_fail(const iv_agent_t *a)
+{
+    return (a != NULL) ? iv_netmgr_txn_fail(&a->nm) : 0u;
+}
+
 iv_report_t *iv_agent_report(iv_agent_t *a)
 {
     return (a != NULL) ? &a->rp : NULL;

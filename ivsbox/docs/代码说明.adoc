@@ -3119,6 +3119,129 @@ EC200G 那份做的是：`stty` 原始模式 → `AT+QCFG="usbnet"` 确认 ECM�
 要补的是**掉线重拨**（监听 `usb0` carrier／`AT+QNETDEVSTATUS` 为 0 就重拨），
 落点可以放 udev 脚本外面、也可以由 `ivsboxd` 接管；采用哪种要用户拍板，不在本步范围内。
 
+== 2026-10-19 10:57 Web 展示「当前通信网口」
+
+=== 要解决的问题不是"没显示状态"，是"显示的不是出口"
+
+上一节把**出口**绑进了传输层（`SO_BINDTODEVICE`），但这件事在界面上完全看不见。
+网络页当时只有两类东西：链路的 `up/down`，和两个 WAN 各自的 IP。
+「此刻报文到底从哪张网卡出去」既不在页面上，也不在任何接口里 ——
+只能翻日志（`server addr -> ... (wan=eth0)`）或者上板 `netstat -tn` 看源地址。
+
+这就让双 WAN 自动切换变成一个**无法在界面上自证**的功能：页面显示 `eth0` 有 IP、`usb0` 也有 IP，
+两个都对，但哪一个在发报文，看不出来。「4G 优先」的验收因此只能靠命令行。
+
+=== 为什么给的是网口名，不是 wired/wireless
+
+`iv_agent_active_wan_name()` 返回的是配置里 `net.wan.<w>.name` 的**接口名字符串**
+（`"usb0"`／`"eth0"`），而不是把 `iv_wan_t` 枚举翻成 `wired`/`wireless` 直接给前端。
+
+原因是现场排障时的动作固定是「拿页面上的值去跟 `ip addr` 对照」。
+只给 `wired`，用户还得自己知道 `wired` 对应 `eth0`；给名字就能一眼对上。
+枚举值另外单独给一个 `kind` 字段，用来上色和打标签 —— 两个字段各司其职，不互相顶替。
+
+**未装配、或该 WAN 没配名字时返回空串，不返回 `NULL`** —— 调用方不需要判空，
+少一个空指针分支就少一处漏判。
+
+顺带补了两个读数：`iv_agent_netmgr_switches()`（累计成功切换次数）和
+`iv_agent_netmgr_txn_fail()`（累计事务失败次数）。只给"当前状态"是不够的：
+「一直是 usb0」和「切到 eth0 又切回 usb0」在界面上长得完全一样，
+而后者正是要观察的场景。
+
+=== `net.wan` 字段与 `bound_ok` 的分工
+
+`sys.overview` 的 `net` 段下新增 `wan` 对象：
+
+[cols="2,5",options="header"]
+|===
+|字段 |含义
+
+|`ifname` / `kind` / `ifindex`
+|当前活动网口：接口名、`wired`/`wireless`、内核 ifindex。
+
+|`bound` / `bound_ok`
+|传输层**实际**绑定的网口，以及它与 `ifname` 是否一致。
+
+|`transport`
+|平台连接状态：`up` / `connecting` / `down` / `closed` / `unknown`。
+
+|`server` / `port`
+|平台地址。
+
+|`queue`
+|待发送队列条数（积压时这里会涨）。
+
+|`switches` / `txn_fail`
+|累计出口切换次数 ／ 累计事务失败次数。
+
+|`bind_fail` / `bind_errno`
+|绑定失败次数与最后一次的 `errno`（`SO_BINDTODEVICE` 失败只计数不阻断）。
+|===
+
+**`bound_ok` 由后端一次算好，前端不做字符串比较。**
+它是 `(ifname 非空 && strcmp(ifname, bound) == 0)`。
+「该从哪出去」和「实际绑在哪」是否一致，这是个**判定**，不是事实；
+判定放在后端只有一处实现，放前端就会变成每加一个消费者复制一遍 ——
+设备身份那次已经吃过一次"`mac` 一边给 `null` 一边给全零"的亏，同一个结论两处实现必然分叉。
+
+`transport` 枚举翻字符串也放在后端（`transport_state_name()`），前端只查表不抄表。
+
+=== 页面：新增一张卡，而不是往旧卡里塞行
+
+「链路状态」卡当时有一行「活动出口」，语义是"判定"；新一列要放的是"出口"，
+两者混在一张卡里会让人以为它们是同一层的信息。所以：
+
+* 新增「**平台通信（只读）**」卡，放在「链路状态」与「当前生效」之间 ——
+  读的顺序正好是「链路通不通 → 报文从哪出 → 配置里写的是什么」。
+* 卡片标 **（只读）**：这些值没有一个是能在这里改的，避免用户找编辑入口。
+* 原「活动出口」那一行**移进新卡**并删除，同一事实不重复展示。
+* 7 行内容：当前通信网口（`usb0` ＋ `无线`）、平台连接、传输层实际绑定、
+  平台地址、待发送队列、累计出口切换（含失败次数）、绑定失败（`bind_fail` 非 0 才出现，带 `errno`）。
+* 不一致时**写明不一致**：绑定口与通信网口不同时，行末标「与通信网口不一致」；
+  完全没绑时写「未绑定，走内核默认路由」—— 这两种情况都是**功能退化但仍然能通**，
+  界面上不能显示得像一切正常。
+
+=== 验证
+
+单元与集成：`test_agent_board` 的 b08 加七条，钉住 `net.wan` 块存在、
+`ifname` 取自配置的 `wan_name`（host 初始态是 `usb0`）、`kind` 初始 `wireless`（AUTO 无线优先），
+以及 `bound_ok`／`transport`／`queue`／`switches` 四个字段存在。
+
+反向证伪两条（编译干净、还原后 md5 一致、用例复绿）：
+
+* `ifname` 写死 `"eth0"` ⇒ 只 FAIL `b08 net.wan.ifname comes from configured wan_name`。
+* 整个 `net.wan` 块不输出 ⇒ FAIL 七条。
+
+板端实测（`ivsboxd` md5 `9292dd58…`、`/app.js` md5 `000ba8ff…`），三次 `GET /api/overview` 采样：
+
+[cols="3,2,2,2,2,2",options="header"]
+|===
+|采样 |`state` |`wan.ifname` |`bound` |`bound_ok` |`switches`
+
+|基线（4G 在线）
+|`WIRELESS_UP` |`usb0` |`usb0` |true |0
+
+|`ip link set usb0 down` 后
+|`WIRED_UP` |`eth0` |`eth0` |true |1
+
+|拨回 `usb0` 并等 `hold_s` 后
+|`WIRELESS_UP` |`usb0` |`usb0` |true |2
+|===
+
+日志对应：`10:51:57` down → `10:51:59`（**2 s**）`server addr -> 47.104.250.225:6012 (wan=eth0)`
+＋ `transport reconnect on route switch`。
+**界面读数与真实切换逐次对上，`bound_ok` 全程 true** —— 出口绑定没有在切换过程中掉队。
+
+另外经 Web 端口回取 `/app.js`（58978 B、md5 与工作树一致），确认板端下发的就是新前端，
+排除"改了文件但页面还是旧的"这种假绿。
+
+=== 一个现场要注意的点
+
+静态资源响应里**没有** `ETag`／`Last-Modified`，浏览器会走启发式缓存。
+所以换了前端之后，浏览器上的旧 `app.js` 可能仍被复用 —— 出现"卡片没出来"时先 **Ctrl+F5 强刷**，
+再判断是不是功能没生效。
+
+
 
 == 2026-10-19 11:11 Web 界面重设计交付（现状截图 ＋ 交互原型 ＋ 设计稿 ＋ 方案文档）
 

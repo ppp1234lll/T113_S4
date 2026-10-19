@@ -690,6 +690,89 @@ static void add_device_info(json_object *d)
     json_object_object_add(d, "device", dev);
 }
 
+/* 平台传输层状态名。注意与 `iv_netmgr_state_name()` 的区别：那边答"该走哪条 WAN"，
+ * 这边答"报文管道通不通"，两件事不能互相顶替。 */
+static const char *transport_state_name(iv_transport_state_t s)
+{
+    switch (s) {
+    case IV_TRANSPORT_UP:
+        return "up";
+    case IV_TRANSPORT_CONNECTING:
+        return "connecting";
+    case IV_TRANSPORT_DOWN:
+        return "down";
+    case IV_TRANSPORT_CLOSED:
+        return "closed";
+    default:
+        return "unknown";
+    }
+}
+
+/* 当前通信网口（网络页「平台通信」块的数据源）。
+ *
+ * 这里必须把**判定**和**事实**分开给：
+ *   - `ifname/kind/ifindex`＝netmgr 判定"该走哪条 WAN"（带迟滞）；
+ *   - `bound/transport`＝传输层实际绑定的网卡与连接状态（真正决定报文从哪儿出）。
+ * 2026-10-19 之前就出现过"界面显示选了 4G、报文仍从 eth0 出去"——配置值没传到
+ * 传输层，只看活动出口完全看不出来。所以在后端就把一致性算成 `bound_ok`，
+ * 不让前端各自判（同一条记录两个接口两个答案的坑，本项目已经踩过）。
+ */
+static json_object *build_wan_view(const iv_ctl_ctx_t *ctx)
+{
+    json_object *w = json_object_new_object();
+    iv_report_t *rp;
+    const char  *nm;
+    const char  *bound = "";
+
+    if (w == NULL)
+        return NULL;
+
+    nm = iv_agent_active_wan_name(ctx->agent);
+    rp = iv_agent_report(ctx->agent);
+
+    json_object_object_add(w, "ifname", json_object_new_string(nm));
+    json_object_object_add(
+        w, "kind",
+        json_object_new_string(iv_agent_active_wan(ctx->agent) == IV_WAN_WIRED ? "wired"
+                                                                              : "wireless"));
+    json_object_object_add(w, "ifindex",
+                           json_object_new_int(iv_agent_active_ifindex(ctx->agent)));
+    json_object_object_add(
+        w, "switches", json_object_new_int64((int64_t)iv_agent_netmgr_switches(ctx->agent)));
+    json_object_object_add(
+        w, "txn_fail", json_object_new_int64((int64_t)iv_agent_netmgr_txn_fail(ctx->agent)));
+
+    if (rp != NULL) {
+        bound = iv_transport_bind_if(&rp->tr);
+        json_object_object_add(w, "bound", json_object_new_string(bound));
+        json_object_object_add(
+            w, "transport",
+            json_object_new_string(transport_state_name(iv_transport_state(&rp->tr))));
+        json_object_object_add(w, "server", json_object_new_string(rp->srv_host));
+        json_object_object_add(w, "port", json_object_new_int((int)rp->srv_port));
+        json_object_object_add(w, "queue",
+                               json_object_new_int((int)iv_report_queue_count(rp)));
+        json_object_object_add(
+            w, "bind_fail", json_object_new_int64((int64_t)iv_transport_bind_fail(&rp->tr)));
+        json_object_object_add(w, "bind_errno",
+                               json_object_new_int(iv_transport_bind_errno(&rp->tr)));
+    } else {
+        /* 没有上报链：字段照样给（空值/0），前端不必为"接口缺字段"再写一套分支 */
+        json_object_object_add(w, "bound", json_object_new_string(""));
+        json_object_object_add(w, "transport", json_object_new_string("closed"));
+        json_object_object_add(w, "server", json_object_new_string(""));
+        json_object_object_add(w, "port", json_object_new_int(0));
+        json_object_object_add(w, "queue", json_object_new_int(0));
+        json_object_object_add(w, "bind_fail", json_object_new_int64(0));
+        json_object_object_add(w, "bind_errno", json_object_new_int(0));
+    }
+    /* 空名字＝该 WAN 没配名字（不是"绑对了"），这种情况一律算不一致 */
+    json_object_object_add(
+        w, "bound_ok",
+        json_object_new_boolean(nm[0] != '\0' && strcmp(nm, bound) == 0));
+    return w;
+}
+
 static json_object *build_overview(const iv_ctl_ctx_t *ctx)
 {
     json_object *d   = json_object_new_object();
@@ -773,6 +856,14 @@ static json_object *build_overview(const iv_ctl_ctx_t *ctx)
 
         if (lv != NULL)
             json_object_object_add(net, "link", lv);
+    }
+    /* 当前通信网口：agent 为空时字段全给空值/0（语义＝"未装配"），
+     * 前端据 `net.state == "n/a"` 区分"未装配"与"没配名字"，不必判字段缺失。 */
+    {
+        json_object *wv = build_wan_view(ctx);
+
+        if (wv != NULL)
+            json_object_object_add(net, "wan", wv);
     }
     json_object_object_add(d, "net", net);
 

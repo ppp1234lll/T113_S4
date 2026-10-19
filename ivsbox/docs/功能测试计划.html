@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T113 运维终端（ivsbox）功能测试计划</title>
+<style>
+  :root{
+    --ink:#1f2328; --sub:#5b6570; --line:#d7dee6; --head:#eef3f9;
+    --accent:#0b5cad; --bg:#f5f7fa; --card:#ffffff;
+    --ok:#1a7f37; --okbg:#e8f5ec; --warn:#9a5b00; --warnbg:#fff4e2; --risk:#a4273a; --riskbg:#fdecef;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1200px;margin:0 auto;background:var(--card);padding:36px 40px 72px;
+        box-shadow:0 1px 3px rgba(16,24,40,.06)}
+  header{border-bottom:2px solid var(--accent);padding-bottom:18px;margin-bottom:8px}
+  h1{font-size:24px;margin:0 0 6px;letter-spacing:.2px}
+  .sub{color:var(--sub);font-size:13px}
+  .cards{display:flex;gap:12px;flex-wrap:wrap;margin:20px 0 8px}
+  .card{flex:1 1 180px;border:1px solid var(--line);border-radius:8px;padding:12px 14px;background:#fbfcfe}
+  .card b{display:block;font-size:20px;line-height:1.3;color:var(--accent)}
+  .card span{color:var(--sub);font-size:12px}
+  h2{font-size:18px;margin:34px 0 10px;padding-left:10px;border-left:4px solid var(--accent)}
+  h3{font-size:15px;margin:24px 0 8px;color:#123}
+  p{margin:8px 0}
+  ul,ol{margin:8px 0 8px 22px;padding:0}
+  li{margin:3px 0}
+  table{border-collapse:collapse;width:100%;margin:8px 0 4px;font-size:13px}
+  th,td{border:1px solid var(--line);padding:6px 8px;vertical-align:top;text-align:left}
+  th{background:var(--head);font-weight:600;white-space:nowrap}
+  tbody tr:nth-child(even) td{background:#fbfcfd}
+  td.id{white-space:nowrap;font-family:Consolas,"Courier New",monospace;font-size:12px;color:#123}
+  td.res{min-width:64px;background:#fff !important}
+  .tag{display:inline-block;padding:0 6px;border-radius:3px;font-size:12px;white-space:nowrap}
+  .t-a{background:var(--okbg);color:var(--ok)}
+  .t-s{background:var(--warnbg);color:var(--warn)}
+  .t-r{background:var(--riskbg);color:var(--risk)}
+  .note{background:#f8fafc;border-left:3px solid var(--accent);padding:10px 14px;margin:12px 0;font-size:13px}
+  .note b{color:#123}
+  code{background:#f1f3f6;padding:1px 5px;border-radius:3px;font-family:Consolas,"Courier New",monospace;font-size:12.5px}
+  .foot{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);color:var(--sub);font-size:12px}
+  @media print{
+    body{background:#fff}
+    .wrap{box-shadow:none;padding:0 8mm}
+    h2{page-break-after:avoid}
+    tr{page-break-inside:avoid}
+    thead{display:table-header-group}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>T113 运维终端（ivsbox）功能测试计划</h1>
+  <div class="sub">
+    被测基线：<code>main @ bc51c63</code>（2026-10-17）&nbsp;·&nbsp; 适用范围：M1~M9 已交付功能
+    &nbsp;·&nbsp; 编制：2026-10-19 &nbsp;·&nbsp; 依据：架构 §16 测试与验收体系
+  </div>
+</header>
+
+<div class="cards">
+  <div class="card"><b>86</b><span>功能用例（13 组）</span></div>
+  <div class="card"><b>10</b><span>架构 §16.2 验收场景全覆盖</span></div>
+  <div class="card"><b>≈3 人日</b><span>板端执行工时（不含 72h 长稳）</span></div>
+  <div class="card"><b>P0=0 / P1=0</b><span>准出硬条件</span></div>
+</div>
+
+<h2>1. 目的与范围</h2>
+<p><b>目的</b>：在板端与实验室环境对已交付的 M1~M9 功能做一次完整功能验收，确认每项功能按设计工作，并对架构 §16.2 的 10 个核心场景给出明确结论（通过 / 阻塞 + 原因）。</p>
+<p><b>范围内</b>：主控与守护、配置、采集板串口、GPS、双 WAN 与平台上报、设备管理（探测 / SNMP / 断电重启 / 箱门抓拍）、Web 八页面与鉴权审计、媒体与 SD、OTA、远程通道、control.db、设备身份工装、版本与运维接口。</p>
+<p><b>范围外</b>：平台服务端改造、单片机固件、音频广播（S6.6 已冻结）、量产工装产线流程。详见 §8。</p>
+
+<h2>2. 被测对象与版本</h2>
+<table>
+  <thead><tr><th>对象</th><th>说明</th><th>版本/路径</th></tr></thead>
+  <tbody>
+    <tr><td>ivsboxd</td><td>主控：Reactor、本地通道、装配层</td><td rowspan="3"><code>build/arm/</code> 下 ARM 产物；镜像 <code>/opt/ivsbox/</code></td></tr>
+    <tr><td>ivsbox-media</td><td>媒体：抓图 / 录像 / 存储水位</td></tr>
+    <tr><td>ivsbox-web</td><td>Web：八页面、REST API、摄像机代理</td></tr>
+    <tr><td>ivsbox-updater</td><td>OTA 安装 / 回滚（最小特权窗口）</td><td>root CLI</td></tr>
+    <tr><td>ivsbox-provision</td><td>出厂身份写入（UDP 组播）</td><td>工装模式</td></tr>
+    <tr><td>设备</td><td>TQ113 / T113-S4，Tina 5.4.61-rt37</td><td>出厂镜像 2026-10-16 版（含固定 IP + Web 强制改密）</td></tr>
+  </tbody>
+</table>
+
+<h2>3. 测试环境与准入条件</h2>
+<table>
+  <thead><tr><th>项</th><th>要求</th></tr></thead>
+  <tbody>
+    <tr><td>被测板</td><td>1 台，已烧录 2026-10-16 后镜像；<code>/opt/ivsbox/</code> 已投递；身份分区已写（devid / MAC）</td></tr>
+    <tr><td>网络</td><td>eth0 接实验室交换机（固定 IP 192.168.1.64 / 网关 .1）；4G 卡有流量、usb0 可拨号；平台地址已配置且对端可连</td></tr>
+    <tr><td>摄像机</td><td>海康 / 大华 / UNV / ONVIF 各 ≥1 台，共 ≥6 路；交换机支持 SNMP v2c</td></tr>
+    <tr><td>存储</td><td>SD 卡 ≥32 GB（产品容量口径 192 GB 另配）；备用卡 1 张用于拔卡用例</td></tr>
+    <tr><td>调试</td><td>串口 COM28（115200 8N1）、SSH 可用；编译 VM <code>tqt113</code>（192.168.2.115）可交叉编译</td></tr>
+    <tr><td>PC 工具</td><td>curl、ffprobe、snmpwalk、tcpdump、Chrome；自动化脚本随仓库</td></tr>
+    <tr><td>准入</td><td>自动化层（§4）全绿；配置与档案录入完成；测试用口令与出厂默认口令已在测试环境内，<b>不得使用现场设备口令</b></td></tr>
+  </tbody>
+</table>
+
+<h2>4. 测试分层与自动化入口</h2>
+<table>
+  <thead><tr><th>层</th><th>内容</th><th>命令 / 入口</th><th>判据</th></tr></thead>
+  <tbody>
+    <tr><td>单元</td><td>帧解析、配置、探活、状态机、OTA、隧道、存储等 41 个用例文件</td><td><code>make test</code></td><td>全 PASS，0 FAIL</td></tr>
+    <tr><td>内存/线程</td><td>同上，ASan/UBSan 与 TSan</td><td><code>make asan</code> / <code>setarch -R make tsan</code></td><td>0 报告</td></tr>
+    <tr><td>集成</td><td>真起 ivsboxd：上报、切换、Web、媒体、SD、隧道、摄像机代理</td><td><code>make itest</code></td><td>passed；<b>SKIP 不计通过</b></td></tr>
+    <tr><td>模糊</td><td>UART / 平台 / IPC / SNMP 边界输入</td><td><code>make fuzz</code></td><td>无崩溃、无越界</td></tr>
+    <tr><td>故障注入</td><td>进程卡死、写库中 SIGKILL、升级失败</td><td><code>sh tests/fault-inject.sh</code></td><td>宿主项全 PASS；真机项记 NOT-RUN</td></tr>
+    <tr><td>升级链路</td><td>安装 / 切换 / bootcount 回滚 / 自检超时</td><td><code>sh tests/upgrade-boot.sh</code></td><td>23 项全过</td></tr>
+    <tr><td>长稳</td><td>≥72 h 周期切换 + 媒体启停，采 RSS/fd/线程/DB 大小</td><td><code>sh tests/soak.sh --hours 72</code></td><td>无非预期重启；斜率判定仅在运行 ≥6 h 后有效</td></tr>
+    <tr><td>静态/构建</td><td>交叉编译与静态分析</td><td><code>make arm</code> / <code>make analyze</code></td><td>零告警，出 ELF32 ARM EABI5</td></tr>
+  </tbody>
+</table>
+
+<h2>5. 功能用例</h2>
+<p>方式说明：<span class="tag t-a">自动</span> 脚本或接口即可判定；<span class="tag t-s">现场</span> 需板端与真实外设；<span class="tag t-r">危险</span> 涉及断电/继电器，须现场确认后执行。执行后填“结果”（P / F / 阻塞）并附证据。</p>
+
+<h3>5.1 A 组 · 系统启动与进程守护（§16.2-7）</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">A-01</td><td>冷启动就绪</td><td>上电，等待 ≤90 s</td><td>三个常驻进程在；<code>/tmp/ivsbox-ready</code> 出现；Web 可登录</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">A-02</td><td>主控被杀死自愈</td><td><code>kill -9</code> 主控 pid</td><td>60 s 内 monitor 拉起新主控，就绪标记重新出现，队列数据不丢</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">A-03</td><td>Web 卡死只重启 Web</td><td><code>kill -STOP</code> ivsbox-web</td><td>探针判定失败后只重启 web；主控与媒体 pid 不变，录像不断</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">A-04</td><td>媒体卡死只重启媒体</td><td><code>kill -STOP</code> ivsbox-media</td><td>只重启媒体；控制与上报不受影响</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">A-05</td><td>主 Reactor 卡死看门狗复位</td><td><code>kill -STOP</code> 主控，串口观察</td><td>≤16 s 硬件看门狗复位；重启后业务恢复</td><td><span class="tag t-r">危险</span></td><td class="res"></td></tr>
+    <tr><td class="id">A-06</td><td>优雅退出</td><td><code>kill -TERM</code> 主控</td><td>日志 <code>signal 15</code> → <code>shutting down</code>；端口释放；再启动正常</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">A-07</td><td>反复上下电</td><td>断电 10 次（间隔 30 s）</td><td>每次均能就绪；配置无半写；<code>PRAGMA integrity_check</code> = ok</td><td><span class="tag t-r">危险</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h3>5.2 B 组 · 配置与热更新</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">B-01</td><td>配置读取完整</td><td>登录后 <code>GET /api/config</code></td><td>返回全部键与默认表；中文标签由后端下发的默认表提供</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">B-02</td><td>非法值拒绝</td><td>提交越界值（interval=0、非法 IP、超长串）</td><td>整条拒绝并回显明确错误；旧配置保持生效</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">B-03</td><td>并发双写</td><td>两个窗口同时提交不同改动</td><td>版本号（ETag）拦截后写，不出现互相覆盖</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">B-04</td><td>空值语义</td><td>清空 net.ip / mask / gateway 后查看</td><td>空 = 不在此处指定，不视为丢值；实际值以 <code>sys.overview.net.link</code> 为准</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">B-05</td><td>热更新</td><td>改 <code>sys.report.interval_s</code></td><td>下一周期生效，不重启；无部分生效</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">B-06</td><td>写配置中断电</td><td>apply 过程中硬断电</td><td>重启后为旧值或完整新值，无半截文件</td><td><span class="tag t-r">危险</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h3>5.3 C 组 · 采集板串口</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">C-01</td><td>帧解析健壮性</td><td><code>make test</code> / <code>make fuzz</code> 灌半包、粘包、坏 CRC、超长</td><td>按预期丢弃或重组，不误判为有效帧，不崩溃</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">C-02</td><td>板卡数据展示</td><td>打开控制板页 / <code>GET /api/board</code></td><td>温湿度、电压、电流两位小数；无数据时给 null，不显示 0</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">C-03</td><td>DS 极性</td><td>页面开关灯，观察采集板回读</td><td>DS=1 关 / DS=2 开，回读一致</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">C-04</td><td>RELAY 极性</td><td>逐路测试（ch1 为主网口，须确认后执行）</td><td>RELAY=1 开 / 2 关（与 DS 相反）；单次下发不重传</td><td><span class="tag t-r">危险</span></td><td class="res"></td></tr>
+    <tr><td class="id">C-05</td><td>0xD1 应答超时</td><td>让采集板不应答</td><td>2 s 窗口超时告警，不重传，界面提示失败而非假成功</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">C-06</td><td>串口拔插</td><td>拔 ttySAC5 30 s 后插回</td><td>链路自恢复，不重启进程，数据继续</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">C-07</td><td>重复 / 乱序帧</td><td>注入重复 0xD1 应答与乱序帧</td><td>不重复动作、不重复上报</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h3>5.4 D 组 · GPS</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">D-01</td><td>定位有效</td><td>天线接好，室外/窗边 ≥5 min</td><td><code>/api/gps</code> valid=true，经纬度在合理范围；开启校时后系统时间被校正</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">D-02</td><td>无星降级</td><td>拔掉天线</td><td>valid=false；未知量给 null，界面不显示 0</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">D-03</td><td>串口不占用</td><td>路径置空 / 非 Reactor 模式</td><td>不打开串口，不影响其他业务</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">D-04</td><td>时间跳变</td><td>校时前后观察上报节拍</td><td>周期不乱，不集中补发</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h3>5.5 E 组 · 双 WAN、平台上报（§16.2-1/2）</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">E-01</td><td>常态双 WAN</td><td>AUTO 模式，两路均在线</td><td>活动口与默认路由一致；<code>net.link</code> 只报 eth0 / usb0</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">E-02</td><td>拔无线切有线</td><td>断开 usb0</td><td>fail_n 次后切 eth0；平台 TCP 从新口重建，旧连接拆除</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">E-03</td><td>断线补传</td><td>平台断开期间产生 ≥10 条</td><td>全部入队不丢；恢复后按序补发，不重不丢</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">E-04</td><td>回切稳定期</td><td>恢复 usb0</td><td>hold_s 内不切，到点回切；稳定期内媒体大流量不抢控制链路</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">E-05</td><td>双断</td><td>两路同时断开</td><td>进 BOTH_DOWN 只告警不动作；恢复时无线优先</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">E-06</td><td>4G 数据面</td><td>停 usb0 / 重插模组</td><td>S62usb4g 自动拨号，udhcpc 取到地址，平台自动恢复</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">E-07</td><td>平台地址为空</td><td>清空两条平台地址后 tcpdump</td><td>上报 idle，一字节不发；Web 与本地功能正常</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">E-08</td><td>弱网</td><td>netem 30% 丢包 + 500 ms 延迟</td><td>不误切、不雪崩；队列有界，恢复后补齐</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">E-09</td><td>重启网络恢复</td><td>reboot 后查 IP / 路由</td><td>固定 IP 与网关生效（192.168.1.64 / 1.1），无 DHCP 补发或地址漂移</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h3>5.6 F 组 · 设备管理（§16.2-3/4）</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">F-01</td><td>探测三方式</td><td>切换 LINK / ICMP / TCP</td><td>切换即时生效；CNS 五态正确；7/8 路只录不探测</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">F-02</td><td>多品牌发现</td><td>海康 / 大华 / UNV / ONVIF 各 1 台</td><td>均能建档，通道与端口正确</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">F-03</td><td>档案持久化</td><td>重启后查设备档案</td><td>清单、通道、凭据仍在</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">F-04</td><td>SNMP 旁证</td><td>页面采集值 vs 同 OID <code>snmpwalk</code></td><td>数值一致；错 OID 报“无应答”，不填假值</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">F-05</td><td>改 OID 免重编</td><td>改交换机 OID 后采集</td><td>只改配置即生效，无需重编固件</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">F-06</td><td>摄像机故障重启</td><td>断摄像机网线并等待确认</td><td>多层确认后动作一次；冷却期内不重复</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">F-07</td><td>限次熔断</td><td>持续故障至动作上限</td><td>只告警不再动作；恢复后计数复位</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">F-08</td><td>箱门触发抓拍</td><td>开箱门（采集板 0xC1）</td><td>门事件立即上报；抓图异步完成；抓图失败不影响上报</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">F-09</td><td>主网故障沿</td><td>断主网交换机</td><td>触发断电重启并登记待发 FIFO；恢复后不重复执行</td><td><span class="tag t-r">危险</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h3>5.7 G 组 · Web 页面、鉴权与代理（§16.2-6/10）</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">G-01</td><td>八页走查</td><td>总览 / 网络 / 摄像机 / 设备档案 / 交换机 / 媒体 / 配置 / 运维</td><td>数据均来自本地通道快照；无空白页、无脚本报错</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">G-02</td><td>登录失败口径</td><td>错账号、错口令各试</td><td>均回 401，不区分哪一个错，不泄露账号是否存在</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">G-03</td><td>未登录拦截</td><td>未登录访问 <code>/api/</code> 与 <code>/media/</code></td><td>401；出厂口令期一律 403</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">G-04</td><td>首次强制改密</td><td>用出厂口令登录</td><td>除改密 / 登出外全部 403；改密后旧口令失效</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">G-05</td><td>口令文件保护</td><td>查 <code>web.passwd</code> 权限；手工改坏内容</td><td>权限 0600；内容不合规时回出厂凭据而非放行</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">G-06</td><td>写操作审计</td><td>改配置 / 重启 / 继电器 / 身份写入</td><td>每条落 audit，含时间、来源与结果</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">G-07</td><td>媒体下载鉴权</td><td>不带 Cookie 请求；带 Cookie + Range</td><td>401；带 Cookie 返回 206 且可断点续传</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">G-08</td><td>摄像机代理边界</td><td>访问 <code>/cam/&lt;N&gt;/</code>、<code>/cam/9/</code>、构造跨 IP</td><td>白名单内正常；越界 404/拒绝；跨 IP 与端口一律不通</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">G-09</td><td>输入健壮性</td><td>超长 URL、超大 body、畸形 JSON</td><td>稳定 4xx，不崩、不阻塞其他请求</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">G-10</td><td>并发压测</td><td>50 并发 × 200 请求，前后比 fd 数</td><td>fd 稳定无泄漏，错误码一致</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h3>5.8 H 组 · 媒体与 SD（§16.2-5/6）</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">H-01</td><td>抓图</td><td>连续触发 20 次</td><td>文件与索引齐全，成功率 100%，记录平均时延</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">H-02</td><td>断网录像</td><td>断主网 5 min 后恢复</td><td>自动录制，恢复后封存；ffprobe 可解析、时长连续</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">H-03</td><td>路数上限</td><td>配置 8 路同时录</td><td>8 路并行正常；7/8 路只录不探测</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">H-04</td><td>回放与下载</td><td>Range 请求 + 本地播放</td><td>206 与断点续传正常，文件可直接播放</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">H-05</td><td>水位分级</td><td>灌数据至各级阈值</td><td>日志与动作（告警 / 停录 / 删除）一致，滚动删除按文件大小</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">H-06</td><td>拔卡</td><td>录像中拔出 SD</td><td>fault=1 / alarm=1 / allow_new=0 / stop_rec=1；控制与平台业务继续</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">H-07</td><td>写满</td><td>写满 SD</td><td>level=3 / alarm=1；旧文件滚动删除；控制业务持续</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h3>5.9 I 组 · OTA 升级与回滚（§16.2-8/9）</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">I-01</td><td>未签名包</td><td>推无签名 / 签名错包</td><td>拒绝，事件留档</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">I-02</td><td>型号不匹配</td><td>型号 / 硬件版本 / 软件版本不符</td><td>拒绝，不落盘</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">I-03</td><td>包结构非法</td><td>总长不等、未知键、重复键、无尾换行</td><td>一律拒绝，不做宽容解析</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">I-04</td><td>正常升级</td><td>推合法包并重启</td><td>装入 <code>releases/&lt;ver&gt;</code>，current 切换；新版本运行，previous 保留</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">I-05</td><td>升级中断电</td><td>安装过程中硬断电</td><td>重启回滚上一版本，业务恢复</td><td><span class="tag t-r">危险</span></td><td class="res"></td></tr>
+    <tr><td class="id">I-06</td><td>自检超时回滚</td><td>让新版起不来</td><td>120 s 超时回滚；忽略 TERM 的实例被 KILL</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">I-07</td><td>bootcount 超限</td><td>连续启动失败 4 次</td><td>自动回滚到上一版本</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">I-08</td><td>升级期间业务</td><td>录像中执行升级</td><td>录像不断或恢复后可播；失败不清理现场，便于取证</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h3>5.10 J 组 · 远程通道与受控代理（§16.2-10）</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">J-01</td><td>白名单拒绝矩阵</td><td>构造任意 ip:port、非法服务名等 18 类</td><td>全部拒绝，不生成配置文件</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">J-02</td><td>钥匙派生一致性</td><td>黄金向量比对</td><td>secretKey 与运维侧算法逐字节一致</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">J-03</td><td>开关与到期</td><td>enable → 查标记与配置；等 ttl 过期</td><td>配置权限 0600；到期自动关闭；disable 立即关</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">J-04</td><td>主控退出即关</td><td>开通道后 kill 主控</td><td>通道随主控退出关闭；残留标记不会长期开启</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">J-05</td><td>摄像机 IP 隔离</td><td>检查 frpc.toml 全文</td><td>只出现 127.0.0.1 与本机端口，绝不出现摄像机 IP</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">J-06</td><td>端到端连通</td><td>frps 就位后从运维端访问</td><td>能打开 Web 与摄像机画面；断开后不可达</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h3>5.11 K 组 · 数据与审计</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">K-01</td><td>四表可用</td><td>查 control.db</td><td>device / snmp_latest / audit / net_event 均可读写</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">K-02</td><td>行数不变量</td><td>比对 store 行数、档案条数、已配槽位总数</td><td>三者相等</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">K-03</td><td>写库中 SIGKILL</td><td>提交批次时 <code>kill -9</code></td><td>已提交批次存活、未提交不出现、integrity_check ok、零长库可重建</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+    <tr><td class="id">K-04</td><td>断电后数据库</td><td>断电重启后查库</td><td>可正常打开，无锁残留</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h3>5.12 L 组 · 设备身份与出厂工装</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">L-01</td><td>组播下发身份</td><td>工装发报文后重启</td><td>写入成功，总览显示新 devid</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">L-02</td><td>二次写入覆盖</td><td>再发一次不同身份</td><td>成功覆盖，回显为新值</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">L-03</td><td>无工厂标记</td><td>删除 enable_provision 后发报文</td><td>报文被忽略</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">L-04</td><td>非法报文</td><td>校验错、字段缺失</td><td>拒绝写入，不留半条记录</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">L-05</td><td>身份接口拒绝矩阵</td><td><code>POST /api/device/identity</code> 五种情形</td><td>都省 / 格式不合 / 000000 / 空分区只给 MAC / 写失败均按约定拒绝；成功时带 restart_required</td><td><span class="tag t-a">自动</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h3>5.13 M 组 · 版本、日志与运维接口</h3>
+<table>
+  <thead><tr><th>编号</th><th>测试项</th><th>前置 / 操作</th><th>预期结果</th><th>方式</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">M-01</td><td>版本查询</td><td><code>iv_version</code></td><td>输出版本、构建时间、设备身份，与实际一致</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">M-02</td><td>本地通道查询</td><td><code>iv_ctl</code> 查 sys.overview / ota.status / tunnel.status</td><td>均能返回，与页面显示一致</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">M-03</td><td>日志落盘</td><td>运行 24 h 后检查</td><td>按日 / 小时落 UDISK，滚动不写满、不丢当前日志</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+    <tr><td class="id">M-04</td><td>校时与时区</td><td>手工改时间 + 自动校时</td><td>时间与时区正确，重启后保持</td><td><span class="tag t-s">现场</span></td><td class="res"></td></tr>
+  </tbody>
+</table>
+
+<h2>6. 缺陷分级与准出</h2>
+<table>
+  <thead><tr><th>级别</th><th>定义</th><th>示例</th></tr></thead>
+  <tbody>
+    <tr><td>P0 阻断</td><td>核心业务中断或数据不可恢复</td><td>掉网后不恢复、主控不重启、补传丢/重、OTA 变砖、越权可访问、误动作导致设备断电</td></tr>
+    <tr><td>P1 严重</td><td>主要功能不可用，无绕行手段</td><td>页面打不开、录像不出、采集无数据、SD 拔卡致控制业务中断</td></tr>
+    <tr><td>P2 一般</td><td>功能可用但有明确偏差</td><td>显示单位错误、告警等级不准、单页数据不同步、时延超标</td></tr>
+    <tr><td>P3 轻微</td><td>文案、样式、提示语</td><td>错别字、按钮位置、默认值提示不清晰</td></tr>
+  </tbody>
+</table>
+<p><b>准出条件（全部满足才算通过）</b>：</p>
+<ol>
+  <li>P0 = 0，P1 = 0，P2 ≤ 3 且每条有书面规避方案。</li>
+  <li>自动化层全绿：<code>test</code> / <code>asan</code> / <code>tsan</code> / <code>analyze</code> 0 报告，<code>itest</code> 无 FAIL（SKIP 不计通过）。</li>
+  <li>架构 §16.2 十个场景逐条有结论（通过 / 阻塞 + 原因 + 计划）。</li>
+  <li>72 h 长稳无非预期重启，RSS 与 fd 斜率在阈值内。</li>
+  <li>§8 遗留项已单独登记，不与本轮结论混淆。</li>
+</ol>
+
+<h2>7. 执行批次与工时</h2>
+<table>
+  <thead><tr><th>批次</th><th>内容</th><th>环境</th><th>工时</th></tr></thead>
+  <tbody>
+    <tr><td>1 自动化回归</td><td>§4 全部命令一轮；先跑一遍基线，改动后必重跑</td><td>编译 VM + 宿主</td><td>0.5 人日</td></tr>
+    <tr><td>2 板端基础功能</td><td>A/B/C/D/G/M 组（非破坏性）</td><td>实验室 + 被测板</td><td>1 人日</td></tr>
+    <tr><td>3 异常与破坏性</td><td>E/F/H/I/K/L 组 + 危险项（需现场同意）</td><td>实验室 + 串口兜底</td><td>1 人日</td></tr>
+    <tr><td>4 长稳</td><td>72 h soak，无人值守，异常即记录时刻</td><td>被测板独立供电</td><td>72 h 挂机</td></tr>
+    <tr><td>5 回归与报告</td><td>缺陷修复后重跑相关用例；出测试报告与结论</td><td>同上</td><td>0.5 人日</td></tr>
+  </tbody>
+</table>
+<div class="note"><b>执行顺序原则</b>：先自动化后手工；先非破坏性后破坏性；危险项（A-05/A-07/B-06/C-04/F-09/I-05）集中在批次 3，且必须人在现场、串口可兜底时执行。</div>
+
+<h2>8. 本轮不覆盖 / 不承诺</h2>
+<table>
+  <thead><tr><th>项</th><th>原因</th><th>处理</th></tr></thead>
+  <tbody>
+    <tr><td>平台侧 ERR 故障码上报（SD 故障、版本回退）</td><td>码值类型段未与单片机侧冻结</td><td>登记为跨端待定，不判失败</td></tr>
+    <tr><td>OTA 量产公钥</td><td>私钥由发布侧产出，当前 fail-closed 拒绝一切包</td><td>量产前必须补，本轮只验拒绝路径</td></tr>
+    <tr><td>远程通道端到端连通</td><td>frps 地址 / 端口 / 令牌未下发</td><td>J-06 记阻塞，其余照测</td></tr>
+    <tr><td>音频广播（S6.6）</td><td>硬件前置未确认，功能已冻结</td><td>不交付、不测</td></tr>
+    <tr><td>双 WAN 出口绑定</td><td>传输层未实现 SO_BINDTODEVICE，出口依赖内核默认路由</td><td>登记为已知缺口</td></tr>
+    <tr><td>摄像机 Web 代理的 WebSocket / chunked 响应</td><td>一期明确不承诺</td><td>只测普通 HTTP 与绝对 URL 改写</td></tr>
+    <tr><td>系统 A/B 槽位回滚</td><td>一期只做应用双版本</td><td>只测应用升级与回滚</td></tr>
+    <tr><td>摄像机多品牌全型号兼容矩阵</td><td>实验室只有 4 个品牌样机</td><td>结论限定于所测型号</td></tr>
+  </tbody>
+</table>
+
+<div class="foot">
+  依据：<code>T113运维终端-系统架构设计.md</code> §16.1 / §16.2、<code>ivsbox/docs/功能开发计划.md</code> §0.1 与各阶段退出条件、<code>tests/readme.txt</code> 测试体系约定。
+  用例编号规则：组字母 + 两位序号，报告与缺陷单沿用同一编号。
+</div>
+
+</div>
+</body>
+</html>

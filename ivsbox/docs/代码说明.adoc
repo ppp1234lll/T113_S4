@@ -2974,3 +2974,130 @@ ping -I eth0 47.104.250.225  → 2 发 0 收，100% 丢包
 修法（另开一步，本轮不动）：传输层加一个出口绑定接口（`SO_BINDTODEVICE`
 或 connect 前 bind 源地址），`iv_agent` 在活动 WAN 切换时重建连接；
 同时给出 `probe.target1/2` 的合理默认值（或改用"能否与平台建连"作为探活判据）。
+
+== 2026-10-19 09:28 自动切换：4G 优先 ＋ 传输层出口绑定
+
+用户要求：**自动切换模式下自动选择 4G，只有当 4G 模块网络失败时才切到有线，
+4G 恢复正常后切回 4G。**
+
+=== 结论先说：策略本来就不缺，缺的是"从哪儿出"
+
+`iv_netmgr` 的 AUTO 状态机**本来就是无线优先**：
+
+[source,c]
+----
+evaluate()
+    WIRELESS_UP        /* 无线在用 */
+    WIRELESS_DEGRADED  /* 无线在用但质量差 */
+    SWITCH_TO_WIRED    /* 无线断了、有线在 ⇒ run_txn(→WIRED) */
+    WIRED_UP           /* 有线在用 */
+    SWITCH_TO_WIRELESS /* 有线在用、无线稳定 hold_s(30 s) ⇒ run_txn(→WIRELESS) */
+    BOTH_DOWN
+----
+
+`iv_netmgr_open()` 的初始态就是 `WIRELESS_UP` ＋ `active = WIRELESS`。
+所以用户要的顺序不是要新增策略，而是**已有的策略生效之后报文没跟着换出口**：
+
+. `run_txn()` 的七步只做 `switch_route`（netlink 改系统默认路由）＋
+  `agent_reconnect()`（换平台**地址**）。
+. `iv_transport` 没有出口能力：出 fd 之后直接 `connect()`，
+  不 `SO_BINDTODEVICE`、也不 bind 源地址 ⇒ 走内核默认路由。
+. 这和 R10/R11 的板端现象完全对得上：4G 到平台 2/2 通（RTT 215~300 ms）、
+  eth0 100% 丢包，而 `netstat` 里却是
+  `192.168.2.120:xxxxx → 47.104.250.225:6012 SYN_SENT`（源＝eth0），队列积压 68 条。
+
+=== 做法：把"出口"做成与"地址"成对的参数
+
+[cols="1,3",options="header"]
+|===
+|层 |改动
+
+|`iv_transport`
+|`iv_transport_io_t` 在 `sock_close` 之后加第 8 项
+`int (*sock_bind)(void *arg, int fd, const char *ifname)`（可空＝本层不绑）；
+`iv_transport_cfg_t` 加 `bind_ifname`；句柄加
+`char bind_ifname[IV_TRANSPORT_IF_MAX]`（= `IFNAMSIZ` 16）＋ `bind_fail` ＋ `bind_errno`，
+并给 `iv_transport_bind_if()/bind_fail()/bind_errno()` 三个查询。
+真实实现只有一句 `setsockopt(SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen+1)`。
+
+|`iv_report`
+|`cfg.bind_ifname` ＋ `rp->bind_if[]` 副本 ＋ `iv_report_set_bind_if()`（空串＝解除）；
+`open` 与 `reconnect` **两条**建连路径都往下带；
+`tr_on_state()` 每次状态变化若 `bind_fail != 0` 打一条告警。
+
+|`iv_agent`
+|开机按初始活动 WAN **同时**定地址与网卡；`agent_reconnect()` 切 WAN 时同步换绑定；
+启动日打印 **`bind=<配置值>/<传输层实际值>`** 两个值。
+|===
+
+三条约束是有意为之，改之前先想清楚：
+
+. **必须在 `connect()` 之前绑。** `SO_BINDTODEVICE` 影响的是"这个 socket 选路时看哪张网卡"，
+  连上之后再绑对已建立的连接没有任何作用 —— 单测 `c11` 专门用
+  `bind_at_connect` 记录"绑定时 `bind_calls` 是几"，钉死这个顺序。
+. **绑不上不阻断。** 网卡名写错（`ENODEV`）、没权限（`EPERM`）只 `bind_fail++` 并记 `errno`，
+  接着 `connect()` 走默认路由 —— 退化成加这功能之前的行为。
+  绑不上就整条平台链路不可用，比"从另一条 WAN 出去"更糟。
+. **名字超长在 `open` 就拒。** 不能带着半截网卡名去 `setsockopt`。
+
+=== 本轮踩到的真 bug：逐字段收口漏了一行
+
+第一版改完投递板端，日志是 `bind=usb0/-`（右半边空），`netstat` 仍然从 eth0 发。
+根因不在传输层，在 `iv_report_open()`：
+
+[source,c]
+----
+iv_report_cfg_t c;
+
+iv_report_cfg_default(&c);
+c.serial_path = cfg->serial_path;
+c.server_host = cfg->server_host;      /* ……这里是一长串逐字段赋值 */
+c.server_port = cfg->server_port;
+/* 第一版漏了： c.bind_ifname = cfg->bind_ifname; */
+----
+
+`rp->bind_if` 于是永远是空串，传下去就是 NULL。
+这正是启动日志要打**两个**值的原因：只打配置值，看不出中间层把它吃了；
+只打传输层实际值，分不清是配置没进来还是路上丢了。
+补上之后立刻 `bind=usb0/usb0`。因为这条路径原来没有单测覆盖，
+补了 `test_report.c` 的 **c09**：`open` 之后传输层必须是 `lo`；
+再 `set_bind_if("eth0")` ＋ `reconnect` 之后必须变 `eth0`。
+
+=== 验证（板端时间线）
+
+[cols="2,6",options="header"]
+|===
+|时间 |现象
+
+|09:20:58
+|`agent up: wan0=usb0(if8) wan1=eth0(if4) mode=4 server=47.104.250.225:6012 bind=usb0/usb0`
+|09:21:01
+|`usb0` 无 carrier ⇒ `server addr -> ... (wan=eth0)`（3 s，**4G 失败才切有线**）
+|09:23:43
+|手工拉起 4G（`AT+QNETDEVCTL=1,1,1` ＋ `udhcpc -i usb0` → `10.158.0.108/24`）后
+`(wan=usb0)`，`netstat` 变 `10.158.0.108:44176 → 47.104.250.225:6012 ESTABLISHED`，
+`usb0` 的 `tx/rx` 计数 25 s 内 +88/+52 B（心跳在走、平台有回包），**队列 0 积压**
+|09:26:35
+|`ip link set usb0 down`（模拟 4G 掉线）
+|09:26:38
+|`(wan=eth0)`，新 socket 源地址 `192.168.2.120`，旧 usb0 连接 `FIN_WAIT1`
+|09:27:38
+|4G 起链路 ＋ 拿回地址后约 60 s（含 `hold_s` 30 s 稳定期）⇒ `(wan=usb0)`，
+`10.158.0.108:44180 ESTABLISHED`，旧连接 `TIME_WAIT`
+|===
+
+`ping -I usb0 47.104.250.225` 2/2、RTT 22.7 ms。
+
+=== 登记缺口：4G 拨号没人负责
+
+`usb0` 能不能起来，直接决定"4G 恢复后切回"这条能不能成立。现状：
+
+* 镜像里**没有拨号脚本**（`/etc/init.d` 只有 `S40network`、`S50telnet`，无 `quectel-CM`、无 ppp 拨号）；
+* `ivsboxd` 也不管拨号（`env.csq` 恒 `-1`，没有 AT 通道）；
+* 本次是手工 `AT+QNETDEVCTL=1,1,1` 把 PDP 拉起来的（模块 `Quectel EC200G`，ECM 模式，
+  AT 口在本板是 **`/dev/ttyUSB0`**，`ttyUSB2` 不回话）。
+
+也就是说：模块掉线后**重拨**目前没有任何一方负责。
+是否由 `ivsboxd` 接管（AT 拨号 ＋ 掉线重拨 ＋ `udhcpc`）需要用户拍板后再做，
+不在本步范围内。
+

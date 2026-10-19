@@ -134,6 +134,7 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     const iv_netmgr_txn_ops_t *dflt;
     uint32_t                   dst;
     int                        w;
+    int                        w0;   /* 初始活动出口（地址与绑定网卡都按它取） */
     int                        t;
     int                        arc;
 
@@ -154,7 +155,14 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     iv_report_cfg_default(&rc);
     rc.serial_path  = (cfg->serial_path != NULL) ? cfg->serial_path : IV_REPORT_SERIAL_DEFAULT;
     /* 平台地址按**初始活动出口**取（本口没配则回退另一口；两口都空 ⇒ 不启平台链路） */
-    rc.server_host  = agent_pick_host(cfg, agent_initial_wan(mode), &rc.server_port);
+    w0 = agent_initial_wan(mode);
+    rc.server_host  = agent_pick_host(cfg, w0, &rc.server_port);
+    /* 出口网卡与地址成对设置：只选地址不绑出口时，双 WAN 下报文会顺着内核默认路由
+     * 从另一条链路出去（实测：选中的是 4G，报文却从 eth0 发）。网卡不存在则不绑
+     * （绑一个不存在的名字只会白白记一次 bind_fail）。 */
+    rc.bind_ifname  = (a->wan_ifindex[w0] != 0 && cfg->wan_name[w0][0] != '\0')
+                          ? cfg->wan_name[w0]
+                          : NULL;
     rc.queue_dir    = cfg->queue_dir;
     rc.mod          = cfg->mod;
     rc.sv           = (cfg->sv != NULL) ? cfg->sv : iv_version_string();
@@ -529,12 +537,18 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
 
     a->opened = 1;
     IV_LOG_I(AG_MOD,
-             "agent up: wan0=%s(if%d) wan1=%s(if%d) mode=%d server=%s:%u",
+             "agent up: wan0=%s(if%d) wan1=%s(if%d) mode=%d server=%s:%u bind=%s/%s",
              cfg->wan_name[IV_WAN_WIRELESS], a->wan_ifindex[IV_WAN_WIRELESS],
              cfg->wan_name[IV_WAN_WIRED], a->wan_ifindex[IV_WAN_WIRED],
              (int)mc.mode,
              (rc.server_host != NULL) ? rc.server_host : "(none)",
-             (unsigned)rc.server_port);
+             (unsigned)rc.server_port,
+             (rc.bind_ifname != NULL) ? rc.bind_ifname : "-",
+             /* 后一个值取**传输层实际拿到的**名字：配置里传了、却被中间层漏掉，
+              * 只有把两边都打出来才分得清（本轮板上就踩过：cfg 有值、连接仍走 eth0）。 */
+             (iv_transport_bind_if(&a->rp.tr)[0] != '\0')
+                 ? iv_transport_bind_if(&a->rp.tr)
+                 : "-");
     return IV_OK;
 }
 
@@ -1113,6 +1127,12 @@ static int agent_reconnect(void *arg, int new_ifindex)
     else
         IV_LOG_I(AG_MOD, "server addr -> %s:%u (wan=%s)",
                  (h != NULL) ? h : "(none)", (unsigned)port, a->cfg.wan_name[w]);
+
+    /* 出口网卡必须跟着一起换：只换地址不换出口，报文会继续从系统默认路由那条
+     * 链路出去（板上实测过：地址已指到 4G 的平台，SYN 却是从 eth0 发的）。
+     * 目标口没有 ifindex 时解除绑定，避免拿一个不存在的网卡名去 bind。 */
+    (void)iv_report_set_bind_if(&a->rp,
+                                (a->wan_ifindex[w] != 0) ? a->cfg.wan_name[w] : NULL);
 
     /* S9 延伸：出口切换落 net_event（网络历史；fail-open 同上）。 */
     if (a->cfg.store != NULL) {

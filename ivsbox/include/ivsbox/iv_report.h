@@ -135,6 +135,8 @@ typedef struct {
     const char *serial_path;  /* NULL → IV_REPORT_SERIAL_DEFAULT */
     const char *server_host;  /* **首建**连接的平台地址；NULL 或空串 → 不启动平台链路 */
     uint16_t    server_port;  /* 运行期改址走 iv_report_set_server()（按活动出口选） */
+    const char *bind_ifname;  /* **首建**绑定的出口网卡；NULL/空 → 走内核默认路由。
+                               * 运行期改口走 iv_report_set_bind_if()（按活动出口选）。 */
     const char *queue_dir;    /* NULL → IV_QUEUE_DIR_DEFAULT */
     uint32_t    devid;        /* 设备唯一标识（TID，以 %x 十六进制上报） */
     uint16_t    devtype;      /* 0 → IV_PROTO_DEVTYPE_DEFAULT(0x0400) */
@@ -160,6 +162,10 @@ typedef struct {
      * 这里是"下一次建连实际使用的地址"。 */
     char           srv_host[IV_TRANSPORT_HOST_MAX];
     uint16_t       srv_port;
+    /* 出口网卡（本层自持副本）：空 = 不绑、走内核默认路由。
+     * 与 `srv_host` 配对使用 —— 地址决定"连哪儿"，这里决定"从哪儿出"。
+     * 由 `iv_report_set_bind_if()` 改写，`open` / `reconnect` 时交给传输层。 */
+    char           bind_if[IV_TRANSPORT_IF_MAX];
 
     iv_status_t    st;   /* 采集板状态镜像（S2.6） */
     iv_link_t      lk;   /* 采集板可靠层（S2.3） */
@@ -287,6 +293,17 @@ void iv_report_request_poll(iv_report_t *rp);
  *   IV_OK ；IV_EINVAL（rp 为 NULL 或未 open）；IV_ERANGE（host 超长）
  */
 int iv_report_set_server(iv_report_t *rp, const char *host, uint16_t port);
+
+/*
+ * 设置**下一次建连**绑定的出口网卡（同样不主动断连，配 `iv_report_reconnect()`
+ * 一起用）。`ifname` 为空串或 NULL ⇒ 解除绑定、走内核默认路由。
+ * 这解决的是"地址选了 4G 的服务器、报文却从 eth0 出"这类问题：
+ * 传输层用 `SO_BINDTODEVICE` 把这条 socket 钉死在指定网卡上，**不改系统路由**，
+ * Web / SSH 等其它流量不受影响。
+ * 绑定失败不阻断建连（传输层只计数），故本函数只校验长度。
+ *   IV_OK；IV_EINVAL（rp 为 NULL）；IV_ERANGE（ifname 超长）
+ */
+int iv_report_set_bind_if(iv_report_t *rp, const char *ifname);
 
 /* 关闭：从 Reactor 摘事件/定时器、关串口与传输、关队列。 */
 void iv_report_close(iv_report_t *rp);

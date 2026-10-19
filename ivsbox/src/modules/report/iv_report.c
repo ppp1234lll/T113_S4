@@ -263,6 +263,14 @@ static void tr_on_state(void *arg, iv_transport_state_t st)
 
     (void)rp;
     IV_LOG_I(REP_MOD, "transport state -> %d", (int)st);
+    /* 出口绑定失败：连接照样会建（走内核默认路由），但报文可能从另一条 WAN 出去。
+     * 这种情况光看 "transport UP" 完全看不出来，所以每次状态变化都把它带出来。 */
+    if (iv_transport_bind_fail(&rp->tr) != 0u) {
+        IV_LOG_W(REP_MOD, "bind to %s failed x%llu (errno=%d), falling back to default route",
+                 iv_transport_bind_if(&rp->tr),
+                 (unsigned long long)iv_transport_bind_fail(&rp->tr),
+                 iv_transport_bind_errno(&rp->tr));
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -452,6 +460,7 @@ int iv_report_reconnect(iv_report_t *rp, uint64_t now_ms)
     tc.host       = rp->srv_host; /* 自持副本；open 内部会再拷一次 */
     tc.port       = rp->srv_port;
     tc.io         = NULL; /* 内置真实 socket */
+    tc.bind_ifname = (rp->bind_if[0] != '\0') ? rp->bind_if : NULL; /* 出口网卡 */
     rp->pump.pull = pump_pull;
     rp->pump.ack  = pump_ack;
     rp->pump.arg  = rp;
@@ -492,6 +501,27 @@ int iv_report_set_server(iv_report_t *rp, const char *host, uint16_t port)
 
     memcpy(rp->srv_host, host, n + 1u);
     rp->srv_port = port;
+    return IV_OK;
+}
+
+int iv_report_set_bind_if(iv_report_t *rp, const char *ifname)
+{
+    size_t n;
+
+    if (rp == NULL)
+        return IV_EINVAL;
+
+    if (ifname == NULL || ifname[0] == '\0') {
+        /* 解除绑定：下一次重连走内核默认路由（与加这功能之前的行为一致） */
+        rp->bind_if[0] = '\0';
+        return IV_OK;
+    }
+
+    n = strlen(ifname);
+    if (n >= sizeof(rp->bind_if))
+        return IV_ERANGE;
+
+    memcpy(rp->bind_if, ifname, n + 1u);
     return IV_OK;
 }
 
@@ -554,6 +584,10 @@ int iv_report_open(iv_report_t *rp, const iv_report_cfg_t *cfg,
     c.sv          = cfg->sv;
     c.on_door     = cfg->on_door;
     c.on_door_arg = cfg->on_door_arg;
+    /* 这里是把调用方配置**逐字段**收进局部 c，漏一行就等于该项被默认值顶掉。
+     * bind_ifname 第一版就漏在这里：agent 传了 "usb0"，传输层拿到的却是空，
+     * 表现是报文仍从 eth0 出去，而启动日志里 bind=usb0/- 的右半边一直是 "-"。 */
+    c.bind_ifname = cfg->bind_ifname;
 
     rp->cfg    = c;
     rp->r      = r;
@@ -565,6 +599,10 @@ int iv_report_open(iv_report_t *rp, const iv_report_cfg_t *cfg,
     if (c.server_host != NULL)
         (void)snprintf(rp->srv_host, sizeof(rp->srv_host), "%.127s", c.server_host);
     rp->srv_port = c.server_port;
+    /* 出口网卡：与地址成对——地址决定连哪儿，这个决定从哪儿出 */
+    rp->bind_if[0] = '\0';
+    if (c.bind_ifname != NULL && c.bind_ifname[0] != '\0')
+        (void)snprintf(rp->bind_if, sizeof(rp->bind_if), "%s", c.bind_ifname);
 
     /* 1. 协议层（on_tx 直发到传输层）+ 查询路由 */
     id.devtype = c.devtype;
@@ -610,6 +648,7 @@ int iv_report_open(iv_report_t *rp, const iv_report_cfg_t *cfg,
         tc.host         = rp->srv_host; /* open 内部会再拷一次，副本生命周期足够 */
         tc.port         = rp->srv_port;
         tc.io           = NULL; /* 内置真实 socket */
+        tc.bind_ifname  = (rp->bind_if[0] != '\0') ? rp->bind_if : NULL; /* 出口网卡 */
         rp->pump.pull   = pump_pull;
         rp->pump.ack    = pump_ack;
         rp->pump.arg    = rp;

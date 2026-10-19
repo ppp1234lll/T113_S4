@@ -27,9 +27,10 @@
  *   - **不做业务组装、不做组帧**：取件泵的组帧由装配层注入的 `pull` 完成
  *     （装配层用 `iv_proto_text_frame()` / `iv_proto_bin_build()` 造线路字节），
  *     本层只当字节搬运工。
- *   - **不做出口选择**：双 WAN 切换（S3.3）由装配层在切换事务里调
- *     `iv_transport_close()` 主动断旧连接（架构 §7.2「关闭绑定旧接口的 TCP」），
- *     再用新出口重新 `open()`；本层不选路由、不绑接口。
+ *   - **不选出口，只按调用方指定的网卡绑 socket**：双 WAN 切换（S3.3）由装配层在
+ *     切换事务里调 `iv_transport_close()` 断旧连接，再用新出口重新 `open()`；
+ *     出口由 `cfg.bind_ifname` 指定，本层**不选路由、不改系统默认路由** ——
+ *     只用 `SO_BINDTODEVICE` 把这一条 socket 钉在指定网卡上（Web / SSH 不受影响）。
  *   - **不发 DNS/配置**：目标 host/port 由装配层从 `ivsbox.json` 读好后传入。
  *   - 零 malloc：`iv_transport_t` 由调用方持有，收发缓冲都在句柄内。
  *
@@ -79,6 +80,9 @@ extern "C" {
 /* 单次 read 缓冲上限 */
 #define IV_TRANSPORT_RX_MAX 2048u
 
+/* 出口网卡名上限（含结尾 NUL）＝内核 IFNAMSIZ，`usb0` / `eth0` 远小于此 */
+#define IV_TRANSPORT_IF_MAX 16u
+
 /* 退避默认值（可被 cfg 覆盖）：首次 1 s，翻倍封顶 30 s */
 #define IV_TRANSPORT_DEF_BACKOFF_MS     1000u
 #define IV_TRANSPORT_DEF_BACKOFF_MAX_MS 30000u
@@ -109,6 +113,13 @@ typedef struct {
     int (*sock_error)(void *arg, int fd);
     /* 关闭 fd。 */
     void (*sock_close)(void *arg, int fd);
+    /*
+     * 绑定出口网卡（可选；NULL = 本层不绑，走内核默认路由）。
+     * 在 open 出 fd 之后、connect 之前调用一次。返回 IV_OK 才算绑上；
+     * 失败时本层只计数（`iv_transport_bind_fail`）**并继续建连** ——
+     * 绑不上就退化成原来的行为，不能因为网卡名写错就整条通道不可用。
+     */
+    int (*sock_bind)(void *arg, int fd, const char *ifname);
     void *arg;
 } iv_transport_io_t;
 
@@ -142,6 +153,13 @@ typedef struct {
     void *state_arg;
     uint32_t backoff_ms;              /* 0 = IV_TRANSPORT_DEF_BACKOFF_MS */
     uint32_t backoff_max_ms;          /* 0 = IV_TRANSPORT_DEF_BACKOFF_MAX_MS */
+    /*
+     * 出口网卡名（如 `usb0` / `eth0`；NULL 或空串 = 不绑，走内核默认路由）。
+     * 只影响**本连接**：不碰系统默认路由，Web / SSH 等其它流量完全不受影响。
+     * 这是"自动切换优先 4G"能真正落地的那一半 —— 选服务器的地址只决定连哪儿，
+     * 从哪儿出要靠它（否则双 WAN 时内核按 metric 挑，报文会从 eth0 走）。
+     */
+    const char *bind_ifname;
 } iv_transport_cfg_t;
 
 typedef struct {
@@ -156,6 +174,7 @@ typedef struct {
     void *state_arg;
     uint32_t backoff_ms;
     uint32_t backoff_max_ms;
+    char     bind_ifname[IV_TRANSPORT_IF_MAX]; /* 空 = 不绑出口 */
 
     /* 运行态 */
     uint8_t  opened;
@@ -177,6 +196,8 @@ typedef struct {
     uint64_t connects;      /* 累计成功建连次数 */
     uint64_t drops;         /* 累计连接丢失/失败次数 */
     uint64_t pump_oversize; /* pull 返回超限被丢弃的件数 */
+    uint64_t bind_fail;     /* 出口绑定失败次数（失败仍建连，走默认路由） */
+    int      bind_errno;    /* 最近一次绑定失败的 errno（0 = 从未失败） */
 
     uint8_t  rbuf[IV_TRANSPORT_RX_MAX]; /* 单次 read 缓冲 */
     uint8_t  tbuf[IV_TRANSPORT_TX_MAX]; /* 发送暂存 */
@@ -233,6 +254,15 @@ uint64_t iv_transport_bytes_rx(const iv_transport_t *t);
 uint64_t iv_transport_connects(const iv_transport_t *t);   /* 成功建连次数 */
 uint64_t iv_transport_drops(const iv_transport_t *t);      /* 连接丢失/失败次数 */
 uint64_t iv_transport_pump_oversize(const iv_transport_t *t);
+/* 出口绑定失败次数。持续增长说明网卡名配错或进程没有 CAP_NET_RAW ——
+ * 此时连接仍会建立，只是走了内核默认路由，报文可能从另一条 WAN 出去。 */
+uint64_t iv_transport_bind_fail(const iv_transport_t *t);
+/* 本连接实际绑定的出口网卡名（空串 = 未绑定）。诊断用：日志里打这个值，
+ * 才能分清"配置传了名字"与"传输层真的拿到并绑上了"。 */
+const char *iv_transport_bind_if(const iv_transport_t *t);
+/* 最近一次绑定失败的 errno（0 = 从未失败）。ENODEV＝网卡名不存在，
+ * EPERM＝进程缺 CAP_NET_RAW，ENOTSUP＝注入的 io 没提供 sock_bind。 */
+int iv_transport_bind_errno(const iv_transport_t *t);
 
 #ifdef __cplusplus
 }

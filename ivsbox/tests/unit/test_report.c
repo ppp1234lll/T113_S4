@@ -274,8 +274,35 @@ int main(void)
         chk(iv_report_reconnect(&rp, 0u) == IV_ESTATE, "c08 reconnect on closed -> ESTATE");
     }
 
+    /* ---- 9) 出口网卡必须穿过 open 的"逐字段收口" ----
+     * iv_report_open 把调用方配置逐字段收进局部 c 再往下传，漏一行就被默认值顶掉。
+     * 第一版 bind_ifname 就漏在这里：agent 传了 usb0、传输层拿到空，
+     * 现象是报文照旧从 eth0 出去，光看启动日志两边的值才分得清。 */
+    {
+        static iv_report_t rp;
+        iv_report_cfg_t    cfg;
+
+        iv_report_cfg_default(&cfg);
+        cfg.server_host = "127.0.0.1"; /* 只建 socket，不 step，不产生流量 */
+        cfg.server_port = 1u;
+        cfg.serial_path = "/dev/null";
+        cfg.bind_ifname = "lo";
+
+        chk(iv_report_open(&rp, &cfg, NULL, 0u) == IV_OK, "c09 open ok");
+        chk(strcmp(iv_transport_bind_if(&rp.tr), "lo") == 0,
+            "c09 bind_ifname survives open (field-by-field copy)");
+
+        /* 运行期换出口（netmgr 切换 WAN 走这条）：换完传输层要跟着变 */
+        chk(iv_report_set_bind_if(&rp, "eth0") == IV_OK, "c09 set_bind_if ok");
+        chk(iv_report_reconnect(&rp, 0u) == IV_OK, "c09 reconnect ok");
+        chk(strcmp(iv_transport_bind_if(&rp.tr), "eth0") == 0,
+            "c09 reconnect applies new bind_ifname");
+
+        iv_report_close(&rp);
+    }
+
     if (g_fail == 0)
-        printf("test_report passed (seg/frame/query-crc/json/env/set-server)\n");
+        printf("test_report passed (seg/frame/query-crc/json/env/set-server/bind-if)\n");
     else
         printf("test_report FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

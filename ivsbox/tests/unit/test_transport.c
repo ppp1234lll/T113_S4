@@ -69,6 +69,11 @@ typedef struct {
     int            rx_chunk; /* 单次最多读出字节；<=0 不限 */
     int            rx_eof;   /* 1 = 读尽后返回 0(EOF)，否则 IV_EAGAIN */
     int            close_calls;
+    /* 出口绑定（SO_BINDTODEVICE 的假实现）：记录本层要求绑哪张网卡 */
+    int            bind_calls;
+    int            bind_ret;      /* 0 = 返回 IV_OK；其它值直接透传（模拟绑不上） */
+    int            bind_at_connect; /* 进入 connect 时 bind 已被调用过的次数 */
+    char           bind_name[32];
 } fake_t;
 
 static int f_open(void *arg)
@@ -93,6 +98,9 @@ static int f_connect(void *arg, int fd, const char *host, uint16_t port)
         r = (f->connect_n > 0) ? f->connect_ret[f->connect_n - 1] : IV_OK;
     }
     f->connect_calls++;
+    /* 记录"进入 connect 时已经绑过几次"：用来钉死**绑定必须在 connect 之前**。
+     * 绑在 connect 之后等于没绑 —— 内核已经按旧路由选完出口了，而连接已经发出去。 */
+    f->bind_at_connect = f->bind_calls;
     return r;
 }
 
@@ -161,8 +169,19 @@ static void f_close(void *arg, int fd)
     f->sent_len = 0;
 }
 
+static int f_bind(void *arg, int fd, const char *ifname)
+{
+    fake_t *f = (fake_t *)arg;
+
+    (void)fd;
+    f->bind_calls++;
+    (void)snprintf(f->bind_name, sizeof f->bind_name, "%s",
+                   (ifname != NULL) ? ifname : "(null)");
+    return (f->bind_ret != 0) ? f->bind_ret : IV_OK;
+}
+
 static const iv_transport_io_t g_fake_io = {
-    f_open, f_connect, f_write, f_read, f_error, f_close, NULL,
+    f_open, f_connect, f_write, f_read, f_error, f_close, f_bind, NULL,
 };
 
 /* ---------------------------------------------------------------------------
@@ -814,6 +833,110 @@ static void c10_real_loopback(void)
     }
 }
 
+/*
+ * 出口绑定（2026-10-17 用户要求「自动切换优先 4G」的后半截）。
+ * 传输层必须把 cfg.bind_ifname 交给 io->sock_bind，且发生在 connect 之前；
+ * 绑不上只计数、**照常建连**（退化到走内核默认路由，不能让一个网卡名写错
+ * 就把整条平台通道判死）。
+ * 反向证伪点：① 忽略 bind_ifname（不调 bind）⇒ 第 1 组 bind_calls 断言失败；
+ *   ② 绑定挪到 connect 之后 ⇒ 同上（此时连接已由默认出口发出，绑了也没用）；
+ *   ③ 把绑定失败当致命错 ⇒ 第 3 组"仍能连上"断言失败。
+ */
+static void c11_bind_if(void)
+{
+    fake_t             f;
+    iv_transport_t     t;
+    iv_transport_cfg_t c;
+    iv_transport_io_t  io;
+    uint64_t           now = 0;
+
+    /* 1) 正常绑定：名字原样交下去、每轮建连只调一次、不计失败 */
+    memset(&f, 0, sizeof f);
+    f.fd               = 9;
+    f.write_fail_after = -1;
+    f.connect_ret[0]   = IV_OK;
+    f.connect_n        = 1;
+    io     = g_fake_io;
+    io.arg = &f;
+
+    memset(&c, 0, sizeof c);
+    c.host        = "127.0.0.1";
+    c.port        = 5000;
+    c.io          = &io;
+    c.bind_ifname = "usb0";
+
+    iv_transport_init(&t);
+    chk(iv_transport_open(&t, &c) == IV_OK, "c11 open");
+    chk(f.bind_calls == 0, "c11 open touches no socket, so no bind yet");
+    now += 10;
+    chk(iv_transport_step(&t, now) == IV_OK, "c11 step");
+    chk(f.bind_calls == 1, "c11 bind called exactly once per connect attempt");
+    chk(f.bind_at_connect == 1, "c11 bind happens BEFORE connect (late bind = no bind)");
+    chk(strcmp(f.bind_name, "usb0") == 0, "c11 bind gets the configured ifname");
+    chk(iv_transport_bind_fail(&t) == 0u, "c11 a successful bind is not a failure");
+    chk(iv_transport_state(&t) == IV_TRANSPORT_UP, "c11 connect proceeds after bind");
+    (void)iv_transport_close(&t);
+
+    /* 2) 不绑（空串）：一次都不该调 —— 单 WAN / 老配置走这条 */
+    memset(&f, 0, sizeof f);
+    f.fd               = 9;
+    f.write_fail_after = -1;
+    f.connect_ret[0]   = IV_OK;
+    f.connect_n        = 1;
+    io     = g_fake_io;
+    io.arg = &f;
+
+    memset(&c, 0, sizeof c);
+    c.host        = "127.0.0.1";
+    c.port        = 5000;
+    c.io          = &io;
+    c.bind_ifname = "";
+
+    iv_transport_init(&t);
+    chk(iv_transport_open(&t, &c) == IV_OK, "c11 open (no bind)");
+    now += 10;
+    (void)iv_transport_step(&t, now);
+    chk(f.bind_calls == 0, "c11 empty ifname => bind never called");
+    chk(iv_transport_state(&t) == IV_TRANSPORT_UP, "c11 no-bind path still connects");
+    (void)iv_transport_close(&t);
+
+    /* 3) 绑不上：只计数，照常建连 */
+    memset(&f, 0, sizeof f);
+    f.fd               = 9;
+    f.write_fail_after = -1;
+    f.connect_ret[0]   = IV_OK;
+    f.connect_n        = 1;
+    f.bind_ret         = IV_EIO;
+    io     = g_fake_io;
+    io.arg = &f;
+
+    memset(&c, 0, sizeof c);
+    c.host        = "127.0.0.1";
+    c.port        = 5000;
+    c.io          = &io;
+    c.bind_ifname = "nosuch0";
+
+    iv_transport_init(&t);
+    chk(iv_transport_open(&t, &c) == IV_OK, "c11 open (bind fails)");
+    now += 10;
+    (void)iv_transport_step(&t, now);
+    chk(f.bind_calls == 1, "c11 bind attempted once");
+    chk(iv_transport_bind_fail(&t) == 1u, "c11 bind failure counted");
+    chk(iv_transport_state(&t) == IV_TRANSPORT_UP,
+        "c11 a failed bind must not block the connection");
+    chk(f.connect_calls == 1, "c11 connect still issued after a failed bind");
+    (void)iv_transport_close(&t);
+
+    /* 4) 网卡名超长：open 直接拒，不给"半截名字"去 bind 的机会 */
+    memset(&c, 0, sizeof c);
+    c.host        = "127.0.0.1";
+    c.port        = 5000;
+    c.bind_ifname = "abcdefghijklmnopq"; /* 17 字符 > IV_TRANSPORT_IF_MAX - 1 */
+
+    iv_transport_init(&t);
+    chk(iv_transport_open(&t, &c) == IV_ERANGE, "c11 over-long ifname rejected at open");
+}
+
 int main(void)
 {
     c01_args();
@@ -826,6 +949,7 @@ int main(void)
     c08_drop_repull();
     c09_eof();
     c10_real_loopback();
+    c11_bind_if();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_transport FAILED (%d)\n", g_fail);
@@ -833,6 +957,6 @@ int main(void)
     }
     printf("test_transport passed (args, connect/send/rx, async-connect, "
            "partial-write, backoff, pump-order-ack, send-guard, drop-repull, "
-           "eof, real-loopback)\n");
+           "eof, real-loopback, bind-if)\n");
     return 0;
 }

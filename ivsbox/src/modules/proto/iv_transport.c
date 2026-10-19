@@ -144,6 +144,25 @@ static void real_sock_close(void *arg, int fd)
     }
 }
 
+/*
+ * 绑定出口网卡。`SO_BINDTODEVICE` 只作用于这一个 socket：默认路由、
+ * 其它进程的流量都不受影响（这正是它比"改系统默认路由"更适合本场景的原因）。
+ * 需要 CAP_NET_RAW —— ivsboxd 以 root 运行，满足。
+ * 长度按 `strlen + 1` 传（内核按 C 串处理，含结尾 NUL）。
+ */
+static int real_sock_bind(void *arg, int fd, const char *ifname)
+{
+    (void)arg;
+    if (ifname == NULL || ifname[0] == '\0') {
+        return IV_EINVAL;
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname,
+                   (socklen_t)(strlen(ifname) + 1u)) != 0) {
+        return IV_EIO;
+    }
+    return IV_OK;
+}
+
 static const iv_transport_io_t g_real_io = {
     real_sock_open,
     real_sock_connect,
@@ -151,6 +170,7 @@ static const iv_transport_io_t g_real_io = {
     real_sock_read,
     real_sock_error,
     real_sock_close,
+    real_sock_bind,
     NULL,
 };
 
@@ -211,6 +231,20 @@ static void connect_try(iv_transport_t *t, uint64_t now_ms)
         return;
     }
     t->fd = fd;
+    /* 出口绑定：必须在 connect 之前（bind 之后再 connect，内核才按这张网卡选路）。
+     * 绑不上**不阻断业务** —— 只计数，继续用内核默认路由（退化到加这功能之前的行为）。
+     * errno 由本层当即记下（单线程，errno 是本线程的，不会被别人改掉）：
+     * 绑定失败在现场最常见的两个原因是"网卡名配错"(ENODEV) 和"没权限"(EPERM)。 */
+    if (t->bind_ifname[0] != '\0') {
+        int br = (t->io->sock_bind != NULL)
+                     ? t->io->sock_bind(t->io->arg, fd, t->bind_ifname)
+                     : IV_ENOTSUP;
+
+        if (br != IV_OK) {
+            t->bind_fail++;
+            t->bind_errno = (br == IV_ENOTSUP) ? ENOTSUP : errno;
+        }
+    }
     r = t->io->sock_connect(t->io->arg, fd, t->host, t->port);
     if (r == IV_EAGAIN) {
         set_state(t, IV_TRANSPORT_CONNECTING); /* 进行中，等下个 step 查结果 */
@@ -354,8 +388,22 @@ int iv_transport_open(iv_transport_t *t, const iv_transport_cfg_t *c)
     if (hl + 1u > sizeof t->host) {
         return IV_ERANGE;
     }
+    /* 出口网卡名先校验：宁可在 open 时报错，也不要在第一次 step 里带着半截名字去 bind */
+    if (c->bind_ifname != NULL && c->bind_ifname[0] != '\0' &&
+        strlen(c->bind_ifname) + 1u > sizeof t->bind_ifname) {
+        return IV_ERANGE;
+    }
 
     memcpy(t->host, c->host, hl + 1u);
+    if (c->bind_ifname != NULL && c->bind_ifname[0] != '\0') {
+        size_t bl = strlen(c->bind_ifname);
+
+        memcpy(t->bind_ifname, c->bind_ifname, bl + 1u);
+    } else {
+        t->bind_ifname[0] = '\0';
+    }
+    t->bind_fail  = 0;
+    t->bind_errno = 0;
     t->port       = c->port;
     t->io         = (c->io != NULL) ? c->io : &g_real_io;
     t->pump       = c->pump;
@@ -530,4 +578,19 @@ uint64_t iv_transport_drops(const iv_transport_t *t)
 uint64_t iv_transport_pump_oversize(const iv_transport_t *t)
 {
     return (t == NULL) ? 0u : t->pump_oversize;
+}
+
+uint64_t iv_transport_bind_fail(const iv_transport_t *t)
+{
+    return (t == NULL) ? 0u : t->bind_fail;
+}
+
+const char *iv_transport_bind_if(const iv_transport_t *t)
+{
+    return (t == NULL) ? "" : t->bind_ifname;
+}
+
+int iv_transport_bind_errno(const iv_transport_t *t)
+{
+    return (t == NULL) ? 0 : t->bind_errno;
 }

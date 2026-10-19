@@ -274,6 +274,74 @@ int main(void)
     if (j != NULL)
         json_object_put(j);
 
+    /* ---------------- c31 默认网关只在出口有载波时采信（2026-10-19 修正） ----------------
+     * 缺陷原型：断链后内核**不删**默认路由（只打 `RTNH_F_LINKDOWN`，而这一位
+     * 并不出现在 `/proc/net/route` 的 Flags 列 —— 那列由 `fib_flag_trans()` 现算），
+     * 旧实现照单全收 ⇒ 网络页把一条已经断掉的链路报成"默认网关"，与 4G 页
+     * "SIM 卡未插入"自相矛盾。判定抽成纯函数就是为了能在这里钉死，不必等真机
+     * 掉进那个窗口才有机会复现。 */
+    {
+        iv_ctl_route_t cand[2];
+        json_object   *d, *net, *link;
+
+        (void)memset(cand, 0, sizeof(cand));
+        (void)snprintf(cand[0].ifname, sizeof(cand[0].ifname), "usb0");
+        (void)snprintf(cand[0].gw, sizeof(cand[0].gw), "10.158.0.1");
+        (void)snprintf(cand[1].ifname, sizeof(cand[1].ifname), "eth0");
+        (void)snprintf(cand[1].gw, sizeof(cand[1].gw), "192.168.2.1");
+        cand[0].iface_ok = 0; /* 无载波：内核那条 default 还在，报文却出不去 */
+        cand[1].iface_ok = 0;
+        chk(iv_ctl_route_pick(cand, 2) == -1, "c31: all dead => no gateway (-1)");
+        cand[1].iface_ok = 1;
+        chk(iv_ctl_route_pick(cand, 2) == 1,
+            "c31: skips the dead route and picks the ready one");
+        cand[0].iface_ok = 1;
+        chk(iv_ctl_route_pick(cand, 2) == 0, "c31: keeps /proc order when both are ready");
+        chk(iv_ctl_route_pick(NULL, 2) == -1, "c31: NULL candidates => -1");
+        chk(iv_ctl_route_pick(cand, 0) == -1, "c31: empty list => -1");
+        chk(iv_ctl_route_pick(cand, -3) == -1, "c31: negative count => -1");
+
+        /* JSON 外形：ifaces 每项都要带 `carrier`，link 要带 `gateway_ignored`
+         * —— 前端靠这两样把"关了 / 断了 / 连着"分开说。 */
+        j    = call(&ctx, "{\"m\":\"sys.overview\"}", &rc, raw, sizeof(raw));
+        d    = jodata(j);
+        net  = NULL;
+        link = NULL;
+        if (d != NULL)
+            (void)json_object_object_get_ex(d, "net", &net);
+        if (net != NULL)
+            (void)json_object_object_get_ex(net, "link", &link);
+        chk(link != NULL, "c31: net.link present");
+        if (link != NULL) {
+            json_object *v   = NULL;
+            json_object *ifc = NULL;
+
+            chk(json_object_object_get_ex(link, "gateway_ignored", &v) && v != NULL,
+                "c31: net.link carries gateway_ignored");
+            chk(json_object_object_get_ex(link, "ifaces", &ifc) && ifc != NULL &&
+                    json_object_is_type(ifc, json_type_array) &&
+                    json_object_array_length(ifc) == 2u,
+                "c31: net.link.ifaces is a 2-element array (eth0, usb0)");
+            if (ifc != NULL && json_object_is_type(ifc, json_type_array)) {
+                size_t k;
+                int    have = 1;
+
+                for (k = 0; k < json_object_array_length(ifc); k++) {
+                    json_object *e  = json_object_array_get_idx(ifc, k);
+                    json_object *cv = NULL;
+
+                    if (e == NULL ||
+                        !json_object_object_get_ex(e, "carrier", &cv) || cv == NULL ||
+                        !json_object_is_type(cv, json_type_boolean))
+                        have = 0;
+                }
+                chk(have, "c31: every iface carries a boolean `carrier` flag");
+            }
+        }
+        if (j != NULL)
+            json_object_put(j);
+    }
+
     /* ---------------- c05 坏 JSON ---------------- */
     j = call(&ctx, "{not json", &rc, raw, sizeof(raw));
     chk(rc == IV_OK && j != NULL, "c05: bad json still answered");
@@ -699,6 +767,7 @@ int main(void)
         fprintf(stderr, "test_ctl FAILED (%d checks)\n", g_fail);
         return 1;
     }
-    printf("test_ctl passed (protocol shape, silent unknown, version gate, apply rollback)\n");
+    printf("test_ctl passed (protocol shape, silent unknown, version gate, apply rollback, "
+           "net.link carrier/gateway)\n");
     return 0;
 }

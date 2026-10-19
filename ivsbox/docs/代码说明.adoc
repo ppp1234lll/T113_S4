@@ -3514,3 +3514,114 @@ VM：`make host` rc=0、`make test` **40 passed / 0 FAIL / 1 SKIP**、`make arm`
   应由人工插卡动作触发，不该由守护进程反复发。
 
 
+== 2026-10-19 17:34 网络页链路判据修正（`carrier` ＋ 默认网关）
+
+=== 问题
+
+`usb0` 掉载波之后，内核**不删**默认路由，只给它打一个 `RTNH_F_LINKDOWN`：
+
+----
+usb0: <NO-CARRIER,BROADCAST,MULTICAST,UP> state DOWN
+      inet 10.28.61.123/24                       <- 上次拨号的残留地址，还在
+default via 10.28.61.1 dev usb0 linkdown          <- 这条才是元凶
+default via 192.168.2.1 dev eth0
+----
+
+旧的 `default_route_of()` 见到 `Destination==0` 且 `Flags` 带 `RTF_UP` 就采信，
+于是网络页报 ``网关 10.28.61.1（usb0）``；同时 `add_iface_link()` 判 `up` 只看
+`IFF_UP`，而断链时这一位仍在，于是 `usb0` 显示"已连接"。两块都和 4G 页
+"SIM 卡未插入"打架。
+
+=== 关键结论：不能在 `/proc/net/route` 里过滤 linkdown
+
+最初的想法是"读 `Flags` 列，跳过带 `RTNH_F_LINKDOWN` 的那条"。查 SDK 内核源码后
+这条路**不存在**：
+
+----
+kernel/linux-5.4/net/ipv4/fib_trie.c:2754  fib_flag_trans()
+    flags = RTF_REJECT | RTF_GATEWAY | RTF_HOST | RTF_UP  (仅此四者)
+kernel/linux-5.4/include/uapi/linux/rtnetlink.h:383
+    #define RTNH_F_LINKDOWN  16
+----
+
+`Flags` 列是内核**现算**的，与 `fib_info->fib_flags`（`RTNH_F_*` 存的地方）不是
+一回事。这条结论已写进 `iv_ctl.h` 的注释，免得后来人再试一遍。
+
+=== 做法
+
+改问"**路由的出口网卡自己有没有载波**"。内核那个 linkdown 位本来就是按出口网卡的
+carrier 算出来的，追问网卡与追问内核同源。
+
+* `IVCL_KF_LOWER_UP`（`0x10000`）：`IFF_LOWER_UP` 是内核私有位，glibc
+  `<net/if.h>` 不定义，按内核值补。**用它而不是 `IFF_RUNNING`** —— `ip link`
+  里的 `NO-CARRIER` 正是这一位缺失；`IFF_RUNNING` 是 RFC2863 操作态，还掺了
+  `netif_running` 与 operstate。`getifaddrs()` 的 `ifa_flags` 是 `unsigned int`，
+  装得下这一位（ioctl 的 `ifr_flags` 是 `short`，装不下，所以 `iv_netlink` 的
+  查询路径才退用 `IFF_RUNNING`）。判据与 `iv_netlink.h` 文件头写的事件路径一致。
+* `iface_flags_of()`：取一个网口的 `present/up/carrier`。
+  **显示与网关采信共用它**，判定只留一处，免得"同一个网口两处两个答案"。
+* `iv_ctl_route_pick()`（在 `iv_ctl.h` 里公开）：从候选里挑第一个"出口就绪"的，
+  全不可用返回 `-1`。抽成纯函数只为能单测 —— 这个缺陷在真机上极难稳定复现
+  （要正好在掉线窗口里刷新页面）。
+* `default_route_of()` 重写：先把 `/proc/net/route` 里的默认路由收进
+  `iv_ctl_route_t cand[IV_CTL_ROUTE_MAX]`（带上 `iface_ok`），再 `pick`。
+  **被跳过的条目不丢**，拼进 `gateway_ignored`：`10.28.61.1（usb0 无载波）`，
+  多条用"；"连。现场"`ip route` 里明明有 default、设备说没有"就查这一行。
+* `add_iface_link()` 加 `carrier`，`up` 保持 `IFF_UP` 原义（管理态开关）。
+  **两个字段必须分开**：断链时 `up` 仍为真且残留 IPv4 还在，合成一个字段就没法
+  区分"关掉了"与"断了"。
+
+=== 前端
+
+`pageNet()` 的网口状态从两态改**四态**，`up` 与 `carrier` 分别参与判定：
+
+----
+!present              -> 未检测到                    warn
+!up                   -> 已关闭                      warn
+up && !carrier        -> 已启用，无载波（链路断开）   err
+up && carrier && !ip  -> 有载波，无 IPv4 地址         warn
+up && carrier && ip   -> 已连接                      ok
+----
+
+默认网关那行在有 `gateway_ignored` 时补一行"已忽略的默认路由"，标 `err`。
+
+=== 验证
+
+VM：`make host` rc=0、`error:`/`warning:` 各 0；`make test` 全绿（唯一 `SKIP`
+是既有的 netlink"无 `IFF_UP`-clear 网口可探"用例）；`make arm` rc=0 零告警，
+md5 `668408bcd7a9722e92e388aee981c5db`。
+
+反向证伪：`if (r[i].iface_ok)` 改成 `if (r[i].iface_ok || 1)`（恒真＝不跳过任何
+候选），编译干净（0 error），**精确 2 条新断言变红**
+（`c31: all dead => no gateway (-1)`、`c31: skips the dead route and picks the ready one`），
+其余不动；还原后 `md5sum -c` 通过、复绿。
+
+板端真机（**现场正好处于缺陷态**，没有人为制造）：
+
+----
+              旧版 f0d6cda0…                     新版 668408bc…
+gateway       10.28.61.1                          192.168.2.1
+gateway_if    usb0                                eth0
+gateway_ignored  (无此字段)                       10.28.61.1（usb0 无载波）
+eth0          up=true  (无 carrier)               up=true  carrier=true
+usb0          up=true  (无 carrier)               up=true  carrier=false
+----
+
+新版与同一次响应里的 `net.state=WIRED_UP`、`net.wan.ifname=eth0` 终于一致。
+
+**接口取证没有登录 Web**：`/api/overview` 对未登录请求回 401，而现场口令不能动。
+改用板端 `python3` 直连本地通道 `/var/run/ivsbox/ctl`（`AF_UNIX` ＋
+`SOCK_SEQPACKET`，32 B 小端头 `<IHHIIQII`，magic `0x42535649`、type 1=REQ），
+把 `{"m":"sys.overview"}` 发过去直接读响应。
+
+前端 `app.js` 同步投递到 `/opt/ivsbox/web/static/`（md5 `d2803b7e…`）。
+静态资源无 ETag/Last-Modified ⇒ 浏览器要 Ctrl+F5。
+
+=== 口径提醒
+
+`net.link.ifaces[].up` **不等于**"通"。要判"这条链路能不能走"，用
+`up && carrier`（`inet` 地址也不可信：拨号残留的地址在掉线后还挂着）。
+`sys.overview.net.wan` 那边的 `bound_ok` 是另一条更严格的判据
+（`iv_agent` 的 `wan_iface_ready()`），两者不冲突但也不要互相替代。
+
+

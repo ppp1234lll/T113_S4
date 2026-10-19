@@ -815,16 +815,26 @@
       (lk.ifaces || []).forEach(function (f) {
         var nm = NAMES[f.name] || f.name;
         var st, cls;
+        /* 四态、不是两态：**网口开着但没载波**（拔线 / 4G 掉线）与"网口没启用"
+         * 是两回事，前者 IPv4 地址往往还残留着（拨号遗迹），最容易被误读成
+         * "还连着"。所以 up 与 carrier 必须分开说。 */
         if (!f.present) { st = '未检测到'; cls = 'warn'; }
-        else if (!f.up) { st = '未启用'; cls = 'warn'; }
-        else if (!f.ip) { st = '已启用，无 IPv4 地址'; cls = 'warn'; }
+        else if (!f.up) { st = '已关闭'; cls = 'warn'; }
+        else if (!f.carrier) { st = '已启用，无载波（链路断开）'; cls = 'err'; }
+        else if (!f.ip) { st = '有载波，无 IPv4 地址'; cls = 'warn'; }
         else { st = '已连接'; cls = 'ok'; }
         grid.appendChild(kv(nm, st + (f.ip ? '　' + f.ip : ''), cls));
         grid.appendChild(kv(nm + ' · 子网掩码', f.mask || '—'));
         grid.appendChild(kv(nm + ' · MAC', f.mac || '—'));
       });
+      /* 默认网关只认"出口有载波"的那条。被忽略的路由单列一行 ——
+       * 现场「ip route 里明明有 default，设备却说没有」就查这一行。 */
       grid.appendChild(kv('默认网关',
-        (lk.gateway || '无') + (lk.gateway_if ? '（' + lk.gateway_if + '）' : '')));
+        (lk.gateway || '无') + (lk.gateway_if ? '（' + lk.gateway_if + '）' : ''),
+        lk.gateway ? null : (lk.gateway_ignored ? 'err' : 'warn')));
+      if (lk.gateway_ignored) {
+        grid.appendChild(kv('已忽略的默认路由', lk.gateway_ignored, 'err'));
+      }
     });
 
     root.appendChild(configCard('网络参数（net.*）', ['net', 'sys'],

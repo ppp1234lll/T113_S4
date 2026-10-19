@@ -178,6 +178,46 @@ typedef struct {
 int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
                   char *out, size_t out_cap, size_t *out_len);
 
+/* ---------------------------------------------------------------------------
+ * 网络页"默认网关"的候选与选择（M5-S5.5，2026-10-19 修正）
+ *
+ * ============================ 修的是什么 ============================
+ * 断链之后内核**不删**默认路由，只是打一个 `RTNH_F_LINKDOWN`（`ip route` 里显示
+ * 成 `default via 10.158.0.1 dev usb0 linkdown`）。原实现在 `/proc/net/route`
+ * 里见到 `Destination==0 && Flags&RTF_UP` 就采信，于是网络页把一个已经断掉
+ * 的链路报成"默认网关"，与 4G 页"SIM 卡未插入"自相矛盾。
+ *
+ * ============================ 为什么不能查 Flags ============================
+ * `/proc/net/route` 的 `Flags` 列**不含 linkdown 位**：它是内核用
+ * `fib_flag_trans()` 现算的，值域只有 `RTF_UP|RTF_GATEWAY|RTF_HOST|RTF_REJECT`
+ * （见 linux-5.4 `net/ipv4/fib_trie.c`）。"读 Flags 过滤 linkdown"这条路不存在，
+ * 不要在这上面浪费时间。
+ *
+ * ============================ 本模块的判据 ============================
+ * **问路由的出口网卡自己有没有载波**。内核那个 linkdown 位本来就是按出口网卡的
+ * carrier 算出来的，追问网卡与追问内核同源；而网卡状态经 `getifaddrs()` 一定
+ * 拿得到（`ifa_flags` 是 `unsigned int`，装得下内核私有位 `IFF_LOWER_UP`）。
+ * 判据与 `iv_netlink.h` 文件头写的事件路径一致：**`IFF_UP && IFF_LOWER_UP`**。
+ * ------------------------------------------------------------------------- */
+#define IV_CTL_ROUTE_MAX  4
+/* 出口网卡名缓冲。取 32 而不是系统 `IFNAMSIZ`(16)：解析 `/proc/net/route` 时用
+ * `%31s` 读入，两处宽度一致才不会在 `-Wformat-truncation` 下被判为可能截断。 */
+#define IV_CTL_IFNAME_MAX 32
+
+typedef struct {
+    char ifname[IV_CTL_IFNAME_MAX]; /* 出口网卡名 */
+    char gw[16];                    /* 点分十进制；空串＝网关是 0.0.0.0 */
+    int  iface_ok;                  /* 出口就绪：存在 && IFF_UP && 有载波 */
+} iv_ctl_route_t;
+
+/*
+ * 挑出第一个"出口就绪"的候选，返回其下标；全不可用返回 -1。
+ *
+ * 抽成纯函数只为能单测：这条判定错了就是"断掉的链路被当成默认网关"，
+ * 而这在真机上极难稳定复现（要正好在掉线窗口里刷新页面）。
+ */
+int iv_ctl_route_pick(const iv_ctl_route_t *r, int n);
+
 /* 已知方法名（按登记顺序），`i` 越界返回 NULL。给单测与 `/api/methods` 用。 */
 const char *iv_ctl_method_name(int i);
 

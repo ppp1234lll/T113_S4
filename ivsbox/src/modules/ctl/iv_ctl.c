@@ -363,16 +363,89 @@ static void add_status_view(json_object *d, const iv_report_t *rp)
  * （`0102A8C0` → 192.168.2.1）。**不要套 htonl/ntohl** —— 套了就变成
  * `0.1.2.192` 这类反向地址，且在多字节地址上很难一眼看出。
  * ------------------------------------------------------------------------- */
+/* 内核私有标志位：`IFF_LOWER_UP` = "有物理承载"（网线插着 / 4G 拨通）。
+ * glibc 的 `<net/if.h>` 不定义它（与 iv_netlink.c 的处理一致），按内核值补一个。
+ *
+ * **为什么用它而不是 `IFF_RUNNING`**：`ip link` 输里的 `NO-CARRIER` 正是这一位
+ * 缺失，语义与"载波"严丝合缝；`IFF_RUNNING` 是内核按 RFC2863 合成的操作态，
+ * 还掺了 `netif_running` 与 operstate 判断，对 USB 网卡有过渡态。
+ * 这与 `iv_netlink.h` 文件头写的事件路径判据（`IFF_UP && IFF_LOWER_UP`）一致。
+ *
+ * `getifaddrs()` 的 `ifa_flags` 是 `unsigned int`，装得下 0x10000 这一位；
+ * 而 ioctl 的 `ifr_flags` 是 short 装不下 —— 这就是 `iv_netlink` 查询路径不得不
+ * 退用 `IFF_RUNNING` 的原因，本处没有那个限制。 */
+#define IVCL_KF_LOWER_UP ((unsigned int)0x00010000u)
+
+/* 单个网口的三态。三个都 0 表示这个网口不存在。 */
+typedef struct {
+    int present; /* 内核里有这个网口 */
+    int up;      /* 管理态已启用（IFF_UP） */
+    int carrier; /* 有物理承载（IFF_LOWER_UP） */
+} ivcl_iface_t;
+
+/*
+ * 取一个网口的三态。
+ *
+ * **默认网关的可用性与网络页的显示都用它**——判定只留在这一处，免得"同一个
+ * 网口两处两个答案"（这类不一致在现场最难查）。同网口会返回多条记录
+ * （AF_INET / AF_INET6 / AF_PACKET），flags 相同，取第一条即可。
+ */
+static void iface_flags_of(const char *name, ivcl_iface_t *out)
+{
+    struct ifaddrs *head = NULL;
+    struct ifaddrs *ifa;
+
+    out->present = 0;
+    out->up      = 0;
+    out->carrier = 0;
+    if (getifaddrs(&head) != 0)
+        return;
+    for (ifa = head; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_name == NULL || strcmp(ifa->ifa_name, name) != 0)
+            continue;
+        out->present = 1;
+        out->up      = (ifa->ifa_flags & IFF_UP) != 0;
+        out->carrier = (ifa->ifa_flags & IVCL_KF_LOWER_UP) != 0;
+        break;
+    }
+    freeifaddrs(head);
+}
+
+/* 出口网卡为什么不能用 —— 页面要照实说，不能笼统写"不可用"。 */
+static const char *iface_state_text(const ivcl_iface_t *s)
+{
+    if (!s->present)
+        return "未检测到";
+    if (!s->up)
+        return "已关闭";
+    return "无载波";
+}
+
+int iv_ctl_route_pick(const iv_ctl_route_t *r, int n)
+{
+    int i;
+
+    if (r == NULL || n <= 0)
+        return -1;
+    for (i = 0; i < n; i++) {
+        if (r[i].iface_ok)
+            return i;
+    }
+    return -1;
+}
+
 static void add_iface_link(json_object *arr, const char *want)
 {
     struct ifaddrs *head = NULL;
     struct ifaddrs *ifa;
     json_object    *o;
+    ivcl_iface_t    st;
     char            ip[INET_ADDRSTRLEN]   = "";
     char            mask[INET_ADDRSTRLEN] = "";
     char            mac[20]               = "";
-    int             present = 0;
-    int             up      = 0;
+
+    /* 三个状态位统一走 iface_flags_of()（默认网关那边用的是同一个判定）。 */
+    iface_flags_of(want, &st);
 
     if (getifaddrs(&head) != 0)
         return;
@@ -381,9 +454,7 @@ static void add_iface_link(json_object *arr, const char *want)
 
         if (ifa->ifa_name == NULL || strcmp(ifa->ifa_name, want) != 0)
             continue;
-        present = 1;
-        up      = (ifa->ifa_flags & IFF_UP) ? 1 : 0;
-        sa      = ifa->ifa_addr;
+        sa = ifa->ifa_addr;
         if (sa == NULL)
             continue;
         if (sa->sa_family == AF_INET && ip[0] == '\0') {
@@ -413,23 +484,50 @@ static void add_iface_link(json_object *arr, const char *want)
     if (o == NULL)
         return;
     json_object_object_add(o, "name", json_object_new_string(want));
-    json_object_object_add(o, "present", json_object_new_boolean(present));
-    json_object_object_add(o, "up", json_object_new_boolean(up));
+    json_object_object_add(o, "present", json_object_new_boolean(st.present));
+    /* `up` 只管管理态（等价于 `ip link` 里的 `<...,UP>`）；
+     * `carrier` 单独给"有没有承载"。两者分开是因为**断链时 `up` 仍为真**
+     * （网口开着、只是没线/没信号），合成一个字段就没法区分"关掉了"与"断了"。 */
+    json_object_object_add(o, "up", json_object_new_boolean(st.up));
+    json_object_object_add(o, "carrier", json_object_new_boolean(st.carrier));
     json_object_object_add(o, "ip", json_object_new_string(ip));
     json_object_object_add(o, "mask", json_object_new_string(mask));
     json_object_object_add(o, "mac", json_object_new_string(mac));
     json_object_array_add(arr, o);
 }
 
-/* 取默认路由的出口与网关（见上面"默认网关的一个坑"）。取不到给空串/0。 */
-static void default_route_of(char *ifout, size_t ifcap, char *gwout, size_t gwcap)
+/*
+ * 取**可用**默认路由的出口与网关。取不到给空串。
+ *
+ * ============================ 与旧实现的差别 ============================
+ * 旧实现见到 `Destination==0 && Flags&RTF_UP` 就采信。但断链后内核**不删**默认
+ * 路由，只给它打 `RTNH_F_LINKDOWN`（`ip route` 显示成
+ * `default via 10.158.0.1 dev usb0 linkdown`），于是断掉的链路被报成"默认网关"，
+ * 与 4G 页"SIM 卡未插入"自相矛盾。现在多一道闸门：**出口网卡必须存在、已启用、
+ * 有载波**；不满足的条目不采信，并把"内核里那条为什么不算"写进 skipout，
+ * 让页面能照实说明，而不是悄悄换一个值。
+ *
+ * **不要去 `/proc/net/route` 的 Flags 列找 linkdown 位**：那一列由内核
+ * `fib_flag_trans()` 现算，值域只有 `RTF_UP|RTF_GATEWAY|RTF_HOST|RTF_REJECT`
+ * （linux-5.4 `net/ipv4/fib_trie.c`），linkdown 根本不在里面。
+ */
+static void default_route_of(char *ifout, size_t ifcap, char *gwout, size_t gwcap,
+                             char *skipout, size_t skipcap)
 {
-    FILE *f;
+    iv_ctl_route_t cand[IV_CTL_ROUTE_MAX];
+    const char    *why[IV_CTL_ROUTE_MAX] = { NULL };
+    int            ncand = 0;
+    int            pick;
+    int            i;
+    FILE          *f;
 
     if (ifout != NULL && ifcap > 0u)
         ifout[0] = '\0';
     if (gwout != NULL && gwcap > 0u)
         gwout[0] = '\0';
+    if (skipout != NULL && skipcap > 0u)
+        skipout[0] = '\0';
+
     f = fopen("/proc/net/route", "r");
     if (f == NULL)
         return;
@@ -440,27 +538,67 @@ static void default_route_of(char *ifout, size_t ifcap, char *gwout, size_t gwca
             (void)fclose(f); /* 连表头都没有：空表 */
             return;
         }
-        while (fgets(line, sizeof(line), f) != NULL) {
+        while (fgets(line, sizeof(line), f) != NULL && ncand < IV_CTL_ROUTE_MAX) {
             char          ifname[32];
             unsigned long dst = 0ul;
             unsigned long g   = 0ul;
             unsigned long fl  = 0ul;
             struct in_addr a;
+            ivcl_iface_t  st;
 
             if (sscanf(line, "%31s %lx %lx %lx", ifname, &dst, &g, &fl) != 4)
                 continue;
             if (dst != 0ul || (fl & 0x1ul) == 0ul) /* 非默认路由 / 未启用 */
                 continue;
+            (void)memset(&cand[ncand], 0, sizeof(cand[ncand]));
+            (void)snprintf(cand[ncand].ifname, sizeof(cand[ncand].ifname), "%s",
+                           ifname);
+            /* 见上面"默认网关的一个坑"：strtoul 的结果直接就是网络序字节 */
             a.s_addr = (uint32_t)g;
-            if (ifout != NULL && ifcap > 0u)
-                (void)snprintf(ifout, ifcap, "%s", ifname);
-            if (gwout != NULL && gwcap > 0u &&
-                inet_ntop(AF_INET, &a, gwout, (socklen_t)gwcap) == NULL)
-                gwout[0] = '\0';
-            break;
+            if (inet_ntop(AF_INET, &a, cand[ncand].gw,
+                          (socklen_t)sizeof(cand[ncand].gw)) == NULL)
+                cand[ncand].gw[0] = '\0';
+
+            iface_flags_of(ifname, &st);
+            cand[ncand].iface_ok = (st.present && st.up && st.carrier) ? 1 : 0;
+            why[ncand]           = iface_state_text(&st);
+            ncand++;
         }
     }
     (void)fclose(f);
+
+    pick = iv_ctl_route_pick(cand, ncand);
+    if (pick >= 0) {
+        if (ifout != NULL && ifcap > 0u)
+            (void)snprintf(ifout, ifcap, "%s", cand[pick].ifname);
+        if (gwout != NULL && gwcap > 0u)
+            (void)snprintf(gwout, gwcap, "%s", cand[pick].gw);
+    }
+
+    /* 不可用的那些照样列出来：现场最想知道的是"我明明看见有默认路由，
+     * 为什么设备说没有"。多条用"；"连，超长就地截断。 */
+    {
+        size_t used = 0u;
+
+        for (i = 0; i < ncand; i++) {
+            int n;
+
+            if (cand[i].iface_ok)
+                continue;
+            if (skipout == NULL || skipcap == 0u || used + 1u >= skipcap)
+                break;
+            n = snprintf(skipout + used, skipcap - used, "%s%s（%s %s）",
+                         (used > 0u) ? "；" : "",
+                         (cand[i].gw[0] != '\0') ? cand[i].gw : "0.0.0.0",
+                         cand[i].ifname,
+                         (why[i] != NULL) ? why[i] : "不可用");
+            if (n > 0) {
+                size_t adv = used + (size_t)n;
+
+                used = (adv < skipcap) ? adv : (skipcap - 1u);
+            }
+        }
+    }
 }
 
 /* 恒返回一个对象（取不到也返回，只是各字段为空/0），前端据此统一渲染。 */
@@ -470,6 +608,7 @@ static json_object *build_link_view(void)
     json_object *arr = json_object_new_array();
     char         gwif[32];
     char         gw[INET_ADDRSTRLEN];
+    char         skipped[256];
 
     if (l == NULL || arr == NULL) {
         if (l != NULL)
@@ -479,9 +618,13 @@ static json_object *build_link_view(void)
         return NULL;
     }
 
-    default_route_of(gwif, sizeof(gwif), gw, sizeof(gw));
+    default_route_of(gwif, sizeof(gwif), gw, sizeof(gw), skipped, sizeof(skipped));
     json_object_object_add(l, "gateway", json_object_new_string(gw));
     json_object_object_add(l, "gateway_if", json_object_new_string(gwif));
+    /* 内核里有、但出口没载波而被忽略的默认路由（空串＝没有）。
+     * 单列出来是因为"设备说没有网关"与"有网关但链路断了"是两回事，
+     * 现场看到的现象一样，处置办法完全不同。 */
+    json_object_object_add(l, "gateway_ignored", json_object_new_string(skipped));
 
     /* 只报两条 WAN（架构 §18.3：无线＝usb0、有线＝eth0）。
      * `wlan0` 是给摄像机用的 AP，不是 WAN，故不列 —— 列进来会被读成"第三条外网"。*/

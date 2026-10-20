@@ -450,8 +450,9 @@ static int rep_send_report(iv_report_t *rp)
         rp->reports++;
         /* 每条周期上报留一行 DT —— 这是"设备到底按没按时发"的**唯一现场证据**。
          * 300 s 一条＝12 行/小时，代价可忽略；与平台「历史数据」对账时逐条比。 */
-        IV_LOG_I(REP_MOD, "report #%llu DT=%s seg=%d frame=%u m=%08x",
-                 (unsigned long long)rp->reports, dt, n, (unsigned)flen, (unsigned)h);
+        IV_LOG_I(REP_MOD, "report #%llu DT=%s seg=%d frame=%u m=%08x end=%.4s",
+                 (unsigned long long)rp->reports, dt, n, (unsigned)flen, (unsigned)h,
+                 (flen >= 4u) ? (const char *)&frame[flen - 4u] : "");
     } else if (rc == IV_EFULL) {
         rp->queue_full++;
     }

@@ -346,18 +346,22 @@ static size_t next_report_frame(const char *buf, size_t len, size_t off,
 {
     size_t sl;
 
-    if (off + 8u > len)
+    /* 固定开销 10＝`##`2 + 长度域4 + CRC2 + `##`2。末尾 `##` **必须落在帧内**：
+     * 以前按 8 算，帧尾被截掉也不报错，线上表现为平台隔一帧丢一帧。 */
+    if (off + 10u > len)
         return 0u;
     if (buf[off] != '#' || buf[off + 1u] != '#')
         return 0u;
     sl = (size_t)(buf[off + 2u] - '0') * 1000u +
          (size_t)(buf[off + 3u] - '0') * 100u +
          (size_t)(buf[off + 4u] - '0') * 10u + (size_t)(buf[off + 5u] - '0');
-    if (off + 8u + sl > len)
+    if (off + 10u + sl > len)
+        return 0u;
+    if (buf[off + 6u + sl + 2u] != '#' || buf[off + 6u + sl + 3u] != '#')
         return 0u;
     *seg     = buf + off + 6u;
     *seg_len = sl;
-    return 8u + sl;
+    return 10u + sl;
 }
 
 /* 取 `CSQ=<n>;` 中的 n；没有则 -1（用例用它给每帧打序号，证补传按序） */

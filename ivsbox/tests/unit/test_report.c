@@ -136,7 +136,10 @@ int main(void)
             snprintf(hex, sizeof(hex), "%02x", (unsigned)crc);
             chk(iv_proto_text_frame(seg, (size_t)n, frame, &flen) == IV_OK,
                 "c01 frame ok");
-            chk(flen == 8u + (size_t)n, "c01 frame len");
+            /* 固定开销 10（`##`2+长度4+CRC2+`##`2），字面量锁死 */
+            chk(flen == 10u + (size_t)n, "c01 frame len");
+            chk(frame[flen - 2u] == '#' && frame[flen - 1u] == '#',
+                "c01 frame tail ## inside flen");
             chk(frame[6 + n] == (uint8_t)hex[0] &&
                 frame[6 + n + 1] == (uint8_t)hex[1],
                 "c01 frame crc covers &&data&& only");

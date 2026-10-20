@@ -265,7 +265,9 @@ int main(void)
 
         rc = iv_proto_text_frame(seg, seg_len, out, &olen);
         chk(rc == IV_OK, "text_frame ok");
-        chk(olen == 8u + seg_len, "text_frame len");
+        /* 固定开销＝`##`2 + 长度域4 + CRC2 + `##`2 ＝ 10。**用字面量而不是宏**：
+         * 宏被填错（曾把 10 填成 8）时这条必须红，宏自己证明不了宏。 */
+        chk(olen == 10u + seg_len, "text_frame len (##+4+seg+crc+##)");
         chk(out[0] == '#' && out[1] == '#', "text head");
         chk(out[2] == '0' && out[3] == '0' &&
             out[4] == (uint8_t)('0' + seg_len / 10u) &&
@@ -274,6 +276,10 @@ int main(void)
         chk(memcmp(&out[6], seg, seg_len) == 0, "text seg");
         chk(out[6 + seg_len + 2] == '#' && out[6 + seg_len + 3] == '#',
             "text tail");
+        /* ★ 回归闸门：帧尾 `##` 必须落在**回报长度之内**。长度少算 2 时，
+         * 调用方按回报长度入队 ⇒ 末尾 `##` 被截掉 ⇒ 平台隔一帧丢一帧。 */
+        chk(out[olen - 2u] == '#' && out[olen - 1u] == '#',
+            "text tail inside reported length");
 
         /* CRC 只覆盖段内第一个 "&&" 起到段尾（权威：指令表 + com.c strstr） */
         crc = iv_crc8(suf, suf_len, IV_CRC8_SEED_INIT);
@@ -288,12 +294,12 @@ int main(void)
         /* 长度探测 */
         olen = 0;
         rc = iv_proto_text_frame(seg, seg_len, NULL, &olen);
-        chk(rc == IV_OK && olen == 8u + seg_len, "text probe");
+        chk(rc == IV_OK && olen == 10u + seg_len, "text probe");
 
-        /* 缓冲不足 */
-        olen = 7u + seg_len;
+        /* 缓冲不足（差 1 字节也要拦） */
+        olen = 9u + seg_len;
         rc = iv_proto_text_frame(seg, seg_len, out, &olen);
-        chk(rc == IV_ERANGE && olen == 8u + seg_len, "text ERANGE");
+        chk(rc == IV_ERANGE && olen == 10u + seg_len, "text ERANGE");
 
         /* 缺数据区（段内无 "&&"）→ IV_EINVAL（畸形段，拒绝发出） */
         olen = sizeof(out);
@@ -432,9 +438,13 @@ int main(void)
             const char *seg = "QN=0;CP=&&DT=1&&";
             size_t seg_len = strlen(seg);
             chk(iv_proto_send_text(&pf, seg, seg_len) == IV_OK, "send_text ok");
-            chk(g_tx.n == 1 && g_tx.len[0] == 8u + seg_len, "send_text len");
+            chk(g_tx.n == 1 && g_tx.len[0] == 10u + seg_len, "send_text len");
             chk(g_tx.buf[0][0] == '#' && g_tx.buf[0][1] == '#' &&
                 memcmp(&g_tx.buf[0][6], seg, seg_len) == 0, "send_text bytes");
+            /* 真正落到线缆上的最后一个字节必须是 `##` 的第二个 `#` */
+            chk(g_tx.buf[0][g_tx.len[0] - 1u] == '#' &&
+                g_tx.buf[0][g_tx.len[0] - 2u] == '#',
+                "send_text tail ## on the wire");
         }
 
         /* 缺 "&&" 的上报段 ⇒ IV_EINVAL，且一帧都不发 */

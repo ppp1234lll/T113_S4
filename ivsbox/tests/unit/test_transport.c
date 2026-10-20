@@ -680,8 +680,17 @@ static void c08_drop_repull(void)
     iv_transport_open(&t, &c);
 
     now += 10;
-    iv_transport_step(&t, now); /* UP → 拉件 → 写 2 字节 → 第 2 次写失败 → DOWN */
-    chk(iv_transport_state(&t) == IV_TRANSPORT_DOWN, "c08 write error => DOWN");
+    iv_transport_step(&t, now); /* UP → 拉件 → 写 2 字节 → 第 2 次写失败 → 重试 1/3 */
+    chk(iv_transport_state(&t) == IV_TRANSPORT_UP, "c08 1st write error still UP (retry 1/3)");
+    chk(p.acked_n == 0, "c08 in-flight item NOT acked while retrying");
+
+    now += 10;
+    iv_transport_step(&t, now); /* 重试 2/3：仍失败，仍不判死 */
+    chk(iv_transport_state(&t) == IV_TRANSPORT_UP, "c08 2nd write error still UP (retry 2/3)");
+
+    now += 10;
+    iv_transport_step(&t, now); /* 重试 3/3 耗尽 ⇒ 判链路死并排重连 */
+    chk(iv_transport_state(&t) == IV_TRANSPORT_DOWN, "c08 3 write errors => DOWN");
     chk(p.acked_n == 0, "c08 in-flight item NOT acked on drop");
     chk(p.idx == 0, "c08 pump not advanced");
     chk(iv_transport_drops(&t) == 1u, "c08 drops=1");

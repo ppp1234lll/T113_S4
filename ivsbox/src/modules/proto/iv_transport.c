@@ -204,6 +204,7 @@ static void link_down(iv_transport_t *t, uint64_t now_ms)
     t->pump_len    = 0;
     t->pump_active = 0;
     t->pump_cookie = 0;
+    t->tx_tries    = 0;
 
     t->drops++;
     t->retry_at_ms = now_ms + (uint64_t)t->backoff;
@@ -490,9 +491,20 @@ int iv_transport_step(iv_transport_t *t, uint64_t now_ms)
     if (t->state == IV_TRANSPORT_UP) {
         pump_fill(t);
         if (tx_flush(t) != IV_OK) {
+            /* 参考实现 send.c:send_handle_fail()：失败先重试 `SEND_RETRY_MAX`(=3) 次，
+             * 3 次都失败才复位连接（`eth_set_tcp_connect_reset` /
+             * `gsm_set_network_reset_function`）。这里照做：暂存**不清**，下个节拍
+             * 原样再写同一件；耗尽才判链路死。区别只在间隔——它 10 ms，我们是
+             * reactor 一个节拍（`IV_REPORT_TICK_MS` = 200 ms）：在 200 ms 节拍里塞
+             * 10 ms 忙等会卡住整条 reactor，不划算。在途件本来就不 ack，重连后整件重发。 */
+            if (++t->tx_tries < IV_TRANSPORT_TX_TRIES) {
+                return IV_OK;
+            }
+            t->tx_tries = 0;
             link_down(t, now_ms);
             return IV_OK;
         }
+        t->tx_tries = 0;
         if (rx_pump(t) != IV_OK) {
             link_down(t, now_ms);
             return IV_OK;

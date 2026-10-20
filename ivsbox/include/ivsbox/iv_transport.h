@@ -87,6 +87,10 @@ extern "C" {
 #define IV_TRANSPORT_DEF_BACKOFF_MS     1000u
 #define IV_TRANSPORT_DEF_BACKOFF_MAX_MS 30000u
 
+/* 同一件最多连写几次才判链路死（对齐参考实现 `SEND_RETRY_MAX` = 3：失败重试 3 次，
+ * 耗尽才复位 TCP／复位 4G 网络）。判死之后由持久队列在重连后整件重发。 */
+#define IV_TRANSPORT_TX_TRIES 3u
+
 /* ---------------------------------------------------------------------------
  * 状态
  * ------------------------------------------------------------------------- */
@@ -189,6 +193,10 @@ typedef struct {
     uint16_t tx_len;
     uint16_t pump_len;      /* 暂存头部属于在途取件件的字节数（0 = 无） */
     uint64_t pump_cookie;
+    /* 同一条消息"连发几次才判链路死"的计数（对齐参考实现 send.c:send_handle_fail：
+     * 失败重试 `SEND_RETRY_MAX`=3 次、耗尽才 `set_tcp_connect_reset`／`network_reset`）。
+     * 暂存不清，下个节拍原样重写；3 次都写不出去才 `link_down()`。 */
+    uint8_t  tx_tries;
 
     /* 统计 */
     uint64_t bytes_tx;      /* 累计写出线路字节 */

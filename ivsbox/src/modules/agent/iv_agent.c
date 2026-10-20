@@ -810,6 +810,15 @@ static void env_feed(iv_agent_t *a, uint64_t now_ms)
         }
     }
 
+    /* 4G 信号强度（上报帧 `CSQ=`）：只在模组**确实取到** 0..31 时上报；
+     * 99（规范里的"未知"）或 AT 口没开 ⇒ -1 ⇒ 该字段不上传（不编 0 冒充
+     * "无信号"，与"未知量给 null 不给 0"同一口径）。
+     * 原先这一路从没被填过：`env.csq` 只在 iv_report_open() 里初始化成 -1，
+     * 全仓再无第二次赋值 ⇒ `if (e->csq >= 0)` 永不成立，`CSQ=` 一直发不出去
+     * （参考实现 com.c 是恒发 `CSQ=%d` 的）。 */
+    env.csq = (a->cell.snap.csq >= 0 && a->cell.snap.csq <= 31) ? a->cell.snap.csq
+                                                                : -1;
+
     for (i = 0; i < (int)IV_RECOVERY_MASTER_N && i < (int)IV_WAN_N; i++) {
         int st;
 

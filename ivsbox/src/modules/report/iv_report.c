@@ -411,18 +411,29 @@ int iv_report_step(iv_report_t *rp, uint64_t now_ms)
     if (rp->tr.opened)
         (void)iv_transport_step(&rp->tr, now_ms);
 
-    /* 定时器（一次性触发后顺延；用 >= 以免欠跑时漏拍） */
+    /* 定时器：**自由运行的整倍数节拍**（对齐参考实现 —— 那边是 1 ms 硬件计数器
+     * 累加到设定值就发，唤醒延迟不进入下一拍）。
+     * 原先写 `next = now_ms + period`：每次唤醒的延迟（tick 200 ms + 调度抖动）
+     * 都会累加进下一拍，300 s 上报会持续后移 —— 实测 40 min 慢 1 s、一天 30 s 以上，
+     * 平台上表现为"时间不固定"。改成 `next += period` 后节拍只由开启时刻决定；
+     * 兜底：落后超过一整周期（长时间挂起/时钟回退）则从 now 重新对齐。 */
     if (now_ms >= rp->next_poll) {
-        rp->next_poll = now_ms + rp->cfg.poll_ms;
+        rp->next_poll += rp->cfg.poll_ms;
+        if (rp->next_poll <= now_ms)
+            rp->next_poll = now_ms + rp->cfg.poll_ms;
         rep_poll(rp);
     }
     if (now_ms >= rp->next_hb) {
-        rp->next_hb = now_ms + rp->cfg.heartbeat_ms;
+        rp->next_hb += rp->cfg.heartbeat_ms;
+        if (rp->next_hb <= now_ms)
+            rp->next_hb = now_ms + rp->cfg.heartbeat_ms;
         if (iv_proto_heartbeat(&rp->pf) == IV_OK)
             rp->heartbeats++;
     }
     if (now_ms >= rp->next_report) {
-        rp->next_report = now_ms + rp->cfg.report_ms;
+        rp->next_report += rp->cfg.report_ms;
+        if (rp->next_report <= now_ms)
+            rp->next_report = now_ms + rp->cfg.report_ms;
         (void)rep_send_report(rp);
     }
     return IV_OK;
@@ -522,6 +533,33 @@ int iv_report_set_bind_if(iv_report_t *rp, const char *ifname)
         return IV_ERANGE;
 
     memcpy(rp->bind_if, ifname, n + 1u);
+    return IV_OK;
+}
+
+/*
+ * 运行期改"周期上报间隔"。
+ *
+ * 病根：`report_ms` 原先只在 `iv_report_open()` 里从配置取一次，之后再无写入口 ——
+ * 用户在网页上把「定时上报间隔」从 600 改成 300（或反过来），进程里跑的还是**开进程
+ * 那一刻**的值，必须重启才生效。现场表现正是"页面上写着 5 分钟，平台上却十分钟一条"。
+ *
+ * 语义：只改周期，不动在用连接、不动队列；当前这一拍已排好的截止时刻按新周期就地
+ * 前移（新周期更短时），使新值立即生效而不必等旧的那一拍到点。
+ */
+int iv_report_set_report_period(iv_report_t *rp, uint32_t report_ms)
+{
+    if (rp == NULL || !rp->opened)
+        return IV_EINVAL;
+    if (report_ms == 0u)
+        report_ms = IV_REPORT_REPORT_MS;
+    if (report_ms == rp->cfg.report_ms)
+        return IV_OK;
+
+    IV_LOG_I(REP_MOD, "report period %u -> %u ms", (unsigned)rp->cfg.report_ms,
+             (unsigned)report_ms);
+    rp->cfg.report_ms = report_ms;
+    if (rp->next_report > rp->now_ms + report_ms)
+        rp->next_report = rp->now_ms + report_ms;
     return IV_OK;
 }
 
@@ -744,7 +782,11 @@ int iv_report_build_seg(const iv_status_t *st, const iv_report_env_t *env,
     APPEND(out, cap, n, "DEVTYPE=%04x;", (unsigned)IV_PROTO_DEVTYPE_DEFAULT);
     APPEND(out, cap, n, "CP=&&");
 
-    /* ---- 数据区（按指令表字段表顺序；未取到值的不上传） ---- */
+    /* ---- 数据区：**逐字段对齐参考实现 `com.c:com_report_normally_function()`**
+     * 的拼接顺序（2026-10-20 复核）：DT CNS MN V A APOWER AKW H T P DS
+     * RELAY CHV CHA POWER ELEC CSQ MIU(LAT/LNG) ERR。
+     * 原先是 V A H T DS P APOWER AKW —— `DS`/`P` 互换、`APOWER`/`AKW` 后置，
+     * 与参考实现不一致（见文件头"字段顺序"一节）。未取到值的不上传。 */
     APPEND(out, cap, n, "DT=%s;", dt14);
 
     APPEND(out, cap, n, "CNS=%d,%d,%d,%d,%d,%d;",
@@ -756,19 +798,20 @@ int iv_report_build_seg(const iv_status_t *st, const iv_report_env_t *env,
             APPEND(out, cap, n, "V=%.2f;", (double)d->V);
         if (st->valid.A)
             APPEND(out, cap, n, "A=%.2f;", (double)d->A);
-        if (st->valid.H)
-            APPEND(out, cap, n, "H=%.2f;", (double)d->H);
-        if (st->valid.T)
-            APPEND(out, cap, n, "T=%.2f;", (double)d->T);
-        /* DS：指令表数据区无此行，按示例串位置（T 与 P 之间）原值直传（见文件头 ⚠1） */
-        if (st->valid.DS)
-            APPEND(out, cap, n, "DS=%d;", (int)d->DS);
-        if (st->valid.P)
-            APPEND(out, cap, n, "P=%d;", (int)d->P);
+        /* 总功率/总用电量：参考实现紧跟 V/A 之后（`APOWER`/`AKW`） */
         if (d->APOWER[0] != '\0')
             APPEND(out, cap, n, "APOWER=%s;", d->APOWER);
         if (d->AKW[0] != '\0')
             APPEND(out, cap, n, "AKW=%s;", d->AKW);
+        if (st->valid.H)
+            APPEND(out, cap, n, "H=%.2f;", (double)d->H);
+        if (st->valid.T)
+            APPEND(out, cap, n, "T=%.2f;", (double)d->T);
+        /* 箱体姿态 P → 箱门 DS（参考实现先 P 后 DS） */
+        if (st->valid.P)
+            APPEND(out, cap, n, "P=%d;", (int)d->P);
+        if (st->valid.DS)
+            APPEND(out, cap, n, "DS=%d;", (int)d->DS);
 
         if (st->valid.RELAY)
             APPEND(out, cap, n, "RELAY=%d,%d,%d;",
@@ -787,10 +830,11 @@ int iv_report_build_seg(const iv_status_t *st, const iv_report_env_t *env,
                    (double)d->ELEC[0], (double)d->ELEC[1], (double)d->ELEC[2]);
     }
 
-    if (e->have_loc)
-        APPEND(out, cap, n, "LAT=%.6f;LNG=%.6f;", e->lat, e->lng);
+    /* CSQ 紧接 ELEC（参考实现位置）；未取到信号强度（<0）则不上传 */
     if (e->csq >= 0)
         APPEND(out, cap, n, "CSQ=%d;", e->csq);
+    if (e->have_loc)
+        APPEND(out, cap, n, "LAT=%.6f;LNG=%.6f;", e->lat, e->lng);
     if (e->err != NULL && e->err[0] != '\0')
         APPEND(out, cap, n, "ERR=%s;", e->err);
 

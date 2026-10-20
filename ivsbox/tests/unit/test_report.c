@@ -82,8 +82,7 @@ int main(void)
         const char *want =
             "QN=0;TID=5947;VER=11;DEVTYPE=0400;CP=&&"
             "DT=20250725171635;CNS=0,0,0,0,0,0;MN=3,0;"
-            "V=234.17;A=0.00;H=50.01;T=31.33;DS=1;P=0;"
-            "APOWER=0.00;AKW=0.00;"
+            "V=234.17;A=0.00;APOWER=0.00;AKW=0.00;H=50.01;T=31.33;P=0;DS=1;"
             "RELAY=1,1,1;"
             "CHV=234.17,234.17,234.17;"
             "CHA=0.00,0.00,0.00;"
@@ -106,6 +105,23 @@ int main(void)
             fprintf(stderr, "  got : %s\n  want: %s\n", seg, want);
         /* 数据段必含数据区标记（否则上报帧 CRC 无从算起） */
         chk(strstr(seg, "&&") != NULL, "c01 seg has &&");
+
+        /* 字段相对顺序：对齐参考实现 com.c（黄金串已整体锁死，这里给单点定位，
+         * 顺序再被改动时报错信息能直接指出是哪一段错位） */
+        {
+            const char *ea = strstr(seg, ";A=0.00;");
+            const char *ap = strstr(seg, "APOWER=");
+            const char *eh = strstr(seg, ";H=50.01;");
+            const char *pp = strstr(seg, "P=0;");
+            const char *dd = strstr(seg, "DS=1;");
+
+            chk(ea != NULL && ap != NULL && eh != NULL && pp != NULL && dd != NULL,
+                "c01 order anchors present");
+            if (ea != NULL && ap != NULL && eh != NULL)
+                chk(ea < ap && ap < eh, "c01 APOWER/AKW sit right after A");
+            if (pp != NULL && dd != NULL)
+                chk(pp < dd, "c01 P before DS (com.c order)");
+        }
 
         /* 该段能被 ## 上报帧打包，且 CRC 只覆盖 &&数据区&& */
         {
@@ -336,8 +352,71 @@ int main(void)
         iv_report_close(&rp);
     }
 
+    /* ---- 11) 运行期改"周期上报间隔"（2026-10-20 现场缺陷的库层回归） ----
+     * 原先 report_ms 只在 iv_report_open() 从配置取一次，网页上把
+     * 「定时上报间隔」从 600 改 300，进程里跑的还是开进程那一刻的值 ——
+     * 不重启等于没改。本用例锁三件事：改完立刻换节拍、只动节拍不动连接、
+     * 0 回落默认。 */
+    {
+        static iv_report_t rp;
+        iv_report_cfg_t    cfg;
+
+        iv_report_cfg_default(&cfg);
+        cfg.server_host = "127.0.0.1";
+        cfg.server_port = 1u;
+        cfg.serial_path = "/dev/null";
+        cfg.report_ms   = 300000u;
+
+        chk(iv_report_open(&rp, &cfg, NULL, 1000u) == IV_OK, "c11 open ok");
+        chk(rp.next_report == 301000u, "c11 first report one period out");
+
+        chk(iv_report_set_report_period(&rp, 60000u) == IV_OK, "c11 set 60 s ok");
+        chk(rp.cfg.report_ms == 60000u, "c11 period applied");
+        chk(rp.next_report == 61000u, "c11 pending deadline pulled in");
+
+        /* 放长：已排得更早的那一拍不动（不能因为改大就推迟，更不能补发） */
+        chk(iv_report_set_report_period(&rp, 900000u) == IV_OK, "c11 set 900 s ok");
+        chk(rp.next_report == 61000u, "c11 longer period keeps pending deadline");
+
+        chk(iv_report_set_report_period(&rp, 0u) == IV_OK, "c11 set 0 ok");
+        chk(rp.cfg.report_ms == IV_REPORT_REPORT_MS, "c11 0 falls back to default");
+
+        chk(iv_report_set_report_period(NULL, 1000u) == IV_EINVAL, "c11 null rejected");
+        iv_report_close(&rp);
+        chk(iv_report_set_report_period(&rp, 1000u) == IV_EINVAL,
+            "c11 closed rejected");
+    }
+
+    /* ---- 12) 节拍是"自由运行整倍数"：唤醒延迟不得累加进下一拍 ----
+     * 参考实现靠 1 ms 硬件计数器（`report_time++` 到点清零），延迟不进下一拍。
+     * 本层原先写 `next = now_ms + period`，每次唤醒晚多少就往后推多少 ——
+     * 300 s 上报实测 40 min 慢 1 s，平台上看着像"时间不固定"。
+     * 这里故意让 step 迟到 137 ms / 900 ms：下一拍必须仍落在整倍数网格上。 */
+    {
+        static iv_report_t rp;
+        iv_report_cfg_t    cfg;
+
+        iv_report_cfg_default(&cfg);
+        cfg.server_host = "127.0.0.1";
+        cfg.server_port = 1u;
+        cfg.serial_path = "/dev/null";
+        cfg.report_ms   = 300000u;
+
+        chk(iv_report_open(&rp, &cfg, NULL, 1000u) == IV_OK, "c12 open ok");
+        chk(rp.next_report == 301000u, "c12 grid starts one period out");
+
+        chk(iv_report_step(&rp, 301137u) == IV_OK, "c12 step ok (late by 137 ms)");
+        chk(rp.next_report == 601000u, "c12 delay NOT accumulated into next beat");
+
+        chk(iv_report_step(&rp, 601900u) == IV_OK, "c12 second step ok");
+        chk(rp.next_report == 901000u, "c12 beat still on the grid");
+
+        iv_report_close(&rp);
+    }
+
     if (g_fail == 0)
-        printf("test_report passed (seg/frame/query-crc/json/env/set-server/bind-if)\n");
+        printf("test_report passed (seg/frame/query-crc/json/env/set-server/bind-if/"
+               "report-period)\n");
     else
         printf("test_report FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

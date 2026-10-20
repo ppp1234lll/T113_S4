@@ -537,16 +537,25 @@ static int agent_sync_server_cfg(int force)
     return changed;
 }
 
-/* 配置事务通知（F7）。只认 `net` 分类：其余分类的热更新各有归属
- * （`sys.*` 由 tunnel 那边处理，见 on_config_event）。 */
+/* 配置事务通知（F7）。这里只接两条"改完必须马上生效"的：
+ *   - `net` 分类：平台地址/端口（与出口网卡成对刷新）→ 断开旧连接、连新平台；
+ *   - `sys` 分类里的 `sys.report.interval_s`：周期上报间隔 → 换节拍，**不断链**。
+ * 其余分类的热更新各有归属（隧道见 on_config_event）。 */
 static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, void *user)
 {
     (void)c;
     (void)name;
     (void)user;
-    if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_NET)) == 0u)
-        return;
-    (void)agent_sync_server_cfg(1);
+    if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_NET)) != 0u)
+        (void)agent_sync_server_cfg(1);
+    if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_SYS)) != 0u) {
+        /* `sys.report.interval_s` 原先只在 app_init 里读一次，网页上改了等于没改
+         * （必须重启进程）—— 现场"设了 5 分钟、平台上还是十分钟一条"正是这个。 */
+        int64_t v = 0;
+
+        if (iv_config_get_int(g_cfg, "sys.report.interval_s", &v) == IV_OK && v > 0)
+            (void)iv_report_set_report_period(&g_agent.rp, (uint32_t)v * 1000u);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1152,9 +1161,13 @@ static int app_init(void)
      * 已是新值，重载比对等于"没变化"，压根不会触发）。
      * 先 force=0 对齐一次缓存，避免刚装配完就白重连一次。 */
     (void)agent_sync_server_cfg(0);
-    if (iv_config_subscribe(g_cfg, IV_CFG_CLASS_MASK(IV_CFG_CLS_NET),
+    if (iv_config_subscribe(g_cfg,
+                            IV_CFG_CLASS_MASK(IV_CFG_CLS_NET) |
+                                IV_CFG_CLASS_MASK(IV_CFG_CLS_SYS),
                             on_cfg_committed, NULL) != IV_OK)
-        IV_LOG_W(APP_MOD, "subscribe(net) failed -- server addr change needs a restart");
+        IV_LOG_W(APP_MOD,
+                 "subscribe(net+sys) failed -- server addr / report interval "
+                 "change needs a restart");
 
     /* 9d. M8-S8.3 受控远程通道装配（身份/令牌/服务端/落点/巡检定时器）。
      *    在 9b 之后：与 agent 装配同级，都在 reactor 建好之后。 */

@@ -3718,3 +3718,88 @@ netmgr 换出口         才经 agent_reconnect 重推一次   <- 唯一的更�
   现场遇到就重启板子。
 
 
+
+== 2026-10-20 11:00 上报帧对齐参考实现（com.c）：字段顺序 ＋ 定时间隔热生效 ＋ CSQ
+
+=== 起因
+
+现场反馈：同样一台平台，单片机（`GD32F460`，参考实现 `General_Version/main`）3 分钟上报很准时；
+我们的设备 5 分钟一条却"时间不固定"。用户要求对照参考实现自查，不许拿"平台降采样"解释。
+
+=== 对照结论（三处我方差异 ＋ 一处隐性漂移）
+
+`com.c` 的 `com_report_normally_function()` 拼接顺序：
+
+[source,c]
+----
+QN; TID; VER; DEVTYPE; CP=&&
+DT; CNS; MN; V; A; APOWER; AKW; H; T; P; DS;
+RELAY; CHV; CHA; POWER; ELEC; CSQ; MIU; [WATER]; [LAT;LNG]; ERR
+&&
+----
+
+我们原来发的是 `V;A;H;T;DS;P;APOWER;AKW` —— **`P`/`DS` 互换、`APOWER`/`AKW` 后置**。
+另外两处：`sys.report.interval_s` 只在 `iv_report_open()` 读一次（网页改完等于没改，必须重启）；
+`env.csq` 全仓只有 open 里那句 `= -1`，**`CSQ=` 从来没发出去过**。
+
+节拍上的差异更隐蔽：参考实现是 `app_com_time_function()` 每 1 ms 给 `report_time` 加一，
+到 `report * 1000` 就发并清零 —— **延迟不进下一拍**。我们写的是 `next = now_ms + period`，
+每次唤醒晚多少就往后推多少（tick 200 ms ＋ 调度抖动），300 s 上报实测 40 min 慢 1 s、一天 30 s 以上。
+
+=== 改法
+
+* `iv_report_build_seg()` 按上表逐字段重排（未取到值的字段仍不上传）。
+* 新增 `iv_report_set_report_period(rp, report_ms)`：只改周期 —— 不动在用连接、不动队列、不清统计；
+  新周期更短时把已排好的那一拍就地前移，改完立即生效。装配层 `on_cfg_committed()` 兼管 `sys` 分类，
+  订阅掩码从 `NET` 扩成 `NET|SYS`。
+* `env_feed()` 从 `a->cell.snap.csq` 取 0..31 填 `env.csq`；`99`（规范里的未知）或 AT 口没开仍给 `-1`
+  ⇒ 字段不上传。**不编 0 冒充"无信号"** —— 与"未知量给 null 不给 0"同口径。
+* 三个定时器（上报/心跳/轮询）全改 `next += period`，并留一条兜底：落后超过一整周期就从 `now_ms`
+  重新对齐（应对长时间挂起或时钟回退）。
+* `MIU`（漏电）**不补**：采集板协议里没有这个量，按指令表"未用到的字段无需上传"处理，不编值。
+* 顺带修正文件头一处自己编的依据：原注释称示例串里有 `DS`，实际 Excel 示例串 `T=31.33;P=0;APOWER=0.00;`
+  **没有 DS**；现在依据改成"参考实现恒发 `DS` 且在 `P` 之后"。
+
+=== 反向证伪（三条，均在 VM 上做、还原后 md5 逐字节回基线）
+
+| 变异 | 期望红 | 实测 |
+| `P`/`DS` 换回旧顺序 | c01 黄金段 ＋ 顺序断言 | 2 条红，`got` 串里 `DS=1;P=0` 一目了然 |
+| `next += period` 改回 `= now + period` | c12 | `c12 delay NOT accumulated into next beat`、`c12 beat still on the grid` 2 条红 |
+| 删掉 `rp->cfg.report_ms = report_ms` | c11 | `c11 period applied` 1 条红 |
+
+=== 单测
+
+* c01：黄金段（含新顺序）＋ `APOWER` 紧跟 `A`、`P` 在 `DS` 之前两条相对位置断言（顺序再被改动时，报错能直接指出错在哪一段）。
+* c11：改周期的四条语义（立即前移／放长不动已排拍／`0` 回落默认／NULL 与未 open 拒绝）。
+* c12：故意迟到 137 ms、900 ms，下一拍仍落在整倍数网格（`301000 → 601000 → 901000`）。
+
+=== 板端实测
+
+[source]
+----
+10:54:36 INFO [agent]  server addr reloaded -> 62.35.221:9998 (wan=usb0, bind=usb0)
+10:54:36 INFO [report] report period 300000 -> 60000 ms            <-- 改配置，未重启
+10:55:36 / 10:56:36 / 10:57:36 / 10:58:36 / 10:59:36               <-- 抓包 DT，严格 60 s
+10:59:51 INFO [report] report period 60000 -> 300000 ms            <-- 改回 300
+----
+
+实抓一帧（251 B，透明代理）：
+
+[source]
+----
+##0241QN=0;TID=b2cc1;VER=11;DEVTYPE=0400;CP=&&
+DT=20261020105536;CNS=0,0,0,0,0,0;MN=1,1;
+V=0.00;A=0.00;APOWER=0.0;AKW=0.00;H=14.78;T=42.61;P=90;DS=1;
+RELAY=1,1,1;CHV=0.00,0.00,0.00;CHA=0.00,0.00,0.00;
+POWER=0.00,0.00,0.00;ELEC=0.00,0.00,0.00;CSQ=24;&&b6
+----
+
+顺序与 `com.c` 一致，`CSQ=24` 是本次才第一次出现。
+帧里 `V/A/APOWER` 全是 0 是**采集板真实值**（`board.status` 同源，串口链路 `frames=34 / crc_err=0`），
+平台上该设备的"电压／电流"列为空由此而来，与上报节拍无关。
+
+=== 还没做的
+
+* 平台门户侧人工复核（本机没有平台账权）：设备侧时间戳与帧内容已用抓包钉死，平台"历史数据"页
+  是否恢复成 5 分钟一条，需用户刷新确认。
+* `MIU`（漏电）取值来源：需确认采集板是否真有该量，有再接、没有就保持不发。

@@ -87,7 +87,8 @@ int main(void)
             "CHV=234.17,234.17,234.17;"
             "CHA=0.00,0.00,0.00;"
             "POWER=0.00,0.00,0.00;"
-            "ELEC=0.00,0.00,0.00;&&";
+            "ELEC=0.00,0.00,0.00;"
+            "CSQ=;MIU=;ERR=0;&&";
         int n;
 
         fill_mirror(&st);
@@ -142,7 +143,7 @@ int main(void)
         }
     }
 
-    /* ---- 2) 未刷新字段不上传 ---- */
+    /* ---- 2) 未刷新字段：**字段名照发、值留空**（对齐参考实现的无条件拼接） ---- */
     {
         static iv_status_t st;
         iv_report_env_t    env;
@@ -156,14 +157,17 @@ int main(void)
         chk(iv_report_build_seg(&st, &env, 0x101u, "20250101000000",
                                 seg, sizeof(seg)) > 0, "c02 built");
         chk(strstr(seg, "V=12.50;") != NULL, "c02 V present");
-        chk(strstr(seg, "A=") == NULL, "c02 A omitted (not valid)");
-        chk(strstr(seg, "H=") == NULL, "c02 H omitted (not valid)");
-        chk(strstr(seg, "DS=") == NULL, "c02 DS omitted (not valid)");
-        chk(strstr(seg, "RELAY=") == NULL, "c02 RELAY omitted");
-        chk(strstr(seg, "APOWER=") == NULL, "c02 APOWER omitted (empty)");
-        chk(strstr(seg, "CSQ=") == NULL, "c02 CSQ omitted (unknown)");
+        chk(strstr(seg, "A=;") != NULL, "c02 A empty (not valid)");
+        chk(strstr(seg, "H=;") != NULL, "c02 H empty (not valid)");
+        chk(strstr(seg, "DS=;") != NULL, "c02 DS empty (not valid)");
+        chk(strstr(seg, "RELAY=,,;") != NULL, "c02 RELAY keeps 3 empty slots");
+        chk(strstr(seg, "APOWER=;") != NULL, "c02 APOWER empty");
+        chk(strstr(seg, "CSQ=;") != NULL, "c02 CSQ empty (unknown)");
+        chk(strstr(seg, "MIU=;") != NULL, "c02 MIU slot always present");
         chk(strstr(seg, "LAT=") == NULL, "c02 LAT omitted (no fix)");
-        chk(strstr(seg, "ERR=") == NULL, "c02 ERR omitted (empty)");
+        chk(strstr(seg, "ERR=0;") != NULL, "c02 ERR=0 when healthy");
+        /* 空值 ≠ 0：不能把"没取到"写成 0 */
+        chk(strstr(seg, "A=0.00;") == NULL, "c02 empty != 0");
     }
 
     /* ---- 3) DS 原值直传 + RELAY 三路 ---- */
@@ -218,8 +222,9 @@ int main(void)
                                 seg, sizeof(seg)) > 0, "c05 NULL st/env ok");
         chk(strstr(seg, "QN=0;TID=101;VER=11;DEVTYPE=0400;CP=&&DT=") == seg,
             "c05 NULL st keeps header");
-        chk(strstr(seg, "DT=") != NULL && strstr(seg, "CSQ=") == NULL,
-            "c05 NULL env -> no CSQ");
+        chk(strstr(seg, "CSQ=;") != NULL, "c05 NULL env -> empty CSQ slot");
+        chk(strstr(seg, "MIU=;") != NULL && strstr(seg, "ERR=0;") != NULL,
+            "c05 MIU/ERR slots always present");
 
         chk(iv_report_build_seg(&st, NULL, 1u, NULL, seg, sizeof(seg)) == IV_EINVAL,
             "c05 NULL dt EINVAL");

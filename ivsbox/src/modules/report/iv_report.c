@@ -29,6 +29,67 @@ static void on_serial_ev(int fd, uint32_t events, void *arg);
         (n) += (size_t)_w;                                           \
     } while (0)
 
+/* ---- "字段名无条件发、取不到就留空" -----------------------------------------
+ * 参考实现 `com.c:com_report_normally_function()` 对**每个**字段都无条件
+ * `sprintf` 一次（读数拿不到时拼出来的就是 `V=;` 这种空值），所以它的上报
+ * 字段表是**恒长**的。我们原先只在 `valid.X` 为真时才拼，字段个数随镜像刷新
+ * 情况变化：同一台设备相邻两帧长度不同、字段表不同。
+ * 空值 ≠ 0 —— 没取到就不填数，不伪造读数（见记忆"未 init 读数全零看着健康"）。
+ * ------------------------------------------------------------------------- */
+#define APPEND_F2(key, valid, v)                                             \
+    do {                                                                     \
+        int _w = (valid) ? snprintf(out + n, cap - n, "%s=%.2f;", (key),     \
+                                    (double)(v))                             \
+                         : snprintf(out + n, cap - n, "%s=;", (key));         \
+        if (_w < 0 || (size_t)_w >= cap - n)                                 \
+            return IV_ERANGE;                                                \
+        n += (size_t)_w;                                                     \
+    } while (0)
+
+#define APPEND_I1(key, valid, v)                                             \
+    do {                                                                     \
+        int _w = (valid) ? snprintf(out + n, cap - n, "%s=%d;", (key), (v))  \
+                         : snprintf(out + n, cap - n, "%s=;", (key));         \
+        if (_w < 0 || (size_t)_w >= cap - n)                                 \
+            return IV_ERANGE;                                                \
+        n += (size_t)_w;                                                     \
+    } while (0)
+
+/* 字符串字段：空指针/空串都当"没取到"，只发键名 */
+#define APPEND_S1(key, s)                                                    \
+    do {                                                                     \
+        const char *_s = (s);                                                \
+        int _w = (_s != NULL && _s[0] != '\0')                               \
+                     ? snprintf(out + n, cap - n, "%s=%s;", (key), _s)        \
+                     : snprintf(out + n, cap - n, "%s=;", (key));             \
+        if (_w < 0 || (size_t)_w >= cap - n)                                 \
+            return IV_ERANGE;                                                \
+        n += (size_t)_w;                                                     \
+    } while (0)
+
+/* 三路数组：没取到就发 `,,`（键名在、值位空），与参考实现 `%01d,%01d,%01d`
+ * 的三槽布局保持一一对应，平台按槽取数不会错位。 */
+#define APPEND_I3(key, valid, a, b, c)                                       \
+    do {                                                                     \
+        int _w = (valid) ? snprintf(out + n, cap - n, "%s=%d,%d,%d;", (key), \
+                                    (int)(a), (int)(b), (int)(c))            \
+                         : snprintf(out + n, cap - n, "%s=,,;", (key));       \
+        if (_w < 0 || (size_t)_w >= cap - n)                                 \
+            return IV_ERANGE;                                                \
+        n += (size_t)_w;                                                     \
+    } while (0)
+
+#define APPEND_F3(key, valid, a, b, c)                                       \
+    do {                                                                     \
+        int _w = (valid) ? snprintf(out + n, cap - n, "%s=%.2f,%.2f,%.2f;",  \
+                                    (key), (double)(a), (double)(b),         \
+                                    (double)(c))                             \
+                         : snprintf(out + n, cap - n, "%s=,,;", (key));       \
+        if (_w < 0 || (size_t)_w >= cap - n)                                 \
+            return IV_ERANGE;                                                \
+        n += (size_t)_w;                                                     \
+    } while (0)
+
 /* ---------------------------------------------------------------------------
  * 生命周期
  * ------------------------------------------------------------------------- */
@@ -247,12 +308,32 @@ static void pump_ack(void *arg, uint64_t cookie)
 {
     iv_report_t *rp = arg;
 
+    /* 走到这里 ⇔ 传输层把这**一整件写进了 socket**（`tx_consume()` 写尽才 ack）。
+     * 与 `rep_send_report()` 的 `report #N` 配对看：两条计数应一一对应。
+     * 对不上 ⇒ 丢在取件/写出这一段（我们的问题）；对得上 ⇒ 帧确实交付给了内核，
+     * 之后再少就是链路或对端的事 —— 这个争议一次测完，别再靠代理抓包来回猜。 */
+    IV_LOG_I(REP_MOD, "queue item written: seq=%llu left=%u", (unsigned long long)cookie,
+             (unsigned)iv_queue_count(&rp->q));
     (void)iv_queue_ack(&rp->q, cookie);
 }
 
 static void tr_on_rx(void *arg, const uint8_t *bytes, size_t len)
 {
     iv_report_t *rp = arg;
+    size_t       i;
+    size_t       k = 0u;
+    char         hex[3u * 32u + 1u];
+
+    /* 平台→设备方向取证：下行解析器对"帧头对不上"的字节是**静默丢弃**的，
+     * 所以没有这一行，"平台一条没下发"和"下发了但被我们丢了"在日志里长得
+     * 一模一样。平台这一路正常情况下是安静的（心跳 0xFF 除外），量很小。 */
+    for (i = 0u; i < len && i < 32u; i++) {
+        (void)snprintf(&hex[k], sizeof(hex) - k, "%02x", (unsigned)bytes[i]);
+        k += 2u;
+    }
+    hex[k] = '\0';
+    IV_LOG_I(REP_MOD, "rx %u bytes: %s%s", (unsigned)len, hex,
+             (len > 32u) ? "..." : "");
 
     iv_proto_recv(&rp->pf, bytes, len); /* 半包/粘包由 iv_proto 缓冲 */
 }
@@ -354,12 +435,23 @@ static int rep_send_report(iv_report_t *rp)
 
     rc = iv_queue_push(&rp->q, IV_QUEUE_PRIO_STATE, frame, flen, &seq);
     if (rc == IV_OK) {
+        /* 内容指纹：**故意从 `CNS=` 起算，把 `DT` 排除在外** —— 这样两帧指纹相同
+         * 就等价于"测量值一模一样，只有时间戳不同"。平台若按"重复值不再存"处理，
+         * 这种帧会被吞掉，外部表现就是"报文少了一半、间隔翻倍"。
+         * （采集板镜像是 0xE1 轮询刷新的，`iv_link_send` 遇 IV_EBUSY 会整拍跳过。） */
+        const char *tail = strstr(seg, "CNS=");
+        uint32_t    h    = 2166136261u;
+        size_t      k;
+
+        for (k = 0u; tail != NULL && tail[k] != '\0'; k++) {
+            h ^= (uint32_t)(uint8_t)tail[k];
+            h *= 16777619u;
+        }
         rp->reports++;
         /* 每条周期上报留一行 DT —— 这是"设备到底按没按时发"的**唯一现场证据**。
-         * 300 s 一条＝12 行/小时，代价可忽略；与平台「历史数据」对账时逐条比。
-         * 少了哪条、间隔变成多少，看这一列就够，不用再架透明代理抓包。 */
-        IV_LOG_I(REP_MOD, "report #%llu DT=%s seg=%d frame=%u",
-                 (unsigned long long)rp->reports, dt, n, (unsigned)flen);
+         * 300 s 一条＝12 行/小时，代价可忽略；与平台「历史数据」对账时逐条比。 */
+        IV_LOG_I(REP_MOD, "report #%llu DT=%s seg=%d frame=%u m=%08x",
+                 (unsigned long long)rp->reports, dt, n, (unsigned)flen, (unsigned)h);
     } else if (rc == IV_EFULL) {
         rp->queue_full++;
     }
@@ -808,60 +900,62 @@ int iv_report_build_seg(const iv_status_t *st, const iv_report_env_t *env,
     APPEND(out, cap, n, "CP=&&");
 
     /* ---- 数据区：**逐字段对齐参考实现 `com.c:com_report_normally_function()`**
-     * 的拼接顺序（2026-10-20 复核）：DT CNS MN V A APOWER AKW H T P DS
-     * RELAY CHV CHA POWER ELEC CSQ MIU(LAT/LNG) ERR。
-     * 原先是 V A H T DS P APOWER AKW —— `DS`/`P` 互换、`APOWER`/`AKW` 后置，
-     * 与参考实现不一致（见文件头"字段顺序"一节）。未取到值的不上传。 */
+     * 的拼接顺序与"无条件拼接"语义（2026-10-20 复核）：DT CNS MN V A APOWER
+     * AKW H T P DS RELAY CHV CHA POWER ELEC CSQ MIU (LAT/LNG) ERR。
+     * 字段名一律发：取到值就填数、取不到留空（`V=;`）—— 参考实现对每个字段都
+     * `sprintf` 一次，读不到就拼出空值，因此它的字段表**恒长**；我们照此办理。 */
     APPEND(out, cap, n, "DT=%s;", dt14);
 
     APPEND(out, cap, n, "CNS=%d,%d,%d,%d,%d,%d;",
            e->cns[0], e->cns[1], e->cns[2], e->cns[3], e->cns[4], e->cns[5]);
     APPEND(out, cap, n, "MN=%d,%d;", e->mn[0], e->mn[1]);
 
-    if (d != NULL && st != NULL) {
-        if (st->valid.V)
-            APPEND(out, cap, n, "V=%.2f;", (double)d->V);
-        if (st->valid.A)
-            APPEND(out, cap, n, "A=%.2f;", (double)d->A);
-        /* 总功率/总用电量：参考实现紧跟 V/A 之后（`APOWER`/`AKW`） */
-        if (d->APOWER[0] != '\0')
-            APPEND(out, cap, n, "APOWER=%s;", d->APOWER);
-        if (d->AKW[0] != '\0')
-            APPEND(out, cap, n, "AKW=%s;", d->AKW);
-        if (st->valid.H)
-            APPEND(out, cap, n, "H=%.2f;", (double)d->H);
-        if (st->valid.T)
-            APPEND(out, cap, n, "T=%.2f;", (double)d->T);
-        /* 箱体姿态 P → 箱门 DS（参考实现先 P 后 DS） */
-        if (st->valid.P)
-            APPEND(out, cap, n, "P=%d;", (int)d->P);
-        if (st->valid.DS)
-            APPEND(out, cap, n, "DS=%d;", (int)d->DS);
+    APPEND_F2("V", d != NULL && st->valid.V, d != NULL ? d->V : 0.0);
+    APPEND_F2("A", d != NULL && st->valid.A, d != NULL ? d->A : 0.0);
+    /* 总功率/总用电量：参考实现紧跟 V/A 之后（`APOWER`/`AKW`），字符串直传 */
+    APPEND_S1("APOWER", d != NULL ? d->APOWER : NULL);
+    APPEND_S1("AKW",    d != NULL ? d->AKW : NULL);
+    APPEND_F2("H", d != NULL && st->valid.H, d != NULL ? d->H : 0.0);
+    APPEND_F2("T", d != NULL && st->valid.T, d != NULL ? d->T : 0.0);
+    /* 箱体姿态 P → 箱门 DS（参考实现先 P 后 DS） */
+    APPEND_I1("P",  d != NULL && st->valid.P,  d != NULL ? (int)d->P : 0);
+    APPEND_I1("DS", d != NULL && st->valid.DS, d != NULL ? (int)d->DS : 0);
 
-        if (st->valid.RELAY)
-            APPEND(out, cap, n, "RELAY=%d,%d,%d;",
-                   (int)d->RELAY[0], (int)d->RELAY[1], (int)d->RELAY[2]);
-        if (st->valid.CHV)
-            APPEND(out, cap, n, "CHV=%.2f,%.2f,%.2f;",
-                   (double)d->CHV[0], (double)d->CHV[1], (double)d->CHV[2]);
-        if (st->valid.CHA)
-            APPEND(out, cap, n, "CHA=%.2f,%.2f,%.2f;",
-                   (double)d->CHA[0], (double)d->CHA[1], (double)d->CHA[2]);
-        if (st->valid.POWER)
-            APPEND(out, cap, n, "POWER=%.2f,%.2f,%.2f;",
-                   (double)d->POWER[0], (double)d->POWER[1], (double)d->POWER[2]);
-        if (st->valid.ELEC)
-            APPEND(out, cap, n, "ELEC=%.2f,%.2f,%.2f;",
-                   (double)d->ELEC[0], (double)d->ELEC[1], (double)d->ELEC[2]);
-    }
+    APPEND_I3("RELAY", d != NULL && st->valid.RELAY,
+              d != NULL ? (int)d->RELAY[0] : 0,
+              d != NULL ? (int)d->RELAY[1] : 0,
+              d != NULL ? (int)d->RELAY[2] : 0);
+    APPEND_F3("CHV", d != NULL && st->valid.CHV,
+              d != NULL ? d->CHV[0] : 0.0,
+              d != NULL ? d->CHV[1] : 0.0,
+              d != NULL ? d->CHV[2] : 0.0);
+    APPEND_F3("CHA", d != NULL && st->valid.CHA,
+              d != NULL ? d->CHA[0] : 0.0,
+              d != NULL ? d->CHA[1] : 0.0,
+              d != NULL ? d->CHA[2] : 0.0);
+    APPEND_F3("POWER", d != NULL && st->valid.POWER,
+              d != NULL ? d->POWER[0] : 0.0,
+              d != NULL ? d->POWER[1] : 0.0,
+              d != NULL ? d->POWER[2] : 0.0);
+    APPEND_F3("ELEC", d != NULL && st->valid.ELEC,
+              d != NULL ? d->ELEC[0] : 0.0,
+              d != NULL ? d->ELEC[1] : 0.0,
+              d != NULL ? d->ELEC[2] : 0.0);
 
-    /* CSQ 紧接 ELEC（参考实现位置）；未取到信号强度（<0）则不上传 */
-    if (e->csq >= 0)
-        APPEND(out, cap, n, "CSQ=%d;", e->csq);
+    /* CSQ 紧接 ELEC（参考实现位置）；没取到信号强度就发空值，不发 -1 */
+    APPEND_I1("CSQ", e->csq >= 0, e->csq);
+    /* MIU（漏电）：参考实现在 CSQ 之后**无条件**发 `MIU=%d;`。我们没有取值
+     * 来源（见遗留项"MIU 取值来源"），所以只发键名占位，绝不编一个 0 出去。 */
+    APPEND(out, cap, n, "MIU=;");
+
     if (e->have_loc)
         APPEND(out, cap, n, "LAT=%.6f;LNG=%.6f;", e->lat, e->lng);
-    if (e->err != NULL && e->err[0] != '\0')
-        APPEND(out, cap, n, "ERR=%s;", e->err);
+
+    /* 错误码：参考实现 `Error_Get_Codesbuf()` **无条件**拼
+     * `ERR=<数量>[,<故障码>...];`，健康时就是 `ERR=0;`。原先 err 为空就整段
+     * 不发 ⇒ 帧尾缺字段，字段表随之变短。 */
+    APPEND(out, cap, n, "ERR=%s;",
+           (e->err != NULL && e->err[0] != '\0') ? e->err : "0");
 
     APPEND(out, cap, n, "&&");
 

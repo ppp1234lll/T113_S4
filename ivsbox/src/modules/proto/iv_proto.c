@@ -445,18 +445,26 @@ static void dispatch(const iv_proto_frame_t *f, void *arg)
             return;
         }
     }
-    /* 未注册命令：保守回 OK（MCU 参考实现 default 分支同语义）。
-     * ⚠ 已知欠账：参考实现有一整张 `CONFIGURE_*` 下发处理表（0xF5 定时上报间隔、
-     * 0xF2 PING、0xF3 传输模式、0xF4 本地网络、0xF7 摄像机 IP、0xA5 搜索方式…），
-     * 我们只实现了 0xE2/0xE3/0xE4/0xE7/0xA5 五条查询与配置；其余配置命令现在
-     * 会"回 OK 但不执行"——平台以为设成功、设备没变。属 M4 遗留，按命令逐条补。
+    /* 未注册命令：回**明确的失败码**，不再回 0x01。
+     *
+     * 2026-10-20 对照参考实现（`com.c:com_deal_frame()` 的 switch）重新核过：
+     *   - 参考实现里**每一条**已实现的命令都自己 `app_set_reply_parameters_function()`
+     *     给出 0x01 或 0x74，**没有"未命中就回 0x01"这种分支**；
+     *     它的 default 分支 `com_deal_ack_parameter()` 处理的是**上行报文的回包**
+     *     （把 DATA[0] 当 error 记发送结果），不是"给未知指令回个 OK"。
+     *   - 我们原来在这里一律回 `0x01`，于是 0xD9 重启、0xF7 配置摄像机 IP、
+     *     0xA3 改设备名……二十多条没实现的指令，平台收到的都是"设置成功"，
+     *     而设备一分没动。这是**比不回更糟**的谎：现场排查时会一路怀疑网络。
+     *
+     * 改回 0x74（`IV_PROTO_ERR_EXEC`，参考实现的"配置错误/执行失败"）后：
+     * 平台能看到失败、我们能从日志看到是哪个码没实现，两边口径一致。
      *
      * 这条日志是**现场唯一的观测窗口**：不登录平台、不架代理，也能从板端
      * `/mnt/UDISK/log/<日期>/<小时>.log` 看到平台到底下发过哪些命令、多长载荷。
      * 0xFF 心跳在上面已经提前返回，不会把这里刷爆。 */
-    IV_LOG_W(PROTO_MOD, "downlink cmd 0x%02X not handled (%u bytes), auto-ack 0x%02X",
-             (unsigned)f->cmd, (unsigned)f->len, (unsigned)IV_PROTO_ACK_OK);
-    (void)iv_proto_ack(pf, f->cmd, IV_PROTO_ACK_OK);
+    IV_LOG_W(PROTO_MOD, "downlink cmd 0x%02X not implemented (%u bytes), ack 0x%02X",
+             (unsigned)f->cmd, (unsigned)f->len, (unsigned)IV_PROTO_ERR_EXEC);
+    (void)iv_proto_ack(pf, f->cmd, IV_PROTO_ERR_EXEC);
 }
 
 void iv_proto_recv(iv_proto_t *pf, const uint8_t *buf, size_t len)

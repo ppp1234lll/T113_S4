@@ -275,8 +275,11 @@ int iv_proto_route(iv_proto_t *pf, uint8_t cmd, iv_proto_cmd_cb cb, void *arg);
 /*
  * 喂收到的平台字节：解出的每条帧先查路由表，
  *   命中   → 调 handler（handler 自己决定是否回 ACK/数据）；
- *   未命中 → 自动回 ACK：DATA[0]=IV_PROTO_ACK_OK（保守"已收到"语义，
- *            与 MCU 参考实现的 default 分支一致——未知命令也回 0x01）。
+ *   未命中 → 回 `IV_PROTO_ERR_EXEC`(0x74) 并打 WARN。
+ *            **不能回 0x01**：那是"已执行成功"的意思，而没实现的指令根本没有执行
+ *            （参考实现里每条已实现命令都自己给 0x01/0x74，没有"未命中默认 OK"
+ *            这种分支）。回假成功会让现场一路去怀疑网络。
+ * 例外：0xFF 心跳是**单向下行**，收到不回（回了会自激乒乓，见 iv_proto.c）。
  * CRC/帧尾错帧静默丢弃（不回错误帧——链路噪声下避免放大流量）。
  */
 void iv_proto_recv(iv_proto_t *pf, const uint8_t *buf, size_t len);

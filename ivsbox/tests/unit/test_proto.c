@@ -375,13 +375,17 @@ int main(void)
         chk(g_hit_f.qn1 == 0xAu && g_hit_f.qn2 == 0xBu, "hit qn");
         chk(g_tx.n == 0, "no auto ack on hit");
 
-        /* 未命中：E9 → 自动 ACK，QN 回填、字节黄金校验 */
+        /* 未命中：E9 → 回**失败码 0x74**（不是 0x01），QN 回填、字节黄金校验 */
         l = mk_down(f_e9, 0x0400u, 0x010203u, 0xE9u, 0x11223344u, 0x55667788u,
                     NULL, 0);
         iv_proto_recv(&pf, f_e9, l);
         chk(g_hit == 1 && g_tx.n == 1, "miss -> auto ack");
-        want_len = mk_down(want, 0x0400u, 0x010203u, 0xE9u,
-                           0x11223344u, 0x55667788u, &ack_data, 1);
+        {
+            uint8_t err = IV_PROTO_ERR_EXEC;
+
+            want_len = mk_down(want, 0x0400u, 0x010203u, 0xE9u,
+                               0x11223344u, 0x55667788u, &err, 1);
+        }
         /* want 用下行头；实际发的是上行头——跳过前 2 字节比对 */
         chk(g_tx.len[0] == want_len, "ack len");
         chk(memcmp(&g_tx.buf[0][2], &want[2], want_len - 2) == 0, "ack bytes");
@@ -424,11 +428,19 @@ int main(void)
             chk(g_tx.n == 0, "rx heartbeat -> NO reply (anti ping-pong)");
             chk(pf.rx_frames == 1u, "rx heartbeat still counted");
 
-            /* 对照：同样没注册的**非心跳**命令仍按 MCU default 语义回 OK */
+            /* 对照：没注册的**非心跳**命令仍要回一帧，但码必须是 0x74（失败），
+             * 不是 0x01（成功）—— 参考实现里每条已实现命令都自己给 0x01/0x74，
+             * 没有"未命中默认 OK"这种分支。回假成功会让平台把"没实现"当成"已配置"，
+             * 现场只能一路怀疑网络。 */
             rec_reset();
             lh = mk_down(f_hb, 0x0400u, 0x010203u, 0x5Au, 0x11u, 0x22u, NULL, 0);
             iv_proto_recv(&pf, f_hb, lh);
-            chk(g_tx.n == 1, "unknown non-heartbeat cmd still auto-ack");
+            chk(g_tx.n == 1, "unknown non-heartbeat cmd still replies");
+            /* 应答帧：cmd 回显 0x5A、DATA 一个字节 0x74 */
+            chk(g_tx.n == 1 && g_tx.buf[0][8] == 0x5Au, "unknown cmd echoes cmd");
+            chk(g_tx.n == 1 && g_tx.buf[0][17] == 0x01u, "unknown cmd ack len == 1");
+            chk(g_tx.n == 1 && g_tx.buf[0][18] == 0x74u,
+                "unknown cmd ack code == 0x74 (ERR_EXEC), NOT 0x01");
         }
 
         /* send_text（上报帧：长度=整段、CRC 覆盖 &&数据区&&） */

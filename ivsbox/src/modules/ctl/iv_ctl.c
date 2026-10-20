@@ -2183,8 +2183,8 @@ static int m_cell_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap,
     data = json_object_new_object();
     if (data != NULL) {
         add_tri_or_null(data, "attached", s.attached);
-        json_object_object_add(data, "active",
-                               json_object_new_boolean(s.pdp_active != 0));
+        /* 三态：1 有上下文 / 0 明确没有 / -1 没读到（ECM 常态）⇒ null，不编值 */
+        add_tri_or_null(data, "active", s.pdp_active);
         add_str_or_null(data, "ip", (s.pdp_ip[0] != '\0') ? s.pdp_ip : NULL);
         add_str_or_null(data, "apn", (s.apn[0] != '\0') ? s.apn : NULL);
         add_str_or_null(data, "dns1", (s.dns1[0] != '\0') ? s.dns1 : NULL);

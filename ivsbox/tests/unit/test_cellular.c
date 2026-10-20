@@ -169,7 +169,8 @@ static void c02_live_nosim(void)
     chk(s.rsrp == -85 && s.rsrq == -9 && s.sinr == 69, "c02 rsrp/rsrq/sinr raw");
     chk(strcmp(s.act, "LTE") == 0, "c02 act LTE");
 
-    chk(s.pdp_active == 0 && s.pdp_ip[0] == '\0', "c02 bare OK => no PDP");
+    /* CGCONTRDP 只回裸 OK（ECM 常态）⇒ 不知道，记 -1；不是"没有上下文" */
+    chk(s.pdp_active == -1 && s.pdp_ip[0] == '\0', "c02 bare OK => PDP unknown(-1)");
     chk(s.usable == 0, "c02 not usable with no SIM");
     chk(strstr(s.reason, "SIM") != NULL, "c02 reason points at SIM");
 }
@@ -315,7 +316,7 @@ static void c06_round_reset(void)
     iv_cell_snapshot(&c, &s);
 
     chk(s.pdp_ip[0] == '\0', "c06 stale PDP ip cleared at round start");
-    chk(s.pdp_active == 0, "c06 stale pdp_active cleared");
+    chk(s.pdp_active == -1, "c06 stale pdp_active reset to unknown");
     chk(s.rsrp == IV_CELL_UNKNOWN, "c06 stale rsrp cleared to sentinel");
     chk(s.usable == 0, "c06 unusable when nothing answers");
     /* 静态字段（型号/固件/SIM 状态）保留：它们不会每轮变，重读不到不该清空 */
@@ -365,8 +366,22 @@ static void c09_readonly(void)
     }
 }
 
-/* 10) 自动重拨判定：四个事实条件只差"地址"才拨，且带节奏限制。
- * 这一段是纯函数，输入是快照 —— 所以能把"卡没插也去拨号"这种事故先拦在单测里。 */
+/* 在"数据面已断够久"的状态下问一次：先让判定记下起点，再等持续门槛到期问第二遍。
+ * 事实条件不满足时判定会把计时清零，所以每个场景都得重新走这两步。 */
+static int redial_after_hold(const iv_cell_snap_t *s, iv_cell_redial_t *r,
+                             int wan, uint64_t now)
+{
+    (void)iv_cell_redial_due(s, r, wan, now);
+    return iv_cell_redial_due(s, r, wan, now + IV_CELL_REDIAL_DOWN_HOLD_MS);
+}
+
+/* 10) 自动重拨判定：事实层（卡/注册/附着）→ 数据面层（内核地址为主）→ 节奏层。
+ *
+ * 本用例的重点是**"模组侧没读到"不等于"数据面断了"**。板端 ECM（`cdc_ether`）模式下
+ * `AT+CGCONTRDP` 结构性地不报活动上下文，pdp_active 恒为"未知"；早先按
+ * "必须 PDP 有地址"判，于是每小时恒定空拨 5 次，每次 `AT+CFUN=1,1` 让模组重枚举、
+ * usb0 消失、平台 TCP 断链重连 —— 而同期 usb0 一直 ESTABLISHED。
+ */
 static void c10_redial(void)
 {
     iv_cell_snap_t   s;
@@ -379,51 +394,90 @@ static void c10_redial(void)
     s.sim_present = 1;
     s.cereg_stat  = 1;
     s.attached    = 1;
-    s.pdp_active  = 0;
+    s.pdp_active  = -1;         /* ECM 常态：AT 侧没读到 */
 
+    /* ---- A. 数据面判据：内核侧为主 ---- */
     iv_cell_redial_init(&r);
-    chk(iv_cell_redial_due(&s, &r, wan, now) == 1, "c10 ready but no PDP => dial");
+    /* 内核有地址 + 模组没读到 ⇒ 通。跑满 1 小时也不许拨（就是这条拦住空拨）。 */
+    chk(iv_cell_redial_due(&s, &r, 1, now) == 0, "c10 wan ip + pdp unknown => no dial");
+    chk(iv_cell_redial_due(&s, &r, 1, now + 3600000u) == 0,
+        "c10 wan ip + pdp unknown => still no dial after 1h");
+    chk(r.down_since_ms == 0, "c10 healthy data plane keeps down timer at 0");
 
-    /* 前置条件：少一条都不拨 */
+    /* 内核有地址 + 模组**明确否认** ⇒ 残留 IP 假象，照样要拨 */
+    iv_cell_redial_init(&r);
+    {
+        iv_cell_snap_t d = s;
+
+        d.pdp_active = 0;
+        chk(iv_cell_redial_due(&d, &r, 1, now) == 0, "c10 pdp denied => starts hold timer");
+        chk(iv_cell_redial_due(&d, &r, 1, now + IV_CELL_REDIAL_DOWN_HOLD_MS) == 1,
+            "c10 pdp denied + hold elapsed => dial");
+    }
+    /* 内核有地址 + 模组报出地址 ⇒ 通 */
+    iv_cell_redial_init(&r);
+    {
+        iv_cell_snap_t d = s;
+
+        d.pdp_active = 1;
+        (void)strcpy(d.pdp_ip, "10.28.61.123");
+        chk(iv_cell_redial_due(&d, &r, 1, now) == 0, "c10 pdp ip + wan ip => no dial");
+    }
+
+    /* ---- B. 持续门槛：刚发现断了不动手，给开机拨号留余量 ---- */
+    iv_cell_redial_init(&r);
+    chk(iv_cell_redial_due(&s, &r, 0, now) == 0, "c10 first sighting => wait, no dial");
+    chk(r.down_since_ms == now, "c10 down timer anchored at first sighting");
+    chk(iv_cell_redial_due(&s, &r, 0, now + IV_CELL_REDIAL_DOWN_HOLD_MS - 1u) == 0,
+        "c10 1ms before hold => still no dial");
+    chk(iv_cell_redial_due(&s, &r, 0, now + IV_CELL_REDIAL_DOWN_HOLD_MS) == 1,
+        "c10 hold elapsed => dial");
+    /* 数据面恢复 ⇒ 计时归零，下次断线重新计时（不是沿用上次的"已断很久"） */
+    chk(iv_cell_redial_due(&s, &r, 1, now + IV_CELL_REDIAL_DOWN_HOLD_MS + 1u) == 0,
+        "c10 data plane back => no dial");
+    chk(r.down_since_ms == 0, "c10 data plane back => hold timer reset");
+
+    /* ---- C. 事实条件：少一条都不拨，且必须把计时清零 ---- */
+    iv_cell_redial_init(&r);
+    (void)iv_cell_redial_due(&s, &r, 0, now);   /* 让它先开始计时 */
     {
         iv_cell_snap_t t;
 
         t = s; t.valid = 0;
-        chk(iv_cell_redial_due(&t, &r, wan, now) == 0, "c10 no finished round => no dial");
-        t = s; t.sim_present = 0;
-        chk(iv_cell_redial_due(&t, &r, wan, now) == 0, "c10 SIM absent => no dial");
-        t = s; t.sim_present = -1;
-        chk(iv_cell_redial_due(&t, &r, wan, now) == 0, "c10 SIM unknown => no dial");
-        t = s; t.cereg_stat = 2;
-        chk(iv_cell_redial_due(&t, &r, wan, now) == 0, "c10 not registered => no dial");
-        t = s; t.cereg_stat = 5;
-        chk(iv_cell_redial_due(&t, &r, wan, now) == 1, "c10 roaming registered => dial");
-        t = s; t.attached = 0;
-        chk(iv_cell_redial_due(&t, &r, wan, now) == 0, "c10 not attached => no dial");
-        t = s; t.attached = -1;
-        chk(iv_cell_redial_due(&t, &r, wan, now) == 0, "c10 attach unknown => no dial");
+        chk(redial_after_hold(&t, &r, 0, now) == 0, "c10 no finished round => no dial");
+        chk(r.down_since_ms == 0, "c10 unknown round clears hold timer");
 
-        /* 数据面两条腿：模组侧 PDP 与内核侧接口地址，任一缺失都算"没有地址"。
-         * 这是本板真实踩过的两种假象：模组清了上下文但 usb0 留着残留 IP；
-         * 反过来 PDP 还在、usb0 掉了载波（地址被摘）。 */
-        t = s; t.pdp_active = 1;
-        (void)strcpy(t.pdp_ip, "10.28.61.123");
-        chk(iv_cell_redial_due(&t, &r, 1, now) == 0, "c10 PDP ip + wan ip => no dial");
-        chk(iv_cell_redial_due(&t, &r, 0, now) == 1, "c10 PDP ip but wan no ip => dial");
-        t = s;
-        chk(iv_cell_redial_due(&t, &r, 1, now) == 1, "c10 wan ip but no PDP => dial");
-        chk(iv_cell_redial_due(&t, &r, 0, now) == 1, "c10 PDP without ip => dial");
+        t = s; t.sim_present = 0;
+        chk(redial_after_hold(&t, &r, 0, now) == 0, "c10 SIM absent => no dial");
+        t = s; t.sim_present = -1;
+        chk(redial_after_hold(&t, &r, 0, now) == 0, "c10 SIM unknown => no dial");
+        t = s; t.cereg_stat = 2;
+        chk(redial_after_hold(&t, &r, 0, now) == 0, "c10 not registered => no dial");
+        t = s; t.attached = 0;
+        chk(redial_after_hold(&t, &r, 0, now) == 0, "c10 not attached => no dial");
+        t = s; t.attached = -1;
+        chk(redial_after_hold(&t, &r, 0, now) == 0, "c10 attach unknown => no dial");
+        /* 漫游（stat 5）也是"已注册" */
+        t = s; t.cereg_stat = 5;
+        chk(redial_after_hold(&t, &r, 0, now) == 1, "c10 roaming registered => dial");
     }
 
-    /* 节奏一：最小间隔 120 s */
+    /* ---- D. 节奏一：最小间隔 120 s ---- */
     iv_cell_redial_init(&r);
-    iv_cell_redial_mark(&r, now);
-    chk(r.tries == 1 && r.last_try_ms == now, "c10 mark records try");
-    chk(iv_cell_redial_due(&s, &r, wan, now + 1u) == 0, "c10 no redial 1s later");
-    chk(iv_cell_redial_due(&s, &r, wan, now + 119000u) == 0, "c10 no redial at 119s");
-    chk(iv_cell_redial_due(&s, &r, wan, now + 120000u) == 1, "c10 redial allowed at 120s");
+    (void)iv_cell_redial_due(&s, &r, 0, now);
+    chk(iv_cell_redial_due(&s, &r, 0, now + IV_CELL_REDIAL_DOWN_HOLD_MS) == 1,
+        "c10 first dial after hold");
+    iv_cell_redial_mark(&r, now + IV_CELL_REDIAL_DOWN_HOLD_MS);
+    chk(r.tries == 1 && r.last_try_ms == now + IV_CELL_REDIAL_DOWN_HOLD_MS,
+        "c10 mark records try");
+    chk(iv_cell_redial_due(&s, &r, 0, now + IV_CELL_REDIAL_DOWN_HOLD_MS + 1u) == 0,
+        "c10 no redial 1s later");
+    chk(iv_cell_redial_due(&s, &r, 0, now + IV_CELL_REDIAL_DOWN_HOLD_MS + 119000u) == 0,
+        "c10 no redial at 119s");
+    chk(iv_cell_redial_due(&s, &r, 0, now + IV_CELL_REDIAL_DOWN_HOLD_MS + 120000u) == 1,
+        "c10 redial allowed at 120s");
 
-    /* 节奏二：1 h 窗口内最多 5 次，到顶停手；窗口过期再放开 */
+    /* ---- E. 节奏二：1 h 窗口内最多 5 次，到顶停手；窗口过期再放开 ---- */
     iv_cell_redial_init(&r);
     {
         unsigned i;
@@ -432,18 +486,23 @@ static void c10_redial(void)
             iv_cell_redial_mark(&r, now + (uint64_t)i * 200000u);
     }
     chk(r.tries == IV_CELL_REDIAL_MAX_TRIES, "c10 tries counted");
-    chk(iv_cell_redial_due(&s, &r, wan, now + 2000000u) == 0, "c10 stops after max tries");
-    chk(iv_cell_redial_due(&s, &r, wan, now + IV_CELL_REDIAL_WINDOW_MS + 1u) == 1,
+    (void)iv_cell_redial_due(&s, &r, 0, now + 2000000u);   /* 建立计时 */
+    chk(iv_cell_redial_due(&s, &r, 0, now + 2000000u + IV_CELL_REDIAL_DOWN_HOLD_MS) == 0,
+        "c10 stops after max tries");
+    chk(iv_cell_redial_due(&s, &r, 0, now + IV_CELL_REDIAL_WINDOW_MS + 1u) == 1,
         "c10 window expiry re-allows");
     iv_cell_redial_mark(&r, now + IV_CELL_REDIAL_WINDOW_MS + 1u);
     chk(r.tries == 1, "c10 mark resets counter in new window");
 
-    /* 时钟回拨：now < last_try 时按"没拨过"处理 —— 否则时钟一跳就再也不拨 */
+    /* ---- F. 时钟回拨：计时重新锚定，不会因此永久不拨 ---- */
     iv_cell_redial_init(&r);
-    iv_cell_redial_mark(&r, now + 500000u);
-    chk(iv_cell_redial_due(&s, &r, wan, now) == 1, "c10 clock going back still dials");
+    (void)iv_cell_redial_due(&s, &r, 0, now + 500000u);
+    chk(iv_cell_redial_due(&s, &r, 0, now) == 0, "c10 clock going back restarts hold window");
+    chk(r.down_since_ms == now, "c10 hold timer re-anchored after clock jump");
+    chk(iv_cell_redial_due(&s, &r, 0, now + IV_CELL_REDIAL_DOWN_HOLD_MS) == 1,
+        "c10 hold re-satisfied after clock jump");
 
-    /* 空指针不崩 */
+    /* ---- G. 空指针不崩 ---- */
     chk(iv_cell_redial_due(NULL, &r, wan, now) == 0, "c10 NULL snap => 0");
     chk(iv_cell_redial_due(&s, NULL, wan, now) == 0, "c10 NULL state => 0");
     iv_cell_redial_init(NULL);

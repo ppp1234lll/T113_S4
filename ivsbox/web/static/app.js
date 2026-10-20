@@ -303,8 +303,12 @@
         gData.innerHTML = '';
         gData.appendChild(kv('PS 附着', B(dt.attached),
                              dt.attached === false ? 'warn' : null));
-        gData.appendChild(kv('PDP 上下文', dt.active ? '已建立' : '无',
-                             dt.active ? 'ok' : 'warn'));
+        /* active 是三态：true=已建立 / false=明确没有 / null=没读到（ECM 常见） */
+        gData.appendChild(kv('PDP 上下文',
+                             dt.active === true ? '已建立'
+                                                : (dt.active === false ? '无' : '—'),
+                             dt.active === true ? 'ok'
+                                                : (dt.active === false ? 'warn' : null)));
         gData.appendChild(kv('本机 IP', D(dt.ip)));
         gData.appendChild(kv('APN', D(dt.apn)));
         gData.appendChild(kv('DNS', (dt.dns1 || dt.dns2)

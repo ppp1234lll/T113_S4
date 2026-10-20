@@ -1702,6 +1702,7 @@ static int wan_iface_ready(const char *name)
 static void cell_redial_tick(iv_agent_t *a, uint64_t now_ms)
 {
     iv_cell_snap_t s;
+    int            wan;
 
     if (a == NULL)
         return;
@@ -1752,10 +1753,14 @@ static void cell_redial_tick(iv_agent_t *a, uint64_t now_ms)
     }
 
     iv_cell_snapshot(&a->cell, &s);
-    if (!iv_cell_redial_due(&s, &a->cell_redial,
-                            wan_iface_ready(a->cfg.wan_name[IV_WAN_WIRELESS]),
-                            now_ms))
+    wan = wan_iface_ready(a->cfg.wan_name[IV_WAN_WIRELESS]);
+    if (!iv_cell_redial_due(&s, &a->cell_redial, wan, now_ms))
         return;
+    /* 拨之前把判断依据留在日志里：现场只看这一行就知道"为什么拨"。
+     * `pdp=-1` 表示 AT 侧根本没读到（ECM 常态），此时只可能靠内核侧判定。 */
+    IV_LOG_W(AG_MOD, "cell: no data plane for %llu ms (wan_ipv4=%d pdp=%d), redial #%u",
+             (unsigned long long)(now_ms - a->cell_redial.down_since_ms),
+             wan, s.pdp_active, a->cell_redial.tries + 1u);
     iv_cell_redial_mark(&a->cell_redial, now_ms);
     (void)cell_spawn_dial(a);
 }

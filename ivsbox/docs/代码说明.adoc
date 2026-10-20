@@ -3869,3 +3869,66 @@ if (f->cmd == IV_PROTO_CMD_HEARTBEAT)
 
 平台「历史数据」页刷新后是否恢复 5 分钟一条。设备侧能证明的是"报文已干净、节拍严格 300 s"，
 平台侧的入库策略本机无法观测。
+
+== 2026-10-20 17:05 4G 自愈判定修正：把"没读到"和"没有"分开
+
+=== 干了什么事
+
+四个文件，一条主线：**用"能读到的事实"判定数据面，而不是用"读不到"当"断"**。
+
+`iv_cellular.h`
+* `iv_cell_snap_t.pdp_active` 语义从布尔改为三态：`1` 报出活动上下文 / `0` 明确否认（应答复含 `ERROR`）/ `-1` 没读到。
+* `iv_cell_redial_t` 新增 `down_since_ms`（数据面开始不可用的时刻，`0` = 当前正常）；
+  新增常量 `IV_CELL_REDIAL_DOWN_HOLD_MS`（120 s）。
+* `iv_cell_redial_due()` 的 `r` 由 `const` 改为可写 —— 它要就地维护 `down_since_ms`。
+  仍是确定性逻辑：同一串调用得出同一串结论，没有隐藏时钟、没有 I/O，可以拿真机快照单测。
+
+`iv_cellular.c`
+* `parse_cgcontrdp()`：没有 `+CGCONTRDP:` 行时，按应答里有无 `ERROR` 分岔 —— 有 `ERROR` 记 `0`（明确否认），
+  否则记 `-1`（空应答/不支持/超时 = 不知道）。ECM（`cdc_ether`）模组走后者是常态。
+* `reset_dynamic()`：每轮开始把 `pdp_active` 复位为 `-1`，读到结果才落 `0`/`1`。
+* `iv_cell_redial_due()` 重写为四段：
+  1. 事实层（`valid` / SIM / 注册 / 附着）—— 任一不成立即 `return 0`，**并把 `down_since_ms` 清零**；
+  2. 数据面层 —— `wan_has_ipv4 && pdp_active != 0` ⇒ 通，清计时、`return 0`；
+  3. 持续层 —— 首次发现不可用只记起点；`now < down_since` 视为时钟回拨、重锚；未满 `DOWN_HOLD_MS` 不动手；
+  4. 节奏层 —— 原有的 120 s 最小间隔与 1 h 内 5 次上限保持不变。
+
+`iv_agent.c`
+* 拨之前打一行依据：`cell: no data plane for <ms> ms (wan_ipv4=<0/1> pdp=<-1/0/1>), redial #<n>`。
+  现场只看这一行就知道"为什么拨"，不用再架代理猜。
+
+`iv_ctl.c` / `web/static/app.js`
+* `/api/cell` 的 `data.active` 改用 `add_tri_or_null()`，未知给 `null`；
+  4G 页显示为 `已建立 / 无 / —` 三态，不再把"没读到"画成"无"。
+
+=== 解决什么问题
+
+板端每小时**恒定空拨 5 次**（撞 `MAX_TRIES` 上限），每次 `AT+CFUN=1,1` 都让模组 USB 重枚举：
+`usb0` 消失 → 平台 TCP 断链重连。日志里 `#76~#80`（09:33~09:42）、`#81~#85`（10:34~10:42）、
+间隔 ≈126 s，全天如此；而同期 `netstat` 里 `usb0` 一直 ESTABLISHED ⇒ 数据面本来是好的。
+
+两个根因叠加才成立：
+* `parse_cgcontrdp()` 把"没读到"记成"没有"（ECM 下 `AT+CGCONTRDP` 只回裸 `OK`）；
+* 判定把"PDP 有地址"当**必要条件**，与内核侧地址取"与" ⇒ 永远不满足 ⇒ 每 120 s 拨一次。
+
+修完后：内核侧有地址就绝不拨；只有"内核没地址"或"模组明确否认"才进入计时，且要持续 120 s 才动手。
+
+=== 影响范围
+
+* `pdp_active` 的消费者只有三处：`compute_usable()`、`iv_ctl.c` 的 `/api/cell`、`iv_cell_redial_due()`。
+  `compute_usable()` 写的是 `pdp_active != 0 && pdp_ip[0] != '\0'`，`-1` 时仍因 `pdp_ip` 为空而不通过 ⇒ **usable 行为不变**。
+* `/api/cell` 的 `data.active` 由 `bool` 变为 `bool | null`：只有 4G 页在用，已同步改三态。
+* 未覆盖 / 遗留：`"有载波 ＋ 有残留 IP ＋ 模组确实没 PDP"` 这一种假象，在 ECM 下无法由 AT 区分
+  （正是本次误判的来源）。当前兜底是发送侧 3 次写失败判链路死（`c79ece0`）；"链路死 ⇒ 反推重拨"未实现，登记为后续项。
+
+=== 验证方式与结果
+
+* VM `make test`：40 个程序全过（`test_cellular` 含重写后的 c10）；`make arm` 零告警，
+  ARM `ivsboxd` md5 `2e7ed36b9e3587a91f740ba36dcdeb7c`，ELF32 ARM EABI5。
+* 源码 md5 双端一致：`iv_cellular.c` `d616705dc07fca00d562fa741ebdc5d9`、
+  `iv_cellular.h` `d8d92aefcf4154de2f7a16a79bb6fc7c`。
+* 反向证伪（编译干净、改一处、跑、还原、md5 对账）：
+  1. `pdp_active != 0` → `== 1`：`test_cellular` 精确红 4 条，全部落在"内核有地址 ＋ pdp 未知"与"数据面恢复"两组；
+  2. 持续门槛 `<` → `>`：精确红 3 条（`1ms before hold`、`redial allowed at 120s`、`window expiry re-allows`）。
+* 新断言 `c10 wan ip + pdp unknown => still no dial after 1h` 直接复现事故形态（跑满一小时也不许拨）。
+* 板端实测见随后登记（部署 r29 后观察整点窗口内是否还有 `redial #n`）。

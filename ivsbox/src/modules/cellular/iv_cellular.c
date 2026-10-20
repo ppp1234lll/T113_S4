@@ -495,7 +495,12 @@ static void parse_cgcontrdp(iv_cell_t *c, const char *resp)
     int         n;
 
     if (l == NULL) {
-        c->snap.pdp_active = 0;
+        /* 没有 `+CGCONTRDP:` 行有两种含义，**不能都记成"没有"**：
+         * ① 模组明确回 `ERROR`：上下文确实不在了 ⇒ 0（明确否认）。
+         * ② 空应答 / 命令不支持 / 超时：我们**没读到** ⇒ -1（未知）。
+         * ECM（`cdc_ether`）模组走 ② 是常态；把它记成 0 会让上层把"读不到"
+         * 当成"数据面断了" —— 自愈每小时空拨 5 次就出在这里。 */
+        c->snap.pdp_active = (strstr(resp, "ERROR") != NULL) ? 0 : -1;
         return;
     }
     n = split_csv(l + 11, f, 12);
@@ -630,7 +635,7 @@ static void reset_dynamic(iv_cell_snap_t *s)
     s->cereg_stat = -1;
     s->reg_text[0] = '\0';
     s->attached   = -1;
-    s->pdp_active = 0;
+    s->pdp_active = -1;   /* 本轮还没读到；只有 `ERROR` 或解析出结果才落 0/1 */
     s->pdp_ip[0]  = '\0';
     s->apn[0]     = '\0';
     s->dns1[0]    = '\0';
@@ -873,32 +878,43 @@ void iv_cell_redial_init(iv_cell_redial_t *r)
         return;
     r->last_try_ms     = 0;
     r->window_start_ms = 0;
+    r->down_since_ms   = 0;
     r->tries           = 0;
 }
 
-int iv_cell_redial_due(const iv_cell_snap_t *s, const iv_cell_redial_t *r,
+int iv_cell_redial_due(const iv_cell_snap_t *s, iv_cell_redial_t *r,
                        int wan_has_ipv4, uint64_t now_ms)
 {
-    int pdp_ok;
-
     if (s == NULL || r == NULL)
         return 0;
-    /* 一轮都没跑完 ⇒ 不知道模组什么情况，别乱拨（`valid` 是"至少完成过一轮"）。 */
-    if (!s->valid)
+    /* 一轮都没跑完 ⇒ 不知道模组什么情况，别乱拨（`valid` 是"至少完成过一轮"）。
+     * 事实条件不成立时也要清计时：卡拔了、还没注册，那是"不该拨"，不是"断了很久"，
+     * 否则等卡插回去会立刻满足持续门槛、抢在正常拨号之前动手。 */
+    if (!s->valid || s->sim_present != 1 || s->attached != 1 ||
+        (s->cereg_stat != 1 && s->cereg_stat != 5)) {
+        r->down_since_ms = 0;
         return 0;
-    /* 事实条件：少一条都不该拨。 */
-    if (s->sim_present != 1)
+    }
+
+    /* 数据面：内核侧有地址、且模组没有明确否认，就算通。
+     * `pdp_active == -1`（没读到）**不否认** —— ECM 模式下这是常态。 */
+    if (wan_has_ipv4 && s->pdp_active != 0) {
+        r->down_since_ms = 0;
         return 0;
-    if (s->cereg_stat != 1 && s->cereg_stat != 5)
+    }
+
+    /* 走到这里 = 数据面不可用（内核没地址，或模组明确说上下文没了）。
+     * 先记起点、这一拍不动手，等持续够久再说。 */
+    if (r->down_since_ms == 0) {
+        r->down_since_ms = now_ms;
         return 0;
-    if (s->attached != 1)
+    }
+    /* 时钟回拨：按"刚发现"重算，否则永远凑不满持续时长。 */
+    if (now_ms < r->down_since_ms) {
+        r->down_since_ms = now_ms;
         return 0;
-    /* 数据面两条腿：PDP 地址（模组侧）与接口地址（内核侧）。
-     * 两边都有地址才算"通"，否则就是该拨 —— 偏偏这两个方向会各骗一次：
-     * 模组清了上下文但内核还留着残留 IP（本板 10.158.0.108 那例），
-     * 或者模组上下文还在但 usb0 掉了载波。 */
-    pdp_ok = (s->pdp_active == 1 && s->pdp_ip[0] != '\0');
-    if (pdp_ok && wan_has_ipv4)
+    }
+    if (now_ms - r->down_since_ms < IV_CELL_REDIAL_DOWN_HOLD_MS)
         return 0;
 
     /* 节奏条件一：最小间隔。时钟回拨（now < last）按"没拨过"处理。 */

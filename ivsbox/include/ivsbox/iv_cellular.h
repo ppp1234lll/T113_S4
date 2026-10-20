@@ -144,7 +144,7 @@ typedef struct {
 
     /* ---- 数据连接（PDP） ---- */
     int      attached;           /* +CGATT：1 附着 / 0 未附着 / −1 未知 */
-    int      pdp_active;         /* 1 = CGCONTRDP 报出了活动上下文 */
+    int      pdp_active;         /* 1 = 报出活动上下文 / 0 = 明确没有 / -1 = 没读到（未知） */
     char     pdp_ip[IV_CELL_IP_N];
     char     apn[IV_CELL_TXT];
     char     dns1[IV_CELL_IP_N];
@@ -198,11 +198,23 @@ void iv_cell_tick(iv_cell_t *c, uint64_t now_ms);
 void iv_cell_snapshot(const iv_cell_t *c, iv_cell_snap_t *out);
 
 /* ---- 自动重拨判定 -------------------------------------------------------
- * 为什么判定放这里：它是**纯函数**（快照 ＋ 时刻 → 该不该拨），不碰串口、不建进程，
- * 因此可以拿真机快照做单测。真正起进程的动作在 `iv_agent`。
+ * 为什么判定放这里：它是**准纯函数**（快照 ＋ 时刻 ＋ 内部计时 → 该不该拨），
+ * 不碰串口、不建进程，因此可以拿真机快照做单测。真正起进程的动作在 `iv_agent`。
+ * 唯一的副作用是维护"数据面已断多久"（`down_since_ms`），见下。
  *
- * 触发条件是"四个要素只差最后一个"：卡就绪、已注册、已附着，但**没有 PDP 地址**。
- * 少任何一条都不拨 —— 卡没插时拨号脚本只会白跑，还会把共用 AT 口占掉几十秒。
+ * 触发条件分两层：
+ *   ① 事实层：卡就绪、已注册、已附着 —— 少任何一条都不拨，卡没插时拨号脚本
+ *      只会白跑，还会把共用 AT 口占掉几十秒。
+ *   ② 数据面层：**内核侧无线 WAN 没有 IPv4 地址**，或模组**明确否认**有活动上下文
+ *      （`pdp_active == 0`）。`pdp_active == -1`（没读到）**不算否认** ——
+ *      这条是本板的血债：ECM（`cdc_ether`）模式下 `AT+CGCONTRDP` 不报上下文，
+ *      早先把"没读到"当成"没有"，于是每小时恒定空拨 5 次（撞 `MAX_TRIES`），
+ *      每次 `AT+CFUN=1,1` 让模组 USB 重枚举、usb0 消失、平台 TCP 断链重连；
+ *      而同期 `netstat` 里 usb0 一直 ESTABLISHED —— 数据面本来是好的。
+ *
+ * 为什么还要"连续不可用 `DOWN_HOLD_MS` 才动手"：开机阶段 usb0 还没拿到 DHCP
+ * 地址，立刻拨会把出厂脚本那一次正常拨号踩掉（`AT+CFUN=1,1` 会重置模组），
+ * 于是自己把自己拖进"永远拨不完"的圈。宽限期就是给正常拨号留的路。
  *
  * 为什么管这件事：出厂 udev 脚本只在 USB `add` 时拨一次，掉线不重拨（遗留 ⑧）。
  * 4G 是首选出口，挂了没人管就等于整条链路只能等人工。
@@ -210,22 +222,25 @@ void iv_cell_snapshot(const iv_cell_t *c, iv_cell_snap_t *out);
 #define IV_CELL_REDIAL_GAP_MS    ((uint64_t)120000u) /* 两次尝试最小间隔 */
 #define IV_CELL_REDIAL_WINDOW_MS ((uint64_t)3600000u)/* 限速窗口 */
 #define IV_CELL_REDIAL_MAX_TRIES 5u                  /* 窗口内最多尝试次数 */
+#define IV_CELL_REDIAL_DOWN_HOLD_MS ((uint64_t)120000u) /* 数据面连续不可用多久才动手 */
 
 typedef struct {
     uint64_t last_try_ms;     /* 上次尝试的单调时刻；0 = 从未 */
     uint64_t window_start_ms; /* 当前限速窗口起点；0 = 未开始 */
+    uint64_t down_since_ms;   /* 数据面开始不可用的时刻；0 = 当前正常 */
     unsigned tries;           /* 窗口内已尝试次数 */
 } iv_cell_redial_t;
 
 void iv_cell_redial_init(iv_cell_redial_t *r);
 
 /* 返回 1 = 现在该拨，0 = 不该。
- * `wan_has_ipv4`：无线 WAN 接口**此刻有没有 IPv4 地址**（由装配层 getifaddrs 得到）。
- * 为什么要这一维：只看 PDP 会漏掉最常见的一种掉线 —— 模组认为上下文还在，
- * 但 usb0 已经掉了载波、地址被内核摘掉（`NO-CARRIER`），报文其实一个都发不出去。
- * 反过来 PDP 已经被模组清掉、接口地址还留着（残留 IP）也是同一类假象。
- * 两个来源任一"没有地址"就说明数据面不可用，都够格重拨。 */
-int iv_cell_redial_due(const iv_cell_snap_t *s, const iv_cell_redial_t *r,
+ * `wan_has_ipv4`：无线 WAN 接口**此刻有没有 IPv4 地址**（装配层 getifaddrs 得到，
+ * 已含载波判断）。为什么要这一维：只看 PDP 会漏掉最常见的一种掉线 —— 模组认为
+ * 上下文还在，但 usb0 已经掉了载波、地址被内核摘掉（`NO-CARRIER`），报文一个都发不出去。
+ *
+ * `r` **不是 const**：本函数就地维护 `down_since_ms`（恢复即清零、开始断则记起点）。
+ * 仍是可单测的确定性逻辑 —— 同一串调用得出同一串结论，没有隐藏时钟、没有 I/O。 */
+int iv_cell_redial_due(const iv_cell_snap_t *s, iv_cell_redial_t *r,
                        int wan_has_ipv4, uint64_t now_ms);
 
 /* 记一次尝试（由调用方在真正发起后调用，窗口内计数 ＋1）。 */

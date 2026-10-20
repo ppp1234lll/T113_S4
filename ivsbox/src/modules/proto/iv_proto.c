@@ -14,7 +14,10 @@
 #include <string.h>
 
 #include "ivsbox/iv_crc.h"
+#include "ivsbox/iv_log.h"
 #include "ivsbox/iv_proto.h"
+
+#define PROTO_MOD "proto"
 
 /* ---------------------------------------------------------------------------
  * 内部工具
@@ -446,7 +449,13 @@ static void dispatch(const iv_proto_frame_t *f, void *arg)
      * ⚠ 已知欠账：参考实现有一整张 `CONFIGURE_*` 下发处理表（0xF5 定时上报间隔、
      * 0xF2 PING、0xF3 传输模式、0xF4 本地网络、0xF7 摄像机 IP、0xA5 搜索方式…），
      * 我们只实现了 0xE2/0xE3/0xE4/0xE7/0xA5 五条查询与配置；其余配置命令现在
-     * 会"回 OK 但不执行"——平台以为设成功、设备没变。属 M4 遗留，按命令逐条补。 */
+     * 会"回 OK 但不执行"——平台以为设成功、设备没变。属 M4 遗留，按命令逐条补。
+     *
+     * 这条日志是**现场唯一的观测窗口**：不登录平台、不架代理，也能从板端
+     * `/mnt/UDISK/log/<日期>/<小时>.log` 看到平台到底下发过哪些命令、多长载荷。
+     * 0xFF 心跳在上面已经提前返回，不会把这里刷爆。 */
+    IV_LOG_W(PROTO_MOD, "downlink cmd 0x%02X not handled (%u bytes), auto-ack 0x%02X",
+             (unsigned)f->cmd, (unsigned)f->len, (unsigned)IV_PROTO_ACK_OK);
     (void)iv_proto_ack(pf, f->cmd, IV_PROTO_ACK_OK);
 }
 

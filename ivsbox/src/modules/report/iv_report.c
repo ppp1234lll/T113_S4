@@ -353,10 +353,16 @@ static int rep_send_report(iv_report_t *rp)
         return rc;
 
     rc = iv_queue_push(&rp->q, IV_QUEUE_PRIO_STATE, frame, flen, &seq);
-    if (rc == IV_OK)
+    if (rc == IV_OK) {
         rp->reports++;
-    else if (rc == IV_EFULL)
+        /* 每条周期上报留一行 DT —— 这是"设备到底按没按时发"的**唯一现场证据**。
+         * 300 s 一条＝12 行/小时，代价可忽略；与平台「历史数据」对账时逐条比。
+         * 少了哪条、间隔变成多少，看这一列就够，不用再架透明代理抓包。 */
+        IV_LOG_I(REP_MOD, "report #%llu DT=%s seg=%d frame=%u",
+                 (unsigned long long)rp->reports, dt, n, (unsigned)flen);
+    } else if (rc == IV_EFULL) {
         rp->queue_full++;
+    }
     return rc;
 }
 
@@ -560,6 +566,25 @@ int iv_report_set_report_period(iv_report_t *rp, uint32_t report_ms)
     rp->cfg.report_ms = report_ms;
     if (rp->next_report > rp->now_ms + report_ms)
         rp->next_report = rp->now_ms + report_ms;
+    return IV_OK;
+}
+
+/*
+ * 平台下行 0xF5「配置定时上报间隔」载荷解析（纯函数）。
+ * 口径见 include/ivsbox/iv_report.h（与参考实现 `com_set_next_report_time()` 同构）。
+ * 这里只拆字段 —— 采不采纳、落不落盘、回 0x01 还是 0x74 都归装配层：
+ * 本层不认配置键，也不该在协议回调里做文件 I/O。
+ */
+int iv_report_parse_cfg_intv(const uint8_t *data, uint16_t len,
+                             uint8_t *sel, uint16_t *sec)
+{
+    if (data == NULL || sel == NULL || sec == NULL)
+        return IV_EINVAL;
+    if (len < 3u)
+        return IV_EINVAL;
+    *sel = data[0];
+    /* 参考实现：`(buff[1]<<8 | buff[2])` —— **大端**，别按小端读 */
+    *sec = (uint16_t)(((uint16_t)data[1] << 8) | (uint16_t)data[2]);
     return IV_OK;
 }
 

@@ -414,9 +414,38 @@ int main(void)
         iv_report_close(&rp);
     }
 
+    /* ---- 13) 平台 0xF5 载荷解析（纯函数）----
+     * 参考实现：`sel = buff[0]; time = (buff[1]<<8 | buff[2]);`
+     * —— **大端**，按小端读会把 600 读成 22528。短包 / NULL 一律拒。 */
+    {
+        static const uint8_t ok600[3] = { 0x01u, 0x02u, 0x58u }; /* sel=1, 600 s */
+        static const uint8_t zero[3]  = { 0x01u, 0x00u, 0x00u }; /* 0 s */
+        static const uint8_t sel2[3]  = { 0x02u, 0x00u, 0xB4u }; /* sel=2, 180 s */
+        uint8_t              sel      = 0xFFu;
+        uint16_t             sec      = 0xFFFFu;
+
+        chk(iv_report_parse_cfg_intv(ok600, 3u, &sel, &sec) == IV_OK, "c13 parse ok");
+        chk(sel == 1u && sec == 600u, "c13 sel=1 sec=600");
+
+        chk(iv_report_parse_cfg_intv(zero, 3u, &sel, &sec) == IV_OK, "c13 zero ok");
+        chk(sel == 1u && sec == 0u, "c13 0 s parsed as 0 (caller must reject)");
+
+        chk(iv_report_parse_cfg_intv(sel2, 3u, &sel, &sec) == IV_OK, "c13 sel2 ok");
+        chk(sel == 2u && sec == 180u, "c13 0x00B4 = 180 (big endian)");
+
+        chk(iv_report_parse_cfg_intv(ok600, 2u, &sel, &sec) == IV_EINVAL,
+            "c13 short payload rejected");
+        chk(iv_report_parse_cfg_intv(NULL, 3u, &sel, &sec) == IV_EINVAL,
+            "c13 null data rejected");
+        chk(iv_report_parse_cfg_intv(ok600, 3u, NULL, &sec) == IV_EINVAL,
+            "c13 null sel rejected");
+        chk(iv_report_parse_cfg_intv(ok600, 3u, &sel, NULL) == IV_EINVAL,
+            "c13 null sec rejected");
+    }
+
     if (g_fail == 0)
         printf("test_report passed (seg/frame/query-crc/json/env/set-server/bind-if/"
-               "report-period)\n");
+               "report-period/cfg-intv)\n");
     else
         printf("test_report FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

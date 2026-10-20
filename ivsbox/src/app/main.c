@@ -896,6 +896,74 @@ static void cfg_rec_sources(iv_agent_cfg_t *ac)
         ac->rec_debounce_ms = (uint32_t)v;
 }
 
+/* ---------------------------------------------------------------------------
+ * 平台下发：0xF5「配置定时上报间隔」
+ * ---------------------------------------------------------------------------
+ * 语义逐条对齐参考实现 `com.c:com_set_next_report_time()`（2026-10-20 核对）：
+ *   `DATA = sel(1) + 秒数(大端 u16)`，共 3 字节；
+ *   - `秒 == 0`  ⇒ 不采纳、回 `0x74`；
+ *   - `sel != 1` ⇒ 参考实现只在 `sel == 1` 时真正写入，其余选择子照样回 `0x01`；
+ *   - 其余       ⇒ 写入（**先改内存、再落盘**）并回 `0x01`。
+ *
+ * 为什么要补：原先把 0xF5 落到"未注册命令一律回 OK"的默认分支 —— 平台收到
+ * `0x01` 就认定"设备已按新间隔上报"，而设备的周期一分没动，两边对"多久一条"
+ * 的认知从此不一致。这是平台**唯一**能改我们上报节拍的入口，不能只回话不干活。
+ *
+ * 顺序照抄参考实现：先让新周期在运行期生效，再落盘（落盘失败不影响本次生效，
+ * 只影响下次启动）。保存成功后配置层还会通知 `on_cfg_committed(SYS)` 再调一次
+ * `iv_report_set_report_period()` —— 同值早返回，不会抖。
+ * ------------------------------------------------------------------------- */
+static void on_plat_report_intv(const iv_proto_frame_t *f, void *arg)
+{
+    uint8_t  sel = 0;
+    uint16_t sec = 0;
+    int64_t  cur = 0;
+    int      rc;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+
+    if (iv_report_parse_cfg_intv(f->data, f->len, &sel, &sec) != IV_OK) {
+        IV_LOG_W(APP_MOD, "0xF5 payload too short (%u bytes), ack 0x74",
+                 (unsigned)f->len);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    if (sec == 0u) {
+        IV_LOG_W(APP_MOD, "0xF5 sel=%u interval=0s rejected, ack 0x74", (unsigned)sel);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    if (sel != 1u) {
+        /* 参考实现只在 sel==1 时写入，但**照样回 0x01**（= “已处理”） */
+        IV_LOG_I(APP_MOD, "0xF5 sel=%u interval=%us ignored (only sel=1 applied)",
+                 (unsigned)sel, (unsigned)sec);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+    if (iv_config_get_int(g_cfg, "sys.report.interval_s", &cur) == IV_OK &&
+        cur == (int64_t)sec) {
+        /* 同值：不重复落盘（平台可能反复下发同一配置，别白写 flash） */
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+
+    rc = iv_config_set_int(g_cfg, "sys.report.interval_s", (int64_t)sec);
+    if (rc != IV_OK) {
+        /* 超出默认值表范围（5..3600 s）：如实回失败，而不是假装设成功 */
+        IV_LOG_W(APP_MOD, "0xF5 interval=%us out of range (%d), ack 0x74",
+                 (unsigned)sec, rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    (void)iv_report_set_report_period(&g_agent.rp, (uint32_t)sec * 1000u);
+    rc = iv_config_save(g_cfg, NULL, 0);
+    IV_LOG_I(APP_MOD, "platform set report interval -> %u s (save rc=%d)",
+             (unsigned)sec, rc);
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
 static int agent_setup(void)
 {
     iv_agent_cfg_t ac;
@@ -1028,6 +1096,12 @@ static int agent_setup(void)
         IV_LOG_E(APP_MOD, "agent open failed");
         return -1;
     }
+
+    /* 平台下行 0xF5「配置定时上报间隔」——**建链之后**注册（路由表挂在 rp.pf 上，
+     * 而 pf 是 iv_agent_open → iv_report_open 里才初始化的）。查询类的 0xE2/0xE3
+     * 在 iv_report_open 内部注册；这条要写配置，只有装配层够得着 g_cfg。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_REPORT_INTV,
+                         on_plat_report_intv, NULL);
     return 0;
 }
 

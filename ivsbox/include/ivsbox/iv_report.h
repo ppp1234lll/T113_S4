@@ -333,6 +333,27 @@ int iv_report_set_bind_if(iv_report_t *rp, const char *ifname);
  */
 int iv_report_set_report_period(iv_report_t *rp, uint32_t report_ms);
 
+/**
+ * 解析平台下行 `0xF5`「配置定时上报间隔」的 DATA 段（纯函数，无副作用）。
+ *
+ * 口径逐条对齐参考实现 `com.c:com_set_next_report_time()`（2026-10-20 核对）：
+ *   `DATA = sel(1 字节) + 秒数(大端 u16)`，共 **3 字节**
+ *   - `秒 == 0`：参考实现**不采纳**，回 `0x74`（`IV_PROTO_ERR_EXEC`）；
+ *   - `sel != 1`：参考实现 `app_set_next_report_time_other()` 只在 `sel == 1`
+ *     时写入，其余选择子**照样回 `0x01`**（告诉平台"已处理"）；
+ *   - 其余：写入并回 `0x01`，参考实现另外**落盘**。
+ *
+ * 本函数只做解析，采纳/落盘/回什么码由装配层决定（见 `src/app/main.c`）。
+ *
+ * @param data  DATA 段起址（可为 NULL，此时必返回 IV_EINVAL）
+ * @param len   DATA 段长度；< 3 ⇒ IV_EINVAL
+ * @param sel   [out] 选择子（不可为 NULL）
+ * @param sec   [out] 秒数（不可为 NULL）
+ * @return IV_OK / IV_EINVAL
+ */
+int iv_report_parse_cfg_intv(const uint8_t *data, uint16_t len,
+                             uint8_t *sel, uint16_t *sec);
+
 /* 关闭：从 Reactor 摘事件/定时器、关串口与传输、关队列。 */
 void iv_report_close(iv_report_t *rp);
 

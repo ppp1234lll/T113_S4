@@ -445,7 +445,7 @@ static void c10_redial(void)
 
         t = s; t.valid = 0;
         chk(redial_after_hold(&t, &r, 0, now) == 0, "c10 no finished round => no dial");
-        chk(r.down_since_ms == 0, "c10 unknown round clears hold timer");
+        chk(r.down_since_ms != 0, "c10 unknown snapshot keeps the hold timer");
 
         t = s; t.sim_present = 0;
         chk(redial_after_hold(&t, &r, 0, now) == 0, "c10 SIM absent => no dial");
@@ -460,6 +460,27 @@ static void c10_redial(void)
         /* 漫游（stat 5）也是"已注册" */
         t = s; t.cereg_stat = 5;
         chk(redial_after_hold(&t, &r, 0, now) == 1, "c10 roaming registered => dial");
+    }
+
+    /* ---- C2. 轮询中段的"未知"不得打断计时 ----
+     * 板端实测形态：`/api/cell` 快照里 attached=null、csq=null、age_ms≈30 s ——
+     * AT 一轮十来条命令，每轮开头字段被复位，中段读到的就是 -1。若在未知时清零
+     * `down_since_ms`，真断时计时每 30 s 重来一次，持续门槛永远凑不满 ⇒ 自愈失效。 */
+    iv_cell_redial_init(&r);
+    {
+        iv_cell_snap_t unknown = s;
+        uint64_t       t0      = now;
+
+        unknown.attached   = -1;
+        unknown.cereg_stat = -1;
+        (void)iv_cell_redial_due(&s, &r, 0, t0);                  /* 真断，开始计时 */
+        chk(r.down_since_ms == t0, "c10 outage anchors the timer");
+        (void)iv_cell_redial_due(&unknown, &r, 0, t0 + 20000u);   /* 轮中未知 */
+        chk(r.down_since_ms == t0, "c10 mid-round unknown keeps the timer");
+        (void)iv_cell_redial_due(&s, &r, 0, t0 + 40000u);         /* 轮结束 */
+        chk(r.down_since_ms == t0, "c10 timer survives a round boundary");
+        chk(iv_cell_redial_due(&s, &r, 0, t0 + IV_CELL_REDIAL_DOWN_HOLD_MS) == 1,
+            "c10 dials after hold despite mid-round unknowns");
     }
 
     /* ---- D. 节奏一：最小间隔 120 s ---- */

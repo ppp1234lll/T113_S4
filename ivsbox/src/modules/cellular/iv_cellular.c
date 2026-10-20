@@ -887,14 +887,16 @@ int iv_cell_redial_due(const iv_cell_snap_t *s, iv_cell_redial_t *r,
 {
     if (s == NULL || r == NULL)
         return 0;
-    /* 一轮都没跑完 ⇒ 不知道模组什么情况，别乱拨（`valid` 是"至少完成过一轮"）。
-     * 事实条件不成立时也要清计时：卡拔了、还没注册，那是"不该拨"，不是"断了很久"，
-     * 否则等卡插回去会立刻满足持续门槛、抢在正常拨号之前动手。 */
+    /* 一轮都没跑完 / 卡没插 / 没注册 / 没附着 ⇒ 不该拨。
+     * **这里绝不能清 `down_since_ms`**：AT 轮询是分批发命令的，每轮开头
+     * `reset_dynamic()` 会把 `cereg_stat`/`attached`/`pdp_active` 复位成 -1，
+     * 一轮中段读到的快照就是"未知"。若在未知时清零，断线计时每 30 s 被打断一次，
+     * 永远凑不满 `DOWN_HOLD_MS` ⇒ 自愈彻底失效（实测 `/api/cell` 的快照正是这个形态：
+     * `attached=null`、`csq=null`，而 `age_ms≈30 s`）。
+     * 计时只由"数据面恢复"清零，见下。 */
     if (!s->valid || s->sim_present != 1 || s->attached != 1 ||
-        (s->cereg_stat != 1 && s->cereg_stat != 5)) {
-        r->down_since_ms = 0;
+        (s->cereg_stat != 1 && s->cereg_stat != 5))
         return 0;
-    }
 
     /* 数据面：内核侧有地址、且模组没有明确否认，就算通。
      * `pdp_active == -1`（没读到）**不否认** —— ECM 模式下这是常态。 */

@@ -404,6 +404,27 @@ int main(void)
         chk(memcmp(&g_tx.buf[0][2], &want[2], want_len - 2) == 0,
             "heartbeat bytes");
 
+        /* 收到平台心跳（0xFF）：**不回**。它是对我方心跳的应答，单向下行；
+         * 回了（ACK 也是 cmd=0xFF + 回显 QN 的同形帧）⇒ 平台再当心跳应答回来
+         * ⇒ 自激乒乓（2026-10-20 板端实测 1~2 帧/s 双向不停）。 */
+        {
+            uint8_t f_hb[64];
+            size_t  lh;
+
+            rec_reset();
+            lh = mk_down(f_hb, 0x0400u, 0x010203u, 0xFFu, 0xFFFFFFFFu,
+                         0xFFFFFFFFu, &hb_data, 1);
+            iv_proto_recv(&pf, f_hb, lh);
+            chk(g_tx.n == 0, "rx heartbeat -> NO reply (anti ping-pong)");
+            chk(pf.rx_frames == 1u, "rx heartbeat still counted");
+
+            /* 对照：同样没注册的**非心跳**命令仍按 MCU default 语义回 OK */
+            rec_reset();
+            lh = mk_down(f_hb, 0x0400u, 0x010203u, 0x5Au, 0x11u, 0x22u, NULL, 0);
+            iv_proto_recv(&pf, f_hb, lh);
+            chk(g_tx.n == 1, "unknown non-heartbeat cmd still auto-ack");
+        }
+
         /* send_text（上报帧：长度=整段、CRC 覆盖 &&数据区&&） */
         rec_reset();
         chk(iv_proto_init(&pf, &id, on_tx, NULL) == IV_OK, "ctx init 4");

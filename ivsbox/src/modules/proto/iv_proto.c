@@ -423,13 +423,30 @@ static void dispatch(const iv_proto_frame_t *f, void *arg)
     pf->last_qn1 = f->qn1;
     pf->last_qn2 = f->qn2;
 
+    /* 平台心跳（0xFF）是**单向下行**：它是对我方心跳的应答，不是请求 ——
+     * 参考实现的接收分发里根本没有这一条（`com.h` 把 0xFF 定义为"心跳上传"，
+     * 接收 switch 里没有 case）⇒ 收到不回。
+     *
+     * 我们原来落到下面"未注册命令一律回 OK"的默认分支，而 `iv_proto_ack()`
+     * 发出的帧是 **cmd 相同 + 回显请求 QN** 的同一形态 ⇒ 平台把它当成又一个
+     * 心跳应答再回来 ⇒ **自激乒乓**。2026-10-20 板端实测（透明代理）：
+     * 4 min 内 871 帧下行 / 634 帧上行，稳定 1~2 帧/s 双向不停 —— 报文里
+     * 唯一异常就是它，也是唯一与参考实现不同的下行行为。
+     */
+    if (f->cmd == IV_PROTO_CMD_HEARTBEAT)
+        return;
+
     for (i = 0; i < pf->n_route; i++) {
         if (pf->route[i].cmd == f->cmd) {
             pf->route[i].cb(f, pf->route[i].arg);
             return;
         }
     }
-    /* 未注册命令：保守回 OK（MCU 参考实现 default 分支同语义） */
+    /* 未注册命令：保守回 OK（MCU 参考实现 default 分支同语义）。
+     * ⚠ 已知欠账：参考实现有一整张 `CONFIGURE_*` 下发处理表（0xF5 定时上报间隔、
+     * 0xF2 PING、0xF3 传输模式、0xF4 本地网络、0xF7 摄像机 IP、0xA5 搜索方式…），
+     * 我们只实现了 0xE2/0xE3/0xE4/0xE7/0xA5 五条查询与配置；其余配置命令现在
+     * 会"回 OK 但不执行"——平台以为设成功、设备没变。属 M4 遗留，按命令逐条补。 */
     (void)iv_proto_ack(pf, f->cmd, IV_PROTO_ACK_OK);
 }
 

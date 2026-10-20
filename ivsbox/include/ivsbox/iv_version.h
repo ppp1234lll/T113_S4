@@ -33,6 +33,24 @@ const char *iv_version_git(void);
  */
 int iv_version_git_valid(void);
 
+/*
+ * 构建日期串 "YYYYMMDD"（Makefile 注入 -DIV_BUILD_DATE；未注入时为 "00000000"）。
+ * 返回值同样是编译期常量，调用方不得修改或释放。
+ */
+const char *iv_version_build_date(void);
+
+/*
+ * **给平台看的**软件版本串，形如 "1.0.0.20261020"。
+ *
+ * 与 iv_version_string() 的分工（两者都不能互相替代）：
+ *   - iv_version_string()：三段版本 + `+g<短哈希>`，给工程与现场排障用，
+ *     能直接定位到某一笔提交；
+ *   - 本条：三段版本 + 构建日期，给平台 E3 应答的 `sysver` 用。平台侧只按
+ *     "版本号+时间"这一种格式显示（参考实现 SOFT_NO_STR 即 "2.0.0.20260501"），
+ *     带上 `+g…` 会把日期那一格污染成不可读的串。
+ */
+const char *iv_version_sysver(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -62,6 +62,10 @@ static int            g_wd_fd = -1;
 /* M3 业务装配（约 35 KB，必须放静态区/堆，勿放栈） */
 static iv_agent_t     g_agent;
 
+/* E3 应答的 `tsn`（芯片唯一号）：装配期读一次，指针交给 agent 长持。
+ * 放静态区而不是栈上临时量 —— `iv_report_cfg_t` 里存的是指针，栈变量出作用域就悬空。 */
+static char           g_tsn[IV_PROV_TSN_MAX];
+
 /* 本地通道（M5-S5.1 起改为**多客户端** ＋ 方法路由）：
  * 原来只支持一个客户端、只认 system.snapshot。Web 进程会长期占一条连接，
  * 调试工具/平台探活可能同时连进来，单客户端槽会让后来者被直接踢掉。 */
@@ -1091,6 +1095,19 @@ static int agent_setup(void)
         else
             IV_LOG_W(APP_MOD, "no factory identity; reporting devid=0 (platform cannot match)");
     }
+
+    /* 硬件型号（E3 应答 `mod`）：配置键 `sys.device.model`，Web 配置页可改
+     * （用户 2026-10-20 明确要求）。这里只存**指针**：配置的字符串存在定长缓冲里、
+     * 原地改写，所以网页改完下一帧 E3 应答就是新值，不用重启 —— 与 `net.server.*`
+     * 那种"open 时拷贝副本"的做法刻意不同。
+     * 取不到（键被删/空串）就送 NULL，E3 里落成空串，平台显示为空而不是假型号。 */
+    ac.mod = cfg_str("sys.device.model");
+
+    /* 终端序列号（E3 应答 `tsn`）：芯片唯一号，**不派生自 devid** —— 见
+     * iv_provision.h 里 iv_prov_tsn() 的说明。读不到就空串（宁缺勿编）。 */
+    if (iv_prov_tsn(g_tsn) == 0)
+        IV_LOG_W(APP_MOD, "chip serial unavailable; E3 tsn will be empty");
+    ac.tsn = g_tsn;
 
     if (iv_agent_open(&g_agent, &ac, g_reactor, iv_clock_monotonic_ms()) != IV_OK) {
         IV_LOG_E(APP_MOD, "agent open failed");

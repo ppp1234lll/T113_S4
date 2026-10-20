@@ -369,20 +369,28 @@ static void h_query_version(const iv_proto_frame_t *f, void *arg)
 {
     iv_report_t *rp = arg;
     char         qn[32];
-    char         json[320];
+    /* 缓冲按**最坏情况**算：qn 17 + mod 31 + sysver/sv 各 ~25 + tsn 12 + 其余键，
+     * 实测约 210 B；留一倍余量，免得别人再加字段时悄悄撞 IV_ERANGE
+     * （撞了的表现是"点了查询毫无反应"，比截断更难查）。 */
+    char         json[384];
     int          n;
 
     qn_to_str(f->qn1, f->qn2, qn, sizeof(qn));
     n = iv_report_build_query_json(rp->pf.id.devtype, rp->pf.id.devid,
-                                   qn, rp->cfg.mod, rp->cfg.sv,
+                                   qn, rp->cfg.mod, rp->cfg.sv, rp->cfg.tsn,
                                    json, sizeof(json));
     if (n <= 0) {
         IV_LOG_W(REP_MOD, "E3 json build failed (%d)", n);
         (void)iv_proto_ack(&rp->pf, f->cmd, IV_PROTO_ERR_EXEC);
         return;
     }
-    if (iv_proto_send_json(&rp->pf, json, (size_t)n) == IV_OK)
+    if (iv_proto_send_json(&rp->pf, json, (size_t)n) == IV_OK) {
         rp->query_resp++;
+        /* 原样回显一份：平台"点了没反应"时，光有 query_rsp 计数证明不了
+         * 回的内容对不对（字段名写错也照样计数）。E3 是人工点击触发、频率极低，
+         * 一条日志换"不用抓包就能对账"。 */
+        IV_LOG_I(REP_MOD, "E3 reply: %s", json);
+    }
 }
 
 /* E2 立即上报设备状态 → 回 ACK + 立刻入一帧上报 */
@@ -738,6 +746,7 @@ int iv_report_open(iv_report_t *rp, const iv_report_cfg_t *cfg,
     c.poll_ms     = cfg->poll_ms ? cfg->poll_ms : IV_REPORT_POLL_MS;
     c.mod         = cfg->mod;
     c.sv          = cfg->sv;
+    c.tsn         = cfg->tsn;
     c.on_door     = cfg->on_door;
     c.on_door_arg = cfg->on_door_arg;
     /* 这里是把调用方配置**逐字段**收进局部 c，漏一行就等于该项被默认值顶掉。
@@ -984,7 +993,7 @@ uint8_t iv_report_query_crc(uint16_t devtype, uint32_t devid, uint8_t cmd)
 
 int iv_report_build_query_json(uint16_t devtype, uint32_t devid,
                                const char *qn, const char *mod, const char *sv,
-                               char *out, size_t cap)
+                               const char *tsn, char *out, size_t cap)
 {
     char    crc2[3];
     size_t  n = 0;
@@ -995,18 +1004,26 @@ int iv_report_build_query_json(uint16_t devtype, uint32_t devid,
         mod = "";
     if (sv == NULL)
         sv = "";
+    if (tsn == NULL)
+        tsn = "";
     (void)snprintf(crc2, sizeof(crc2), "%02x",
                    (unsigned)iv_report_query_crc(devtype, devid,
                                                  IV_PROTO_CMD_QUERY_VERSION));
 
+    /* 字段顺序照抄参考实现 `com_version_information()`：
+     * ver → devtype → tid → cmd → mod → sysver → tsn → crc；
+     * `type` / `sv` 紧跟各自的主名之后（见头文件里的别名说明），不改变主序。 */
     APPEND(out, cap, n, "{\"code\":0,\"qn\":\"%s\",\"data\":{",
            (qn != NULL && qn[0] != '\0') ? qn : "0");
     APPEND(out, cap, n, "\"ver\":\"%02x\",", (unsigned)IV_PROTO_VER);
+    APPEND(out, cap, n, "\"devtype\":\"%04x\",", (unsigned)devtype);
     APPEND(out, cap, n, "\"type\":\"%04x\",", (unsigned)devtype);
     APPEND(out, cap, n, "\"tid\":\"%x\",", (unsigned)devid);
     APPEND(out, cap, n, "\"cmd\":\"%02X\",", (unsigned)IV_PROTO_CMD_QUERY_VERSION);
-    APPEND(out, cap, n, "\"mod\":\"%s\",", mod);
+    APPEND(out, cap, n, "\"mod\":\"%.*s\",", (int)IV_REPORT_MOD_MAX, mod);
+    APPEND(out, cap, n, "\"sysver\":\"%s\",", sv);
     APPEND(out, cap, n, "\"sv\":\"%s\",", sv);
+    APPEND(out, cap, n, "\"tsn\":\"%s\",", tsn);
     APPEND(out, cap, n, "\"crc\":\"%s\"}}", crc2);
     return (int)n;
 }

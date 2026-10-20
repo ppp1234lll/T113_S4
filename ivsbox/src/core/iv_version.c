@@ -14,6 +14,9 @@
 #ifndef IV_GIT_VER
 #define IV_GIT_VER "unknown"
 #endif
+#ifndef IV_BUILD_DATE
+#define IV_BUILD_DATE "00000000"
+#endif
 
 #define IV_VERSION_UNKNOWN  "unknown"
 
@@ -35,6 +38,12 @@ static const char s_version_unknown[] = IVV_STR(IVSBOX_VERSION_MAJOR) "."
                                         IVV_STR(IVSBOX_VERSION_MINOR) "."
                                         IVV_STR(IVSBOX_VERSION_PATCH) "+g"
                                         IV_VERSION_UNKNOWN;
+
+/* 平台视图的版本串：三段版本 + 构建日期（同属编译期常量，理由见头文件）。 */
+static const char s_sysver[] = IVV_STR(IVSBOX_VERSION_MAJOR) "."
+                               IVV_STR(IVSBOX_VERSION_MINOR) "."
+                               IVV_STR(IVSBOX_VERSION_PATCH) "."
+                               IV_BUILD_DATE;
 
 /*
  * 短哈希合法性：非空、非占位值、且全部为十六进制字符。
@@ -66,4 +75,14 @@ int iv_version_git_valid(void)
 const char *iv_version_string(void)
 {
     return git_ver_usable(IV_GIT_VER) ? s_version_git : s_version_unknown;
+}
+
+const char *iv_version_build_date(void)
+{
+    return IV_BUILD_DATE;
+}
+
+const char *iv_version_sysver(void)
+{
+    return s_sysver;
 }

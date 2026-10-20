@@ -107,6 +107,7 @@ extern "C" {
 
 /* 字段容量 */
 #define IV_PROV_TID_MAX   8u    /* "1234FF" + NUL */
+#define IV_PROV_TSN_MAX   13u   /* 12 位大写 HEX + NUL（对齐参考实现 "%04X%04X%04X"） */
 #define IV_PROV_DATE_MAX  16u   /* "20230531" / "20230531125625" */
 #define IV_PROV_TYPE_MAX  24u
 #define IV_PROV_MAC_MAX   20u   /* "aa:bb:cc:dd:ee:ff" + NUL */
@@ -188,6 +189,20 @@ void iv_prov_devinfo_from_id(const iv_prov_id_t *id, iv_prov_devinfo_t *out);
  * -------------------------------------------------------------------------- */
 /* 0x1234FF → "1234FF"（大写、零填充 6 位）。out 容量至少 IV_PROV_TID_MAX。 */
 void iv_prov_tid_from_u32(uint32_t devid, char out[IV_PROV_TID_MAX]);
+
+/*
+ * 终端序列号（平台 E3 应答的 `tsn`）：**12 位大写 HEX**，格式对齐参考实现
+ * `start_get_device_id_str()` 的 `%04X%04X%04X`（那边取 MCU 的 3×u16 chipid）。
+ *
+ * 数据源（**运行时事实，不进配置**）：
+ *   1) `/sys/class/sunxi_info/sys_info` 里的 `sunxi_chipid : <32 hex>`，取前 12 位；
+ *   2) 读不到再退 `/proc/cpuinfo` 的 `Serial`（16 hex），同样取前 12 位；
+ *   3) 都读不到 ⇒ 写**空串**。不编造：`tid` 是配置身份，`tsn` 是芯片唯一号，
+ *      两者混用会让平台把"同一台设备"认成两台（或反之）。
+ *
+ * 返回值：1 = 取到，0 = 取不到（out 为空串）。out 容量至少 IV_PROV_TSN_MAX。
+ */
+int iv_prov_tsn(char out[IV_PROV_TSN_MAX]);
 
 /* "1234FF" → 0x1234FF（大小写皆可；**必须恰 6 位 HEX**）。
  * 返回 IV_OK / IV_EINVAL。 */

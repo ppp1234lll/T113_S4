@@ -11,9 +11,11 @@
  *      工具只负责"收包→问决策→照做→回包"，单测据此覆盖全部分支。
  *   4. **组包输出严格 JSON**（无尾逗号）：容错是"读"的责任，"写"只写最保守的形态。
  */
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -151,6 +153,85 @@ void iv_prov_mac_format(const uint8_t mac[6], char out[IV_PROV_MAC_MAX])
     (void)snprintf(out, IV_PROV_MAC_MAX, "%02x:%02x:%02x:%02x:%02x:%02x",
                    (unsigned)mac[0], (unsigned)mac[1], (unsigned)mac[2],
                    (unsigned)mac[3], (unsigned)mac[4], (unsigned)mac[5]);
+}
+
+/* --------------------------------------------------------------------------
+ * 终端序列号（平台 `tsn`）
+ * --------------------------------------------------------------------------
+ * 只认"芯片唯一号"这一路事实，**绝不从 devid/tid 派生** —— 参考实现里 tsn 来自
+ * MCU 的 chipid（`start_get_device_id_str()` = "%04X%04X%04X"），tid 来自设备
+ * 配置 ID。两者混用会让平台把同一台设备认成两台（或反过来）。
+ *
+ * 解析一律"找键 → 跳冒号 → 跳空白 → 连取 HEX 到 12 位"，不用 sscanf 的格式串：
+ * `/proc/cpuinfo` 是 `Serial\t\t: xxx`、sunxi 是 `sunxi_chipid      : xxx`，
+ * 冒号前的空白数量不固定，写死格式串在这块板子上必然踩空一次。
+ * -------------------------------------------------------------------------- */
+static int hex12_from_file(const char *path, const char *key,
+                           char out[IV_PROV_TSN_MAX])
+{
+    const int want = (int)IV_PROV_TSN_MAX - 1; /* 12 */
+    char      line[256];
+    FILE     *fp;
+
+    if (path == NULL || key == NULL || out == NULL)
+        return 0;
+    out[0] = '\0';
+
+    fp = fopen(path, "r");
+    if (fp == NULL)
+        return 0;
+
+    while (fgets(line, (int)sizeof(line), fp) != NULL) {
+        const char *p = strstr(line, key);
+        int         n = 0;
+
+        if (p == NULL)
+            continue;
+        p += strlen(key);
+        while (*p != '\0' && *p != ':')
+            p++;
+        if (*p == ':')
+            p++;
+        while (*p != '\0' && isspace((unsigned char)*p))
+            p++;
+        while (hex_val(*p) >= 0 && n < want) {
+            out[n] = (char)toupper((unsigned char)*p);
+            n++;
+            p++;
+        }
+        out[n] = '\0';
+        if (n == want) {
+            (void)fclose(fp);
+            return 1;
+        }
+        out[0] = '\0'; /* 这一行的 HEX 不够 12 位，继续找下一行 */
+    }
+    (void)fclose(fp);
+    return 0;
+}
+
+int iv_prov_tsn(char out[IV_PROV_TSN_MAX])
+{
+    const char *path = "/sys/class/sunxi_info/sys_info";
+    const char *ov = getenv("IVSBOX_CHIPID_FILE");
+
+    if (out == NULL)
+        return 0;
+    out[0] = '\0';
+    /* 覆盖口只为单测/联调：Host 上没有 sunxi 的 sysfs，真值只能在板上验证。
+     * 与 IVSBOX_CELL_DEV / IVSBOX_GPS_DEV 同一口径 —— 产线不设，也不进配置键。 */
+    if (ov != NULL && ov[0] != '\0')
+        path = ov;
+
+    if (hex12_from_file(path, "sunxi_chipid", out) != 0)
+        return 1;
+    if (hex12_from_file(path, "Serial", out) != 0)
+        return 1;
+    if (ov == NULL || ov[0] == '\0') {
+        if (hex12_from_file("/proc/cpuinfo", "Serial", out) != 0)
+            return 1;
+    }
+    return 0;
 }
 
 void iv_prov_date_now(char out[IV_PROV_DATE_MAX], int with_time)

@@ -152,6 +152,84 @@ int main(void)
             chk(d[i] >= '0' && d[i] <= '9', "p01t: date digits only");
         iv_prov_date_now(d, 1);
         chk(strlen(d) == 14u, "p01u: date with time is YYYYMMDDHHMMSS");
+
+        /* tsn（芯片唯一号）：格式必须与参考实现 `%04X%04X%04X` 同宽同大小写。
+         * Host 上没有 /sys/class/sunxi_info/sys_info 也没有 `Serial:` 行，
+         * 必然取不到 ⇒ 这里只能钉住"降级为空串、不编值"这一半语义；
+         * 真值由板端 /api 证据核对（见 docs/修改记录.md）。 */
+        {
+            char tsn[IV_PROV_TSN_MAX];
+            int  got;
+
+            /* 先铺成"没有 NUL 的脏缓冲"，再把最后一个字节置零：既能证明实现确实
+             * 自己收尾（而不是撞巧），又能保证断言本身不会越界读。 */
+            memset(tsn, 'X', sizeof(tsn) - 1u);
+            tsn[sizeof(tsn) - 1u] = '\0';
+            got = iv_prov_tsn(tsn);
+            chk(got == 0 || got == 1, "p01v: tsn returns 0/1");
+            chk(strlen(tsn) < (size_t)IV_PROV_TSN_MAX, "p01w: tsn is a C string within the buffer");
+            chk(strlen(tsn) == (got ? 12u : 0u), "p01x: tsn is 12 hex or empty");
+            if (got) {
+                for (i = 0u; i < 12u; i++)
+                    chk((tsn[i] >= '0' && tsn[i] <= '9') ||
+                            (tsn[i] >= 'A' && tsn[i] <= 'F'),
+                        "p01y: tsn is uppercase hex");
+            }
+            chk(iv_prov_tsn(NULL) == 0, "p01z: NULL tsn rejected");
+        }
+
+        /* tsn 解析器与**板端真实文件内容**对账（IVSBOX_CHIPID_FILE 覆盖口）：
+         * Host 上没有 sunxi sysfs，光靠"取不到返回空"证明不了取得到时对不对。
+         * 下面两段是 T113 板子上 `cat` 回来的原文（前缀/冒号/空白一字未改）。 */
+        {
+            static const char *const cases[] = {
+                /* /sys/class/sunxi_info/sys_info：32 位 chipid，取前 12 位大写 */
+                "sunxi_platform    : sun8iw20\n"
+                "sunxi_secure      : normal\n"
+                "sunxi_chipid      : 934072007c0048140102a04c48791918\n"
+                "sunxi_serial      : 487919180102a04c00007c0000000000\n"
+                "sunxi_chiptype    : 00000000\n",
+                /* /proc/cpuinfo 兜底：`Serial\t\t: <16 hex>`，同样取前 12 位 */
+                "processor\t: 0\n"
+                "model name\t: ARMv7 Processor rev 5 (v7l)\n"
+                "Serial\t\t: 7c00102a04c48791\n"
+            };
+            static const char *const want[] = { "934072007C00", "7C00102A04C4" };
+            char        tsn[IV_PROV_TSN_MAX];
+            char        path[64];
+            unsigned    k;
+
+            for (k = 0u; k < 2u; k++) {
+                FILE *fp;
+
+                (void)snprintf(path, sizeof(path), "/tmp/iv_tsn_fixture_%u.txt", k);
+                fp = fopen(path, "w");
+                chk(fp != NULL, "p01A: fixture created");
+                if (fp == NULL)
+                    continue;
+                fputs(cases[k], fp);
+                (void)fclose(fp);
+                (void)setenv("IVSBOX_CHIPID_FILE", path, 1);
+
+                memset(tsn, 0, sizeof(tsn));
+                chk(iv_prov_tsn(tsn) == 1, "p01B: tsn found in fixture");
+                chk(strcmp(tsn, want[k]) == 0,
+                    "p01C: tsn = first 12 hex, uppercase");
+                if (strcmp(tsn, want[k]) != 0)
+                    fprintf(stderr, "  got : %s\n  want: %s\n", tsn, want[k]);
+            }
+
+            /* 覆盖口指向不存在的文件 ⇒ 空串，不编值（也不 fallback 到真实 cpuinfo） */
+            (void)setenv("IVSBOX_CHIPID_FILE", "/tmp/iv_tsn_no_such_file", 1);
+            memset(tsn, 'X', sizeof(tsn) - 1u);
+            tsn[sizeof(tsn) - 1u] = '\0';
+            chk(iv_prov_tsn(tsn) == 0 && tsn[0] == '\0',
+                "p01D: missing chipid file -> empty, no fabrication");
+
+            (void)unsetenv("IVSBOX_CHIPID_FILE");
+            (void)remove("/tmp/iv_tsn_fixture_0.txt");
+            (void)remove("/tmp/iv_tsn_fixture_1.txt");
+        }
     }
 
     /* ---------------- p02 解析：容错与拒收 ---------------- */

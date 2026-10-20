@@ -3952,3 +3952,92 @@ if (f->cmd == IV_PROTO_CMD_HEARTBEAT)
 
 教训：**"未知"既不能当作"是"，也不能当作"否"** —— 它只能让结论"维持上一拍"。
 凡是把三态压成二态的地方，都要回头看一遍调用频率与复位时机。
+
+== 2026-10-20 18:27 平台「查询设备版本号」：E3 应答字段对齐参考实现
+
+=== 干了什么事
+
+一件事拆成四块，都在回答同一个问题：**平台点一下"查版本"，那串 JSON 里该有什么。**
+
+`Makefile`
+* 新增 `BUILD_DATE := $(shell date +%Y%m%d)` 并以 `-DIV_BUILD_DATE='"…"'` 注入，
+  写法与既有的 `IV_GIT_VER` 完全一致（含引号那个坑）。
+* `VER_STAMP` 的内容由 `$(GIT_VER)` 改为 `$(GIT_VER)-$(BUILD_DATE)`。
+  不改这一步的后果很隐蔽：`-D` 变了但源文件没动 ⇒ make 不重编 ⇒ 二进制的构建日期停在第一次编译那天。
+
+`iv_version.c/.h`
+* `iv_version_build_date()` 返回注入的 `YYYYMMDD`；`iv_version_sysver()` 返回
+  `1.0.0.20261020` 形态的平台串。两者都是**预处理期拼好的常量**，
+  延续"运行期零状态、天然线程安全"的既有设计 —— 没有改用 `__DATE__`，
+  因为那需要在运行期把 `"Oct 20 2026"` 换算成 `20261020`，会把这条常量变成静态缓冲＋ready 标志。
+* 与 `iv_version_string()` 的分工写在头文件里：后者带 `+g<短哈希>` 给工程排障，
+  前者给平台显示，两者不能互相替代。
+
+`iv_provision.c/.h`
+* 新增 `iv_prov_tsn()`：读 `/sys/class/sunxi_info/sys_info` 的 `sunxi_chipid`，
+  取前 **12 位大写 HEX**（对齐参考实现 `start_get_device_id_str()` 的 `%04X%04X%04X` 宽度），
+  取不到退 `/proc/cpuinfo` 的 `Serial`，再取不到写空串。
+* 解析不用 `sscanf` 格式串，而是"找键 → 跳到冒号 → 跳空白 → 连取 HEX"：
+  板端两处冒号前的空白数量不一样（`sunxi_chipid      :` 与 `Serial\t\t:`）。
+* 环境变量 `IVSBOX_CHIPID_FILE` 可覆盖路径，只为单测能拿**板端原文**做夹具；
+  与 `IVSBOX_CELL_DEV` / `IVSBOX_GPS_DEV` 同口径，产线不设、不进配置键。
+
+`iv_report.c/.h`、`iv_agent.c/.h`、`iv_config.c`、`main.c`
+* `iv_report_build_query_json()` 由 6 参改 7 参（多一个 `tsn`），字段顺序照抄
+  `com.c:com_version_information()`：`ver / devtype / tid / cmd / mod / sysver / tsn / crc`，
+  另把 `type` / `sv` 作为**同值别名**紧跟主名之后。
+* E3 应答缓冲 320 → 384 B；`mod` 按 `IV_REPORT_MOD_MAX`（31）用 `%.*s` 截断。
+* `iv_report_open()` 的"逐字段收口"补上 `c.tsn = cfg->tsn`（那张清单漏一行的老坑）。
+* 发送成功后 `IV_LOG_I(REP_MOD, "E3 reply: %s", json)` 回显整条应答。
+* 新增配置键 `sys.device.model`（SYS 类，默认 `FN_RZTY_PY`）；`main.c` 里
+  `ac.mod = cfg_str("sys.device.model")` **只存指针**，`ac.tsn` 指向静态缓冲 `g_tsn`。
+
+=== 解决什么问题
+
+平台点「查询设备版本号」没有任何反应。板端日志里其实**收到了两次 E3、也回了两次**
+（`query_rsp=2`），所以问题不在链路上，而在回的内容：
+
+[cols="1,1,1,2"]
+|===
+|键 |我们发的 |参考实现 |结论
+
+|设备类型 |`type` |`devtype` |平台不认 `type`
+|软件版本 |`sv` |`sysver` |平台不认 `sv`
+|硬件型号 |`mod`（恒为空）|`mod`（`HARD_NO_STR`）|`ac.mod` 从初始化起就没赋过值
+|终端序列号 |（没有）|`tsn` |整个字段缺失
+|===
+
+根因是三处"以为有人填、其实没人填"：`ac.mod`/`ac.sv` 在装配层从未赋值；
+`iv_report_cfg_t.mod` 的注释写着"硬件型号串"，读代码也读不出它永远是空；
+`tsn` 在参考实现里有、在我们的实现里连字段都没有 —— 只对 `query_rsp` 计数是看不出这些的。
+
+用户 2026-10-20 定的口径：型号 `FN_RZTY_PY`、要能在 Web 界面改；
+`sysver` 用 `1.0.0.<构建日期>`（对齐参考实现 `SOFT_NO_STR "2.0.0.20260501"` 那种"版本号+时间"）。
+
+`mod` 走配置键，是对架构 §10.2「身份不进配置」的一次**用户授权的例外**：
+型号是"类别"不是"唯一标识"，改它只影响平台展示与分组，不像 `devid`/MAC 那样会把设备认成另一台。
+又因为配置的字符串存在定长缓冲里、原地改写，装配层只存指针就够了 ——
+网页改完，下一次查询就是新值，不需要重启。
+
+=== 影响范围
+
+* `iv_report_build_query_json()` 的签名变了：唯一调用点是 `h_query_version()`，已同步。
+* E3 应答多了两个键（`devtype`/`sysver`）也多了两个别名（`type`/`sv`），
+  内容更长但同值；JSON 消费方忽略未知键，两种字段表都能读到。
+* 配置项总数 80 → 81：`test_config.c` 里五处计数断言同步改（含分类注释里的加法算式）。
+  配置容量上限 128，离满还有余量。
+* 新增两条环境变量口子（`IVSBOX_CHIPID_FILE`），不影响产线默认行为。
+* 平台链路、上报帧、`/api/cell` 均未触及。
+
+=== 怎么验证
+
+* VM：`make test` 40 个程序全绿，`make arm` 零告警；
+  `strings build/arm/ivsboxd` 能查到 `1.0.0.20261020` 与 `FN_RZTY_PY`。
+* 反向证伪 5 处，逐处单独红、还原后 md5 与基线一致：
+  `devtype` 改名为 `devtypeX`（红 golden/length）、删 `c.tsn = cfg->tsn`（红 c09 逐字段收口）、
+  `IV_REPORT_MOD_MAX` 31→64（红截断断言）、tsn 去掉大写归一、tsn 宽度 12→8（各红 p01C）。
+* 板端 r32：启动无 `chip serial unavailable`（tsn 取到）、`sys.device.model=FN_RZTY_PY`、链路 `state->2`。
+* 平台侧要人点一次「查询设备版本号」，然后看板端日志的 `E3 reply:` 那一行与期望串逐字比对。
+
+教训：**"回了"和"回对了"是两件事**。计数类指标（`query_rsp`）只能证明发了，
+证明不了内容；凡是平台"点了没反应"的排查，第一步就该把应答体本身打进日志。

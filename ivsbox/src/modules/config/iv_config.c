@@ -141,6 +141,17 @@ static const cfg_default_t s_defaults[] = {
     D_INT(IV_CFG_CLS_SYS, "sys.transport.mode",
           "传输模式：1=有线 2=无线 3=有线+无线 4=自动选择", 4, 1, 4),
     D_INT(IV_CFG_CLS_SYS, "sys.sample.period_ms", "采集周期（毫秒）", 1000, 100, 60000),
+    /* 硬件型号：平台 E3「查询设备版本号」应答里的 `mod`。
+     *
+     * 架构 §10.2 的口径是"身份不进配置"，这里**是用户 2026-10-20 明确要求破例**：
+     * 「mod 硬件型号在WEB界面可更改」。型号串是随箱体变体走的（同款板子装不同箱体
+     * 就是不同型号），量产的箱子不止一种，写死在编译期只能靠出多个固件分支。
+     *
+     * 与 `devid`/MAC 的区别：那两个是**唯一标识**（改了平台就认成另一台设备），
+     * 型号是**类别**，改了只影响平台展示与分组，安全得多。
+     * `mod` 在 E3 应答里按 IV_REPORT_MOD_MAX（31 字符）截断。 */
+    D_STR(IV_CFG_CLS_SYS, "sys.device.model", "硬件型号（平台查询版本时上报的 mod）",
+          "FN_RZTY_PY", NULL),
     /* M8-S8.3 受控远程通道。这里**只放非机密的落点与端口**：令牌不进配置 —— 配置是
      * 明文 JSON，而 `config.all` 会把整份配置导出去给前端，把共享密钥的原料塞进去
      * 等于明文下发。令牌读 `<secure>/tunnel.token`（见 src/app/main.c 的 tunnel_token）。

@@ -29,6 +29,16 @@ GIT_VER := $(shell git rev-parse --short HEAD 2>/dev/null)
 GIT_VER := $(if $(strip $(GIT_VER)),$(strip $(GIT_VER)),unknown)
 CFLAGS  += -DIV_GIT_VER='"$(GIT_VER)"'
 
+# 构建日期（YYYYMMDD）。
+# 用途：平台 E3「查询设备版本号」应答里的 `sysver` 固定是 `1.0.0.<构建日期>`
+# （用户 2026-10-20 拍板，对齐参考实现 SOFT_NO_STR 的"版本号+时间"格式）。
+# 刻意不在源码里用 __DATE__：「Oct 20 2026」→「20261020」要在运行期换算，
+# 而 iv_version 目前是零运行期状态（纯编译期常量、天然线程安全），不想为一个
+# 日期串把它变成静态缓冲 + ready 标志。注入方式与 IV_GIT_VER 完全一致。
+BUILD_DATE := $(shell date +%Y%m%d)
+BUILD_DATE := $(if $(strip $(BUILD_DATE)),$(strip $(BUILD_DATE)),00000000)
+CFLAGS     += -DIV_BUILD_DATE='"$(BUILD_DATE)"'
+
 # -----------------------------------------------------------------------------
 # vendored 第三方库（third_party/<lib>/）
 # -----------------------------------------------------------------------------
@@ -257,13 +267,16 @@ help:
 # `make arm` 会直接报"对 build 无需做任何事"而什么都不产出（2026-09-24 实测踩过）。
 .PRECIOUS: $(TEST_OBJS) $(FUZZ_OBJS) $(ITEST_OBJS)
 
-# 版本戳：只在 Git 短哈希真的变化时刷新 mtime，从触发相关 .o 重编。
-# 少了这一步会出现"提交后哈希变了、二进制里仍是旧哈希"的静默不一致。
+# 版本戳：只在 Git 短哈希/构建日期真的变化时刷新 mtime，从触发相关 .o 重编。
+# 少了这一步会出现"提交后哈希变了、二进制里仍是旧哈希"的静默不一致；
+# 同理，跨天重编若不换戳，`-DIV_BUILD_DATE` 变了但 .o 不重编，平台查到的
+# sysver 日期会一直停在第一次编译那天。
 VER_STAMP := $(BUILD_DIR)/.gitver
+VER_TAG   := $(GIT_VER)-$(BUILD_DATE)
 
 $(VER_STAMP): FORCE
 	@mkdir -p $(dir $@)
-	@echo "$(GIT_VER)" | cmp -s - $@ || echo "$(GIT_VER)" > $@
+	@echo "$(VER_TAG)" | cmp -s - $@ || echo "$(VER_TAG)" > $@
 
 FORCE:
 .PHONY: FORCE

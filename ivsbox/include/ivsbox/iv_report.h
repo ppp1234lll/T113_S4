@@ -131,6 +131,11 @@ extern "C" {
 #define IV_REPORT_CNS_N 6
 #define IV_REPORT_MN_N  2
 
+/* E3 应答里 `mod`（硬件型号）的截断长度：型号串来自配置键 `sys.device.model`
+ * （`IV_CFG_STR_MAX` 允许 159 字符），而整个 JSON 要能装进一个 `##` 帧且留余量。
+ * 参考实现的型号串是编译期常量（"FN-YJTY-PY-8"，12 字符），31 已经够宽。 */
+#define IV_REPORT_MOD_MAX 31
+
 /* ---------------------------------------------------------------------------
  * 外部注入的"非采集板"事实（本层不自己探测，由装配层填）
  * ------------------------------------------------------------------------- */
@@ -160,7 +165,9 @@ typedef struct {
     uint32_t    heartbeat_ms; /* 0 → IV_REPORT_HEARTBEAT_MS */
     uint32_t    poll_ms;      /* 0 → IV_REPORT_POLL_MS */
     const char *mod;          /* 硬件型号串（E3 应答 `mod`）；NULL → "" */
-    const char *sv;           /* 软件版本串（E3 应答 `sv`）；NULL → iv_version_string() */
+    const char *sv;           /* 软件版本串（E3 应答 `sysver`）；NULL → ""（本层不兜底，
+                               * 由装配层填 iv_version_sysver()，见 iv_version.h 的分工） */
+    const char *tsn;          /* 终端序列号（E3 应答 `tsn`，12 位 HEX）；NULL → "" */
 
     /* 箱门开启事件（S4.5）：`0xC1` 到达时回调（M4 阶段装配层只记日志；
      * 抓图本体属 M6-S6.2）。NULL = 不通知。详见文件头"已知取舍"。 */
@@ -377,13 +384,22 @@ uint8_t iv_report_query_crc(uint16_t devtype, uint32_t devid, uint8_t cmd);
 
 /*
  * 组装 E3（查设备软硬件版本）的 **JSON 响应体**（不含 ## 壳）：
- *   {"code":0,"qn":"<qn>","data":{"ver":"..","type":"..","tid":"..","cmd":"E3",
- *     "mod":"..","sv":"..","crc":".."}}
- * qn 为 NULL/"" 时写 "0"；mod/sv 为 NULL 时写 ""。返回写入长度或 IV_ERANGE。
+ *   {"code":0,"qn":"<qn>","data":{"ver":"11","devtype":"0400","type":"0400",
+ *     "tid":"b2cc1","cmd":"E3","mod":"FN_RZTY_PY","sysver":"1.0.0.20261020",
+ *     "sv":"1.0.0.20261020","tsn":"934072007C00","crc":"06"}}
+ *
+ * 字段名对齐参考实现 `com.c:com_version_information()`：`devtype` / `sysver` / `tsn`。
+ * 同时保留旧名 `type` / `sv` 作**别名**（值完全相同）——协议 Excel 的字段表写的是
+ * `devtype`+`sysver`，同一张表的示例串写的却是 `type`+`sv`，自相矛盾；平台按哪份
+ * 实现都读得到，多两个键对 JSON 消费方无害。
+ *
+ * `qn` 为 NULL/"" 时写 "0"；`mod`/`sv`/`tsn` 为 NULL 时写 ""；`mod` 超长按 31 字符
+ * 截断（E3 应答缓冲只有几百字节，型号串是配置项、长度可控）。
+ * 返回写入长度或 IV_ERANGE。
  */
 int iv_report_build_query_json(uint16_t devtype, uint32_t devid,
                                const char *qn, const char *mod, const char *sv,
-                               char *out, size_t cap);
+                               const char *tsn, char *out, size_t cap);
 
 /* ---------------------------------------------------------------------------
  * 只读读数

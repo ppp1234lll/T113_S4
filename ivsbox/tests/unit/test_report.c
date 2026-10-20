@@ -256,18 +256,22 @@ int main(void)
             "c06 different cmd -> different crc");
     }
 
-    /* ---- 7) E3 应答 JSON 黄金串 ---- */
+    /* ---- 7) E3 应答 JSON 黄金串 ----
+     * 字段名对齐参考实现 com_version_information()：devtype/sysver/tsn；
+     * `type`/`sv` 是同一张 Excel 示例串里的旧名，作为别名保留（值必须与主名一致，
+     * 否则平台读哪份实现都得不到同一个答案）。 */
     {
         const char *want =
             "{\"code\":0,\"qn\":\"20210121143412008\",\"data\":{"
-            "\"ver\":\"11\",\"type\":\"0400\",\"tid\":\"101\",\"cmd\":\"E3\","
-            "\"mod\":\"FN1110-G\",\"sv\":\"FN1110-G-1.0.0.200526\","
-            "\"crc\":\"06\"}}";
+            "\"ver\":\"11\",\"devtype\":\"0400\",\"type\":\"0400\",\"tid\":\"101\","
+            "\"cmd\":\"E3\",\"mod\":\"FN_RZTY_PY\",\"sysver\":\"1.0.0.20261020\","
+            "\"sv\":\"1.0.0.20261020\",\"tsn\":\"934072007C00\",\"crc\":\"06\"}}";
         char json[512];
         int  n = iv_report_build_query_json(0x0400u, 0x101u,
                                             "20210121143412008",
-                                            "FN1110-G",
-                                            "FN1110-G-1.0.0.200526",
+                                            "FN_RZTY_PY",
+                                            "1.0.0.20261020",
+                                            "934072007C00",
                                             json, sizeof(json));
 
         chk(n > 0 && (size_t)n == strlen(want), "c07 json length");
@@ -275,13 +279,55 @@ int main(void)
         if (strcmp(json, want) != 0)
             fprintf(stderr, "  got : %s\n  want: %s\n", json, want);
 
-        /* NULL qn/mod/sv 的降级 */
-        n = iv_report_build_query_json(0x0400u, 0x101u, NULL, NULL, NULL,
+        /* 别名与主名同值：这条不变量比"两个键都在"更重要 */
+        chk(strstr(json, "\"sysver\":\"1.0.0.20261020\"") != NULL &&
+                strstr(json, "\"sv\":\"1.0.0.20261020\"") != NULL,
+            "c07 sysver/sv aliases carry the same value");
+
+        /* NULL qn/mod/sv/tsn 的降级 */
+        n = iv_report_build_query_json(0x0400u, 0x101u, NULL, NULL, NULL, NULL,
                                        json, sizeof(json));
         chk(n > 0 && strstr(json, "\"qn\":\"0\"") != NULL, "c07 NULL qn -> 0");
         chk(strstr(json, "\"mod\":\"\"") != NULL, "c07 NULL mod -> empty");
+        chk(strstr(json, "\"sysver\":\"\"") != NULL, "c07 NULL sv -> empty");
+        chk(strstr(json, "\"tsn\":\"\"") != NULL, "c07 NULL tsn -> empty");
 
-        chk(iv_report_build_query_json(0x0400u, 0x101u, "1", "m", "s", json, 8u)
+        /* 型号串按 IV_REPORT_MOD_MAX 截断：不截断会撑爆应答缓冲、退化成 ERANGE，
+         * 症状是"点查询毫无反应"，比截断难查得多。
+         * ⚠ 这里用**字面量 31**、不用宏：断言拿宏去比宏，等于宏填错两次也全绿
+         * （IV_PROTO_TXT_FIXED 那次踩过，见 修改记录 2026-10-20 10:5x）。 */
+        {
+            char        sbuf[80];
+            const int   lim = 31;
+
+            memset(sbuf, 'X', sizeof(sbuf) - 1u);
+            sbuf[sizeof(sbuf) - 1u] = '\0';
+            n = iv_report_build_query_json(0x0400u, 0x101u, "1", sbuf, "s", "t",
+                                           json, sizeof(json));
+            chk(n > 0, "c07 long mod still builds");
+            chk(strstr(json, "\"mod\":\"") != NULL, "c07 long mod key present");
+            /* 截断后紧跟右引号：数一下 XXX 的个数 */
+            {
+                const char *p = strstr(json, "\"mod\":\"");
+                int         cnt = 0;
+
+                if (p != NULL) {
+                    p += 7;
+                    while (*p == 'X') {
+                        cnt++;
+                        p++;
+                    }
+                    chk(cnt == lim, "c07 long mod truncated to 31 chars");
+                    chk(*p == '"', "c07 truncation stays inside the quotes");
+                } else {
+                    chk(0, "c07 long mod key present");
+                }
+            }
+            /* 整条应答必须能装进装配层那块 384 B 缓冲（留一倍余量） */
+            chk((size_t)n < 384u, "c07 worst-case reply fits the 384 B buffer");
+        }
+
+        chk(iv_report_build_query_json(0x0400u, 0x101u, "1", "m", "s", "t", json, 8u)
                 == IV_ERANGE, "c07 small cap ERANGE");
     }
 
@@ -311,10 +357,19 @@ int main(void)
         cfg.server_port = 1u;
         cfg.serial_path = "/dev/null";
         cfg.bind_ifname = "lo";
+        cfg.mod         = "M";
+        cfg.sv          = "S";
+        cfg.tsn         = "T";
 
         chk(iv_report_open(&rp, &cfg, NULL, 0u) == IV_OK, "c09 open ok");
         chk(strcmp(iv_transport_bind_if(&rp.tr), "lo") == 0,
             "c09 bind_ifname survives open (field-by-field copy)");
+        /* E3 三兄弟同样走"逐字段收口"：漏一行就整条查询应答变空串，
+         * 而平台侧只表现为"点了没反应"，从日志完全看不出是装配层丢的。 */
+        chk(rp.cfg.mod != NULL && strcmp(rp.cfg.mod, "M") == 0 &&
+                rp.cfg.sv != NULL && strcmp(rp.cfg.sv, "S") == 0 &&
+                rp.cfg.tsn != NULL && strcmp(rp.cfg.tsn, "T") == 0,
+            "c09 mod/sv/tsn survive open (field-by-field copy)");
 
         /* 运行期换出口（netmgr 切换 WAN 走这条）：换完传输层要跟着变 */
         chk(iv_report_set_bind_if(&rp, "eth0") == IV_OK, "c09 set_bind_if ok");

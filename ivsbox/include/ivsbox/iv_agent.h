@@ -75,10 +75,12 @@
  *     `iv_status` 解到 `0xC1`（箱门开启）时同步回调。**M4 阶段＝空实现 ＋ 日志 ＋ 计数**，
  *     抓图本体属 M6-S6.2（到时把 `on_door_open` 换成本地通道 `snapshot.take` 派发即可）；
  *     无鉴权 / 无审计 / 无去重表。
- *   - **devid（TID）/ mod（型号）无配置键来源**：按架构 §10.2「身份不进配置」，
- *     devid 应由工厂身份分区（`/dev/by-name/private`，S5.5）读取 ⇒ **不设配置键**；
- *     mod（硬件型号串）与 `sv` 同类，属**编译期事实**，待用户给型号串后定为默认值。
- *     当前二者分别取 0 与 NULL（→ 空串）。
+ *   - **devid（TID）无配置键来源**：按架构 §10.2「身份不进配置」，
+ *     devid 由工厂身份分区（`/dev/by-name/private`，S5.5）读取 ⇒ **不设配置键**。
+ *   - **mod（型号）/ sv（软件版本）/ tsn（芯片序列号）各有唯一来源**（2026-10-20 定）：
+ *     mod 走配置键 `sys.device.model`（Web 可改，用户明确要求破例，见 iv_config.c）；
+ *     sv 由本层填 `iv_version_sysver()`（`1.0.0.<构建日期>`，平台只认这个格式）；
+ *     tsn 由装配层从 `iv_prov_tsn()` 取芯片唯一号，**不派生自 devid**。
  */
 #ifndef IVSBOX_IV_AGENT_H
 #define IVSBOX_IV_AGENT_H
@@ -219,6 +221,7 @@ typedef struct {
     uint16_t    srv_port[IV_WAN_N];
     const char *mod;         /* 硬件型号串（E3 应答）；NULL → "" */
     const char *sv;          /* 软件版本串（E3 应答）；NULL → 由本层填 iv_version */
+    const char *tsn;         /* 终端序列号（E3 应答）；NULL → "" */
     uint32_t    devid;       /* 设备标识（TID） */
     uint16_t    devtype;     /* 0 → 默认 0x0400 */
     uint32_t    report_ms;   /* 周期上报间隔；0 → 默认 300 s */

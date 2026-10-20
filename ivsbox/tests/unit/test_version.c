@@ -6,7 +6,8 @@
  *   2) 与编译期注入的 IV_GIT_VER 自洽（注入可用时串尾即该哈希）；
  *   3) 未注入 / 非法注入值降级为 "unknown"，不产生半截串；
  *   4) 幂等（重复调用内容稳定）且长度受内部缓冲约束；
- *   5) 注入值合法性判定的边界（空、占位、非十六进制、大小写混合）。
+ *   5) 注入值合法性判定的边界（空、占位、非十六进制、大小写混合）；
+ *   6) 平台视图串 iv_version_sysver()：<M>.<m>.<p>.<8 位构建日期>，不带 `+g`。
  *
  * 纯字符串断言，无文件系统 / POSIX 依赖，Host 与板端都能跑。
  * --version 的命令行行为由构建后手工比对（见 docs/修改记录.md），单测不 fork 自身。
@@ -99,6 +100,29 @@ int main(void)
         size_t gl = strlen(git);
 
         chk(gl >= 4u && gl <= 40u, "sha length within [4,40]");
+    }
+
+    /* 6) 平台视图的版本串：恒为 "<M>.<m>.<p>.<8 位构建日期>"（用户 2026-10-20 拍板）
+     * 不断言具体日期 —— 日期由 Makefile 注入，写死就等于要求"只有那天能编译"。 */
+    {
+        const char *bd = iv_version_build_date();
+        const char *sv = iv_version_sysver();
+        char        want[64];
+        size_t      i;
+
+        chk(bd != NULL && strlen(bd) == 8u, "build date is 8 digits");
+        for (i = 0u; bd != NULL && i < 8u; i++)
+            chk(bd[i] >= '0' && bd[i] <= '9', "build date is all digits");
+
+        (void)snprintf(want, sizeof(want), "%d.%d.%d.%s",
+                       IVSBOX_VERSION_MAJOR, IVSBOX_VERSION_MINOR,
+                       IVSBOX_VERSION_PATCH, (bd != NULL) ? bd : "?");
+
+        chk(sv != NULL, "iv_version_sysver not NULL");
+        chk(sv != NULL && strcmp(sv, want) == 0, "sysver = <semver>.<build date>");
+        chk(sv != NULL && strchr(sv, '+') == NULL,
+            "sysver carries no '+g<sha>' (platform shows it as the version column)");
+        chk(iv_version_sysver() == sv, "sysver is a stable pointer (compile-time constant)");
     }
 
     if (g_fail) {

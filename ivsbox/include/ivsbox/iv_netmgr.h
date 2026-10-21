@@ -156,6 +156,18 @@ int iv_netmgr_note_probe(iv_netmgr_t *m, iv_wan_t wan, int ok, uint64_t now_ms);
  * 未 open 返回 IV_ESTATE；模式越界返回 IV_EINVAL；与现值相同直接 IV_OK（不抖）。 */
 int iv_netmgr_set_mode(iv_netmgr_t *m, iv_netmgr_mode_t mode, uint64_t now_ms);
 
+/* 运行期改"连续失败几次判该 WAN 不可用"（`probe.max_fail` 的热生效入口）。
+ *
+ * 这个键同时喂两处判定，**必须同源**：`iv_probe` 的 `cfg.fail_n`（判目标 DOWN）与本
+ * 模块的 `cfg.fail_n`（判 WAN 不可用、进而触发切换）。只热更一边会得出"探测说这条
+ * 线死了、状态机说它还活着"这种自相矛盾的结果，比两边都不生效更难查。
+ *
+ * 语义：只改 `cfg.fail_n` 并归一化（0 ⇒ 默认 3），**不动**已经累计的
+ * `fail_streak`/`wan_up`/活动口 —— 阈值问的是"要连续几次"，不是"已经几次"。
+ * 下一拍 `note_probe()` 就按新阈值判定，不需要额外 tick。
+ * 未 open 返回 IV_ESTATE。 */
+int iv_netmgr_set_fail_n(iv_netmgr_t *m, uint32_t fail_n);
+
 /* 周期性驱动：处理 hold_s 回切、稳定期后恢复媒体、事务失败重试窗口。
  * 建议由 Reactor timer（1 s 级）调用。 */
 int iv_netmgr_tick(iv_netmgr_t *m, uint64_t now_ms);

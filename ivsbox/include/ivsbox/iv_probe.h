@@ -308,6 +308,38 @@ int iv_probe_note_result(iv_probe_t *p, int idx, int ok, uint32_t rtt_ms,
  * up!=0 = carrier 就绪。会即时重判绑定该接口的项。 */
 int iv_probe_set_link(iv_probe_t *p, int ifindex, int up, uint64_t now_ms);
 
+/* 运行期调参：节拍、超时、失败阈值（`probe.interval_ms` / `probe.timeout_ms` /
+ * `probe.max_fail` 的热生效入口）。
+ *
+ * 为什么需要：这三个键原先只在 `iv_agent_open()` 里读一次，之后无论从网页改还是
+ * 平台下发 `0xF2`，都**必须重启主控**才生效 —— 与 `sys.report.interval_s` /
+ * `sys.transport.mode` 是同一类坑（改配置要查"有没有人订阅"）。
+ *
+ * 为什么叫 retune 而不是 set_timing：`fail_n` 不是节拍（所以不进项的
+ * `interval_ms`），但它和节拍是**同一批配置**、同一时刻生效；分成两个入口会让
+ * `probe.max_fail` 出"半生效"——probe 换了阈值、netmgr 还是旧的，而这两处的
+ * `fail_n` 本就是从同一个键取的（同源，见 `iv_agent_cfg_t.probe_fail_n`）。
+ *
+ * 为什么不"重建探测表"：重建会把滑窗、连续成功/失败计数全清零，一次改配置就让
+ * netmgr 的迟滞重新从零开始、正在判定的链路暂时"没证据"。这几个键只影响节奏与
+ * 门限、不影响"探的是谁"，没必要付这个代价。（目标 IP 变了才必须重建，那条路径
+ * 在 `iv_agent_reload_probe()` 里，因为 ICMP 项与被动 LINK 项不是同一种东西。）
+ *
+ * 语义：
+ *   - 任一个传 0，或 `timeout_ms >= interval_ms` ⇒ `IV_EINVAL`
+ *     （默认值表下限就是 500/100/1，help 文本也写明"超时必须小于探测周期"；
+ *     给 0 在 init 里是"取默认"，运行期给 0 只能是配错了，不能当默认处理）；
+ *   - `fail_n` 写进 `p->cfg.fail_n`，并**按现有证据立刻重判一次**（连败 2 次、
+ *     阈值从 3 降到 2，此刻结论就该是 DOWN）；已经累计的 `fail_streak` 不清零
+ *     —— 阈值问的是"要连续几次"，不是"已经几次"；
+ *   - 每项的 `interval_ms` 一起改，并把 `next_due_ms` 按新周期从 `now_ms` 重排
+ *     —— 否则把 5 s 改成 300 s 时旧 `next_due` 已排在过去，会立刻再探一次；
+ *     正在探测中（inflight）的项不动，让它按原样收完这一次；
+ *   - 值没变 ⇒ `IV_OK` 且什么都不做（反复下发同一配置不该抖）。
+ * 未 init 返回 `IV_ESTATE`。 */
+int iv_probe_retune(iv_probe_t *p, uint32_t interval_ms, uint32_t timeout_ms,
+                    uint32_t fail_n, uint64_t now_ms);
+
 /* ---------------------------------------------------------------------------
  * 查询
  * ------------------------------------------------------------------------- */

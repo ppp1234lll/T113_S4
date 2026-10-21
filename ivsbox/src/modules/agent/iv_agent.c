@@ -142,6 +142,96 @@ void iv_agent_init(iv_agent_t *a)
     a->opened = 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * 探测表的三个零件（open 与运行期重载共用，2026-10-21）
+ *
+ * 抽出来只为一件事：**open 与 reload 不能各有一套默认值**。当年 `iv_report_open()`
+ * 逐字段收口漏两行，结果字段被默认值静默顶掉、编译不报、日志也不报（教训见
+ * iv_report.h）。探测表同理：如果 reload 自己再写一遍 `iv_probe_cfg_default()` +
+ * 三个 if，将来加了新键只改 open，重载后就会"参数悄悄回到默认"。
+ * ------------------------------------------------------------------------- */
+static void probe_cfg_of(const iv_agent_cfg_t *cfg, iv_probe_cfg_t *pc)
+{
+    iv_probe_cfg_default(pc);
+    if (cfg->probe_interval_ms != 0u)
+        pc->interval_ms = cfg->probe_interval_ms;
+    if (cfg->probe_timeout_ms != 0u)
+        pc->timeout_ms = cfg->probe_timeout_ms;
+    if (cfg->probe_fail_n != 0u)
+        pc->fail_n = cfg->probe_fail_n;
+}
+
+/* 目标 IP：优先 target1，没配则退 target2；都没有 ⇒ 0（只做被动 LINK 探测）。 */
+static uint32_t agent_probe_dst(const iv_agent_cfg_t *cfg)
+{
+    return (cfg->probe_target_be[0] != 0u) ? cfg->probe_target_be[0]
+                                           : cfg->probe_target_be[1];
+}
+
+/* 网络序 IPv4 -> 点分串（日志用）。`_be` 的约定是"字节序原样"，所以把值直接交给
+ * inet_ntop，**不要**手工 `>>24 & 0xFF` —— 小端机上那样打出来是反序的
+ * （192.168.1.99 会变成 99.1.168.192），现场按日志核对目标会直接看错。 */
+static const char *ipv4_dotted(uint32_t be, char *buf, size_t cap)
+{
+    struct in_addr a;
+
+    a.s_addr = be;
+    if (inet_ntop(AF_INET, &a, buf, cap) == NULL)
+        (void)snprintf(buf, cap, "?");
+    return buf;
+}
+
+/* 逐 WAN 建项并开跑。**调用前必须已经 init/reset 过**（n_items 归零、started=0）。
+ * 返回值＝建起来的项数；某个 WAN 建失败只打日志，不影响其它 WAN。 */
+static int agent_probe_build(iv_agent_t *a, uint32_t dst, uint64_t now_ms)
+{
+    int w;
+    int n = 0;
+
+    for (w = 0; w < IV_WAN_N; w++) {
+        int idx;
+
+        a->wan_probe_idx[w] = -1;
+        if (a->wan_ifindex[w] == 0)
+            continue; /* 接口不存在：无项可建，该 WAN 恒 UNKNOWN */
+        idx = (dst != 0u)
+                  ? iv_probe_add_icmp(&a->pb, dst, a->wan_ifindex[w], a->cfg.wan_name[w])
+                  : iv_probe_add_link(&a->pb, a->wan_ifindex[w], a->cfg.wan_name[w]);
+        a->wan_probe_idx[w] = (idx >= 0) ? idx : -1;
+        if (idx < 0) {
+            IV_LOG_W(AG_MOD, "probe item add failed for wan %s (%d)",
+                     a->cfg.wan_name[w], idx);
+            continue;
+        }
+        n++;
+    }
+    if (iv_probe_start(&a->pb, now_ms) != IV_OK)
+        IV_LOG_W(AG_MOD, "probe start failed (icmp may be unavailable)");
+    return n;
+}
+
+/* 同步播一次链路可用性（理由见 open 里 "3b. 开局摸底" 那段）。
+ * **probe 表重建后必须再调一次**：`iv_probe_reset()` 会连 link_ifindex/link_up
+ * 一起清空，而 netlink 只报变化、不回放现状 ⇒ 不重播的话，两条 WAN 都已经 UP 的
+ * 板上，状态机会一直"看不见"任何可用 WAN（就是 2026-10-12 查出的那个故障）。 */
+static void agent_probe_seed_links(iv_agent_t *a, uint64_t now_ms)
+{
+    int w;
+
+    for (w = 0; w < IV_WAN_N; w++) {
+        int up = 0;
+
+        if (a->wan_probe_idx[w] < 0)
+            continue;
+        if (iv_netlink_link_up(a->cfg.wan_name[w], &up) != IV_OK) {
+            IV_LOG_W(AG_MOD, "link seed failed for wan %s", a->cfg.wan_name[w]);
+            continue;
+        }
+        (void)iv_probe_set_link(&a->pb, a->wan_ifindex[w], up, now_ms);
+        IV_LOG_I(AG_MOD, "link seed: %s %s", a->cfg.wan_name[w], up ? "up" : "down");
+    }
+}
+
 int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
                   uint64_t now_ms)
 {
@@ -217,30 +307,10 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     }
 
     /* ---- 3. probe（每条 WAN 一项：有目标走 ICMP，否则被动 LINK）---- */
-    iv_probe_cfg_default(&pc);
-    if (cfg->probe_interval_ms != 0u)
-        pc.interval_ms = cfg->probe_interval_ms;
-    if (cfg->probe_timeout_ms != 0u)
-        pc.timeout_ms = cfg->probe_timeout_ms;
-    if (cfg->probe_fail_n != 0u)
-        pc.fail_n = cfg->probe_fail_n;
+    probe_cfg_of(cfg, &pc);
     (void)iv_probe_init(&a->pb, &pc);
-    dst = (cfg->probe_target_be[0] != 0u) ? cfg->probe_target_be[0]
-                                          : cfg->probe_target_be[1];
-    for (w = 0; w < IV_WAN_N; w++) {
-        int idx;
-        if (a->wan_ifindex[w] == 0)
-            continue; /* 接口不存在：无项可建，该 WAN 恒 UNKNOWN */
-        idx = (dst != 0u)
-                  ? iv_probe_add_icmp(&a->pb, dst, a->wan_ifindex[w], cfg->wan_name[w])
-                  : iv_probe_add_link(&a->pb, a->wan_ifindex[w], cfg->wan_name[w]);
-        a->wan_probe_idx[w] = (idx >= 0) ? idx : -1;
-        if (idx < 0)
-            IV_LOG_W(AG_MOD, "probe item add failed for wan %s (%d)",
-                     cfg->wan_name[w], idx);
-    }
-    if (iv_probe_start(&a->pb, now_ms) != IV_OK)
-        IV_LOG_W(AG_MOD, "probe start failed (icmp may be unavailable)");
+    dst = agent_probe_dst(cfg);
+    agent_probe_build(a, dst, now_ms);
 
     /* ---- 3b. 开局摸底（必须）----
      * netlink 只报"变化"、不回放现状（见 iv_netlink.h 取舍 2），而 netmgr_feed()
@@ -250,18 +320,7 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
      * 真链路验收查出）。这里在装配完成时同步探一次链路可用性播进去
      * （判据 IFF_UP && IFF_RUNNING；为何不是事件路径的 LOWER_UP，见
      * iv_netlink.h 里 iv_netlink_link_up() 的说明）。 */
-    for (w = 0; w < IV_WAN_N; w++) {
-        int up = 0;
-
-        if (a->wan_probe_idx[w] < 0)
-            continue;
-        if (iv_netlink_link_up(cfg->wan_name[w], &up) != IV_OK) {
-            IV_LOG_W(AG_MOD, "link seed failed for wan %s", cfg->wan_name[w]);
-            continue;
-        }
-        (void)iv_probe_set_link(&a->pb, a->wan_ifindex[w], up, now_ms);
-        IV_LOG_I(AG_MOD, "link seed: %s %s", cfg->wan_name[w], up ? "up" : "down");
-    }
+    agent_probe_seed_links(a, now_ms);
 
     /* ---- 4. netmgr（switch_route 复用默认；reconnect 接上报链）---- */
     iv_netmgr_cfg_default(&mc);
@@ -1295,10 +1354,116 @@ int iv_agent_reload_server(iv_agent_t *a)
     return iv_report_reconnect(&a->rp, iv_clock_monotonic_ms());
 }
 
+/* 探活参数热生效（`probe.*` 五个键，含平台 `0xF2`/`0xF8`）。
+ *
+ * 分两条路，区别只在"探的是谁有没有变"：
+ *   - **目标没变** ⇒ 只调参数（`iv_probe_retune()`），探测表与统计原样保留。
+ *     重建表的代价是滑窗、连续成功/失败计数全清零 —— 一次"把 5 s 改成 10 s"
+ *     就会让 netmgr 的迟滞从零重来、正在判死的链路暂时没证据，不值得。
+ *   - **目标变了** ⇒ 必须重建。因为"有目标走 ICMP、没目标退被动 LINK"，
+ *     在 iv_probe 里是**两种不同的项**，改不了层只能重新建表；而且改目标本来
+ *     就意味着一组全新的统计，清掉旧的是对的。
+ *
+ * 与 `iv_report_open()` 那个坑同源的一条纪律：归一化只有 `probe_cfg_of()` 一处，
+ * open 和 reload 都走它。否则将来给 probe 加一个配置键，只改了 open，
+ * 重载一次参数就"悄悄回到默认"，编译不报、日志也不报。 */
+int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_be,
+                          uint32_t interval_ms, uint32_t timeout_ms, uint32_t fail_n,
+                          uint64_t now_ms)
+{
+    iv_agent_cfg_t tmp;
+    iv_probe_cfg_t pc;
+    uint32_t       old_dst;
+    uint32_t       new_dst;
+    char           nb[INET_ADDRSTRLEN];
+    int            rc;
+
+    if (a == NULL) {
+        return IV_EINVAL;
+    }
+    if (!a->opened) {
+        return IV_ESTATE;
+    }
+
+    old_dst = agent_probe_dst(&a->cfg);
+
+    /* 在**快照的副本**上落值再归一化：`probe_cfg_of()` 把 0 翻成默认值，
+     * 运行期直接拿 0 去建项会得到 interval=0（一拍都不探）这种"看起来在跑"的假活。 */
+    tmp                    = a->cfg;
+    tmp.probe_target_be[0] = target1_be;
+    tmp.probe_target_be[1] = target2_be;
+    tmp.probe_interval_ms  = interval_ms;
+    tmp.probe_timeout_ms   = timeout_ms;
+    /* 同一个键 `probe.max_fail` 喂两处判定（探测判 DOWN / 状态机判 WAN 不可用），
+     * 必须一起改 —— 只热更一边会得出"探测说死了、状态机说还活着"。 */
+    tmp.probe_fail_n       = fail_n;
+    tmp.nm_fail_n          = fail_n;
+    probe_cfg_of(&tmp, &pc);
+
+    new_dst = agent_probe_dst(&tmp);
+
+    /* 完全没变 ⇒ 立刻返回，连日志都不打。`on_cfg_committed(PROBE)` 在该分类任何
+     * 一个键变化时都会进来，没有这个早返回的话，改个 target2 也会刷一条
+     * "probe reloaded"，现场看日志会以为探测表被重建过。
+     * 比的是**归一化后的有效值**（a->cfg 里 0 表示"取默认"，不能直接和 5000 比）。 */
+    {
+        iv_probe_cfg_t oldpc;
+
+        probe_cfg_of(&a->cfg, &oldpc);
+        if (oldpc.interval_ms == pc.interval_ms &&
+            oldpc.timeout_ms == pc.timeout_ms && oldpc.fail_n == pc.fail_n &&
+            old_dst == new_dst) {
+            return IV_OK;
+        }
+    }
+
+    if (new_dst != old_dst) {
+        char ob[INET_ADDRSTRLEN];
+
+        IV_LOG_I(AG_MOD, "probe target changed (%s -> %s), rebuild",
+                 ipv4_dotted(old_dst, ob, sizeof(ob)),
+                 ipv4_dotted(new_dst, nb, sizeof(nb)));
+        /* 顺序不能换：先 stop 关掉旧 socket，再 init（init 会 memset 整个结构，
+         * 先 init 就把 fd 号连同结构一起忘了 ⇒ 泄漏）。 */
+        (void)iv_probe_stop(&a->pb);
+        (void)iv_probe_init(&a->pb, &pc);
+        (void)agent_probe_build(a, new_dst, now_ms);
+        /* 建完必须立刻重播一次链路现状：init/reset 把 link_ifindex/link_up 清空了，
+         * 而 netlink 只报"变化"、不回放现状 ⇒ 不重播的话，两条 WAN 都已经 UP 的
+         * 板上，状态机会一直"看不见"任何可用 WAN（2026-10-12 板端真链路验收的故障）。 */
+        agent_probe_seed_links(a, now_ms);
+    } else {
+        rc = iv_probe_retune(&a->pb, pc.interval_ms, pc.timeout_ms, pc.fail_n, now_ms);
+        if (rc != IV_OK) {
+            /* 参数非法（如 timeout >= interval）：如实回报，不动快照、
+             * 也不动 netmgr 阈值 —— 半套生效比不生效更难查。 */
+            IV_LOG_W(AG_MOD, "probe retune rejected (%d): interval=%u timeout=%u fail_n=%u",
+                     rc, (unsigned)pc.interval_ms, (unsigned)pc.timeout_ms,
+                     (unsigned)pc.fail_n);
+            return rc;
+        }
+    }
+
+    /* 快照收口：下次重载要靠它算"旧目标是谁"。漏这一句＝每次都当目标变了，
+     * 探测表被反复重建、统计反复清零。 */
+    a->cfg = tmp;
+
+    /* 状态机的门限与探测同源。失败不致命（未 open 才失败，而上面已判过），
+     * 记一笔就够。 */
+    if (iv_netmgr_set_fail_n(&a->nm, pc.fail_n) != IV_OK) {
+        IV_LOG_W(AG_MOD, "netmgr fail_n not applied");
+    }
+
+    IV_LOG_I(AG_MOD, "probe reloaded: interval=%u timeout=%u fail_n=%u dst=%s",
+             (unsigned)pc.interval_ms, (unsigned)pc.timeout_ms, (unsigned)pc.fail_n,
+             ipv4_dotted(new_dst, nb, sizeof(nb)));
+    return IV_OK;
+}
+
 int iv_agent_set_transport_mode(iv_agent_t *a, iv_netmgr_mode_t mode, uint64_t now_ms)
 {
-    int       rc;
-    iv_wan_t  before;
+    int              rc;
+    iv_wan_t         before;
     iv_netmgr_mode_t cur;
 
     if (a == NULL) {

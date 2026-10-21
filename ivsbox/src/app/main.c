@@ -560,10 +560,12 @@ static int agent_sync_server_cfg(int force)
     return changed;
 }
 
-/* 配置事务通知（F7）。这里只接两条"改完必须马上生效"的：
+/* 配置事务通知（F7）。这里只接"改完必须马上生效"的：
  *   - `net` 分类：平台地址/端口（与出口网卡成对刷新）→ 断开旧连接、连新平台；
  *   - `sys` 分类里的 `sys.report.interval_s`：周期上报间隔 → 换节拍，**不断链**；
- *     `sys.sample.period_ms`：采集（0xE1 轮询）周期 → 只换轮询节拍，同样不断链。
+ *     `sys.sample.period_ms`：采集（0xE1 轮询）周期 → 只换轮询节拍，同样不断链；
+ *     `sys.transport.mode`：传输模式 → 重跑一次状态机判定（活动口真变才重连）；
+ *   - `probe` 分类：`probe.*` 五个键 → 探活参数热生效（目标变才重建探测表）。
  * 其余分类的热更新各有归属（隧道见 on_config_event）。 */
 static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, void *user)
 {
@@ -597,6 +599,29 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
             if (mrc != IV_OK)
                 IV_LOG_W(APP_MOD, "transport mode %d not applied (%d)", (int)v, mrc);
         }
+    }
+    if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_PROBE)) != 0u) {
+        /* `probe.*` 五个键原先只在 `agent_setup()` 里读一次 ⇒ 网页上改探测目标/
+         * 节拍、平台下发 `0xF2`（ping 间隔）/`0xF8`（主网检测 IP）都要重启主控。
+         * 归一化（0＝取默认）在 `iv_agent_reload_probe()` 内部统一做，
+         * 与 `iv_agent_open()` 共用同一份 `probe_cfg_of()`，不在这里二次翻译。 */
+        int64_t  pv   = 0;
+        uint32_t i_ms = 0;
+        uint32_t t_ms = 0;
+        uint32_t f_n  = 0;
+        int      prc;
+
+        if (iv_config_get_int(g_cfg, "probe.interval_ms", &pv) == IV_OK)
+            i_ms = (uint32_t)pv;
+        if (iv_config_get_int(g_cfg, "probe.timeout_ms", &pv) == IV_OK)
+            t_ms = (uint32_t)pv;
+        if (iv_config_get_int(g_cfg, "probe.max_fail", &pv) == IV_OK)
+            f_n = (uint32_t)pv;
+        prc = iv_agent_reload_probe(&g_agent, cfg_ip_be("probe.target1"),
+                                    cfg_ip_be("probe.target2"), i_ms, t_ms, f_n,
+                                    iv_clock_monotonic_ms());
+        if (prc != IV_OK)
+            IV_LOG_W(APP_MOD, "probe.* not applied (%d)", prc);
     }
 }
 
@@ -1614,15 +1639,20 @@ static int app_init(void)
      * 走配置层的 F7 事务通知 —— `config.apply`（内存提交）与文件被外部改写
      * （inotify 重载）两条路径都会回调；只挂 inotify 会漏掉前者（提交时内存
      * 已是新值，重载比对等于"没变化"，压根不会触发）。
-     * 先 force=0 对齐一次缓存，避免刚装配完就白重连一次。 */
+     * 先 force=0 对齐一次缓存，避免刚装配完就白重连一次。
+     *
+     * ⚠ `probe` 分类必须一起订上：`on_cfg_committed()` 里的分支写好了、但掩码
+     * 没订等于**回调永远不触发**，编译、单测全绿、运行期毫无反应（"接线在装配层"
+     * 这一类坑，单测抓不到，只有真拉进程的集成用例才看得见）。 */
     (void)agent_sync_server_cfg(0);
     if (iv_config_subscribe(g_cfg,
                             IV_CFG_CLASS_MASK(IV_CFG_CLS_NET) |
-                                IV_CFG_CLASS_MASK(IV_CFG_CLS_SYS),
+                                IV_CFG_CLASS_MASK(IV_CFG_CLS_SYS) |
+                                IV_CFG_CLASS_MASK(IV_CFG_CLS_PROBE),
                             on_cfg_committed, NULL) != IV_OK)
         IV_LOG_W(APP_MOD,
-                 "subscribe(net+sys) failed -- server addr / report interval "
-                 "change needs a restart");
+                 "subscribe(net+sys+probe) failed -- server addr / report interval / "
+                 "probe params change needs a restart");
 
     /* 9d. M8-S8.3 受控远程通道装配（身份/令牌/服务端/落点/巡检定时器）。
      *    在 9b 之后：与 agent 装配同级，都在 reactor 建好之后。 */

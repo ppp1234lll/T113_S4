@@ -388,6 +388,25 @@ int iv_netmgr_set_mode(iv_netmgr_t *m, iv_netmgr_mode_t mode, uint64_t now_ms)
     return IV_OK;
 }
 
+int iv_netmgr_set_fail_n(iv_netmgr_t *m, uint32_t fail_n)
+{
+    if (m == NULL) {
+        return IV_EINVAL;
+    }
+    if (!m->opened) {
+        return IV_ESTATE;
+    }
+
+    /* 归一化口径与 cfg_normalize() 一致：0 视为默认 3。这里是运行期入口，
+     * 不能像 open 那样整份重走 normalize（那会把 ops 指针等一并重置）。 */
+    m->cfg.fail_n = (fail_n == 0u) ? 3u : fail_n;
+
+    /* 不调 evaluate()：阈值变化本身不构成"现在该切了"的证据 —— 手上的
+     * fail_streak 是按旧阈值累计的，拿它按新阈值重判只会凭空切一次。
+     * 下一拍 note_probe() 自然按新阈值判定。 */
+    return IV_OK;
+}
+
 int iv_netmgr_tick(iv_netmgr_t *m, uint64_t now_ms)
 {
     if (m == NULL || !m->opened) {

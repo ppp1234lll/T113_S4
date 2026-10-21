@@ -843,6 +843,53 @@ int iv_probe_set_link(iv_probe_t *p, int ifindex, int up, uint64_t now_ms)
     return changed;
 }
 
+int iv_probe_retune(iv_probe_t *p, uint32_t interval_ms, uint32_t timeout_ms,
+                    uint32_t fail_n, uint64_t now_ms)
+{
+    int i;
+    int rejudge;
+
+    if (p == NULL)
+        return IV_EINVAL;
+    /* 0 只在 init 里表示"取默认"；运行期给 0 是配错了，别替对方猜。
+     * 超时必须严格小于周期 —— 否则一次超时判定还没结束，下一拍已经到了。 */
+    if (interval_ms == 0u || timeout_ms == 0u || fail_n == 0u ||
+        timeout_ms >= interval_ms)
+        return IV_EINVAL;
+    if (!p->started)
+        return IV_ESTATE;
+
+    if (p->cfg.interval_ms == interval_ms && p->cfg.timeout_ms == timeout_ms &&
+        p->cfg.fail_n == fail_n)
+        return IV_OK; /* 同值不抖 */
+
+    rejudge            = (p->cfg.fail_n != fail_n);
+    p->cfg.interval_ms = interval_ms;
+    p->cfg.timeout_ms  = timeout_ms;
+    /* 阈值直接落 cfg：`recompute()` 判一次读一次。
+     * 已经累计的 fail_streak **不清零** —— 阈值问的是"要连续几次"，不是"已经几次"；
+     * 清了等于把"已经连败 n 次"这个事实抹掉，掉线识别会凭空延后一整轮。 */
+    p->cfg.fail_n      = fail_n;
+
+    for (i = 0; i < p->n_items; i++) {
+        iv_probe_item_t *it = &p->item[i];
+
+        it->interval_ms = interval_ms;
+        /* 从"现在"重排：旧 next_due 可能已经落在过去（周期变小时），也可能远在
+         * 未来（周期变大时）。两种都用新周期从 now 起算，语义最直白：
+         * 「改完之后，下一拍在 interval 之后」。在飞的探测不动 —— 它按 timeout 收。 */
+        if (!it->inflight)
+            it->next_due_ms = now_ms + (uint64_t)interval_ms;
+
+        /* 阈值变了就按现有证据立刻重判一次：连败 2 次、阈值从 3 降到 2，此刻
+         * 结论就该是 DOWN。等下一拍再判会让"引擎自己的配置"和"引擎给出的状态"
+         * 在这段时间里互相矛盾 —— 上层拿去展示就是两个答案。 */
+        if (rejudge)
+            recompute(p, it);
+    }
+    return IV_OK;
+}
+
 /* ---------------------------------------------------------------------------
  * 查询
  * ------------------------------------------------------------------------- */

@@ -4479,3 +4479,47 @@ reload 时 item 数组被重建/清零 ⇒ 那根指针指向的条目没了 ⇒
 `0x74` 是对的 —— 正是那条 WARN 日志让这次能在 10 秒内定位到"不是解析问题、
 不是上报问题、是这条命令没写"。如果还回 `0x01`，平台会显示"配置查询成功"而内容是空的，
 排查方向会完全跑偏。
+
+== 2026-10-21 19:27 `probe.*` 热生效（`iv_agent_reload_probe`）
+
+**问题**：`probe.target1/target2/interval_ms/timeout_ms/max_fail` 只在
+`iv_agent_open()` 里读一次 ⇒ 网页改了等于没改、平台下发 `0xF2`（ping 间隔）/
+`0xF8`（主网检测 IP）没有落点。这与 `sys.report.interval_s`、`net.server.*`、
+`sys.transport.mode` 是同一类坑：**改配置要查"有没有人订阅"**。
+
+**为什么先做这件事**：`0xF2`/`0xF8` 写的就是这几个键。先挂指令、后补热生效，
+等于当场制造两条新的"配置骗人"。
+
+**做法**（三段，各只管一件事）：
+
+. `iv_probe_retune(p, interval, timeout, fail_n, now)` —— 只调参数，**不重建探测表**。
+  重建会把滑窗与连续成功/失败计数清零，一次"5 s 改 10 s"就让 netmgr 的迟滞从零重来。
+  阈值变化时按**现有证据立刻重判一次**（连败 2 次、阈值 3→2 就该是 DOWN），
+  但**不清** `fail_streak` —— 阈值问的是"要连续几次"，不是"已经几次"。
+. `iv_netmgr_set_fail_n(m, n)` —— 同一个键 `probe.max_fail` 喂两处判定（探测判目标
+  DOWN ／状态机判 WAN 不可用），必须一起改，否则"探测说死了、状态机说还活着"。
+  它**不调 `evaluate()`**：门限变化本身不是"现在该切了"的证据。
+. `iv_agent_reload_probe(...)` —— 两条路：目标没变只调参；目标变了必须重建
+  （"有目标走 ICMP、没目标退被动 LINK"，在 `iv_probe` 里是**两种项**）。
+  顺序 `stop → init → build → seed`：`init` 会 `memset`，先 stop 才不会漏 fd；
+  重建后**必须重播链路现状**，否则 `link_ifindex/link_up` 被清空、netlink 又不回放
+  现状 ⇒ 两条 WAN 都 UP 的板"看不见"任何可用 WAN（2026-10-12 那个故障）。
+
+**一条纪律**：open 与 reload 共用 `probe_cfg_of()` 做归一化（0＝取默认）。
+`iv_report_open()` 当年逐字段收口漏两行、字段被默认值静默顶掉、编译不报日志也不报，
+探测表同理：将来加一个 probe 键只改 open，重载一次就"悄悄回默认"。
+
+**顺手修的日志缺陷**：`probe reloaded` 里的目标 IP 原来用 `>>24 & 0xFF` 手工拼点分串，
+小端机上打出来是反序的（`192.168.1.99` → `99.1.168.192`），现场按日志核对检测目标会看错。
+`_be` 的约定本就是"字节序原样"，改用 `inet_ntop()`。
+
+**验证**：`test` 40/40（`test_probe` c13 18 条、`test_netmgr` c11 8 条）／`analyze` 0 报告／
+`arm` 0 告警（`ivsboxd` md5 `777c8409e5e98fa4149ad91252aee441`）／`itest` 16 个 0 失败 1 SKIP。
+VM 端到端 16 条断言全 PASS（真拉起主控走 `config.apply`）：同值下发零日志、目标变打
+`probe target changed ... rebuild` 并重播 `link seed:`、`timeout >= interval` 被跨字段校验拒、
+全程主控 pid 不变。反向证伪两条：①订阅掩码去掉 `PROBE` ⇒ 配置照样落盘、版本号照样 +1，
+但日志一行不增（10 条红）；②重建分支去掉 `agent_probe_seed_links()` ⇒ 只有重播那条红。
+
+**坑**：本机（编译 VM）只有 `lo`/`ens33`，而 WAN 名硬编码 `usb0`/`eth0` ⇒ 两条
+`ifindex` 都是 0、一个探测项都建不起来，"重建后重播"压根不会执行。e2e 才需要先造一条
+**保持 down** 的 dummy `usb0`（down 的链路不会被状态机选成出口，不会改本机默认路由）。

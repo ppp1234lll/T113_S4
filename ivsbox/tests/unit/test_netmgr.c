@@ -614,6 +614,48 @@ static void c10_set_mode(void)
     chk(iv_netmgr_switches(&m) == 1u, "c10 auto convergence ran exactly one txn");
 }
 
+/* 运行期改失败门限（probe.max_fail 的热生效入口）。
+ * 三件事必须钉住：
+ *   ① 未 open 如实拒绝；
+ *   ② 只改门限**不当场切** —— 手上是"按旧门限累计的连败次数"，拿它按新门限重判
+ *      等于凭空切一次线；
+ *   ③ 0 归一化成默认 3（与 cfg_normalize 同口径），不能留个"永不判死"的 0。 */
+static void c11_set_fail_n(void)
+{
+    iv_netmgr_t     m;
+    iv_netmgr_cfg_t c;
+    fake_t          f;
+
+    fake_init(&f);
+    cfg_auto(&c, &f);
+    iv_netmgr_init(&m);
+    chk(iv_netmgr_set_fail_n(NULL, 3) == IV_EINVAL, "c11 set_fail_n NULL -> EINVAL");
+    chk(iv_netmgr_set_fail_n(&m, 3) == IV_ESTATE, "c11 set_fail_n before open -> ESTATE");
+
+    chk(iv_netmgr_open(&m, &c, 0) == IV_OK, "c11 open");
+    chk(m.cfg.fail_n == FAIL_N, "c11 default fail_n");
+
+    feed_n(&m, IV_WAN_WIRED, 1, OK_N, 100);
+    feed_n(&m, IV_WAN_WIRELESS, 0, FAIL_N - 1, 200);
+    chk(iv_netmgr_wan_is_up(&m, IV_WAN_WIRELESS) == 1,
+        "c11 below default threshold: still up");
+
+    /* 门限降到 2：此刻连败正好 2 次，但**当场不翻**（证据是按旧门限收的） */
+    chk(iv_netmgr_set_fail_n(&m, 2) == IV_OK, "c11 set_fail_n ok");
+    chk(m.cfg.fail_n == 2u, "c11 cfg.fail_n updated");
+    chk(iv_netmgr_wan_is_up(&m, IV_WAN_WIRELESS) == 1,
+        "c11 threshold change alone does not flip the verdict");
+
+    /* 下一条结论按新门限判：连败 3 次 >= 2 ⇒ 判死 */
+    feed_n(&m, IV_WAN_WIRELESS, 0, 1, 300);
+    chk(iv_netmgr_wan_is_up(&m, IV_WAN_WIRELESS) == 0,
+        "c11 next conclusion judged by the new threshold");
+
+    /* 0 ⇒ 默认 3（不是"永不判死"） */
+    chk(iv_netmgr_set_fail_n(&m, 0) == IV_OK, "c11 set_fail_n 0 ok");
+    chk(m.cfg.fail_n == 3u, "c11 fail_n 0 normalizes to default");
+}
+
 int main(void)
 {
     c01_lifecycle();
@@ -626,6 +668,7 @@ int main(void)
     c08_both_down();
     c09_modes();
     c10_set_mode();
+    c11_set_fail_n();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_netmgr FAILED (%d)\n", g_fail);
@@ -633,6 +676,6 @@ int main(void)
     }
     printf("test_netmgr passed (lifecycle/normalize, hysteresis, switch-order+args, "
            "media-resume, txn-rollback+retry-window, hold-s-return, wired-down-immediate, "
-           "both-down-recovery, modes, runtime-set-mode)\n");
+           "both-down-recovery, modes, runtime-set-mode, runtime-set-fail-n)\n");
     return 0;
 }

@@ -625,6 +625,73 @@ static void c12_icmp_packet_bytes(void)
     (void)iv_probe_stop(&p);
 }
 
+/* 运行期调参（probe.interval_ms / timeout_ms / max_fail 的热生效入口）。
+ * 重点不是"能不能改"，而是三件容易改错的事：
+ *   ① 非法值必须拒（0 在 init 里是"取默认"，运行期只能是配错了）；
+ *   ② 同值必须不抖 —— 尤其不能把 next_due 往后推，否则平台反复下发同一配置
+ *      会让这条链路永远等不到下一拍；
+ *   ③ 改阈值不能抹掉已累计的连败（那是"已经发生的事实"），也不能等下一拍才认。 */
+static void c13_retune(void)
+{
+    iv_probe_t      p;
+    iv_probe_cfg_t  c = mk_cfg();
+    iv_probe_stat_t st;
+    uint64_t        nd;
+
+    c.interval_ms = 5000;
+    c.timeout_ms  = 1000;
+    c.fail_n      = 3;
+    mock_reset();
+    (void)iv_probe_init(&p, &c);
+    (void)iv_probe_add_icmp(&p, DST, 0, "icmp");
+
+    /* 未 start 一律拒：运行期入口不允许"先把参数塞进去、等 start 再生效" */
+    chk(iv_probe_retune(&p, 10000, 2000, 3, 5000) == IV_ESTATE,
+        "c13 retune before start -> ESTATE");
+
+    (void)iv_probe_start(&p, 5000);
+
+    chk(iv_probe_retune(&p, 0, 1000, 3, 5000) == IV_EINVAL, "c13 interval 0 rejected");
+    chk(iv_probe_retune(&p, 10000, 0, 3, 5000) == IV_EINVAL, "c13 timeout 0 rejected");
+    chk(iv_probe_retune(&p, 10000, 10000, 3, 5000) == IV_EINVAL,
+        "c13 timeout >= interval rejected");
+    chk(iv_probe_retune(&p, 10000, 2000, 0, 5000) == IV_EINVAL, "c13 fail_n 0 rejected");
+    chk(p.cfg.interval_ms == 5000u && p.cfg.timeout_ms == 1000u && p.cfg.fail_n == 3u,
+        "c13 rejections leave cfg untouched");
+
+    /* 正常调参：cfg 与每项都跟着改，next_due 从 now 重排 */
+    chk(iv_probe_retune(&p, 10000, 2000, 4, 5000) == IV_OK, "c13 retune ok");
+    chk(p.cfg.interval_ms == 10000u && p.cfg.timeout_ms == 2000u && p.cfg.fail_n == 4u,
+        "c13 cfg updated");
+    chk(p.item[0].interval_ms == 10000u, "c13 item interval updated");
+    chk(p.item[0].next_due_ms == 15000u, "c13 next_due rebased from now");
+
+    /* 同值不抖：时钟不能被重新起算 */
+    chk(iv_probe_retune(&p, 10000, 2000, 4, 9000) == IV_OK, "c13 same values ok");
+    chk(p.item[0].next_due_ms == 15000u, "c13 same values do not restart the clock");
+
+    /* 在飞的项不动：让它按原 timeout 收完这一次 */
+    (void)iv_probe_tick(&p, 15000);
+    chk(p.item[0].inflight == 1, "c13 item inflight after tick");
+    nd = p.item[0].next_due_ms;
+    chk(iv_probe_retune(&p, 20000, 3000, 4, 16000) == IV_OK, "c13 retune while inflight");
+    chk(p.item[0].next_due_ms == nd, "c13 inflight item keeps its next_due");
+
+    /* 阈值：连败累计不清零，降阈值立刻认 */
+    (void)iv_probe_note_result(&p, 0, 0, 0, 17000);
+    (void)iv_probe_note_result(&p, 0, 0, 0, 17000);
+    (void)iv_probe_stat_get(&p, 0, &st);
+    chk(st.fail_streak == 2u, "c13 fail_streak accumulated");
+    chk(st.state != IV_PROBE_DOWN, "c13 below threshold still not DOWN");
+
+    chk(iv_probe_retune(&p, 20000, 3000, 2, 18000) == IV_OK, "c13 lower fail_n ok");
+    (void)iv_probe_stat_get(&p, 0, &st);
+    chk(st.fail_streak == 2u, "c13 retune keeps fail_streak");
+    chk(st.state == IV_PROBE_DOWN, "c13 lower threshold rejudged immediately");
+
+    (void)iv_probe_stop(&p);
+}
+
 int main(void)
 {
     c01_args_and_guards();
@@ -639,12 +706,13 @@ int main(void)
     c10_now_is_caller_clock();
     c11_lifecycle_guards();
     c12_icmp_packet_bytes();
+    c13_retune();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_probe FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_probe passed (args, stat window, hysteresis, degrade, link event, "
-           "icmp disable/reply/packet-bytes, tcp result, timeout, lifecycle)\n");
+           "icmp disable/reply/packet-bytes, tcp result, timeout, lifecycle, retune)\n");
     return 0;
 }

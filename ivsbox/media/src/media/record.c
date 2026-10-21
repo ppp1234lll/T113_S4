@@ -104,7 +104,7 @@ static int output_init_smart(record_context_t *ctx, int allow_audio) {
     // 放宽 MP4 封装器的标准检查
     ctx->output_ctx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
 
-    for (int i = 0; i < ctx->input_ctx->nb_streams; i++) {
+    for (int i = 0; i < (int)ctx->input_ctx->nb_streams; i++) {
         AVStream *in_stream = ctx->input_ctx->streams[i];
 
         // 如果本次尝试不允许音频，直接跳过音频流
@@ -182,8 +182,6 @@ err:
 }
 
 static int output_init(record_context_t *ctx) {
-    int ret = -1;
-
     // 第一次尝试：带音频
     if (output_init_smart(ctx, 1) >= 0) {
         return 0;
@@ -220,8 +218,8 @@ int record_process(record_context_t *ctx, int segment_duration, exitFunc exit) {
     }
 
     while (av_read_frame(ctx->input_ctx, pkt) >= 0) {
-        int stream_idx = pkt->stream_index;
-        
+        unsigned int stream_idx = (unsigned int)pkt->stream_index;
+
         if (!ctx->output_ctx || stream_idx >= ctx->output_ctx->nb_streams || stream_idx >= 8) {
             av_packet_unref(pkt);
             continue;

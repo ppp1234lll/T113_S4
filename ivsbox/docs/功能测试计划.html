@@ -114,7 +114,7 @@
     <tr><td>存储</td><td>SD 卡 ≥32 GB（产品容量口径 192 GB 另配）；备用卡 1 张用于拔卡用例</td><td><span class="tag st-n">待确认</span></td></tr>
     <tr><td>调试</td><td>串口 COM28（115200 8N1）、SSH 可用；编译 VM <code>tqt113</code>（192.168.2.115）可交叉编译</td><td><span class="tag st-p">就绪</span> SSH 走 VM 中转 <code>2222</code>；串口 COM28</td></tr>
     <tr><td>PC 工具</td><td>curl、ffprobe、snmpwalk、tcpdump、Chrome；自动化脚本随仓库</td><td><span class="tag st-p">就绪</span> 另有工装 <code>tests/tools/fake_plat.py</code>（含 <code>--dump</code>）</td></tr>
-    <tr><td>准入</td><td>自动化层（§4）全绿；配置与档案录入完成；测试用口令已在测试环境内，<b>不得使用现场设备口令</b></td><td><span class="tag st-b">仍未满足</span> <code>test</code>/<code>asan</code>/<code>tsan</code>/<code>arm</code>/<code>itest</code> 已绿；<code>analyze</code> 7 条告警、<code>fuzz</code> 只编不跑</td></tr>
+    <tr><td>准入</td><td>自动化层（§4）全绿；配置与档案录入完成；测试用口令已在测试环境内，<b>不得使用现场设备口令</b></td><td><span class="tag st-b">仍未满足</span> <code>test</code>/<code>asan</code>/<code>tsan</code>/<code>arm</code>/<code>analyze</code>/<code>itest</code> 已绿；<code>fuzz</code> 只编不跑</td></tr>
   </tbody>
 </table>
 
@@ -129,10 +129,10 @@
     <tr><td>故障注入</td><td>进程卡死、写库中 SIGKILL、升级失败</td><td><code>sh tests/fault-inject.sh</code></td><td>宿主项全 PASS；真机项记 NOT-RUN</td><td><span class="tag st-n">未跑</span></td></tr>
     <tr><td>升级链路</td><td>安装 / 切换 / bootcount 回滚 / 自检超时</td><td><code>sh tests/upgrade-boot.sh</code></td><td>23 项全过</td><td><span class="tag st-n">未跑</span></td></tr>
     <tr><td>长稳</td><td>≥72 h 周期切换 + 媒体启停，采 RSS/fd/线程/DB 大小</td><td><code>sh tests/soak.sh --hours 72</code></td><td>无非预期重启；斜率判定仅在运行 ≥6 h 后有效</td><td><span class="tag st-n">未跑</span> 排在 §7 批次 4</td></tr>
-    <tr><td>静态/构建</td><td>交叉编译与静态分析</td><td><code>make arm</code> / <code>make analyze</code></td><td>零告警，出 ELF32 ARM EABI5</td><td><span class="tag st-p">已跑</span> <code>make arm</code> 零告警；<code>analyze</code> 未跑</td></tr>
+    <tr><td>静态/构建</td><td>交叉编译与静态分析</td><td><code>make arm</code> / <code>make analyze</code></td><td>零告警，出 ELF32 ARM EABI5</td><td><span class="tag st-p">通过</span> <code>make arm</code> 零告警；<code>make analyze</code> <b>0 条告警</b>（17:36 清零）</td></tr>
   </tbody>
 </table>
-<div class="note w"><b>准入判定</b>：自动化层已跑完一轮——<code>test</code> 40/40、<code>asan</code>/<code>tsan</code> 0 报告、<code>arm</code> 0 告警、<code>itest</code> 15/16；仍有两项未达标：<code>analyze</code> 7 条告警（全在 <code>media/</code>）、<code>fuzz</code> 只编译不运行。按 §6 准出条件第 2 条，本轮<b>尚不满足准出</b>。</div>
+<div class="note w"><b>准入判定</b>：自动化层已跑完一轮——<code>test</code> 40/40、<code>asan</code>/<code>tsan</code> 0 报告、<code>arm</code> 0 告警、<code>analyze</code> <b>0 告警</b>、<code>itest</code> 15/16；只剩 <code>fuzz</code> 只编译不运行这一项。按 §6 准出条件第 2 条，本轮<b>尚不满足准出</b>。</div>
 
 <h2>5. 功能用例</h2>
 <p>方式说明：<span class="tag t-a">自动</span> 脚本或接口即可判定；<span class="tag t-s">现场</span> 需板端与真实外设；<span class="tag t-r">危险</span> 涉及断电/继电器，须现场确认后执行。</p>
@@ -391,7 +391,7 @@
 <p><b>准出条件（全部满足才算通过）</b>：</p>
 <ol>
   <li>P0 = 0，P1 = 0，P2 ≤ 3 且每条有书面规避方案。</li>
-  <li>自动化层全绿：<code>test</code> / <code>asan</code> / <code>tsan</code> / <code>analyze</code> 0 报告，<code>itest</code> 无 FAIL（SKIP 不计通过）。<b>当前 <code>fuzz</code> 未真跑、<code>analyze</code> 7 条告警、<code>itest</code> 1 条 SKIP</b>。</li>
+  <li>自动化层全绿：<code>test</code> / <code>asan</code> / <code>tsan</code> / <code>analyze</code> 0 报告，<code>itest</code> 无 FAIL（SKIP 不计通过）。<b>当前 <code>fuzz</code> 未真跑、<code>itest</code> 1 条 SKIP（无设备身份）</b>；<code>analyze</code> 已于 17:36 清零。</li>
   <li>架构 §16.2 十个场景逐条有结论（通过 / 阻塞 + 原因 + 计划）。</li>
   <li>72 h 长稳无非预期重启，RSS 与 fd 斜率在阈值内。</li>
   <li>§8 遗留项已单独登记，不与本轮结论混淆。</li>
@@ -401,7 +401,7 @@
 <table>
   <thead><tr><th>批次</th><th>内容</th><th>环境</th><th>计划窗口</th><th>工时</th><th>状态</th></tr></thead>
   <tbody>
-    <tr><td>1 自动化回归</td><td>§4 全部命令一轮（含补齐 <code>asan</code>/<code>tsan</code>/<code>itest</code>/<code>fuzz</code>/<code>analyze</code>）＋ N 组复测</td><td>编译 VM + 宿主</td><td><b>2026-10-21（周三）</b>～10-22（周四）</td><td>1 人日</td><td><span class="tag st-p">已跑完</span> 剩 <code>fuzz</code> 真跑、<code>analyze</code> 清零</td></tr>
+    <tr><td>1 自动化回归</td><td>§4 全部命令一轮（含补齐 <code>asan</code>/<code>tsan</code>/<code>itest</code>/<code>fuzz</code>/<code>analyze</code>）＋ N 组复测</td><td>编译 VM + 宿主</td><td><b>2026-10-21（周三）</b>～10-22（周四）</td><td>1 人日</td><td><span class="tag st-p">已跑完</span> 只剩 <code>fuzz</code> 真跑</td></tr>
     <tr><td>2 板端基础功能</td><td>A / B / C（非破坏）/ D / G / M 组 + N 组剩余</td><td>实验室 + 被测板</td><td><b>2026-10-23（周五）～10-26（周一）</b></td><td>2 人日</td><td><span class="tag st-b">前置未满足</span> 等新镜像 + 摄像机样机</td></tr>
     <tr><td>3 异常与破坏性</td><td>E / F / H / I / K / L 组 + 危险项</td><td>实验室 + 串口兜底</td><td><b>2026-10-27（周二）～10-28（周三）</b></td><td>2 人日</td><td><span class="tag st-n">待启动</span> 危险项须现场同意</td></tr>
     <tr><td>4 长稳</td><td>72 h soak，无人值守，异常即记录时刻</td><td>被测板独立供电</td><td><b>2026-10-29（周四）09:00 ～ 11-01（周日）09:00</b></td><td>72 h 挂机</td><td><span class="tag st-n">待启动</span> 依赖批次 3 结论</td></tr>
@@ -470,7 +470,7 @@
     <tr><td>内存</td><td><code>make asan</code></td><td>0</td><td>同样 <b>40/40</b> 在 ASan/UBSan 下跑完，0 条 ASan/LSan 报告</td><td><span class="tag st-p">通过</span></td></tr>
     <tr><td>线程</td><td><code>setarch -R make tsan</code></td><td>0</td><td><b>40/40</b> 在 TSan 下跑完，0 条 ThreadSanitizer 报告</td><td><span class="tag st-p">通过</span></td></tr>
     <tr><td>交叉编译</td><td><code>make arm</code></td><td>0</td><td>0 告警；产物 ELF32 ARM EABI5；<code>ivsboxd</code> md5 与板端 r35 一致</td><td><span class="tag st-p">通过</span></td></tr>
-    <tr><td>静态分析</td><td><code>make analyze</code>（<code>gcc -fanalyzer</code>）</td><td>0</td><td>编译无错，但<b>报出 7 条告警，全部在 <code>media/</code></b>（详见 §9.6 的 D-02/D-03 及 5 条次要项）</td><td><span class="tag st-b">未达“0 报告”</span></td></tr>
+    <tr><td>静态分析</td><td><code>make analyze</code>（<code>gcc -fanalyzer</code>）</td><td>0</td><td>初跑 <b>7 条告警，全部在 <code>media/</code></b>（D-02/D-03/D-07）；<b>17:36 修完复跑 = 0 条告警</b></td><td><span class="tag st-p">通过</span> 0 报告</td></tr>
     <tr><td>模糊</td><td><code>make fuzz</code></td><td>0</td><td><b>只编译 3 个 fuzz 可执行文件，从未运行</b>（Makefile <code>fuzz:</code> 仅依赖 <code>$(FUZZ_BINS)</code>）</td><td><span class="tag st-b">判据空转</span></td></tr>
     <tr><td>集成</td><td><code>make itest</code>（root 跑，<code>/var/run/ivsbox/ctl</code> 是 <code>root:root 0660</code>）</td><td><b>0</b></td><td><b>16 条：15 通过 ＋ 1 SKIP</b>（<code>test_tunnel_e2e</code> 缺设备身份）。初跑时 <code>test_agent_switch</code> 9 FAIL、<code>test_e2e_report</code> 2 FAIL、<code>test_tunnel_e2e</code> 5 FAIL —— 根因分别是 D-01 / D-13 / D-14 / D-15，均已在 17:15 前修完</td><td><span class="tag st-p">通过（15/16）</span></td></tr>
   </tbody>
@@ -536,12 +536,12 @@
   <thead><tr><th>编号</th><th>级别</th><th>位置</th><th>现象</th><th>影响</th></tr></thead>
   <tbody>
     <tr><td class="id">D-01</td><td>P1</td><td><code>tests/integration/test_agent_switch.c</code></td><td>9 条断言 FAIL，k03 起 <code>connect()</code> 一直 <code>EINPROGRESS</code> 不收敛。<b>真因：用例把平台地址写成回环，而装配层把 socket 钉在 dummy 出口上</b>（<code>SO_BINDTODEVICE</code> ＋ <code>127.0.0.0/8</code> 走 <code>lo</code> ⇒ oif 不匹配 ⇒ SYN 从 dummy 出去被丢弃，无 RST 无 SYN-ACK）</td><td><b>已修（17:15，纯用例侧，产品二进制 md5 与板端 r35 一致未变）</b>：每个出口改用<b>自己网卡上</b>的地址（netns 造 <code>10.9.0.1/24</code>／<code>10.8.0.1/24</code>，真网卡模式 <code>getifaddrs</code> 取现值）</td></tr>
-    <tr><td class="id">D-02</td><td>P1</td><td><code>media/src/http/http_server.c:155</code></td><td><code>if (ret &lt; 0) { ret - 1; }</code> —— <b>语句无效</b>，本意应是 <code>ret = -1;</code> 或 <code>ret -= 1;</code></td><td>取不到 <code>id</code> 查询参数时不报错，继续 <code>atoi("")</code> ⇒ <b>静默当成 0 号通道</b>，可能操作错通道</td></tr>
-    <tr><td class="id">D-03</td><td>P2</td><td><code>media/src/media/media.c:180</code></td><td><code>void *</code> 线程函数走到 <code>}</code> 没有 <code>return</code>（<code>-Wreturn-type</code>）</td><td>未定义行为；当前未被 join，实际风险低</td></tr>
+    <tr><td class="id">D-02</td><td>P1</td><td><code>media/src/http/http_server.c</code> 的 <code>get_id()</code></td><td><code>if (ret &lt; 0) { ret - 1; }</code> —— <b>空语句</b>，运行时什么都不做</td><td>取不到 <code>id</code> 参数时不报错，继续 <code>atoi("")</code> ⇒ <b>静默当成 0 号通道</b>，前端漏传 id 就会操作错通道。<b>已修（17:36）</b>：改为 <code>return -1;</code>，三个调用点本就按 <code>id &lt; 0</code> 回 400。反向证伪：退回空语句 ⇒ <code>analyze</code> 重新报 <code>-Wunused-value</code></td></tr>
+    <tr><td class="id">D-03</td><td>P2</td><td><code>media/src/media/media.c</code> 的 <code>record_worker()</code></td><td><code>void *</code> 线程函数走到 <code>}</code> 没有 <code>return</code>（<code>-Wreturn-type</code>）</td><td>未定义行为；当前未被 join，实际风险低。<b>已修（17:36）</b>：补 <code>return NULL;</code>；顺带给 <code>monitor_worker()</code> 补 <code>(void)arg;</code></td></tr>
     <tr><td class="id">D-04</td><td>P2</td><td><code>sys.sample.period_ms</code></td><td>全仓只有默认表一处定义，<b>零消费方</b>；实际节拍是 <code>IV_REPORT_POLL_MS = 30*1000</code> 写死</td><td>Web 上把采集周期调到 1 s 完全没有效果（实测 30.9 s/轮），属“配置骗人”</td></tr>
     <tr><td class="id">D-05</td><td>P2</td><td><code>Makefile</code> 的 <code>fuzz:</code></td><td>只 <code>$(MAKE) TARGET=host $(FUZZ_BINS)</code>，从不执行</td><td>“无崩溃、无越界”这条判据实际从未被验证；C-01 的自动部分等于空转</td></tr>
     <tr><td class="id">D-06</td><td>P2</td><td>配置 / 装配层</td><td><code>camera.ch.*</code> 槽位未建立（<code>camera_count=0</code>），<code>fill_missing_defaults()</code> 按设计跳过未建槽位</td><td>CNS 恒 <code>[0,0,0,0,0,0]</code>、摄像机 SNMP 目标 IP 恒 0、E1 的 <code>c1..c6</code> 恒空；F/H 组无法验证。非缺陷，但现场若也不建槽位，摄像机功能整体不可用</td></tr>
-    <tr><td class="id">D-07</td><td>P3</td><td><code>media/src/media/record.c</code>、<code>media.c</code></td><td>另有 5 条告警：2 处 <code>-Wsign-compare</code>、2 处 <code>-Wunused-parameter</code>、1 处 <code>-Wunused-variable</code></td><td>不影响功能，但使 <code>make analyze</code> 达不到“0 报告”</td></tr>
+    <tr><td class="id">D-07</td><td>P3</td><td><code>media/src/media/record.c</code>、<code>media.c</code></td><td>另有 5 条告警：2 处 <code>-Wsign-compare</code>、2 处 <code>-Wunused-parameter</code>、1 处 <code>-Wunused-variable</code></td><td><b>已修（17:36）</b>：循环上界显式 <code>(int)</code> 转换、<code>stream_idx</code> 改 <code>unsigned int</code>、删掉未用的 <code>ret</code>、补 <code>(void)sig;</code> / <code>(void)arg;</code>。复跑 <code>make analyze</code> <b>0 告警</b></td></tr>
     <tr><td class="id">D-08</td><td>P3</td><td>ctl <code>system.snapshot</code></td><td>只回 <code>{"method","version","status":"ok"}</code>，<b>没有快照内容</b>（S10 兼容垫片）</td><td>方法名与行为不符，容易误用</td></tr>
     <tr><td class="id">D-09</td><td>P3</td><td>ctl 分发</td><td>未知方法（如 <code>net.link</code>）→ <b>直接断连，不回错误 JSON</b></td><td>客户端无法区分“方法名写错”与“主控挂了”</td></tr>
     <tr><td class="id">D-10</td><td>P3</td><td>ctl <code>record.status</code></td><td>无录像时回 <code>e=-22</code>（EINVAL）</td><td>语义应是“未在录”而不是参数错</td></tr>
@@ -557,14 +557,14 @@
 <table>
   <thead><tr><th>准出条件</th><th>状态</th><th>说明</th></tr></thead>
   <tbody>
-    <tr><td>P0 = 0，P1 = 0，P2 ≤ 3</td><td><span class="tag st-r">不满足</span></td><td>P1 现存 <b>1 条</b>（D-02，<code>media/</code> 静默落 0 号通道）；D-01 已闭环（真因在用例侧，产品未改）。<b>P2 × 4</b>（D-03~D-06）未动</td></tr>
-    <tr><td>自动化层全绿（test / asan / tsan / analyze / itest）</td><td><span class="tag st-r">不满足</span></td><td>test 40/40、asan/tsan 0 报告、arm 0 告警、<b>itest 16 条 15 通过 1 SKIP</b>；仍不绿的是 <code>analyze</code> 7 条告警（全在 <code>media/</code>）与 <code>fuzz</code> 只编不跑</td></tr>
+    <tr><td>P0 = 0，P1 = 0，P2 ≤ 3</td><td><span class="tag st-r">不满足</span></td><td><b>P1 已清零</b>（D-01 在用例侧闭环、D-02 已修）。<b>P2 剩 3 条</b>（D-04 <code>sys.sample.period_ms</code> 死键、D-05 <code>fuzz</code> 空转、D-06 摄像机槽位）；D-03 已修</td></tr>
+    <tr><td>自动化层全绿（test / asan / tsan / analyze / itest）</td><td><span class="tag st-r">不满足</span></td><td>test 40/40、asan/tsan 0 报告、arm 0 告警、<b>analyze 0 告警</b>、<b>itest 16 条 15 通过 1 SKIP</b>；唯一未达标的是 <code>fuzz</code> 只编不跑</td></tr>
     <tr><td>§16.2 十场景逐条有结论</td><td><span class="tag st-b">未完成</span></td><td>场景 1/2（双 WAN、补传）板端已验；3/4/5/8/9 需外设或危险项；6/7/10 部分验</td></tr>
     <tr><td>72 h 长稳</td><td><span class="tag st-b">未执行</span></td><td>板端已连续运行 4 天且当日 0 ERROR，但未按 soak 脚本采集 RSS/fd 斜率，不作数</td></tr>
     <tr><td>§8 遗留项单独登记</td><td><span class="tag st-p">已满足</span></td><td>§8 已列 14 条，本轮新增的 D-01~D-12 亦已单列</td></tr>
   </tbody>
 </table>
-<div class="note"><b>本轮结论</b>：<b>可以给现场试用的部分</b>——上报节拍、链路切换与补传、采集板串口、GPS 降级、Web 鉴权、平台 E1/E2/E3、配置读写与热生效（限已接订阅者的键）。<b>不能宣称通过的部分</b>——静态分析 7 条告警与 <code>fuzz</code> 空转未清、平台 17 条指令未实现、摄像机与媒体全链路未验、OTA 与远程通道未验、72 h 长稳未做。按 §6 五条准出条件逐条对照，<b>本轮不满足准出</b>。</div>
+<div class="note"><b>本轮结论</b>：<b>可以给现场试用的部分</b>——上报节拍、链路切换与补传、采集板串口、GPS 降级、Web 鉴权、平台 E1/E2/E3、配置读写与热生效（限已接订阅者的键）。<b>不能宣称通过的部分</b>——<code>fuzz</code> 从未真跑、平台 17 条指令未实现、摄像机与媒体全链路未验、OTA 与远程通道未验、72 h 长稳未做。按 §6 五条准出条件逐条对照，<b>本轮不满足准出</b>。</div>
 
 <div class="foot">
   依据：<code>T113运维终端-系统架构设计.md</code> §16.1 / §16.2、<code>ivsbox/docs/功能开发计划.md</code> §0.1 与各阶段退出条件、<code>ivsbox/docs/代码说明.adoc</code> 2026-10-20 / 10-21 两节、<code>tests/readme.txt</code> 测试体系约定。<br>

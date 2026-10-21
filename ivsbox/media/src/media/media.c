@@ -177,10 +177,15 @@ static void *record_worker(void *arg)
 
         log_warn("record stop, ret: %d, url: %s\n", ret, task->ctx.url);
     }
+
+    /* 线程函数必须有返回值：原来走到 `}` 直接返回，`void *` 函数的返回值是
+     * 不确定值（未定义行为）。当前没人在 join 它，所以现场没炸，但不是可留的写法。 */
+    return NULL;
 }
 
 static void *monitor_worker(void *arg)
 {
+    (void)arg; /* 巡检靠全局 g_tasks，不需要参数 */
     log_info("record monitor started");
     
     while (1)

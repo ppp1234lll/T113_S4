@@ -14,6 +14,7 @@ static void handleMessage(struct mg_connection *c, int ev, void *ev_data);
 // 信号处理函数（捕获 Ctrl+C）
 static void signal_handler(int sig)
 {
+    (void)sig; /* 信号编号用不上，只借它的到来置退出标志 */
     s_signaled = true;
 }
 
@@ -150,9 +151,15 @@ static int get_id(const struct mg_str *query)
 {
     char id_str[8] = {0};
     int ret = mg_http_get_var(query, API_QUERY_ID, id_str, sizeof(id_str));
+
+    /* 取不到 id 参数必须**当场失败**。这里原先是 `ret - 1;` 这条空语句
+     * （语句无效，编译器只报 -Wunused-value，运行时什么都不做）：id_str 保持
+     * 全 0，`atoi("")` 得 0 ⇒ **静默当成 0 号通道** —— 前端漏传 id 就会去操作
+     * 0 号通道（开录/停录/查状态都中招）。三个调用点都按 `id < 0` 回 400，
+     * 所以这里返回 -1 正是它们期待的语义。 */
     if (ret < 0)
     {
-        ret - 1;
+        return -1;
     }
 
     int id = atoi(id_str);

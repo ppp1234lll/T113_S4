@@ -14,7 +14,7 @@
  *   c05 平台断开 → 上报入队积压（不丢）；
  *   c06 平台恢复 → 欠包按序补发（CSQ 11/12/13 的到达顺序即序号顺序）、队列清空；
  *   c07 平台下发 E3 查询 → `##`+JSON+`##` 应答、**QN 按平台原值回填**、crc=06；
- *   c08 平台下发未注册命令 → 回 ACK(0x01)（协议层默认分支）；
+ *   c08 平台下发未注册命令 → 回 ACK(0x74)（明确失败；回 OK 等于对平台撒谎）；
  *   c09 串口断开清除旧镜像，重连后自动重新查询；
  *   c10 关闭后资源收口（is_open=0）。
  *
@@ -479,7 +479,14 @@ int main(void)
         if (used > 0u) {
             chk(strncmp(seg, want_hdr, sizeof want_hdr - 1u) == 0,
                 "c04 segment header (QN/TID/VER/DEVTYPE/CP)");
-            chk(strstr(seg, "V=234.17;A=0.50;H=50.01;T=31.33;DS=1;P=0;") != NULL,
+            /* 字段序对齐参考实现（2026-10-20 复核）：V A APOWER AKW H T P DS。
+             * 两处容易写错的点：**APOWER/AKW 夹在 A 与 H 之间**，**P 在 DS 之前**
+             * （原先的黄金是 `...H;T;DS;P;`，与参考实现相反，已按代码口径更正）。 */
+            if (strstr(seg, "V=234.17;A=0.50;APOWER=0.00;AKW=0.00;H=50.01;"
+                            "T=31.33;P=0;DS=1;") == NULL)
+                fprintf(stderr, "  c04 DEBUG seg=%s\n", seg);
+            chk(strstr(seg, "V=234.17;A=0.50;APOWER=0.00;AKW=0.00;H=50.01;"
+                            "T=31.33;P=0;DS=1;") != NULL,
                 "c04 mirror fields in field-table order");
             chk(strstr(seg, "RELAY=1,1,1;") != NULL, "c04 RELAY 3 entries");
             chk(strstr(seg, "CSQ=9;") != NULL, "c04 injected CSQ");
@@ -646,8 +653,15 @@ int main(void)
                 "c08 up-frame head");
             chk((uint8_t)rx[2] == (uint8_t)IV_PROTO_VER, "c08 ver");
             chk((uint8_t)rx[8] == 0x99u, "c08 ACK echoes cmd");
-            chk((uint8_t)rx[17] == 0x01u && (uint8_t)rx[18] == IV_PROTO_ACK_OK,
-                "c08 ACK data[0]=01");
+            /* 0x99 是**从没实现过**的命令 ⇒ 按 2026-10-20 定下的口径必须回
+             * 0x74(IV_PROTO_ERR_EXEC)，不能回 0x01 —— 回 OK 等于对平台撒谎
+             * （"设置成功"而设备一分没动），现场排查会一路怀疑网络。
+             * 口径原文见 iv_proto.c 的 dispatch() 未注册分支。 */
+            if (!((uint8_t)rx[17] == 0x01u && (uint8_t)rx[18] == IV_PROTO_ERR_EXEC))
+                fprintf(stderr, "  c08 DEBUG len=%u data0=0x%02X\n",
+                        (unsigned)(uint8_t)rx[17], (unsigned)(uint8_t)rx[18]);
+            chk((uint8_t)rx[17] == 0x01u && (uint8_t)rx[18] == IV_PROTO_ERR_EXEC,
+                "c08 ACK data[0]=0x74 (unimplemented cmd must not lie OK)");
             /* 22 字节帧：crc 在 [19]，帧尾在 [20][21] */
             chk((uint8_t)rx[20] == 0xFFu && (uint8_t)rx[21] == 0xFFu,
                 "c08 frame tail");

@@ -85,6 +85,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h> /* 真网卡模式：取网卡自己的 IPv4 */
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h> /* kill()：探测 4G 看护是否在跑 */
@@ -111,11 +112,21 @@
 /* 两张 WAN 的接口名（架构 §18.3 冻结：无线=usb0 / 有线=eth0） */
 #define WAN_WL        "usb0"
 #define WAN_WD        "eth0"
-/* 两条出口各自的平台地址（同一监听端口、**不同回环地址**）：
- * 127.0.0.1 = 无线口、127.0.0.2 = 有线口 —— 用来钉住"换出口时平台地址跟着换"
- * （监听套接字绑 INADDR_ANY，故两个地址都能连上）。 */
-#define SRV_WL        "127.0.0.1"
-#define SRV_WD        "127.0.0.2"
+/* 两条出口各自的平台地址（同一监听端口、**两条不同地址**）：
+ * 每个地址都落在**被绑定的那张网卡自己身上** —— 用来钉住"换出口时平台地址跟着换"
+ * （监听套接字绑 INADDR_ANY，故两个地址都能连上）。
+ *
+ * ⚠ 不能用 127.0.0.1 / 127.0.0.2（2026-10-21 实测：k03 起 9 条断言全红）：
+ * 装配层把 `bind_ifname` 设成**活动出口的网卡名**（iv_agent.c 的 open /
+ * agent_reconnect），传输层照做 `SO_BINDTODEVICE`。socket 被钉在 usb0/eth0 上后，
+ * 127.0.0.0/8 的 local 路由挂在 **lo** 上 ⇒ oif 不匹配 ⇒ 落到 main 表的
+ * `default dev usb0` ⇒ SYN 从 dummy 发出去，dummy 的 ndo_start_xmit 直接丢包，
+ * **既没有 RST 也没有 SYN-ACK** ⇒ connect 永远停在 EINPROGRESS（要等 ~127 s 的
+ * TCP 重传超时才失败），用例的注入时钟等不到那一天。
+ * 换成"本网卡自己的地址"后，table local 里的 `local 10.9.0.1 dev usb0` 与 oif 匹配，
+ * 内核按 RTN_LOCAL 走本地投递（dev_out 强制 lo），连接当场建立。 */
+#define WL_ADDR       "10.9.0.1/24"
+#define WD_ADDR       "10.8.0.1/24"
 /* 「已进入私有 netns」的环境标记；未置位则自重启 */
 #define NS_ENV        "IV_AGENT_TEST_NETNS"
 /* 「真网卡模式」环境标记（板端无 unshare/dummy，直接跑真 usb0/eth0） */
@@ -128,6 +139,9 @@ static iv_agent_t g_agent;
 static int        g_fail;
 static int        g_realnic; /* 1 = 真网卡模式（REALNIC_ENV 置位） */
 static uint64_t   g_now;
+/* 两条出口各自的平台地址（netns：造地址时读回；真网卡：取网卡自己的 IPv4） */
+static char       g_srv_wl[INET_ADDRSTRLEN];
+static char       g_srv_wd[INET_ADDRSTRLEN];
 
 /* 串口下行字节的**留存副本**：pump_agent 原先是"读了就扔"，M4-S4.4 要证明
  * 主网故障沿真的变成了 pty 上的 0xD1 报文，就得把字节留下。 */
@@ -244,8 +258,8 @@ static int listen_port(uint16_t in_port, uint16_t *out_port)
     (void)setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
     memset(&sa, 0, sizeof sa);
     sa.sin_family      = AF_INET;
-    /* 绑 INADDR_ANY（而非 INADDR_LOOPBACK）：本用例用 127.0.0.1 / 127.0.0.2
-     * 两个回环地址区分无线口/有线口的平台地址，二者同端口、都指向本套接字。 */
+    /* 绑 INADDR_ANY（而非 INADDR_LOOPBACK）：本用例用两条**分属不同出口网卡**的
+     * 地址区分无线口/有线口的平台地址，二者同端口、都指向本套接字。 */
     sa.sin_addr.s_addr = htonl(INADDR_ANY);
     sa.sin_port        = htons(in_port);
     if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 ||
@@ -413,6 +427,39 @@ static int ip_set_state(const char *name, int up)
     char *av[] = { (char *)"ip", (char *)"link", (char *)"set", (char *)name,
                    (char *)(up ? "up" : "down"), NULL };
     return run_ip(av);
+}
+
+/* 给网卡加一个 IPv4（netns 里造出来的 dummy 没有地址，而**没有地址的网卡做不了
+ * SO_BINDTODEVICE 的连接目标** —— 理由见文件头 SRV_* 那段）。 */
+static int ip_addr_add(const char *name, const char *cidr)
+{
+    char *av[] = { (char *)"ip", (char *)"addr", (char *)"add", (char *)cidr,
+                   (char *)"dev", (char *)name, NULL };
+    return run_ip(av);
+}
+
+/* 取某网卡的 IPv4（点分十进制）。没有地址返回 0。 */
+static int iface_ipv4(const char *name, char *out, size_t cap)
+{
+    struct ifaddrs *ifs = NULL;
+    struct ifaddrs *p;
+    int             ok = 0;
+
+    if (getifaddrs(&ifs) != 0)
+        return 0;
+    for (p = ifs; p != NULL; p = p->ifa_next) {
+        if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET)
+            continue;
+        if (strcmp(p->ifa_name, name) != 0)
+            continue;
+        if (inet_ntop(AF_INET, &((struct sockaddr_in *)(void *)p->ifa_addr)->sin_addr,
+                      out, (socklen_t)cap) == NULL)
+            continue;
+        ok = 1;
+        break;
+    }
+    freeifaddrs(ifs);
+    return ok;
 }
 
 /* ---------------------------------------------------------------------------
@@ -636,6 +683,14 @@ static int scenario(void)
             printf("SKIP: real-NIC mode needs existing %s / %s\n", WAN_WL, WAN_WD);
             return 0;
         }
+        /* 平台地址＝网卡自己的 IPv4：真 usb0/eth0 已配地址，直接取；取不到说明
+         * 链路还没起来，本用例无法造出"可被绑定的连接目标" ⇒ SKIP。 */
+        if (!iface_ipv4(WAN_WL, g_srv_wl, sizeof g_srv_wl) ||
+            !iface_ipv4(WAN_WD, g_srv_wd, sizeof g_srv_wd)) {
+            printf("SKIP: real-NIC mode needs an IPv4 on both %s / %s\n",
+                   WAN_WL, WAN_WD);
+            return 0;
+        }
     } else {
         if (ip_add_dummy(WAN_WL) != 0 || ip_add_dummy(WAN_WD) != 0) {
             printf("SKIP: cannot create dummy interfaces (iproute2 missing?)\n");
@@ -643,6 +698,15 @@ static int scenario(void)
         }
         if (ip_set_state("lo", 1) != 0) {
             printf("SKIP: cannot bring lo up\n");
+            return 0;
+        }
+        if (ip_addr_add(WAN_WL, WL_ADDR) != 0 || ip_addr_add(WAN_WD, WD_ADDR) != 0) {
+            printf("SKIP: cannot assign addresses to the dummy interfaces\n");
+            return 0;
+        }
+        if (!iface_ipv4(WAN_WL, g_srv_wl, sizeof g_srv_wl) ||
+            !iface_ipv4(WAN_WD, g_srv_wd, sizeof g_srv_wd)) {
+            printf("SKIP: cannot read back the dummy addresses\n");
             return 0;
         }
     }
@@ -662,9 +726,9 @@ static int scenario(void)
     iv_agent_cfg_default(&cfg);
     cfg.serial_path  = slave_path;
     cfg.queue_dir    = qdir;
-    cfg.srv_host[IV_WAN_WIRELESS] = SRV_WL;
+    cfg.srv_host[IV_WAN_WIRELESS] = g_srv_wl;
     cfg.srv_port[IV_WAN_WIRELESS] = port;
-    cfg.srv_host[IV_WAN_WIRED]    = SRV_WD;
+    cfg.srv_host[IV_WAN_WIRED]    = g_srv_wd;
     cfg.srv_port[IV_WAN_WIRED]    = port;
     cfg.devid        = 0x101u;
     cfg.mod          = "AGENT-MOD";
@@ -724,9 +788,9 @@ static int scenario(void)
     chk(iv_agent_netmgr_state(&g_agent) == IV_NETMGR_WIRELESS_UP,
         "k01 initial state WIRELESS_UP (无线优先)");
     chk(iv_agent_active_wan(&g_agent) == IV_WAN_WIRELESS, "k01 initial active = wireless");
-    chk(strcmp(iv_agent_report(&g_agent)->srv_host, SRV_WL) == 0,
+    chk(strcmp(iv_agent_report(&g_agent)->srv_host, g_srv_wl) == 0,
         "k01 platform addr = the wireless one (按初始活动出口选址)");
-    chk(strcmp(iv_agent_report(&g_agent)->tr.host, SRV_WL) == 0,
+    chk(strcmp(iv_agent_report(&g_agent)->tr.host, g_srv_wl) == 0,
         "k01 transport really dials the wireless addr");
     /* 装配把接口名解析成了 ifindex；解析不到整条链就不成立，必须钉死 */
     chk(g_agent.wan_ifindex[IV_WAN_WIRELESS] > 0, "k01 wireless ifindex resolved");
@@ -862,9 +926,9 @@ static int scenario(void)
     chk(iv_netmgr_switches(&g_agent.nm) == 1u,
         "k04 switch transaction fired (route change AND reconnect both returned OK)");
     chk(iv_agent_active_wan(&g_agent) == IV_WAN_WIRED, "k04 active WAN -> wired");
-    chk(strcmp(iv_agent_report(&g_agent)->srv_host, SRV_WD) == 0,
+    chk(strcmp(iv_agent_report(&g_agent)->srv_host, g_srv_wd) == 0,
         "k04 platform addr switched to the wired one (按活动出口选地址)");
-    chk(strcmp(iv_agent_report(&g_agent)->tr.host, SRV_WD) == 0,
+    chk(strcmp(iv_agent_report(&g_agent)->tr.host, g_srv_wd) == 0,
         "k04 transport really re-dials the wired addr");
     chk(iv_agent_netmgr_state(&g_agent) == IV_NETMGR_WIRED_UP, "k04 state WIRED_UP");
     chk(iv_agent_active_ifindex(&g_agent) == g_agent.wan_ifindex[IV_WAN_WIRED],
@@ -958,6 +1022,10 @@ static int scenario(void)
                                 (char *)"6", (char *)"-T", (char *)"2", NULL };
 
             (void)run_ip(av_dhcp);
+            /* DHCP 可能把地址换掉：平台地址必须跟着改（agent 在切回时从 a->cfg
+             * 取地址），否则 k06 会去连一个已经不存在的地址。 */
+            if (iface_ipv4(WAN_WL, g_srv_wl, sizeof g_srv_wl))
+                g_agent.cfg.srv_host[IV_WAN_WIRELESS] = g_srv_wl;
             if (!back)
                 printf("NOTE: real %s did not return to carrier after link up — the "
                        "EC200G PDP may need AT+QNETDEVCTL=1,1,1 (S62usb4g does that; "
@@ -975,12 +1043,12 @@ static int scenario(void)
     chk(iv_agent_active_wan(&g_agent) == IV_WAN_WIRELESS, "k06 active WAN -> wireless");
     chk(iv_agent_mn(&g_agent, IV_WAN_WIRELESS) == 1u,
         "k06b wireless MN back to 1 after recovery (edge detector re-armed)");
-    chk(strcmp(iv_agent_report(&g_agent)->srv_host, SRV_WL) == 0,
+    chk(strcmp(iv_agent_report(&g_agent)->srv_host, g_srv_wl) == 0,
         "k06 platform addr back to the wireless one");
     chk(iv_agent_netmgr_state(&g_agent) == IV_NETMGR_WIRELESS_UP, "k06 state WIRELESS_UP");
 
     chk(wait_transport_up(60), "k06 transport UP on the restored platform");
-    chk(strcmp(iv_agent_report(&g_agent)->tr.host, SRV_WL) == 0,
+    chk(strcmp(iv_agent_report(&g_agent)->tr.host, g_srv_wl) == 0,
         "k06 transport re-dials the wireless addr");
     cs = accept_ms(ls, 2000);
     chk(cs >= 0, "k06 platform accepted the reconnected TCP");

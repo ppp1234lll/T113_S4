@@ -154,6 +154,17 @@ int main(int argc, char *argv[])
         chk(strstr(body, "secret") == NULL, "no secretKey in a status response");
     }
 
+    /* 身份未装备时（VM / 开发机既没有 sunxi_chipid、配置里也没有 tunnel.sn +
+     * tunnel.token）`tunnel.enable` 必然回 ENOIDENT —— 这是**环境缺失**，不是
+     * 代码错，按本目录口径优雅 SKIP（与 unshare / pty 的处理一致），不弄红
+     * `make itest`。真机上 SN 由身份分区给出，本用例才有意义。 */
+    if (rc == IV_OK && strstr(body, "\"sn\":\"\"") != NULL) {
+        printf("SKIP: device identity not provisioned (empty sn) -- tunnel needs "
+               "sn + token; run on the board or set them in the daemon config\n");
+        (void)close(fd);
+        return 0;
+    }
+
     /* 2) 初始为关 */
     rc = round_trip(fd, "{\"m\":\"tunnel.status\"}", body, sizeof body, NULL);
     if (rc == IV_OK)

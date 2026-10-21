@@ -189,8 +189,26 @@ asan:
 tsan:
 	$(MAKE) TARGET=host SANITIZE=thread BUILD_DIR=build/tsan test
 
+# 模糊测试：**编了还要真跑**。
+#
+# 原先这里只有 `$(MAKE) TARGET=host $(FUZZ_BINS)` —— 只编译、从不执行，于是
+# 「随机灌流无崩溃、无越界」这条准出判据**从未被验证过**（D-05，2026-10-21）。
+# 两处一起改：
+#   ① 按 SANITIZE=1（ASan+UBSan）重编 —— 不这样编，越界/UAF 根本抓不到，
+#      灌十小时也只是"没崩"；独立 BUILD_DIR=build/fuzz，不污染 build/host 的 .o。
+#   ② 编完**逐个真跑**：`FUZZ_SEC` 控制时长（默认 10 s；0 = 只跑一轮自检；
+#      出测试报告前用 `make fuzz FUZZ_SEC=600`）。任一个非零退出即整体失败。
+FUZZ_SEC       ?= 10
+FUZZ_BUILD_DIR ?= build/fuzz
+FUZZ_RUN_BINS   = $(patsubst tests/fuzz/%.c,$(FUZZ_BUILD_DIR)/tests/fuzz/%,$(FUZZ_SRCS))
+
 fuzz:
-	$(MAKE) TARGET=host $(FUZZ_BINS)
+	$(MAKE) TARGET=host SANITIZE=1 BUILD_DIR=$(FUZZ_BUILD_DIR) $(FUZZ_RUN_BINS)
+	@for f in $(FUZZ_RUN_BINS); do \
+		echo "RUN $$f $(FUZZ_SEC)s"; \
+		"$$f" $(FUZZ_SEC) || exit 1; \
+	done
+	@echo "fuzz OK: $(words $(FUZZ_RUN_BINS)) 个 harness × $(FUZZ_SEC)s，ASan/UBSan 零报告"
 
 analyze:
 	$(MAKE) TARGET=host ANALYZE=1 BUILD_DIR=build/analyze analyze-build
@@ -243,7 +261,7 @@ help:
 	@echo "  asan     - build and run tests with ASan/UBSan"
 	@echo "  tsan     - build and run tests with TSan (host only, exclusive with asan)"
 	@echo "  itest    - build and run integration tests (requires a running ivsboxd)"
-	@echo "  fuzz     - build fuzz targets"
+	@echo "  fuzz     - build (ASan) and RUN fuzz harnesses, FUZZ_SEC=10"
 	@echo "  analyze  - build with GCC -fanalyzer"
 	@echo "  package  - copy ARM binaries to packaging/"
 	@echo "  clean    - remove build/ and packaging/"

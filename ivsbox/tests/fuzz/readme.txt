@@ -12,13 +12,21 @@ tests/fuzz  ——  模糊测试：随机输入灌被测模块，撞崩溃/挂�
                  提高同步字/CRC 路径命中率，随机 now_ms 喂 tick 覆盖超时路径
   fuzz_link.c    iv_link 可靠层模糊测试：随机选择 recv（随机块+1/8 混合法帧）/ send /
                  tick，回调内访问 data 边界，ASan/UBSan 下越界立即暴露
+  fuzz_netlink.c iv_netlink 的 rtnetlink 报文解析模糊测试：随机属性流喂解析器，
+                 ASan/UBSan 下越界立即暴露
   .gitkeep       目录占位文件（保留空目录于 git；本目录当前并非空目录）
 
 【运行方式】
-  make fuzz                    构建本目录全部 harness（宿主）
-  build/host/tests/fuzz/fuzz_frame [秒数]   直接跑，默认 10 s，0 只跑一轮自检
-  build/host/tests/fuzz/fuzz_link  [秒数]   同上
-  # 建议配合 `make asan` 口径重编后再跑，越界/UAF 才能被捕获
+  make fuzz                                 **构建并按 ASan/UBSan 口径真跑**全部 harness，
+                                            每个 10 s（FUZZ_SEC 可改）；任一个非零退出即失败
+  make fuzz FUZZ_SEC=600                    出测试报告前跑满 10 min
+  build/fuzz/tests/fuzz/fuzz_frame [秒数]   直接跑，默认 10 s
+  build/fuzz/tests/fuzz/fuzz_link  [秒数]   同上
+  build/fuzz/tests/fuzz/fuzz_netlink [秒数] 同上
+
+  产物在 `build/fuzz/`（`SANITIZE=1`，独立于 build/host 与 build/asan）。
+  2026-10-21 之前 `make fuzz` **只编译、从不执行**，于是"无崩溃、无越界"这条判据
+  一直没被验证过（D-05）；现在它会真的跑，且非零退出会让整条命令失败。
 
 【约定与注意事项】
   - 每个 harness 用 xorshift64* 伪随机并做非零播种（全零态输出恒 0）。

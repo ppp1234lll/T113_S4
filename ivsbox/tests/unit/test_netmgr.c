@@ -550,6 +550,70 @@ static void c09_modes(void)
     chk((int)iv_netmgr_active_wan(&m) == (int)IV_WAN_WIRELESS, "c09 both active wireless");
 }
 
+/* c10：运行期改传输模式（`sys.transport.mode` 的热生效入口，2026-10-21）
+ *
+ * 这个函数存在的唯一理由是"改配置要立刻生效"，所以断言分两类：
+ *   ① 模式 1/2/3 改完**当场**就换活动口（不靠下一拍探活、也不跑切换事务）；
+ *   ② 改成 AUTO 时不硬塞答案，交给迟滞状态机按当前可用性收敛（该跑事务就跑）。
+ * 另外必须钉住"同值不抖"：平台会反复下发同一配置，每次抖一次就是拆一次链路。 */
+static void c10_set_mode(void)
+{
+    iv_netmgr_t      m;
+    iv_netmgr_cfg_t  c;
+    fake_t           f;
+
+    /* 未 open / 参数非法 —— 一律如实拒绝，不悄悄当 AUTO */
+    fake_init(&f);
+    cfg_auto(&c, &f);
+    iv_netmgr_init(&m);
+    chk(iv_netmgr_set_mode(&m, IV_NETMGR_MODE_WIRED_ONLY, 0) == IV_ESTATE,
+        "c10 set_mode before open -> ESTATE");
+    chk(iv_netmgr_set_mode(NULL, IV_NETMGR_MODE_AUTO, 0) == IV_EINVAL,
+        "c10 set_mode NULL -> EINVAL");
+
+    chk(iv_netmgr_open(&m, &c, 0) == IV_OK, "c10 open");
+    chk(iv_netmgr_set_mode(&m, (iv_netmgr_mode_t)0, 0) == IV_EINVAL,
+        "c10 mode 0 rejected (0 只在 cfg 里当 AUTO，指令面不接受)");
+    chk(iv_netmgr_set_mode(&m, (iv_netmgr_mode_t)5, 0) == IV_EINVAL,
+        "c10 mode 5 rejected");
+    chk(m.cfg.mode == IV_NETMGR_MODE_AUTO, "c10 rejected mode leaves cfg untouched");
+
+    /* 两条 WAN 都可用：起始无线（AUTO） */
+    feed_n(&m, IV_WAN_WIRELESS, 1, OK_N, 100);
+    feed_n(&m, IV_WAN_WIRED, 1, OK_N, 200);
+    chk((int)iv_netmgr_active_wan(&m) == (int)IV_WAN_WIRELESS, "c10 pre: active wireless");
+
+    /* ① 1=只用有线：当场换过去，且**不跑切换事务**（活动口即出口选择） */
+    chk(iv_netmgr_set_mode(&m, IV_NETMGR_MODE_WIRED_ONLY, 300) == IV_OK,
+        "c10 -> wired-only ok");
+    chk((int)iv_netmgr_active_wan(&m) == (int)IV_WAN_WIRED, "c10 wired-only active wired");
+    chk(iv_netmgr_state(&m) == IV_NETMGR_WIRED_UP, "c10 wired-only state");
+    chk(iv_netmgr_switches(&m) == 0u, "c10 wired-only does not run txn");
+    chk(m.cfg.mode == IV_NETMGR_MODE_WIRED_ONLY, "c10 cfg.mode updated");
+
+    /* 同值再下发：不动任何东西（平台反复下发同一配置不该拆链路） */
+    chk(iv_netmgr_set_mode(&m, IV_NETMGR_MODE_WIRED_ONLY, 400) == IV_OK,
+        "c10 same mode ok");
+    chk(iv_netmgr_switches(&m) == 0u && (int)iv_netmgr_active_wan(&m) == (int)IV_WAN_WIRED,
+        "c10 same mode does not churn");
+
+    /* ② 2=只用无线 / 3=双链路：都回无线优先 */
+    chk(iv_netmgr_set_mode(&m, IV_NETMGR_MODE_WIRELESS_ONLY, 500) == IV_OK,
+        "c10 -> wireless-only ok");
+    chk((int)iv_netmgr_active_wan(&m) == (int)IV_WAN_WIRELESS,
+        "c10 wireless-only active wireless");
+    chk(iv_netmgr_set_mode(&m, IV_NETMGR_MODE_BOTH, 600) == IV_OK, "c10 -> both ok");
+    chk((int)iv_netmgr_active_wan(&m) == (int)IV_WAN_WIRELESS, "c10 both active wireless");
+
+    /* ③ 无线掉了以后再改回 AUTO：不硬塞，让状态机按 wd 收敛（该跑事务就跑） */
+    feed_n(&m, IV_WAN_WIRELESS, 0, FAIL_N, 700);
+    chk(iv_netmgr_state(&m) == IV_NETMGR_WIRELESS_DEGRADED, "c10 wireless degraded");
+    chk(iv_netmgr_set_mode(&m, IV_NETMGR_MODE_AUTO, 800) == IV_OK, "c10 -> auto ok");
+    chk((int)iv_netmgr_active_wan(&m) == (int)IV_WAN_WIRED,
+        "c10 auto converges to wired (wireless down, wired up)");
+    chk(iv_netmgr_switches(&m) == 1u, "c10 auto convergence ran exactly one txn");
+}
+
 int main(void)
 {
     c01_lifecycle();
@@ -561,6 +625,7 @@ int main(void)
     c07_wired_down_immediate();
     c08_both_down();
     c09_modes();
+    c10_set_mode();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_netmgr FAILED (%d)\n", g_fail);
@@ -568,6 +633,6 @@ int main(void)
     }
     printf("test_netmgr passed (lifecycle/normalize, hysteresis, switch-order+args, "
            "media-resume, txn-rollback+retry-window, hold-s-return, wired-down-immediate, "
-           "both-down-recovery, modes)\n");
+           "both-down-recovery, modes, runtime-set-mode)\n");
     return 0;
 }

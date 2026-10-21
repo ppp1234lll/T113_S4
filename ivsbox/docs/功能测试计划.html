@@ -81,6 +81,7 @@
   ② 每条用例的结果列首次全部填状态（<span class="tag st-p">P</span> 有证据 /
   <span class="tag st-n">未测</span> / <span class="tag st-b">阻塞</span>），不再留空；
   ③ 新增 <b>N 组 · 平台协议指令</b> 11 条——原计划完全没有覆盖平台下行指令，而这是近三天的主要工作面；
+  <b>10-21 18:49 补 N-12</b>（<code>0xF3</code> 传输模式，原来归在 N-09 的"未实现码"里）；
   ④ 新增 §5.15 已闭环缺陷回归记录（板端实测过、但原计划无对应用例的项）；
   ⑤ 新增 §7 计划时间（日历到日）。
 </div>
@@ -356,9 +357,10 @@
     <tr><td class="id">N-06</td><td><code>0xE8</code> 查 PING</td><td>下发 <code>0xE8</code></td><td>返回 <code>st1..st4</code> / <code>dt1..dt4</code></td><td><span class="tag t-a">自动</span></td><td class="res"><span class="tag st-n">未测</span><br><span style="font-size:11px;color:#5b6570">2026-10-21 工装下发 0xE8 -> 0x74，确认未实现</span></td></tr>
     <tr><td class="id">N-07</td><td><code>0xF5</code> 配上报间隔</td><td>下发 <code>0xF5</code> 改间隔</td><td>落配置、回 <code>0x01</code>、<b>下一拍即生效不断链</b></td><td><span class="tag t-a">自动</span></td><td class="res"><span class="tag st-p" title="2026-10-21 工装下发 0xF5 -> ACK 0x01；同一间隔的热生效路径另见 B-05">P</span></td></tr>
     <tr><td class="id">N-08</td><td><code>0xA5</code> 配搜索方式</td><td>下发 <code>0xA5</code> 选探测方式</td><td>转 camdet 并回 <code>0x01</code>；CNS 行为随之变化</td><td><span class="tag t-a">自动</span></td><td class="res"><span class="tag st-p" title="2026-10-21 工装下发 0xA5 -> ACK 0x01（转 camdet set_mode）；CNS 行为变化因无摄像机槽位未能观察">P</span></td></tr>
-    <tr><td class="id">N-09</td><td>未知 / 未实现命令</td><td>逐个下发 <code>F2 F3 F8 FE A3 A4</code> 等未实现码</td><td>回 <code>0x74</code> 并打 WARN 日志（含命令码与载荷长度），<b>不回假成功 <code>0x01</code></b></td><td><span class="tag t-a">自动</span></td><td class="res" title="2026-10-20 22 条实测：E1/E5/E6/E7/E8/F2/F3/F8/A2/A3/A4/A7/A9/BE/FE/BF/B1 等 17 条回 0x74 且日志有 downlink cmd 0x.. not implemented。正是这条 WARN 让 10-21 的 E1 问题 10 秒定位"><span class="tag st-p">P</span></td></tr>
+    <tr><td class="id">N-09</td><td>未知 / 未实现命令</td><td>逐个下发 <code>F2 F8 FE A3 A4</code> 等未实现码</td><td>回 <code>0x74</code> 并打 WARN 日志（含命令码与载荷长度），<b>不回假成功 <code>0x01</code></b></td><td><span class="tag t-a">自动</span></td><td class="res" title="2026-10-20 22 条实测：E1/E5/E6/E7/E8/F2/F3/F8/A2/A3/A4/A7/A9/BE/FE/BF/B1 等 17 条回 0x74 且日志有 downlink cmd 0x.. not implemented。正是这条 WARN 让 10-21 的 E1 问题 10 秒定位。18:49 起 0xF3 已实现（见 N-12），不再属于本条"><span class="tag st-p">P</span></td></tr>
     <tr><td class="id">N-10</td><td><code>0xFF</code> 心跳不自激</td><td>下发 <code>0xFF</code></td><td>只更新链路活性，<b>不回帧</b>；不得出现设备与平台互回的死循环</td><td><span class="tag t-a">自动</span></td><td class="res"><span class="tag st-n">未测</span><br><span style="font-size:11px;color:#5b6570">代码路径已早返回，端到端未抓包确认</span></td></tr>
     <tr><td class="id">N-11</td><td>上报字段序与 <code>CSQ</code></td><td>抓上行帧，逐字段比对</td><td>顺序 <code>DT CNS MN V A APOWER AKW H T P DS RELAY CHV CHA POWER ELEC CSQ</code>；<code>CSQ</code> 只在 4G 取到 0..31 时出；<code>MIU</code> 无源不发</td><td><span class="tag t-a">自动</span></td><td class="res" title="2026-10-19 起板端连续核对，字段序按参考实现收口；见提交 091c859"><span class="tag st-p">P</span></td></tr>
+    <tr><td class="id">N-12</td><td><code>0xF3</code> 配传输模式</td><td>下发 <code>0xF3</code>，载荷 1 字节 1/2/3/4</td><td>回 <code>0x01</code>、落配置、<b>不重启即按新模式选活动网口</b>；越界（<code>0</code>／<code>&gt;4</code>）回 <code>0x74</code>；同值不重复重连</td><td><span class="tag t-a">自动</span></td><td class="res"><span class="tag st-n">未测</span><br><span style="font-size:11px;color:#5b6570">18:49 已实现（原来回 0x74）。网页侧同一路径已端到端验证：改 <code>sys.transport.mode</code> ⇒ 日志 <code>transport mode -&gt; N</code>、进程不重启；平台侧这一条待板端由平台点一次（<code>test_e2e_report</code> 是进程内构造，抓不到 main.c 注册的处理器）</span></td></tr>
   </tbody>
 </table>
 
@@ -374,7 +376,7 @@
     <tr><td>AT 口漂移</td><td><code>AT+CFUN=1,1</code> 后模组重枚举，AT 口从 <code>ttyUSB0</code> 变 <code>ttyUSB1</code></td><td>启动脚本用 <code>IVSBOX_CELL_DEV</code> 覆盖</td><td>板端实测走 <code>/dev/ttyUSB1</code> 可读全部 12 条查询</td><td><span class="tag st-p">已验</span></td></tr>
     <tr><td>E3 <code>mod</code> 空串</td><td>配置 item 指针在 reload 后悬空</td><td><code>2a00afe</code>：<code>g_mod[]</code> static ＋ <code>model_refresh()</code></td><td>板端 <code>E3 reply</code> 恢复 <code>FN_RZTY_PY</code></td><td><span class="tag st-p">已验</span></td></tr>
     <tr><td>E4/E7 只回 ACK</td><td>平台看不到内容</td><td><b>未修</b>：JSON schema 未冻结</td><td>—</td><td><span class="tag st-n">未修</span></td></tr>
-    <tr><td>改配置要重启</td><td><code>sys.transport.mode</code>／<code>probe.*</code>／<code>camera.ch.N.ip</code> 等只在启动读一次</td><td><b>未修</b>：<code>iv_netmgr</code> 无 <code>set_mode()</code>，<code>iv_probe</code> 无 reload 入口</td><td>—</td><td><span class="tag st-n">未修</span></td></tr>
+    <tr><td>改配置要重启</td><td><code>probe.*</code>／<code>camera.ch.N.ip</code> 等只在启动读一次</td><td><b>部分已修</b>：<code>sys.transport.mode</code> 18:49 已补 <code>iv_netmgr_set_mode()</code>＋订阅（含平台 <code>0xF3</code>）；<code>iv_probe</code>／camdet 仍无 reload 入口</td><td>—</td><td><span class="tag st-b">部分</span></td></tr>
   </tbody>
 </table>
 
@@ -444,7 +446,7 @@
     <tr><td><code>0xE4</code>/<code>0xE7</code> 应答 JSON 正文</td><td>schema 未冻结；路由与 ACK 已通</td><td>N-04/N-05 记未测，实现后补测</td></tr>
     <tr><td><code>0xE8</code> 查 PING、<code>F2</code> 配 PING 间隔、<code>F3</code> 配传输模式、<code>F8</code> 配主网检测 IP、<code>FE</code> 配网络延时、<code>A3</code> 设备名、<code>A4</code> 阈值</td><td>未实现，下发回 <code>0x74</code></td><td>登记为 A 类待补；<code>F3</code> 需先补 <code>iv_netmgr_set_mode()</code></td></tr>
     <tr><td>C 类危险指令（<code>F1</code>/<code>F4</code>/<code>F7</code>/<code>D9</code>~<code>DE</code>/<code>C1</code>/<code>C4</code>/<code>A8</code>/<code>F6</code>/<code>F9</code>/<code>FB</code>/<code>AC</code>/<code>A6</code>/<code>B2</code>/<code>B3</code>）</td><td>改平台地址 / 改本机 IP / 重启 / 控电源，误操作会把设备踢下线</td><td>须现场书面同意后单独批次，本轮不测</td></tr>
-    <tr><td><code>sys.transport.mode</code> 热生效</td><td><code>iv_netmgr</code> 无 <code>set_mode()</code>，改配置需重开状态机（会短暂断链）</td><td>登记为已知缺口，待同意断链窗口后实现</td></tr>
+    <tr><td><code>sys.transport.mode</code> 热生效</td><td>已实现（18:49）：<code>iv_netmgr_set_mode()</code> 只重跑一次判定、不新造规则；<code>iv_agent_set_transport_mode()</code> 同值早返回</td><td>网页改配置端到端已验证（进程不重启、日志出现 <code>transport mode -></code>）；平台 <code>0xF3</code> 的链路待板端点一次</td></tr>
     <tr><td><code>probe.*</code> / <code>camera.ch.N.ip</code> / <code>netthr.*</code> / <code>snmp.*</code> 热生效</td><td>只在启动读一次，无订阅者</td><td>同登记；与上一条同批实现</td></tr>
     <tr><td>平台侧 ERR 故障码上报（SD 故障、版本回退）</td><td>码值类型段未与单片机侧冻结</td><td>登记为跨端待定，不判失败</td></tr>
     <tr><td>OTA 量产公钥</td><td>私钥由发布侧产出，当前 fail-closed 拒绝一切包</td><td>量产前必须补，本轮只验拒绝路径</td></tr>
@@ -516,7 +518,7 @@
     <tr><td class="id">A2 / A3 / A4 / A7 / A9 / BE / BF / B1</td><td>摄像机账号 / 设备名 / 阈值 / 485 / ONVIF / SNMP OID / 网络传输电源 / 校时</td><td>ACK <code>0x74</code></td><td><span class="tag st-b">未实现</span> 其中 <code>B1</code> 在参考实现里是“故意不回 ACK”，行为不同但同样不产生副作用</td></tr>
   </tbody>
 </table>
-<p>合计：<b>5 条回 <code>0x01</code></b>（E2/E4/F5/A5 及 E1/E3 的 JSON）、<b>17 条回 <code>0x74</code></b>，与 §5.14 N 组的判定一致；每条 <code>0x74</code> 在日志里都有对应 <code>downlink cmd 0x.. not implemented</code> 的 WARN，可追溯。</p>
+<p>合计：<b>6 条回 <code>0x01</code></b>（E2/E4/F5/A5 及 E1/E3 的 JSON，<b>18:49 起 <code>0xF3</code> 也在内</b>）、<b>16 条回 <code>0x74</code></b>，与 §5.14 N 组的判定一致；每条 <code>0x74</code> 在日志里都有对应 <code>downlink cmd 0x.. not implemented</code> 的 WARN，可追溯。</p>
 
 <h3>9.4 Web 接口（经 VM 中转 <code>8080</code> → 板端 <code>80</code>）</h3>
 <table>

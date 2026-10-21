@@ -586,6 +586,17 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
          * 不断链、不清队列。 */
         if (iv_config_get_int(g_cfg, "sys.sample.period_ms", &v) == IV_OK && v > 0)
             (void)iv_report_set_poll_period(&g_agent.rp, (uint32_t)v);
+        /* 传输模式：原先只在 agent_setup() 读一次、交给 iv_agent_open() 定初始
+         * 活动口，之后**必须重启主控**才生效（D 类"改配置不生效"清单里的一条）。
+         * 这里补上订阅；iv_agent_set_transport_mode() 内部对同值早返回，
+         * 所以改上报间隔/采集周期不会顺带把平台链路拆一次。 */
+        if (iv_config_get_int(g_cfg, "sys.transport.mode", &v) == IV_OK) {
+            int mrc = iv_agent_set_transport_mode(&g_agent, (iv_netmgr_mode_t)v,
+                                                  iv_clock_monotonic_ms());
+
+            if (mrc != IV_OK)
+                IV_LOG_W(APP_MOD, "transport mode %d not applied (%d)", (int)v, mrc);
+        }
     }
 }
 
@@ -1236,6 +1247,66 @@ static void on_plat_report_intv(const iv_proto_frame_t *f, void *arg)
     (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
 }
 
+/* ---------------------------------------------------------------------------
+ * 平台下行 0xF3「配置传输模式」
+ *
+ * 载荷 1 字节：1=有线 2=无线 3=有线+无线 4=自动选择（与 iv_netmgr_mode_t 同值）。
+ * 参考实现存进 local->server_mode 后回 0x01；我们多一步"立刻生效" —— 原先这个键
+ * 只在启动时读一次，改了要重启，那等于平台点了个没反应的按钮。
+ *
+ * 生效会**拆一次现有平台连接**（活动出口换了就得按新出口重连，见
+ * iv_agent_set_transport_mode 的说明），所以同值下发直接回 0x01、不重复落盘、
+ * 不重复重连。
+ * ------------------------------------------------------------------------- */
+static void on_plat_mode(const iv_proto_frame_t *f, void *arg)
+{
+    int64_t cur = 0;
+    int     mode;
+    int     rc;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+
+    if (f->len < 1u) {
+        IV_LOG_W(APP_MOD, "0xF3 payload empty (0 bytes), ack 0x74");
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    mode = (int)f->data[0];
+    if (mode < (int)IV_NETMGR_MODE_WIRED_ONLY || mode > (int)IV_NETMGR_MODE_AUTO) {
+        /* 参考实现对非法 mode 也是 0x74；这里同样不猜"你是不是想设自动" */
+        IV_LOG_W(APP_MOD, "0xF3 mode=%d out of range (1..4), ack 0x74", mode);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    if (iv_config_get_int(g_cfg, "sys.transport.mode", &cur) == IV_OK &&
+        cur == (int64_t)mode) {
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+
+    rc = iv_config_set_int(g_cfg, "sys.transport.mode", (int64_t)mode);
+    if (rc != IV_OK) {
+        IV_LOG_W(APP_MOD, "0xF3 mode=%d rejected by config layer (%d), ack 0x74",
+                 mode, rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    /* 先让新模式在运行期生效，再落盘（落盘失败只影响下次启动）。
+     * 配置层保存后还会通知 on_cfg_committed(SYS) 再调一次 —— 同值早返回，不会抖。 */
+    rc = iv_agent_set_transport_mode(&g_agent, (iv_netmgr_mode_t)mode,
+                                     iv_clock_monotonic_ms());
+    {
+        int save_rc = iv_config_save(g_cfg, NULL, 0);
+
+        IV_LOG_I(APP_MOD, "platform set transport mode -> %d (apply rc=%d, save rc=%d)",
+                 mode, rc, save_rc);
+    }
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd,
+                       (rc == IV_OK) ? IV_PROTO_ACK_OK : IV_PROTO_ERR_EXEC);
+}
+
 static int agent_setup(void)
 {
     iv_agent_cfg_t ac;
@@ -1409,6 +1480,9 @@ static int agent_setup(void)
      * 在 iv_report_open 内部注册；这条要写配置，只有装配层够得着 g_cfg。 */
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_REPORT_INTV,
                          on_plat_report_intv, NULL);
+    /* 平台下行 0xF3「配置传输模式」：同样要写配置 ＋ 立刻生效，
+     * 只有装配层够得着 g_cfg 与 agent 句柄（2026-10-21 补）。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_MODE, on_plat_mode, NULL);
     return 0;
 }
 

@@ -137,6 +137,25 @@ int iv_netmgr_open(iv_netmgr_t *m, const iv_netmgr_cfg_t *cfg, uint64_t now_ms);
  * 并**立即跑一次状态推进**（可能触发切换事务）。返回值恒为 IV_OK（喂结论本身不失败）。 */
 int iv_netmgr_note_probe(iv_netmgr_t *m, iv_wan_t wan, int ok, uint64_t now_ms);
 
+/* 运行期改传输模式（`sys.transport.mode` 的热生效入口）。
+ *
+ * 为什么需要：这个键原先只在 `iv_agent_open()` 里读一次（`main.c` 的
+ * `agent_setup()`），网页或平台改了以后**必须重启进程**才生效 —— 与当年
+ * `sys.report.interval_s` 那个"改了等于没改"是同一类坑。
+ *
+ * 语义：只改 `cfg.mode` 并**立刻跑一次 `evaluate()`**，与 open 之后第一次 tick
+ * 走的是同一条判定路径：
+ *   - 1(WIRED_ONLY)   ⇒ 活动口强制有线；
+ *   - 2(WIRELESS_ONLY)/3(BOTH) ⇒ 活动口强制无线（"无线优先"）；
+ *   - 4(AUTO)         ⇒ 跑完整迟滞状态机（按当前 wan_up 判定，不另立规则）。
+ * 这里**不新造**"换到哪条更好"的判断 —— 那属于探活迟滞的职责，越过它拍板等于
+ * 把状态机的结论覆盖掉。活动 WAN 真的变了以后，装配层还要把 `iv_report` 的
+ * 出口绑定与目标地址一起刷新（见 `iv_agent_set_transport_mode()`），
+ * 那一刷会**拆掉一次现有 TCP 连接**。
+ *
+ * 未 open 返回 IV_ESTATE；模式越界返回 IV_EINVAL；与现值相同直接 IV_OK（不抖）。 */
+int iv_netmgr_set_mode(iv_netmgr_t *m, iv_netmgr_mode_t mode, uint64_t now_ms);
+
 /* 周期性驱动：处理 hold_s 回切、稳定期后恢复媒体、事务失败重试窗口。
  * 建议由 Reactor timer（1 s 级）调用。 */
 int iv_netmgr_tick(iv_netmgr_t *m, uint64_t now_ms);

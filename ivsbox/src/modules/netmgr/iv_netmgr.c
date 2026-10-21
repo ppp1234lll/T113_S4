@@ -364,6 +364,30 @@ int iv_netmgr_note_probe(iv_netmgr_t *m, iv_wan_t wan, int ok, uint64_t now_ms)
     return IV_OK;
 }
 
+int iv_netmgr_set_mode(iv_netmgr_t *m, iv_netmgr_mode_t mode, uint64_t now_ms)
+{
+    if (m == NULL) {
+        return IV_EINVAL;
+    }
+    if ((int)mode < (int)IV_NETMGR_MODE_WIRED_ONLY || (int)mode > (int)IV_NETMGR_MODE_AUTO) {
+        return IV_EINVAL;
+    }
+    if (!m->opened) {
+        return IV_ESTATE;
+    }
+    if (m->cfg.mode == mode) {
+        return IV_OK; /* 同值不抖：平台反复下发同一配置不该把链路拆一次 */
+    }
+
+    m->cfg.mode = mode;
+
+    /* 只重跑判定，不新造"该换哪条"的规则：模式 1/2/3 的分支由 evaluate() 直接
+     * 写活动口，模式 4 才跑迟滞状态机。这与 open 之后第一次 tick 完全同一条路径，
+     * 所以"开机时按模式几选哪条"和"运行期改成模式几"不会给出两个答案。 */
+    evaluate(m, now_ms);
+    return IV_OK;
+}
+
 int iv_netmgr_tick(iv_netmgr_t *m, uint64_t now_ms)
 {
     if (m == NULL || !m->opened) {

@@ -1295,6 +1295,45 @@ int iv_agent_reload_server(iv_agent_t *a)
     return iv_report_reconnect(&a->rp, iv_clock_monotonic_ms());
 }
 
+int iv_agent_set_transport_mode(iv_agent_t *a, iv_netmgr_mode_t mode, uint64_t now_ms)
+{
+    int       rc;
+    iv_wan_t  before;
+    iv_netmgr_mode_t cur;
+
+    if (a == NULL) {
+        return IV_EINVAL;
+    }
+    if (!a->opened) {
+        return IV_ESTATE;
+    }
+
+    /* **同值必须早返回、且连 reload 都不做**：`on_cfg_committed(SYS)` 在 SYS 类
+     * 任何一个键变化时都会调本函数（改上报间隔、改采集周期……）。要是在这里无条件
+     * 往下走，改个上报间隔就会把平台链路拆一次 —— 那是比"模式不生效"更难受的坑。 */
+    cur = (a->cfg.mode == 0) ? IV_NETMGR_MODE_AUTO : a->cfg.mode;
+    if (cur == mode) {
+        return IV_OK;
+    }
+
+    before = iv_netmgr_active_wan(&a->nm);
+    rc = iv_netmgr_set_mode(&a->nm, mode, now_ms);
+    if (rc != IV_OK) {
+        /* 越界模式如实返回，不悄悄当成 AUTO —— 平台侧要知道自己发错了 */
+        IV_LOG_W(AG_MOD, "transport mode %d rejected (%d)", (int)mode, rc);
+        return rc;
+    }
+    a->cfg.mode = mode;
+
+    IV_LOG_I(AG_MOD, "transport mode -> %d (active wan %d -> %d)", (int)mode,
+             (int)before, (int)iv_netmgr_active_wan(&a->nm));
+
+    /* 活动出口可能变了：目标地址与出口绑定必须**成对**刷新。没变也走一次
+     * reload_server —— 它按活动口重取地址，代价只是重连几秒；而漏刷一次的
+     * 后果是"报文从旧网卡出去"，在板上表现为平台一直等不到设备，极难查。 */
+    return iv_agent_reload_server(a);
+}
+
 uint64_t iv_agent_netmgr_switches(const iv_agent_t *a)
 {
     return (a != NULL) ? iv_netmgr_switches(&a->nm) : 0u;

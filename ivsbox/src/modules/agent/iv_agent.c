@@ -187,6 +187,8 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
      * 不能用带 `+g<短哈希>` 的工程串 —— 那一截会把日期格子污染成不可读的串。 */
     rc.sv           = (cfg->sv != NULL) ? cfg->sv : iv_version_sysver();
     rc.tsn          = cfg->tsn;
+    rc.on_query_cfg     = cfg->on_query_cfg;
+    rc.on_query_cfg_arg = cfg->on_query_cfg_arg;
     rc.devid        = cfg->devid;
     rc.devtype      = cfg->devtype;
     rc.report_ms    = cfg->report_ms;

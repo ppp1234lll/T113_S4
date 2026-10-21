@@ -222,6 +222,12 @@ typedef struct {
     const char *mod;         /* 硬件型号串（E3 应答）；NULL → "" */
     const char *sv;          /* 软件版本串（E3 应答）；NULL → 由本层填 iv_version */
     const char *tsn;         /* 终端序列号（E3 应答）；NULL → "" */
+
+    /* 平台 0xE1（查询设备当前参数设置）的 `data` 段：契约见
+     * `iv_report_cfg_t::on_query_cfg`。本层只把它透传给 report。
+     * NULL ⇒ 0xE1 回 0x74（"未实现"），不发半份配置。 */
+    int (*on_query_cfg)(char *out, size_t cap, void *arg);
+    void *on_query_cfg_arg;
     uint32_t    devid;       /* 设备标识（TID） */
     uint16_t    devtype;     /* 0 → 默认 0x0400 */
     uint32_t    report_ms;   /* 周期上报间隔；0 → 默认 300 s */

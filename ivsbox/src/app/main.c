@@ -481,6 +481,25 @@ static const char *cfg_str(const char *key)
     return s;
 }
 
+/* 硬件型号（E3 应答 `mod`）的**值拷贝**。
+ *
+ * 2026-10-21 板端实测踩到：原先直接存 `cfg_str("sys.device.model")` 返回的指针，
+ * 而那是配置模块 item 数组内部的定长缓冲。`config.apply` 会触发 inotify reload，
+ * reload 时 item 数组被重建/清零 ⇒ 那根指针指向的条目没了 ⇒ E3 的 `mod` 变空串。
+ * `net.server.*` 有 `on_cfg_committed()` 在配置事件里重新取值所以能自愈，
+ * `mod` 没有订阅者，就一直空着。
+ *
+ * 改法：固定指向本文件的 static 缓冲，配置事件里**原地改写内容**（指针不变）
+ * ⇒ 既保住"网页改完下一帧就生效"，又永不悬空。 */
+static char g_mod[IV_REPORT_MOD_MAX + 1u];
+
+static void model_refresh(void)
+{
+    const char *s = cfg_str("sys.device.model");
+
+    (void)snprintf(g_mod, sizeof(g_mod), "%s", (s != NULL) ? s : "");
+}
+
 /* 配置里的端口：未配/越界 → 0（0 ＝ 该条地址无效） */
 static uint16_t cfg_port(const char *key)
 {
@@ -557,6 +576,9 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
          * （必须重启进程）—— 现场"设了 5 分钟、平台上还是十分钟一条"正是这个。 */
         int64_t v = 0;
 
+        /* 硬件型号（E3 的 `mod`）同理：它存的是本文件的 static 缓冲，这里必须
+         * 重新读一次，否则网页改完要重启才生效。 */
+        model_refresh();
         if (iv_config_get_int(g_cfg, "sys.report.interval_s", &v) == IV_OK && v > 0)
             (void)iv_report_set_report_period(&g_agent.rp, (uint32_t)v * 1000u);
     }
@@ -802,6 +824,247 @@ static void local_link_info(const char *ifname, uint32_t *ip_be, uint8_t mac[6])
         }
     }
     freeifaddrs(head);
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台 0xE1（查询设备当前参数设置）的 `data` 段
+ * ---------------------------------------------------------------------------
+ * 参考实现 `com.c:com_query_configuration_function()` 有 30 余个键，这里只送
+ * **我们真有的**：配置键、芯片序列号、4G 快照、eth0 实取地址。
+ * 本板没有对应外设/数据的（风扇温湿度 `ft`/`fh`、网络延时 `pt`、加热与漏电阈值、
+ * 网络电源次数 `lannum`/`lantime`）一律送 0 —— 不编造，但**键一个都不能少**：
+ * 平台是按 key 取的，缺键和值为 0 在界面上是两种表现。
+ * 所有值都是**字符串**，与参考实现 `my_cjson_join_string_function()` 一致
+ * （`"rt":"180,0,0"` 而不是 `"rt":180`）。
+ * ------------------------------------------------------------------------- */
+
+/* "host:port" —— 任一半缺失就整条空串（参考实现 sprintf("%s:%d") 会出 ":0"，
+ * 平台会把它当合法地址显示，比空串更误导）。 */
+static const char *endpoint_of(const char *hk, const char *pk,
+                               char *out, size_t cap)
+{
+    const char *h = cfg_str(hk);
+    uint16_t    p = cfg_port(pk);
+
+    if (h == NULL || p == 0u) {
+        out[0] = '\0';
+        return out;
+    }
+    (void)snprintf(out, cap, "%s:%u", h, (unsigned)p);
+    return out;
+}
+
+/* 网口的 IPv4 / 掩码 / MAC ＋ 默认网关。
+ * 网关从 `/proc/net/route` 取：Destination=00000000 且 Iface 匹配的那条。
+ * ⚠ 该文件打印的是 `s_addr` 的**内存值**（小端），`strtoul` 的结果直接赋给
+ * `s_addr` 即可，不要再 `htonl`。 */
+static void if_facts(const char *ifname, char ip[20], char mask[20],
+                     char gw[20], char mac[20])
+{
+    struct ifaddrs *head = NULL;
+    struct ifaddrs *ifa;
+    FILE           *fp;
+
+    ip[0] = mask[0] = gw[0] = mac[0] = '\0';
+    if (ifname == NULL || ifname[0] == '\0')
+        return;
+
+    if (getifaddrs(&head) == 0) {
+        for (ifa = head; ifa != NULL; ifa = ifa->ifa_next) {
+            const struct sockaddr *sa = ifa->ifa_addr;
+
+            if (sa == NULL || strcmp(ifa->ifa_name, ifname) != 0)
+                continue;
+            if (sa->sa_family == AF_INET) {
+                const struct sockaddr_in *in =
+                    (const struct sockaddr_in *)(const void *)sa;
+
+                if (ip[0] == '\0')
+                    (void)inet_ntop(AF_INET, &in->sin_addr, ip, 20);
+                if (ifa->ifa_netmask != NULL)
+                    (void)inet_ntop(AF_INET,
+                                    &((const struct sockaddr_in *)
+                                          (const void *)ifa->ifa_netmask)->sin_addr,
+                                    mask, 20);
+            } else if (sa->sa_family == AF_PACKET) {
+                const struct sockaddr_ll *sll =
+                    (const struct sockaddr_ll *)(const void *)sa;
+
+                if (sll->sll_halen == 6u)
+                    (void)snprintf(mac, 20, "%02x:%02x:%02x:%02x:%02x:%02x",
+                                   sll->sll_addr[0], sll->sll_addr[1],
+                                   sll->sll_addr[2], sll->sll_addr[3],
+                                   sll->sll_addr[4], sll->sll_addr[5]);
+            }
+        }
+        freeifaddrs(head);
+    }
+
+    fp = fopen("/proc/net/route", "r");
+    if (fp != NULL) {
+        char line[256];
+
+        (void)fgets(line, sizeof(line), fp); /* 表头 */
+        while (fgets(line, sizeof(line), fp) != NULL) {
+            char          name[32];
+            char          dest[16];
+            char          gate[16];
+            unsigned long flags = 0ul;
+
+            if (sscanf(line, "%31s %15s %15s %lx", name, dest, gate, &flags) != 4)
+                continue;
+            if (strcmp(name, ifname) != 0)
+                continue;
+            if (strtoul(dest, NULL, 16) != 0ul)
+                continue;
+            if (strtoul(gate, NULL, 16) == 0ul)
+                continue;
+            {
+                struct in_addr a;
+
+                a.s_addr = (uint32_t)strtoul(gate, NULL, 16);
+                (void)inet_ntop(AF_INET, &a, gw, 20);
+            }
+            break;
+        }
+        (void)fclose(fp);
+    }
+}
+
+struct cfg_json {
+    char  *p;
+    size_t cap;
+    size_t n;
+    int    ovf;
+};
+
+static void cj_str(struct cfg_json *j, const char *key, const char *val)
+{
+    int w;
+
+    if (j->ovf)
+        return;
+    w = snprintf(j->p + j->n, j->cap - j->n, "%s\"%s\":\"%s\"",
+                 (j->n > 0u) ? "," : "", key, (val != NULL) ? val : "");
+    if (w < 0 || (size_t)w >= j->cap - j->n) {
+        j->ovf = 1;
+        return;
+    }
+    j->n += (size_t)w;
+}
+
+static void cj_int(struct cfg_json *j, const char *key, long long v)
+{
+    char b[24];
+
+    (void)snprintf(b, sizeof(b), "%lld", v);
+    cj_str(j, key, b);
+}
+
+static int query_cfg_json(char *out, size_t cap, void *arg)
+{
+    struct cfg_json       j;
+    const iv_cell_snap_t *cs;
+    char                  ep[96];
+    char                  ip[20];
+    char                  mask[20];
+    char                  gw[20];
+    char                  mac[20];
+    char                  key[40];
+    char                  pair[96];
+    const char           *t1;
+    const char           *t2;
+    int64_t               v = 0;
+    int                   i;
+
+    (void)arg;
+    if (out == NULL || cap == 0u)
+        return IV_EINVAL;
+    j.p = out;
+    j.cap = cap;
+    j.n = 0u;
+    j.ovf = 0;
+
+    cs = &g_agent.cell.snap;
+    /* 参考实现的 `local->ip/nm/gw` 是 lwIP 的**本机网卡**（有线口），对应本板 eth0。 */
+    if_facts("eth0", ip, mask, gw, mac);
+
+    cj_str(&j, "tn", ""); /* 本板无"设备名称"配置项，宁缺不编 */
+    cj_str(&j, "tsn", g_tsn);
+    cj_str(&j, "isi", endpoint_of("net.server.wired.host",
+                                  "net.server.wired.port", ep, sizeof(ep)));
+    cj_str(&j, "osi", endpoint_of("net.server.wireless.host",
+                                  "net.server.wireless.port", ep, sizeof(ep)));
+    cj_str(&j, "usi", endpoint_of("net.server.upgrade.host",
+                                  "net.server.upgrade.port", ep, sizeof(ep)));
+    cj_str(&j, "iccid", cs->iccid);
+    /* IV_CELL 只读 ICCID/IMSI，没有 IMEI —— 不拿 IMSI 冒充。 */
+    cj_str(&j, "imei", "");
+    /* 信号：参考实现送 +CSQ 原始值 0..31；未知（99/未读）送 -1，别送 0
+     * （0 是合法的"极弱信号"，和"没读到时"是两件事）。 */
+    cj_int(&j, "dbm", (cs->csq >= 0 && cs->csq <= 31) ? (long long)cs->csq : -1);
+
+    if (iv_config_get_int(g_cfg, "sys.transport.mode", &v) != IV_OK)
+        v = 0;
+    cj_int(&j, "tm", (long long)v);
+    cj_str(&j, "mac", mac);
+    cj_str(&j, "ip", ip);
+    cj_str(&j, "nm", mask);
+    cj_str(&j, "gw", gw);
+
+    /* 主网检测 IP：参考实现是 "主,副" 两个 IPv4。
+     * 两个都没配时**给空串**，不能发孤零零的 `","` —— 平台会把它当"两个空 IP"
+     * 显示成一行空白，比空串更容易被误判成"设备回了但内容坏了"。 */
+    t1 = cfg_str("probe.target1");
+    t2 = cfg_str("probe.target2");
+    if (t1 == NULL && t2 == NULL) {
+        cj_str(&j, "mip", "");
+    } else {
+        (void)snprintf(pair, sizeof(pair), "%s,%s",
+                       (t1 != NULL) ? t1 : "", (t2 != NULL) ? t2 : "");
+        cj_str(&j, "mip", pair);
+    }
+
+    /* 上报间隔：参考实现发 "秒,0,0"（后两档是给多段间隔预留的） */
+    if (iv_config_get_int(g_cfg, "sys.report.interval_s", &v) != IV_OK || v < 0)
+        v = 0;
+    (void)snprintf(pair, sizeof(pair), "%lld,0,0", (long long)v);
+    cj_str(&j, "rt", pair);
+
+    /* ping 每轮间隔 / 每个设备间隔：对应我们的探测周期与单次超时（毫秒 → 秒） */
+    if (iv_config_get_int(g_cfg, "probe.interval_ms", &v) != IV_OK)
+        v = 0;
+    cj_int(&j, "pl", (long long)(v / 1000));
+    if (iv_config_get_int(g_cfg, "probe.timeout_ms", &v) != IV_OK)
+        v = 0;
+    cj_int(&j, "pn", (long long)(v / 1000));
+
+    /* 风扇温湿度 / 网络延时：本板无风扇、无该配置项 ⇒ 0，不编 */
+    cj_str(&j, "ft", "0,0");
+    cj_str(&j, "fh", "0,0");
+    cj_int(&j, "pt", 0);
+
+    /* 六路摄像机 IP（c1..c6） */
+    for (i = 0; i < IV_REPORT_CNS_N; i++) {
+        const char *camip = NULL;
+
+        (void)snprintf(key, sizeof(key), "camera.ch.%d.ip", i);
+        if (iv_config_get_str(g_cfg, key, &camip) != IV_OK || camip == NULL)
+            camip = "";
+        (void)snprintf(key, sizeof(key), "c%d", i + 1);
+        cj_str(&j, key, camip);
+    }
+
+    /* 电压/电流/漏电/倾斜阈值与网络电源次数：本板无对应采集 ⇒ 0 */
+    cj_int(&j, "ov", 0);
+    cj_int(&j, "uv", 0);
+    cj_int(&j, "oc", 0);
+    cj_int(&j, "angle", 0);
+    cj_int(&j, "miu", 0);
+    cj_int(&j, "lannum", 0);
+    cj_int(&j, "lantime", 0);
+
+    return j.ovf ? IV_ERANGE : (int)j.n;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1097,11 +1360,18 @@ static int agent_setup(void)
     }
 
     /* 硬件型号（E3 应答 `mod`）：配置键 `sys.device.model`，Web 配置页可改
-     * （用户 2026-10-20 明确要求）。这里只存**指针**：配置的字符串存在定长缓冲里、
-     * 原地改写，所以网页改完下一帧 E3 应答就是新值，不用重启 —— 与 `net.server.*`
-     * 那种"open 时拷贝副本"的做法刻意不同。
-     * 取不到（键被删/空串）就送 NULL，E3 里落成空串，平台显示为空而不是假型号。 */
-    ac.mod = cfg_str("sys.device.model");
+     * （用户 2026-10-20 明确要求）。
+     * **送的是本文件 static 缓冲的地址，不是配置内部指针** —— 原因见
+     * `model_refresh()` 上方注释（存指针会在配置 reload 后变空串）。
+     * 缓冲内容由 `model_refresh()` 在启动时与每次 SYS 类配置提交后原地改写，
+     * 所以网页改完下一帧 E3 应答就是新值，不用重启。 */
+    model_refresh();
+    ac.mod = g_mod;
+
+    /* 平台 0xE1（查询设备当前参数设置）：data 段由本层拼（配置键、4G 快照、
+     * eth0 实取地址都在这里），report 层只管 JSON 外壳与发送。 */
+    ac.on_query_cfg     = query_cfg_json;
+    ac.on_query_cfg_arg = NULL;
 
     /* 终端序列号（E3 应答 `tsn`）：芯片唯一号，**不派生自 devid** —— 见
      * iv_provision.h 里 iv_prov_tsn() 的说明。读不到就空串（宁缺勿编）。 */

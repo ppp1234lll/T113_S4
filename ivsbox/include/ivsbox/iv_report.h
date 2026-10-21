@@ -136,6 +136,11 @@ extern "C" {
  * 参考实现的型号串是编译期常量（"FN-YJTY-PY-8"，12 字符），31 已经够宽。 */
 #define IV_REPORT_MOD_MAX 31
 
+/* 平台 0xE1（查询设备当前参数设置）`data` 段的上限。
+ * 参考实现的 E1 应答有 30 余个键、约 420 B；整个 JSON 要装进一个 `##` 帧
+ * （数据段上限 1024）⇒ 外壳约 150 B ＋ 本段，768 留足余量。 */
+#define IV_REPORT_CFG_PAIRS_MAX 768u
+
 /* ---------------------------------------------------------------------------
  * 外部注入的"非采集板"事实（本层不自己探测，由装配层填）
  * ------------------------------------------------------------------------- */
@@ -168,6 +173,14 @@ typedef struct {
     const char *sv;           /* 软件版本串（E3 应答 `sysver`）；NULL → ""（本层不兜底，
                                * 由装配层填 iv_version_sysver()，见 iv_version.h 的分工） */
     const char *tsn;          /* 终端序列号（E3 应答 `tsn`，12 位 HEX）；NULL → "" */
+
+    /* 平台 0xE1（查询设备当前参数设置）的 `data` 段：由**装配层**拼 ——
+     * 配置键、4G 快照、eth0 实取地址都只在装配层手上，本层拿不到。
+     * 契约：写出 `"k":"v","k2":"v2"`（**不带尾逗号**），返回写入字节数；<0 ⇒ E1 回 0x74。
+     * NULL ⇒ 0xE1 一律回 0x74（宁缺勿编：宁可让平台看到"未实现"，
+     * 也不回一份假配置让它以为查询成功了）。 */
+    int (*on_query_cfg)(char *out, size_t cap, void *arg);
+    void             *on_query_cfg_arg;
 
     /* 箱门开启事件（S4.5）：`0xC1` 到达时回调（M4 阶段装配层只记日志；
      * 抓图本体属 M6-S6.2）。NULL = 不通知。详见文件头"已知取舍"。 */
@@ -400,6 +413,25 @@ uint8_t iv_report_query_crc(uint16_t devtype, uint32_t devid, uint8_t cmd);
 int iv_report_build_query_json(uint16_t devtype, uint32_t devid,
                                const char *qn, const char *mod, const char *sv,
                                const char *tsn, char *out, size_t cap);
+
+/* 平台 0xE1（查询设备当前参数设置）应答的 JSON 外壳。
+ *
+ * 形如（**照抄** `com.c:com_query_configuration_function()` 的层级）：
+ *
+ *   ##{"code":0,"data":{"ver":"11","devtype":"0400","qn":"<qn>","tid":"b2cc1",
+ *        "cmd":"E1",<pairs>,"crc":"xx"}}##
+ *
+ * ⚠ 两处与 E3 **刻意不同**，别"统一"：
+ *   ① E1 的 `qn` 在 `data` **里面**，E3 的在顶层；
+ *   ② E1 没有 `type`/`sv` 别名（参考实现 E1 只发主名）。
+ *
+ * `pairs` 由调用方提供（装配层手上的配置/4G/网卡事实），写 `"k":"v",...` 不带尾逗号；
+ * `pairs == NULL` 或返回负值 ⇒ 返回 IV_EROFS 以外的负值，由 handler 回 0x74。
+ * 返回写入长度或负的错误码。
+ */
+int iv_report_build_cfg_json(uint16_t devtype, uint32_t devid, const char *qn,
+                             int (*pairs)(char *out, size_t cap, void *arg),
+                             void *pairs_arg, char *out, size_t cap);
 
 /* ---------------------------------------------------------------------------
  * 只读读数

@@ -33,6 +33,7 @@ VER = 0x11
 DEVTYPE = 0x0400
 TID = 0x0B2CC1
 DEBUG = False          # 由外层用 --tid 覆盖；仅下行帧会被设备校验
+DUMP = False           # --dump：把文本/JSON 应答整条打出来（核对字段用）
 
 
 def crc8(data):
@@ -179,6 +180,10 @@ def summarize(fr):
     d = fr["data"]
     if fr["kind"] == "bin" and fr["len"] == 1:
         return "ACK 0x%02X" % d[0]
+    if DUMP and fr["kind"] == "txt":
+        # 整条原文：核对字段值与顺序时唯一可靠的依据
+        # （设备侧日志的 `E1 reply:` 会被日志层截断，短应答看不全）。
+        return "JSON %dB %s" % (fr["len"], d.decode("utf-8", "replace"))
     try:
         txt = d.decode("utf-8", "replace")
     except Exception:
@@ -204,10 +209,14 @@ def main():
     ap.add_argument("--pause", action="store_true", help="危险命令前等回车")
     ap.add_argument("--debug", action="store_true", help="打印原始收包")
     ap.add_argument("--debug2", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--dump", action="store_true",
+                    help="把文本/JSON 应答整条打印（核对字段值与顺序）")
     a = ap.parse_args()
 
     global DEBUG
     DEBUG = a.debug
+    global DUMP
+    DUMP = a.dump
 
     tid = a.tid
 

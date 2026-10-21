@@ -71,6 +71,27 @@ static void fill_mirror(iv_status_t *st)
     st->valid.ELEC = 1;
 }
 
+/* 0xE1 `data` 段的假回调：只验外壳拼接，字段内容由装配层负责。
+ * 契约＝写 `"k":"v",...` **不带尾逗号**，返回字节数。 */
+static int fake_pairs(char *out, size_t cap, void *arg)
+{
+    int n;
+
+    (void)arg;
+    n = snprintf(out, cap, "\"tn\":\"\",\"tsn\":\"934072007C00\",\"rt\":\"180,0,0\"");
+    if (n < 0 || (size_t)n >= cap)
+        return -1;
+    return n;
+}
+
+static int bad_pairs(char *out, size_t cap, void *arg)
+{
+    (void)out;
+    (void)cap;
+    (void)arg;
+    return -1;
+}
+
 int main(void)
 {
     char seg[IV_REPORT_SEG_MAX + 1u];
@@ -360,6 +381,8 @@ int main(void)
         cfg.mod         = "M";
         cfg.sv          = "S";
         cfg.tsn         = "T";
+        cfg.on_query_cfg     = fake_pairs;
+        cfg.on_query_cfg_arg = NULL;
 
         chk(iv_report_open(&rp, &cfg, NULL, 0u) == IV_OK, "c09 open ok");
         chk(strcmp(iv_transport_bind_if(&rp.tr), "lo") == 0,
@@ -370,6 +393,10 @@ int main(void)
                 rp.cfg.sv != NULL && strcmp(rp.cfg.sv, "S") == 0 &&
                 rp.cfg.tsn != NULL && strcmp(rp.cfg.tsn, "T") == 0,
             "c09 mod/sv/tsn survive open (field-by-field copy)");
+        /* 0xE1 的 data 段回调走同一条"逐字段收口"：漏一行 ⇒ 平台点「查询设备配置」
+         * 永远收到 0x74，而设备侧看起来一切正常（route 注册了、日志也不报错）。 */
+        chk(rp.cfg.on_query_cfg == fake_pairs && rp.cfg.on_query_cfg_arg == NULL,
+            "c09 on_query_cfg survives open (0xE1 data provider)");
 
         /* 运行期换出口（netmgr 切换 WAN 走这条）：换完传输层要跟着变 */
         chk(iv_report_set_bind_if(&rp, "eth0") == IV_OK, "c09 set_bind_if ok");
@@ -506,9 +533,66 @@ int main(void)
             "c13 null sec rejected");
     }
 
+    /* ---- 14) 平台 0xE1 应答 JSON 外壳（查询设备当前参数设置）----
+     * 与 E3 的两处**刻意的不同**，这里逐条锁死（改"统一"就会让平台读不到）：
+     *   ① `qn` 在 `data` 里面（E3 在顶层）；
+     *   ② 没有 `type`/`sv` 别名（参考实现 E1 只发主名）。
+     * 为什么值得单测：0xE1 长期未注册，平台点「查询设备配置」收 0x74 显示失败；
+     * 补上后若把层级抄错，平台变成"收到了但解析不出 qn"，症状一样是失败。 */
+    {
+        const char *want =
+            "{\"code\":0,\"data\":{"
+            "\"ver\":\"11\",\"devtype\":\"0400\",\"qn\":\"20210121143412008\","
+            "\"tid\":\"101\",\"cmd\":\"E1\","
+            "\"tn\":\"\",\"tsn\":\"934072007C00\",\"rt\":\"180,0,0\","
+            "\"crc\":\"08\"}}";
+        char json[IV_REPORT_CFG_PAIRS_MAX + 256u];
+        int  n;
+
+        n = iv_report_build_cfg_json(0x0400u, 0x101u, "20210121143412008",
+                                     fake_pairs, NULL, json, sizeof(json));
+        chk(n > 0 && (size_t)n == strlen(want), "c14 json length");
+        chk(strcmp(json, want) == 0, "c14 json golden");
+        if (strcmp(json, want) != 0)
+            fprintf(stderr, "  got : %s\n  want: %s\n", json, want);
+
+        /* qn 必须在 data 里面：`"data":{...,"qn":` 出现，且顶层没有裸 `"qn":` */
+        {
+            const char *dq = strstr(json, "\"data\":{\"ver\"");
+
+            chk(dq != NULL, "c14 data object first");
+            chk(dq != NULL && strstr(dq, "\"qn\":") != NULL,
+                "c14 qn lives inside data");
+            chk(strstr(json, "\"type\":") == NULL, "c14 no type alias (unlike E3)");
+            chk(strstr(json, "\"sv\":") == NULL, "c14 no sv alias (unlike E3)");
+        }
+
+        /* crc 必须按 E1 算，不能沿用 E3 的（两者只差末位的 cmd，最容易复制粘贴错） */
+        chk(iv_report_query_crc(0x0400u, 0x101u, 0xE1u) !=
+                iv_report_query_crc(0x0400u, 0x101u, 0xE3u),
+            "c14 E1 crc differs from E3");
+
+        /* 装配层没挂回调 ⇒ 负值（handler 据此回 0x74，而不是发一份半空的配置） */
+        chk(iv_report_build_cfg_json(0x0400u, 0x101u, "1", NULL, NULL,
+                                     json, sizeof(json)) < 0,
+            "c14 NULL pairs -> negative (handler replies 0x74)");
+        /* 回调失败 ⇒ 负值 */
+        chk(iv_report_build_cfg_json(0x0400u, 0x101u, "1", bad_pairs, NULL,
+                                     json, sizeof(json)) < 0,
+            "c14 failing pairs -> negative");
+        /* 缓冲不够 ⇒ IV_ERANGE（不能截断成一份能解析但少字段的 JSON） */
+        chk(iv_report_build_cfg_json(0x0400u, 0x101u, "1", fake_pairs, NULL,
+                                     json, 16u) == IV_ERANGE,
+            "c14 small cap ERANGE");
+        /* NULL qn ⇒ "0"（与 E3 同口径） */
+        n = iv_report_build_cfg_json(0x0400u, 0x101u, NULL, fake_pairs, NULL,
+                                     json, sizeof(json));
+        chk(n > 0 && strstr(json, "\"qn\":\"0\"") != NULL, "c14 NULL qn -> 0");
+    }
+
     if (g_fail == 0)
         printf("test_report passed (seg/frame/query-crc/json/env/set-server/bind-if/"
-               "report-period/cfg-intv)\n");
+               "report-period/cfg-intv/cfg-json)\n");
     else
         printf("test_report FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

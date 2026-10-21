@@ -402,6 +402,33 @@ static void h_query_report_now(const iv_proto_frame_t *f, void *arg)
     (void)iv_report_trigger(rp, rp->now_ms);
 }
 
+/* E1 查询设备当前参数设置 → 回 ##{...}## JSON（不是 ACK）。
+ * 2026-10-21 之前这里是**未注册**的，平台点「查询设备配置」收到 0x74 就显示失败；
+ * 板端日志 `downlink cmd 0xE1 not implemented (1 bytes), ack 0x74` 即此。 */
+static void h_query_cfg(const iv_proto_frame_t *f, void *arg)
+{
+    iv_report_t *rp = arg;
+    char         qn[32];
+    /* 外壳约 150 B ＋ 装配层给的 data 段（≤768 B），再留余量。 */
+    char         json[IV_REPORT_CFG_PAIRS_MAX + 256u];
+    int          n;
+
+    qn_to_str(f->qn1, f->qn2, qn, sizeof(qn));
+    n = iv_report_build_cfg_json(rp->pf.id.devtype, rp->pf.id.devid, qn,
+                                 rp->cfg.on_query_cfg, rp->cfg.on_query_cfg_arg,
+                                 json, sizeof(json));
+    if (n <= 0) {
+        IV_LOG_W(REP_MOD, "E1 json build failed (%d)", n);
+        (void)iv_proto_ack(&rp->pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    if (iv_proto_send_json(&rp->pf, json, (size_t)n) == IV_OK) {
+        rp->query_resp++;
+        /* 同 E3：把整条应答打进日志，"回了"和"回对了"是两件事。 */
+        IV_LOG_I(REP_MOD, "E1 reply: %s", json);
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * 上行报文生成
  * ------------------------------------------------------------------------- */
@@ -749,6 +776,11 @@ int iv_report_open(iv_report_t *rp, const iv_report_cfg_t *cfg,
     c.tsn         = cfg->tsn;
     c.on_door     = cfg->on_door;
     c.on_door_arg = cfg->on_door_arg;
+    /* 0xE1 的 data 段回调（装配层拼配置/4G/网卡事实）。漏这行 ⇒ 平台点
+     * 「查询设备配置」永远收到 0x74，设备侧看起来一切正常（路由注册了、
+     * 日志也不报错）。c09 用例就是钉这一行的。 */
+    c.on_query_cfg     = cfg->on_query_cfg;
+    c.on_query_cfg_arg = cfg->on_query_cfg_arg;
     /* 这里是把调用方配置**逐字段**收进局部 c，漏一行就等于该项被默认值顶掉。
      * bind_ifname 第一版就漏在这里：agent 传了 "usb0"，传输层拿到的却是空，
      * 表现是报文仍从 eth0 出去，而启动日志里 bind=usb0/- 的右半边一直是 "-"。 */
@@ -776,6 +808,7 @@ int iv_report_open(iv_report_t *rp, const iv_report_cfg_t *cfg,
         return IV_EINVAL;
     (void)iv_proto_route(&rp->pf, IV_PROTO_CMD_QUERY_VERSION, h_query_version, rp);
     (void)iv_proto_route(&rp->pf, IV_PROTO_CMD_QUERY_INFO, h_query_report_now, rp);
+    (void)iv_proto_route(&rp->pf, IV_PROTO_CMD_QUERY_CFG, h_query_cfg, rp);
 
     /* 2. 采集板可靠层 */
     if (iv_link_init(&rp->lk, NULL, on_link_tx, on_link_upstream,
@@ -1024,6 +1057,44 @@ int iv_report_build_query_json(uint16_t devtype, uint32_t devid,
     APPEND(out, cap, n, "\"sysver\":\"%s\",", sv);
     APPEND(out, cap, n, "\"sv\":\"%s\",", sv);
     APPEND(out, cap, n, "\"tsn\":\"%s\",", tsn);
+    APPEND(out, cap, n, "\"crc\":\"%s\"}}", crc2);
+    return (int)n;
+}
+
+int iv_report_build_cfg_json(uint16_t devtype, uint32_t devid, const char *qn,
+                             int (*pairs)(char *out, size_t cap, void *arg),
+                             void *pairs_arg, char *out, size_t cap)
+{
+    char   crc2[3];
+    char   mid[IV_REPORT_CFG_PAIRS_MAX + 1u];
+    size_t n = 0;
+    int    m;
+
+    if (out == NULL || cap == 0u)
+        return IV_EINVAL;
+    if (pairs == NULL)
+        return IV_ENOENT;   /* 装配层没挂 ⇒ 让 handler 回 0x74，不发半份配置 */
+    m = pairs(mid, sizeof(mid), pairs_arg);
+    if (m < 0)
+        return IV_ERANGE;
+    if ((size_t)m > IV_REPORT_CFG_PAIRS_MAX)
+        return IV_ERANGE;
+    mid[(size_t)m] = '\0';
+
+    (void)snprintf(crc2, sizeof(crc2), "%02x",
+                   (unsigned)iv_report_query_crc(devtype, devid,
+                                                 IV_PROTO_CMD_QUERY_CFG));
+
+    /* 层级照抄 `com_query_configuration_function()`：`code` 在顶层，
+     * `qn` 在 `data` **里面**（与 E3 相反），`crc` 是 data 的最后一个键。 */
+    APPEND(out, cap, n, "{\"code\":0,\"data\":{");
+    APPEND(out, cap, n, "\"ver\":\"%02x\",", (unsigned)IV_PROTO_VER);
+    APPEND(out, cap, n, "\"devtype\":\"%04x\",", (unsigned)devtype);
+    APPEND(out, cap, n, "\"qn\":\"%s\",", (qn != NULL && qn[0] != '\0') ? qn : "0");
+    APPEND(out, cap, n, "\"tid\":\"%x\",", (unsigned)devid);
+    APPEND(out, cap, n, "\"cmd\":\"%02X\",", (unsigned)IV_PROTO_CMD_QUERY_CFG);
+    if (m > 0)
+        APPEND(out, cap, n, "%s,", mid);
     APPEND(out, cap, n, "\"crc\":\"%s\"}}", crc2);
     return (int)n;
 }

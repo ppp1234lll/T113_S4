@@ -698,6 +698,29 @@ int iv_report_set_report_period(iv_report_t *rp, uint32_t report_ms)
 }
 
 /*
+ * 采集周期（0xE1 轮询间隔）热生效 —— `sys.sample.period_ms` 的落点。
+ * 与上报周期同一套口径：只改节拍、不动连接与队列；改得更短时把已排好的
+ * 下一次轮询往前拉，改得更长时**不推迟**已经排得更早的那一拍（不能因为我改大
+ * 就把该发的那次吞掉）。
+ */
+int iv_report_set_poll_period(iv_report_t *rp, uint32_t poll_ms)
+{
+    if (rp == NULL || !rp->opened)
+        return IV_EINVAL;
+    if (poll_ms == 0u)
+        poll_ms = IV_REPORT_POLL_MS;
+    if (poll_ms == rp->cfg.poll_ms)
+        return IV_OK;
+
+    IV_LOG_I(REP_MOD, "poll period %u -> %u ms", (unsigned)rp->cfg.poll_ms,
+             (unsigned)poll_ms);
+    rp->cfg.poll_ms = poll_ms;
+    if (rp->next_poll > rp->now_ms + poll_ms)
+        rp->next_poll = rp->now_ms + poll_ms;
+    return IV_OK;
+}
+
+/*
  * 平台下行 0xF5「配置定时上报间隔」载荷解析（纯函数）。
  * 口径见 include/ivsbox/iv_report.h（与参考实现 `com_set_next_report_time()` 同构）。
  * 这里只拆字段 —— 采不采纳、落不落盘、回 0x01 还是 0x74 都归装配层：

@@ -562,7 +562,8 @@ static int agent_sync_server_cfg(int force)
 
 /* 配置事务通知（F7）。这里只接两条"改完必须马上生效"的：
  *   - `net` 分类：平台地址/端口（与出口网卡成对刷新）→ 断开旧连接、连新平台；
- *   - `sys` 分类里的 `sys.report.interval_s`：周期上报间隔 → 换节拍，**不断链**。
+ *   - `sys` 分类里的 `sys.report.interval_s`：周期上报间隔 → 换节拍，**不断链**；
+ *     `sys.sample.period_ms`：采集（0xE1 轮询）周期 → 只换轮询节拍，同样不断链。
  * 其余分类的热更新各有归属（隧道见 on_config_event）。 */
 static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, void *user)
 {
@@ -581,6 +582,10 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
         model_refresh();
         if (iv_config_get_int(g_cfg, "sys.report.interval_s", &v) == IV_OK && v > 0)
             (void)iv_report_set_report_period(&g_agent.rp, (uint32_t)v * 1000u);
+        /* 采集周期同理（`sys.sample.period_ms`）：只换 0xE1 轮询节拍，不动上报节拍、
+         * 不断链、不清队列。 */
+        if (iv_config_get_int(g_cfg, "sys.sample.period_ms", &v) == IV_OK && v > 0)
+            (void)iv_report_set_poll_period(&g_agent.rp, (uint32_t)v);
     }
 }
 
@@ -1378,6 +1383,21 @@ static int agent_setup(void)
     if (iv_prov_tsn(g_tsn) == 0)
         IV_LOG_W(APP_MOD, "chip serial unavailable; E3 tsn will be empty");
     ac.tsn = g_tsn;
+
+    /* 采集周期（0xE1 轮询间隔）：`sys.sample.period_ms` 的落点。
+     * 这个键在 2026-10-21 之前是**死键**（全仓零消费方，节拍被 IV_REPORT_POLL_MS
+     * 写死成 30 s），网页上改成 1 s 也没用 —— 板端实测 30.9 s 一轮。现在配置即真值：
+     * 这里取一次做初值，之后每次 SYS 类配置提交由 on_cfg_committed() 热更。 */
+    {
+        int64_t v = 0;
+
+        if (iv_config_get_int(g_cfg, "sys.sample.period_ms", &v) == IV_OK && v > 0)
+            ac.poll_ms = (uint32_t)v;
+        /* 现场排查用：日志里一眼能看到「采集周期到底取了多少」。这个键配错/被越界
+         * 丢弃时只会静默回落到 30 s，没有这行日志就只能靠数端口帧。 */
+        IV_LOG_I(APP_MOD, "sample period %u ms (0xE1 polling)",
+                 (unsigned)ac.poll_ms);
+    }
 
     if (iv_agent_open(&g_agent, &ac, g_reactor, iv_clock_monotonic_ms()) != IV_OK) {
         IV_LOG_E(APP_MOD, "agent open failed");

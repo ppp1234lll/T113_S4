@@ -353,6 +353,20 @@ int iv_report_set_bind_if(iv_report_t *rp, const char *ifname);
  */
 int iv_report_set_report_period(iv_report_t *rp, uint32_t report_ms);
 
+/*
+ * 设置**采集周期**（`sys.sample.period_ms` 的落点，＝向采集板发 0xE1 的间隔），
+ * **改完立即生效**。
+ *   - 只改节拍：不动在用连接、不动队列、不重置任何统计；
+ *   - 新周期更短时，已排好的下一次轮询就地前移（不必等旧的那拍到点）；
+ *   - `poll_ms == 0` ⇒ 回落默认 `IV_REPORT_POLL_MS`（30 s）；
+ *   - 与上报节拍同口径：**自由运行的整倍数**，唤醒延迟不累加。
+ * 背景：本参数在 2026-10-21 之前是**死键** —— 全仓没有消费方，节拍被编译期的
+ * `IV_REPORT_POLL_MS` 写死（板端实测 30.9 s 一轮而配置写 1000 ms），网页上把它
+ * 从 30 s 改成 1 s 一点效果都没有。现在配置即真值。
+ *   IV_OK；IV_EINVAL（rp 为 NULL 或未 open）
+ */
+int iv_report_set_poll_period(iv_report_t *rp, uint32_t poll_ms);
+
 /**
  * 解析平台下行 `0xF5`「配置定时上报间隔」的 DATA 段（纯函数，无副作用）。
  *

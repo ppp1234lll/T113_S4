@@ -590,9 +590,49 @@ int main(void)
         chk(n > 0 && strstr(json, "\"qn\":\"0\"") != NULL, "c14 NULL qn -> 0");
     }
 
+    /* ---- 15) 采集周期热生效（`sys.sample.period_ms` 的落点）----
+     * 2026-10-21 前这个键是死键：零消费方、节拍由 IV_REPORT_POLL_MS 写死，
+     * 板端实测 30.9 s 一轮而配置写 1000 ms。这里钉住"配置即真值"＋"改完立即生效"，
+     * 且口径与上报周期一致：改短就前移、改长不推迟已排好的那一拍。 */
+    {
+        static iv_report_t rp;
+        iv_report_cfg_t    cfg;
+
+        iv_report_cfg_default(&cfg);
+        cfg.server_host = "127.0.0.1";
+        cfg.server_port = 1u;
+        cfg.serial_path = "/dev/null";
+        cfg.poll_ms     = 30000u;
+
+        chk(iv_report_open(&rp, &cfg, NULL, 1000u) == IV_OK, "c15 open ok");
+        chk(rp.cfg.poll_ms == 30000u, "c15 poll takes the configured period");
+        /* 开局第一次轮询是**立即**发的（启动摸底，`iv_report_open` 把 next_poll
+         * 设成 now），之后才落到 30 s 网格上 —— 别照抄上报周期那条"一拍之后"。 */
+        chk(rp.next_poll == 1000u, "c15 first poll is immediate");
+
+        (void)iv_report_step(&rp, 1000u); /* 让第一拍落地，建立网格 */
+        chk(rp.next_poll == 31000u, "c15 grid = now + 30 s");
+
+        chk(iv_report_set_poll_period(&rp, 5000u) == IV_OK, "c15 set 5 s ok");
+        chk(rp.cfg.poll_ms == 5000u, "c15 poll applied");
+        chk(rp.next_poll == 6000u, "c15 pending deadline pulled in");
+
+        /* 放长：已排得更早的那一拍不动（不能因为改大就吞掉该发的一次） */
+        chk(iv_report_set_poll_period(&rp, 60000u) == IV_OK, "c15 set 60 s ok");
+        chk(rp.next_poll == 6000u, "c15 longer period keeps pending deadline");
+
+        chk(iv_report_set_poll_period(&rp, 0u) == IV_OK, "c15 set 0 ok");
+        chk(rp.cfg.poll_ms == IV_REPORT_POLL_MS, "c15 0 falls back to default");
+
+        chk(iv_report_set_poll_period(NULL, 1000u) == IV_EINVAL, "c15 null rejected");
+        iv_report_close(&rp);
+        chk(iv_report_set_poll_period(&rp, 1000u) == IV_EINVAL,
+            "c15 closed rejected");
+    }
+
     if (g_fail == 0)
         printf("test_report passed (seg/frame/query-crc/json/env/set-server/bind-if/"
-               "report-period/cfg-intv/cfg-json)\n");
+               "report-period/poll-period/cfg-intv/cfg-json)\n");
     else
         printf("test_report FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

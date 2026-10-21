@@ -52,6 +52,15 @@
   var toastTimer = null;
   function toast(msg, kind) {
     var t = $('#toast');
+    /* 兜底：提示条得挂在 #app 上、不能在 #content 里（那里每次切页被清空，
+     * 见 index.html 的说明与 D-16）。真丢了就现造一个，宁可样式粗糙也不要
+     * 让这里的异常把调用方后面的语句（版本号更新/表单重载）一起带走。 */
+    if (!t) {
+      t = el('div', 'toast hidden');
+      t.id = 'toast';
+      t.setAttribute('role', 'status');
+      ($('#app') || document.body).appendChild(t);
+    }
     t.textContent = msg;
     t.className = 'toast ' + (kind || '');
     if (toastTimer) clearTimeout(toastTimer);
@@ -500,8 +509,11 @@
       .catch(function () { toast('请求失败', 'err'); });
   }
 
-  /* 拉一个分类的配置，渲染成「分组 → 表单」。classes 可以是数组。 */
-  function configCard(title, classes, note) {
+  /* 拉一个分类的配置，渲染成「分组 → 表单」。classes 可以是数组。
+   * onReady(items, reload)：数据就绪后的回调。渲染循环只画"已经存在的键"，
+   * 于是「按需建槽」那类配置（camera.ch.N.*）在没有任何键时无输入框可画，
+   * 得靠调用方自己补一个入口 —— 回调就是为了把 items 与 reload 交出去。 */
+  function configCard(title, classes, note, onReady) {
     var scope = el('div');
     var card = el('div', 'card');
     card.appendChild(el('h3', null, title));
@@ -546,6 +558,7 @@
           body.appendChild(sec);
         });
         body.appendChild(el('p', 'hint', '共 ' + Object.keys(items).length + ' 项，版本 ' + ver));
+        if (onReady) onReady(items, load);
       });
     }
 
@@ -1214,6 +1227,106 @@
     return root;
   }
 
+  /* ==================== 摄像机通道建档（D-06，2026-10-21） ====================
+   * camera.ch.N.* 在配置模块里是「按需变长数组」：出厂一条都没有，
+   * 只有当 config.apply 里出现 camera.ch.N.<某键> 时，set_post_update() 才抬高
+   * camera_count 并把该槽 8 个键整套补默认值（ip/mac/pass/record/stream/url/
+   * user/vendor）。
+   * 而 configCard() 只遍历 config.class 返回的既有键 —— 既有键为空就一个输入框
+   * 都没有，于是现场从网页永远建不出第一路摄像机，只能等平台下发或手改 JSON。
+   * 这里补的就是这个入口：只发一个 ip 键触发建槽，其余 7 项交给后端补齐。
+   */
+  var CAM_SLOT_MAX = 8;   /* 与录像 8 路对齐（CNS 只测前 6 路 ⇒ 7/8 路只录不测） */
+
+  function cameraSlotCard() {
+    var card = el('div', 'card');
+    card.appendChild(el('h3', null, '新增摄像机通道'));
+    card.appendChild(el('p', 'hint',
+      '设备出厂未配置任何通道。选一个序号、填上摄像机 IP，点「建立」即建好这一路；' +
+      '账号／口令／端口／录像等其余字段自动取默认值，建完后可在上方表格里继续修改。'));
+
+    var bar = el('div', 'actions');
+    var sel = document.createElement('select');
+    sel.title = '通道序号';
+    var ip = document.createElement('input');
+    ip.type = 'text';
+    ip.placeholder = '摄像机 IP，如 192.168.1.64';
+    ip.size = 24;
+    var btn = el('button', null, '建立该路通道');
+    btn.type = 'button';
+    bar.appendChild(sel);
+    bar.appendChild(ip);
+    bar.appendChild(btn);
+    card.appendChild(bar);
+    card.appendChild(el('p', 'hint', '通道序号超出实际路数不影响使用：只录不测（检测固定 6 路）。'));
+
+    var known = {};        /* 已存在的槽位序号 -> ip 现值（null = 槽在但 ip 为空） */
+    var onSaved = null;    /* 建槽成功后刷新上方的通道表格 */
+
+    function fillIp() {
+      var cur = known[Number(sel.value)];
+      ip.value = (cur === undefined || cur === null) ? '' : String(cur);
+    }
+
+    /* 按已知槽位重建下拉：既要说清哪几路已配置，又要保住用户当前选中项 */
+    function renderSlots() {
+      var keep = sel.value;
+      sel.innerHTML = '';
+      for (var n = 0; n < CAM_SLOT_MAX; n++) {
+        var o = document.createElement('option');
+        o.value = String(n);
+        o.textContent = '通道 ' + (n + 1) +
+          (known[n] === undefined ? '（未配置）' : '（已配置：' + (known[n] || '无 IP') + '）');
+        sel.appendChild(o);
+      }
+      if (keep !== '') sel.value = keep;
+      fillIp();
+    }
+
+    sel.addEventListener('change', fillIp);
+
+    btn.addEventListener('click', function () {
+      var n = Number(sel.value);
+      var addr = (ip.value || '').replace(/^\s+|\s+$/g, '');
+      if (!addr) { toast('先填摄像机 IP', 'err'); return; }
+      var items = {};
+      items['camera.ch.' + n + '.ip'] = addr;
+      btn.disabled = true;
+      api('/api/config/apply', { method: 'POST', body: { ver: st.ver, items: items } })
+        .then(function (r) {
+          btn.disabled = false;
+          if (r.ok) {
+            st.ver = r.d.version;
+            toast('已建立通道 ' + (n + 1) + '（版本 ' + r.d.version + '）', 'ok');
+            if (onSaved) onSaved();
+          } else if (r.e === -3) {
+            toast('配置已被别处改动，请刷新后重试', 'err');
+          } else {
+            toast('建立失败：' + (r.msg || r.e), 'err');
+          }
+        })
+        .catch(function () { btn.disabled = false; toast('请求失败', 'err'); });
+    });
+
+    renderSlots();
+    return {
+      node: card,
+      /* configCard 每次载入完都会调这里：同步已知槽位 + 拿到刷新手柄 */
+      sync: function (items, reload) {
+        onSaved = reload;
+        known = {};
+        Object.keys(items || {}).forEach(function (k) {
+          var m = /^camera\.ch\.(\d+)\./.exec(k);
+          if (!m) return;
+          var idx = Number(m[1]);
+          if (known[idx] === undefined) known[idx] = null;   /* 槽在，ip 未必在 */
+          if (/\.ip$/.test(k)) known[idx] = items[k];
+        });
+        renderSlots();
+      }
+    };
+  }
+
   function pageCamera() {
     var root = document.createDocumentFragment();
     root.appendChild(el('h2', 'page-title', '摄像机'));
@@ -1244,8 +1357,11 @@
           cm.cns[i] === 1 ? 'ok' : (cm.cns[i] === 2 ? 'err' : 'warn')));
     });
 
+    var slot = cameraSlotCard();
     root.appendChild(configCard('摄像机参数与账号（camera.*）', ['camera'],
-      '检测方式、6 路 IP/账号/端口，以及 SNMP OID 槽位（按机型填值）。'));
+      '检测方式、6 路 IP/账号/端口，以及 SNMP OID 槽位（按机型填值）。',
+      function (items, reload) { slot.sync(items, reload); }));
+    root.appendChild(slot.node);
     return root;
   }
 

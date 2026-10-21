@@ -55,9 +55,13 @@
         <button id="logoutBtn" class="link" type="button">退出</button>
       </div>
     </aside>
-    <main id="content" class="content">
-      <div id="toast" class="toast hidden" role="status"></div>
-    </main>
+    <main id="content" class="content"></main>
+    <!-- 提示条必须在 #content **外面**：go() 每次切页都 `#content.innerHTML=''`，
+         放在里面等于登录（showApp→go）那一刻就被删掉，之后每次 toast() 都在
+         `$('#toast')` 上抛 TypeError。而 toast 抛错的后果不是"少一个提示"：
+         applyChanges 里 toast 之后的 `st.ver = ...` 与 `after()` 全部不执行 ⇒
+         保存后版本号不更新、表单不重载，下一次保存必然撞版本冲突（D-16，10-21）。 -->
+    <div id="toast" class="toast hidden" role="status"></div>
   </div>
 
   <script src="/app.js"></script>

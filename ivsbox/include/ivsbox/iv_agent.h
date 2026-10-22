@@ -162,6 +162,14 @@ extern "C" {
 #define IV_AGENT_PROBE_TICK_MS  200u
 #define IV_AGENT_NETMGR_TICK_MS 1000u
 
+/* 阈值下发（0xF1）待发 JSON 的缓冲。九项全发也就 `{"hv":12345,...}` 一百多字节，
+ * 256 足够；超了 `iv_report_build_thresh()` 会回 `IV_ERANGE`，不会被静默截断。 */
+#define IV_AGENT_THRESH_JSON_MAX 256u
+/* 待发项被 `IV_EBUSY` 挡回后的重试间隔。刻意给 1 s 而不是每拍（200 ms）：
+ * 挡路的通常是 30 s 一次、几百毫秒就结束的 0xE1 轮询，1 s 足够跨过去，
+ * 又不会在采集板长时间不应答时把总线刷满。 */
+#define IV_AGENT_THRESH_RETRY_MS 1000u
+
 /* 探活目标路数（probe.target1 / target2） */
 #define IV_AGENT_TARGET_N 2
 
@@ -401,9 +409,21 @@ typedef struct {
     uint64_t     snmp_runs;           /* 累计完成的采集轮数 */
     uint64_t     snmp_slot_noval;     /* 累计"该项无值"（无应答/异常值）槽位次数 */
 
+    /* 阈值下发（`0xF1`）的待发项。`elec.*`/`sensor.*` 改完只是"想让它生效"，
+     * 真正发帧会被 `IV_EBUSY`（同 cmd 在飞，通常是 30 s 一次的 0xE1 轮询）挡回，
+     * 所以这里存一份**已拼好的 JSON**，每拍重试到 `IV_OK` 为止——与 S4.4 的
+     * "保留队头、下一拍再试"同一套做法。存文本而不是 `iv_thresh_t`：重试时不必
+     * 再读配置（配置可能又变了一次，那会走新的 apply 覆盖它）。 */
+    char         th_json[IV_AGENT_THRESH_JSON_MAX];
+    uint16_t     th_len;       /* 0 = 没有待发项 */
+    uint32_t     th_drops;     /* 累计被更新的阈值覆盖掉的待发项次数（诊断） */
+    uint16_t     th_tries;     /* 当前待发项已重试次数（日志降噪用） */
+    uint64_t     th_next_ms;   /* 下次允许重试的时刻；0 = 立即 */
+
     uint64_t     now_ms;
     uint8_t      opened;
 } iv_agent_t;
+
 
 /* iv_agent_snmp_state() 的返回 */
 #define IV_AGENT_SNMP_IDLE 0
@@ -523,6 +543,30 @@ int iv_agent_reload_server(iv_agent_t *a);
 int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_be,
                           uint32_t interval_ms, uint32_t timeout_ms, uint32_t fail_n,
                           uint64_t now_ms);
+
+/* ---------------------------------------------------------------------------
+ * 阈值下发（2026-10-22 补，对应 `elec.*` / `sensor.*` 九个键）
+ *
+ * ============================ 修的是什么 ============================
+ * 这九个键此前**全工程没有任何消费者**：网页「电阈值与传感器」卡片能改能存，
+ * 存完采集板一无所知 —— 界面上有、设备不认，属于"假功能"。参考 web 的
+ * 「阈值设置」是核心功能，本机只是个配置编辑器。
+ *
+ * ============================ 为什么不在本函数里直接发帧 ============================
+ * `iv_link` 同一 cmd 只许一笔在飞（`IV_EBUSY`），而 0xE1 轮询每 30 s 就占一次
+ * 总线。改配置那一刻撞上在飞的查询是常态，直接发帧会有相当比例的失败。
+ * 所以这里只**登记**待发载荷，真正发帧由 `thresh_drive()` 在每拍重试到成功
+ * 为止 —— 与 S4.4 的「保留队头、下一拍再试」同一套。
+ *
+ * ============================ 同值早返回 ============================
+ * 拼出来的 JSON 与待发项逐字节相同就直接返回 `IV_OK`，不重置重试计数。
+ * 理由与 `iv_agent_reload_probe()` 一致：`on_cfg_committed` 是对整类配置的
+ * 批量回调，改别的键不该顺带把待发项搅乱。
+ *
+ * 返回：`IV_OK` 已登记（或同值无需再发）；`IV_ESTATE` 九项全为 0（没什么可发，
+ * **不是错误**，但也别记"已下发"）；`IV_ERANGE` 拼装超缓冲；`IV_EINVAL` 参数非法。
+ * ------------------------------------------------------------------------- */
+int iv_agent_apply_thresh(iv_agent_t *a, const iv_thresh_t *t, uint64_t now_ms);
 
 /* ---------------------------------------------------------------------------
  * 传输模式热生效（2026-10-21 补，对应平台下行 `0xF3` 与网页 `sys.transport.mode`）

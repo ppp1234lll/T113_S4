@@ -67,7 +67,11 @@ extern "C" {
 
 /* 命令字 */
 #define IV_FRAME_CMD_QUERY  0xE1u /* 查询单片机参数（请求 data=0x00, len=1） */
-#define IV_FRAME_CMD_THRESH 0xF1u /* 配置阈值（请求 data=9 参数×2B=18B） */
+/* 配置阈值。⚠ 载荷是 **JSON**（键 `hv/lv/ov/ld/sl/tu/tl/hu/hl`，值为 0 的项
+ * 不出现），**不是** Excel 写的"9 参数 × 2B = 18B"——现网单片机按 JSON 解析，
+ * 用户 2026-10-08 已裁定取 JSON、Excel 该行作废（见 docs/修改记录.md 该日条目）。
+ * 拼载荷用 `iv_report_build_thresh()`，别再手搓二进制。 */
+#define IV_FRAME_CMD_THRESH 0xF1u
 #define IV_FRAME_CMD_POWER  0xD1u /* 控制电源接口（请求 data=接口序号+控制状态） */
 #define IV_FRAME_CMD_REBOOT 0xD2u /* 设备重启（请求 data=0x00, len=1） */
 #define IV_FRAME_CMD_DOOR   0xC1u /* 箱门开启上报（data=0x01） */

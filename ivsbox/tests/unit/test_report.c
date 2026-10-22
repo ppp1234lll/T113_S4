@@ -10,12 +10,15 @@
  *   6) iv_report_query_crc：与独立复算一致，黄金值按 cmd 区分
  *      （`110400101E3`→0x06、`110400101E1`→0x08；大写 cmd 有区分力）；
  *   7) iv_report_build_query_json：黄金 JSON（E3 应答，`crc` = 0x06）；
- *   8) 组出的数据段能被 iv_proto_text_frame 接受，且 CRC 只覆盖 &&数据区&&。
+ *   8) 组出的数据段能被 iv_proto_text_frame 接受，且 CRC 只覆盖 &&数据区&&；
+ *   9) iv_report_build_thresh/send_thresh：0xF1 阈值载荷是 **JSON**（键序
+ *      hv lv ov ld sl tu tl hu hl、值为 0 的项不下发），不是 Excel 说的 18B 二进制。
  */
 #include <stdio.h>
 #include <string.h>
 
 #include "ivsbox/iv_crc.h"
+#include "ivsbox/iv_frame.h"
 #include "ivsbox/iv_proto.h"
 #include "ivsbox/iv_report.h"
 #include "ivsbox/iv_ret.h"
@@ -630,9 +633,84 @@ int main(void)
             "c15 closed rejected");
     }
 
+    /* c16 阈值下发载荷（0xF1）：JSON 不是 18 字节二进制；值为 0 的项不下发。
+     *
+     * 这一条锁的是**协议口径**：Excel 把 0xF1 写成"9 参数×2B=18B"，现网单片机
+     * 按 JSON 解析，用户 2026-10-08 裁定取 JSON。若哪天有人"照着 Excel 修正"
+     * 改回二进制，这里的黄金串会立刻红。 */
+    {
+        iv_thresh_t t;
+        char        buf[256];
+        size_t      n = 0u;
+
+        memset(&t, 0, sizeof(t));
+        chk(iv_report_build_thresh(&t, buf, sizeof(buf), &n) == IV_ESTATE,
+            "c16 all-zero says nothing to send");
+
+        t.hv = 300;
+        chk(iv_report_build_thresh(&t, buf, sizeof(buf), &n) == IV_OK, "c16 one key ok");
+        chk(n == 10u && strcmp(buf, "{\"hv\":300}") == 0,
+            "c16 single key golden ({\"hv\":300} = 10 B)");
+
+        /* 九项全填：键序 hv lv ov ld sl tu tl hu hl（与单片机解析顺序一致） */
+        t.lv = 180;
+        t.ov = 30;
+        t.ld = 30;
+        t.sl = 45;
+        t.tu = 60;
+        t.tl = -10;
+        t.hu = 90;
+        t.hl = 20;
+        chk(iv_report_build_thresh(&t, buf, sizeof(buf), &n) == IV_OK, "c16 nine ok");
+        chk(strcmp(buf,
+                   "{\"hv\":300,\"lv\":180,\"ov\":30,\"ld\":30,\"sl\":45,"
+                   "\"tu\":60,\"tl\":-10,\"hu\":90,\"hl\":20}") == 0,
+            "c16 nine-key golden (order + negative tl)");
+        chk(n == strlen(buf), "c16 out_len excludes NUL");
+
+        /* 0 ＝ 不设置：把 hv 清 0，它必须从 JSON 里消失（而不是发 \"hv\":0） */
+        t.hv = 0;
+        chk(iv_report_build_thresh(&t, buf, sizeof(buf), &n) == IV_OK, "c16 minus hv ok");
+        chk(strstr(buf, "\"hv\"") == NULL, "c16 zero key omitted, not sent as 0");
+        chk(n == strlen(buf), "c16 out_len still right after omission");
+
+        chk(iv_report_build_thresh(NULL, buf, sizeof(buf), &n) == IV_EINVAL,
+            "c16 null t rejected");
+        chk(iv_report_build_thresh(&t, NULL, sizeof(buf), &n) == IV_EINVAL,
+            "c16 null out rejected");
+        chk(iv_report_build_thresh(&t, buf, sizeof(buf), NULL) == IV_EINVAL,
+            "c16 null out_len rejected");
+        chk(iv_report_build_thresh(&t, buf, 4u, &n) == IV_ERANGE,
+            "c16 small buffer rejected (not silently truncated)");
+    }
+
+    /* c17 下发入口的前置校验（参数/长度；不碰链路） */
+    {
+        static iv_report_t rp;
+        iv_report_cfg_t    cfg;
+
+        iv_report_cfg_default(&cfg);
+        cfg.server_host = "127.0.0.1";
+        cfg.server_port = 1u;
+        cfg.serial_path = "/dev/null";
+
+        chk(iv_report_send_thresh(NULL, "{}", 2u, 1000u) == IV_EINVAL,
+            "c17 null rp rejected");
+        iv_report_init(&rp);
+        chk(iv_report_send_thresh(&rp, NULL, 2u, 1000u) == IV_EINVAL,
+            "c17 null json rejected");
+        chk(iv_report_send_thresh(&rp, "{}", 0u, 1000u) == IV_EINVAL,
+            "c17 zero len rejected");
+        chk(iv_report_send_thresh(&rp, "{}", (size_t)IV_FRAME_DATA_MAX + 1u, 1000u) ==
+                IV_ERANGE,
+            "c17 oversized payload rejected");
+        chk(iv_report_send_thresh(&rp, "{}", 2u, 1000u) == IV_ESTATE,
+            "c17 not-opened rejected (ESTATE, not silent OK)");
+    }
+
     if (g_fail == 0)
         printf("test_report passed (seg/frame/query-crc/json/env/set-server/bind-if/"
-               "report-period/poll-period/cfg-intv/cfg-json)\n");
+               "report-period/poll-period/cfg-intv/cfg-json/thresh-build/thresh-send)\n");
     else
         printf("test_report FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

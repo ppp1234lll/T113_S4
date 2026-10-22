@@ -342,6 +342,57 @@ int main(void)
         chk(gn == 0u, "b06 rejected requests send nothing on the wire");
     }
 
+    /* ---- b06b 阈值下发（0xF1）：载荷是 JSON ＋ 帧字节黄金 ----
+     * 判据同样看**线上字节**。载荷必须是 JSON —— Excel《配置、控制》把它写成
+     * "9 参数 × 2B = 18B"二进制，而现网单片机按 JSON 解析，用户 2026-10-08 已裁定
+     * 取 JSON、Excel 该行作废。照二进制发，帧长/CRC 全都自洽，现场只会表现为
+     * "阈值怎么改都不生效"，所以这里钉死黄金串。 */
+    {
+        iv_thresh_t       t;
+        uint8_t           want[IV_FRAME_MAX];
+        char              got[256];
+        static const char json[] = "{\"hv\":250,\"tu\":55}";
+        size_t            wn;
+        size_t            gn = 0u;
+        int               i;
+
+        memset(&t, 0, sizeof(t));
+        t.hv = 250; /* elec.volt_high */
+        t.tu = 55;  /* sensor.temp_high */
+
+        step(2500u);                               /* 放过上一条 0xD1 的应答窗口 */
+        (void)drain(g_master, got, sizeof got, 20); /* 清掉在飞的 0xE1 */
+
+        chk(iv_agent_apply_thresh(&g_agent, &t, g_now) == IV_OK, "b06b thresh queued");
+
+        /* 撞上在飞的 0xE1 时 `thresh_drive()` 会推后 1 s 重试，所以最多等 3 轮 ——
+         * 这本身就是"改配置那一刻不一定发得出去"的既有事实，不该断言一次必成。 */
+        wn = (size_t)iv_frame_build(IV_FRAME_HEAD_DOWN, IV_FRAME_CMD_THRESH, json,
+                                    (uint16_t)(sizeof json - 1u), want, sizeof want);
+        for (i = 0; i < 3 && gn == 0u; i++) {
+            step(1100u);
+            gn = drain(g_master, got, sizeof got, 300);
+        }
+        chk(wn > 0u && gn == wn, "b06b 0xF1 frame length");
+        chk(gn == wn && memcmp(got, want, wn) == 0,
+            "b06b 0xF1 bytes = JSON {\"hv\":250,\"tu\":55} (not 18-byte binary)");
+
+        /* 同值再登记一次：早返回，**不得再发一帧 0xF1**（否则改别的键会重复下发）。
+         * 判据只比对"这一帧是不是 0xF1"——线上随时可能插进一条 0xE1 轮询，
+         * 断言"线上一个字节都没有"会变成对轮询节拍的断言，那是另一件事。 */
+        (void)drain(g_master, got, sizeof got, 20);
+        chk(iv_agent_apply_thresh(&g_agent, &t, g_now) == IV_OK, "b06b same value ok");
+        step(1100u);
+        gn = drain(g_master, got, sizeof got, 200);
+        chk(!(gn == wn && memcmp(got, want, wn) == 0),
+            "b06b same value does not resend 0xF1");
+
+        /* 九项全 0：没有可下发的内容，明确回 IV_ESTATE（不是"发了"） */
+        memset(&t, 0, sizeof(t));
+        chk(iv_agent_apply_thresh(&g_agent, &t, g_now) == IV_ESTATE,
+            "b06b all-zero returns ESTATE, not OK");
+    }
+
     /* ---- b08 sys.overview 的 device 段（总览页只答"这台设备是谁"） ----
      * 总览页原先堆的是网络/摄像机/采集板三家的实时数据，现在归各自页面；总览只留
      * 身份与版本。这里钉住三件事：① device 段真的在；② 本机可得的（主机名/内核/
@@ -424,8 +475,8 @@ int main(void)
     (void)close(g_master);
     if (g_fail == 0)
         printf("test_agent_board passed (null semantics, 0xE1 decode, relay, limits, "
-               "0xC1/0xC2 events, relay.set 0xD1 bytes, guards, overview device block, "
-               "overview wan block, device identity guards)\n");
+               "0xC1/0xC2 events, relay.set 0xD1 bytes, thresh 0xF1 JSON bytes, guards, "
+               "overview device block, overview wan block, device identity guards)\n");
     else
         printf("test_agent_board FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

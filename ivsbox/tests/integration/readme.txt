@@ -124,6 +124,21 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
                        **诚实边界**：`SIGKILL` 只近似"进程未及清理就消失"，**不等于真掉电**
                        （page cache 里的数据仍会写回）；真拔电只能在板端做，见
                        `tests/fault-inject.sh` 的 MANUAL 项 m6/m7/m8。无需任何外部服务。
+  thresh_e2e.py        阈值下发 0xF1 的**装配层接线**取证（Python；本目录唯一的非 C 用例）。
+                       为什么非它不可：`iv_agent_apply_thresh()` 的单测与
+                       `test_agent_board` b06b 只证明"给它一份阈值能发对帧"，而
+                       **"改配置会不会走到它"取决于 `main.c` 的订阅掩码** —— 掩码漏了
+                       class，分支再对也永不触发，编译/单测/C 集成用例全绿、运行期零反应
+                       （2026-10-21 `probe.*` 就这么踩过；本次两条反向证伪也就是删掩码与
+                       空驱动）。做法：以 root 自己拉起 `build/host/ivsboxd`，经
+                       `/var/run/ivsbox/ctl` 下发 `config.apply`，再从落盘日志断言
+                       ① 只设 `sensor.temp_high` ⇒ `thresh queued` 载荷 `{"tu":55}` 且
+                       **不含** `hv`（0 ＝ 不下发该键）；② 再设 `elec.volt_high` ⇒
+                       `{"hv":250,…,"tu":55}` 九键以配置为准、键序固定；③ 全清零后不再
+                       排队；④ 无采集板时出现 `thresh not sent yet`（重试而非静默丢）；
+                       ⑤ 6 s 内重试日志新增 ≤ 2（退避 ＋ 降噪）。**需 root**（ctl 是
+                       `root:root 0660`）与可写 `/mnt/UDISK/log`；自己起/收 daemon，
+                       故跑之前不能有别的 ivsboxd 在跑。
 
 【运行方式】
   # 只跑自包含用例（无需先起任何服务）
@@ -142,6 +157,10 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
   make itest                # 再构建并运行 tests/integration/*
   # 板端：/etc/init.d/S65ivsboxd start 后，直接跑 build/arm/tests/integration/*
   # 用例可选参数：test_ctl_snapshot [socket_path]（默认 /var/run/ivsbox/ctl）
+
+  # thresh_e2e.py：装配层接线取证。自己起/收 daemon（**跑之前不能有 ivsboxd 在跑**）
+  sudo mkdir -p /mnt/UDISK/log
+  sudo python3 tests/integration/thresh_e2e.py
 
 【约定与注意事项】
   - 本目录**刻意不并入 make test**：目录里既有"需外部服务"的用例，并进去会让 CI 因

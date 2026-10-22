@@ -4564,3 +4564,95 @@ VM 真进程 HTTP e2e `tests/web/logs_e2e.py` 21 条全过。反向证伪两条�
 **未做（登记）**：升级的**上传/安装**（HTTP 层把整包体读进 `rbuf`，`IV_WEB_BODY_MAX`
 = 32 KiB，几 MB 的包传不进来；要做分片上传或给 http 层加"体落文件"状态机）／
 「恢复出厂」「擦除存储」（破坏性，先定口径）／「清除当前批次」（本机无对应实体）。
+
+== 2026-10-22 10:20 阈值下发（0xF1）：把假功能接上
+
+=== 改之前是什么状态
+
+`elec.*`（`volt_high`/`volt_low`/`over_current`/`leak_current`）与 `sensor.*`
+（`tilt`/`temp_high`/`temp_low`/`humi_high`/`humi_low`）九个键**全工程零消费者**：
+
+[source,bash]
+----
+grep -rn "elec\.\|sensor\." src/ --include=*.c | grep -v iv_config.c   # 空
+----
+
+网页上能改、`config.apply` 能存、重启还在，但采集板一无所知——控制板页的「阈值」是一处
+**假功能**。这类"界面骗人"比缺功能更糟：现场会以为自己设过了。
+
+=== 载荷是 JSON，不是 Excel 那 18 字节
+
+Excel 规格写「9 参数 × 2B = 18B」，但**现网单片机解的是 JSON**（键
+`hv/lv/ov/ld/sl/tu/tl/hu/hl`）。2026-10-08 已定「取 JSON、Excel 该行作废」，本次把这条
+口径同时写进 `iv_frame.h` 的 `IV_FRAME_CMD_THRESH` 注释，免得下一个只看 Excel 的人再走
+一遍同样的弯路——协议实现照 PDF 表格写出来的帧，单片机会当垃圾。
+
+=== 值为 0 就不发这个键
+
+`iv_report_build_thresh()` 只把非 0 的项写进 JSON；九项全 0 返 `IV_ESTATE`
+（＝"没什么可发"，不是错误）。
+
+**为什么不做"先按镜像补齐九项再整份下发"**：镜像里没收到的项只能猜 0，而采集板对阈值的
+理解是"下限 0 ⇒ 任何读数都超限"，补齐等于当场让它误报。宁可少发一个键。
+
+代价：**真 0 设不进去**（"关闭某项保护"表达不出来）。这与 `iv_config` 的"`0` 只在 init
+表示取默认"同源，属已知限制，需与平台/单片机另定"清零"语义。
+
+=== 为什么排队 ＋ 每拍重试，而不是在配置回调里直接发
+
+`config.apply` 回调触发的那一刻，很可能正有一条 `0xE1` 采样在飞；这时
+`iv_report_send_cmd()` 会回 `IV_EBUSY`。在回调里直接发，效果是"用户改阈值时正好在采样
+就静默丢掉"——最难查的那种。
+
+所以拆成两半：
+
+* `iv_agent_apply_thresh()` 只**登记**一份待发 JSON（`th_json`/`th_len`），带同值早返回；
+* `thresh_drive()` 每拍试着发，成功即清账，失败退避 1 s 重试。
+
+日志降噪：失败只打第 1 次与每 60 次，否则采集板整场不上线时会一秒一行。
+
+**两处驱动**：`iv_agent_step()` 与 `on_pb_timer()` 都要挂。Reactor 模式下
+`iv_agent_step()` **不被调用**——本项目反复踩过的坑（10-21 的 `storage_drive` 同理）。
+
+=== 同值早返回
+
+`config.apply` 重发同一份配置、或只改了别的 class，不能把重试计数清零。否则那份一直发不
+出去的阈值会永远从头重试，`th_drops` 也统计不出"被覆盖"。
+
+`th_drops` 是诊断计数：上一份还没发出去就被新的覆盖了几次。它不是错误。
+
+=== 0xF1 是幂等的 ⇒ 不进 no-retry 名单
+
+`iv_link.c` 里那份 no-retry 名单是给 `0xD1`（继电器）/`0xD2` 这类"重发会真动作"的指令
+用的。`0xF1` 重复下发只是把同一组阈值再写一遍，所以**没有**加进去，链路层的重传对它是
+安全的。
+
+=== 接线在装配层，单测看不到
+
+`on_cfg_committed()` 里的分支写好了、但 `iv_config_subscribe()` 的掩码没订 `elec`/
+`sensor` 两个 class，等于**回调永远不触发**：编译干净、单测全绿、运行期毫无反应。
+本次掩码已从 `net+sys+probe` 扩到 `net+sys+probe+elec+sensor`，并靠装配层 e2e 取证
+（`test_report`/`test_agent_board` 都碰不到这一层）。
+
+=== 验证
+
+`test` 40/40（`test_report` 新增 `thresh-build`/`thresh-send`）／`analyze` 0 ／`arm` 0
+告警（`ivsboxd` md5 `00854131c22e7f9c0c15b990d77b57f2`）／`itest` 16 条 15 通过 1 SKIP。
+
+线上字节：`test_agent_board` b06b 断言 `0xF1` 帧体逐字节等于 `{"hv":250,"tu":55}`，
+同值不重发，全 0 返 `IV_ESTATE`。
+
+装配层 e2e（`tests/integration/thresh_e2e.py`，VM 真进程 ＋ 本地通道）12 条：只改
+`sensor.temp_high` ⇒ `thresh queued (15 B): {"tu":55}` 且不含 `"hv"`；再改
+`elec.volt_high` ⇒ `{"hv":250,"tu":55}`（以配置为准一起发、键序固定）；无采集板时
+`thresh not sent yet`（重试而非丢弃）；九项清零后不再排队。
+
+反向证伪两条，都**编译干净**：①订阅掩码去掉 `ELEC|SENSOR` ⇒ A1b/A2b/A4a 红而配置照样
+保存成功；②`thresh_drive()` 首行改 `if (a == NULL || 1)` ⇒ 只剩 A4a 红（排队成功、永不
+下发）。还原后 md5 一致、12 条复绿。
+
+=== 未做
+
+* 真 0 值无法下发（见上）。
+* 平台侧 `0xA4` 阈值指令：5 个 u16，**字段序与量纲未知**，不猜。
+

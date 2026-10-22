@@ -623,6 +623,42 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
         if (prc != IV_OK)
             IV_LOG_W(APP_MOD, "probe.* not applied (%d)", prc);
     }
+    if ((mask & (IV_CFG_CLASS_MASK(IV_CFG_CLS_ELEC) |
+                 IV_CFG_CLASS_MASK(IV_CFG_CLS_SENSOR))) != 0u) {
+        /* 阈值九个键（`elec.*` 4 项 ＋ `sensor.*` 5 项）此前**全工程没有消费者**：
+         * 网页能改、能存，采集板一无所知。这里补上"改完就下发 0xF1"。
+         * 值 0 ＝ 该项不设置（不下发该键），口径见 `iv_report_build_thresh()`；
+         * 真发帧由 `thresh_drive()` 每拍重试（撞上在飞的 0xE1 是常态）。 */
+        iv_thresh_t th;
+        double      dv = 0.0;
+        int         trc;
+
+        (void)memset(&th, 0, sizeof(th));
+        if (iv_config_get_dbl(g_cfg, "elec.volt_high", &dv) == IV_OK)
+            th.hv = (int32_t)dv;
+        if (iv_config_get_dbl(g_cfg, "elec.volt_low", &dv) == IV_OK)
+            th.lv = (int32_t)dv;
+        if (iv_config_get_dbl(g_cfg, "elec.over_current", &dv) == IV_OK)
+            th.ov = (int32_t)dv;
+        if (iv_config_get_dbl(g_cfg, "elec.leak_current", &dv) == IV_OK)
+            th.ld = (int32_t)dv;
+        if (iv_config_get_dbl(g_cfg, "sensor.tilt", &dv) == IV_OK)
+            th.sl = (int32_t)dv;
+        if (iv_config_get_dbl(g_cfg, "sensor.temp_high", &dv) == IV_OK)
+            th.tu = (int32_t)dv;
+        if (iv_config_get_dbl(g_cfg, "sensor.temp_low", &dv) == IV_OK)
+            th.tl = (int32_t)dv;
+        if (iv_config_get_dbl(g_cfg, "sensor.humi_high", &dv) == IV_OK)
+            th.hu = (int32_t)dv;
+        if (iv_config_get_dbl(g_cfg, "sensor.humi_low", &dv) == IV_OK)
+            th.hl = (int32_t)dv;
+
+        trc = iv_agent_apply_thresh(&g_agent, &th, iv_clock_monotonic_ms());
+        /* IV_ESTATE 在这里的含义是"九项全为 0，没什么可发"——正常情形（出厂态
+         * 或用户把阈值全清空），不该按告警打。 */
+        if (trc != IV_OK && trc != IV_ESTATE)
+            IV_LOG_W(APP_MOD, "thresh.* not applied (%d)", trc);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1643,16 +1679,19 @@ static int app_init(void)
      *
      * ⚠ `probe` 分类必须一起订上：`on_cfg_committed()` 里的分支写好了、但掩码
      * 没订等于**回调永远不触发**，编译、单测全绿、运行期毫无反应（"接线在装配层"
-     * 这一类坑，单测抓不到，只有真拉进程的集成用例才看得见）。 */
+     * 这一类坑，单测抓不到，只有真拉进程的集成用例才看得见）。`elec`/`sensor`
+     * （阈值下发）同理，一处都不能漏。 */
     (void)agent_sync_server_cfg(0);
     if (iv_config_subscribe(g_cfg,
                             IV_CFG_CLASS_MASK(IV_CFG_CLS_NET) |
                                 IV_CFG_CLASS_MASK(IV_CFG_CLS_SYS) |
-                                IV_CFG_CLASS_MASK(IV_CFG_CLS_PROBE),
+                                IV_CFG_CLASS_MASK(IV_CFG_CLS_PROBE) |
+                                IV_CFG_CLASS_MASK(IV_CFG_CLS_ELEC) |
+                                IV_CFG_CLASS_MASK(IV_CFG_CLS_SENSOR),
                             on_cfg_committed, NULL) != IV_OK)
         IV_LOG_W(APP_MOD,
-                 "subscribe(net+sys+probe) failed -- server addr / report interval / "
-                 "probe params change needs a restart");
+                 "subscribe(net+sys+probe+elec+sensor) failed -- server addr / report "
+                 "interval / probe params / thresholds change needs a restart");
 
     /* 9d. M8-S8.3 受控远程通道装配（身份/令牌/服务端/落点/巡检定时器）。
      *    在 9b 之后：与 agent 装配同级，都在 reactor 建好之后。 */

@@ -45,6 +45,7 @@ static int  agent_reconnect(void *arg, int new_ifindex);
 
 static void probe_drive(iv_agent_t *a, uint64_t now_ms);
 static void netmgr_feed(iv_agent_t *a, uint64_t now_ms);
+static void thresh_drive(iv_agent_t *a, uint64_t now_ms);
 static void env_feed(iv_agent_t *a, uint64_t now_ms);
 static void on_cfg_search_mode(const iv_proto_frame_t *f, void *arg);
 static void on_query_ipc(const iv_proto_frame_t *f, void *arg);
@@ -679,6 +680,7 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
     (void)iv_recovery_tick(&a->rec, now_ms);
     storage_drive(a, now_ms); /* M6-S6.5：SD 水位闸门（先于 rec_drive，同拍生效） */
     rec_drive(a, now_ms); /* M6-S6.3：断网录像状态机（每拍喂判据） */
+    thresh_drive(a, now_ms); /* 阈值下发重试（0xF1）：与 on_pb_timer 同装同驱动 */
     (void)iv_report_step(&a->rp, now_ms);
     if (a->cell_fd >= 0)
         cell_drive(a, now_ms);   /* 4G 查询状态机：与定时器同一入口，重复驱动无害 */
@@ -1097,6 +1099,34 @@ static void on_snmp_done(uint64_t id, int rc, const void *result,
              jb->which, rc, jb->n_slot);
 }
 
+/* 阈值下发（0xF1）的重试驱动：把已登记的那份 JSON 交给 iv_report，发出去就清账。
+ * 每拍都会被调用（`iv_agent_step` 与 `on_pb_timer` 两处，与 storage_drive 同装同驱动），
+ * 所以"撞上在飞的 0xE1"不用特殊处理——下一拍自然重试。
+ * 日志降噪：失败只在第 1 次和第每 60 次打，否则采集板整场不上线时会一秒一行。 */
+static void thresh_drive(iv_agent_t *a, uint64_t now_ms)
+{
+    int rc;
+
+    if (a == NULL || a->th_len == 0u)
+        return;
+    if (a->th_next_ms != 0u && (int32_t)(now_ms - a->th_next_ms) < 0)
+        return;
+
+    rc = iv_report_send_thresh(&a->rp, a->th_json, (size_t)a->th_len, now_ms);
+    if (rc == IV_OK) {
+        IV_LOG_I(AG_MOD, "thresh sent (%u B): %s", (unsigned)a->th_len, a->th_json);
+        a->th_len    = 0u;
+        a->th_tries  = 0u;
+        a->th_next_ms = 0u;
+        return;
+    }
+
+    a->th_tries++;
+    a->th_next_ms = now_ms + IV_AGENT_THRESH_RETRY_MS;
+    if (a->th_tries == 1u || (a->th_tries % 60u) == 0u)
+        IV_LOG_W(AG_MOD, "thresh not sent yet (rc=%d, tries=%u)", rc, (unsigned)a->th_tries);
+}
+
 static void probe_drive(iv_agent_t *a, uint64_t now_ms)
 {
     int n;
@@ -1210,6 +1240,7 @@ static void on_pb_timer(void *arg)
         (void)iv_device_tick(&a->dev, now);
     env_feed(a, now);
     (void)iv_recovery_tick(&a->rec, now);
+    thresh_drive(a, now); /* 阈值下发重试（0xF1）：Reactor 下 step() 不被调用 */
     if (a->r != NULL)
         a->pb_timer = iv_timer_add(a->r, IV_AGENT_PROBE_TICK_MS, on_pb_timer, a);
 }
@@ -1457,6 +1488,38 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
     IV_LOG_I(AG_MOD, "probe reloaded: interval=%u timeout=%u fail_n=%u dst=%s",
              (unsigned)pc.interval_ms, (unsigned)pc.timeout_ms, (unsigned)pc.fail_n,
              ipv4_dotted(new_dst, nb, sizeof(nb)));
+    return IV_OK;
+}
+
+int iv_agent_apply_thresh(iv_agent_t *a, const iv_thresh_t *t, uint64_t now_ms)
+{
+    char   json[IV_AGENT_THRESH_JSON_MAX];
+    size_t len = 0u;
+    int    rc;
+
+    if (a == NULL || t == NULL)
+        return IV_EINVAL;
+    if (!a->opened)
+        return IV_ESTATE;
+
+    rc = iv_report_build_thresh(t, json, sizeof(json), &len);
+    if (rc != IV_OK)
+        return rc; /* IV_ESTATE = 九项全 0；IV_ERANGE = 缓冲不够 */
+
+    /* 同值早返回：改的是别的键（或平台重发同一份配置）时不要重置重试计数。 */
+    if (a->th_len == (uint16_t)len && memcmp(a->th_json, json, len) == 0)
+        return IV_OK;
+
+    if (a->th_len != 0u)
+        a->th_drops++; /* 上一份还没发出去就被新的覆盖了（诊断用，不是错误） */
+
+    memcpy(a->th_json, json, len);
+    a->th_json[len] = '\0';
+    a->th_len      = (uint16_t)len;
+    a->th_tries    = 0u;
+    a->th_next_ms  = 0u; /* 立刻可发，由本拍/下一拍的 thresh_drive() 走 */
+    (void)now_ms;        /* 时间只是为了让签名与其它 *_apply_* 一致，这里不用 */
+    IV_LOG_I(AG_MOD, "thresh queued (%u B): %s", (unsigned)len, a->th_json);
     return IV_OK;
 }
 

@@ -249,6 +249,67 @@ int iv_report_send_cmd(iv_report_t *rp, uint8_t cmd, const void *data,
     return iv_link_send(&rp->lk, cmd, data, len, (uint32_t)now_ms, NULL, NULL);
 }
 
+/* ---------------------------------------------------------------------------
+ * 阈值下发（0xF1）
+ * ------------------------------------------------------------------------- */
+/* 纯函数：只拼 JSON，不碰链路。键序与单片机源码的解析顺序一致；值为 0 的项
+ * **不出现**在 JSON 里（"0＝该项不设置"的口径见 iv_report.h）。 */
+int iv_report_build_thresh(const iv_thresh_t *t, char *out, size_t cap, size_t *out_len)
+{
+    struct {
+        const char *k;
+        int32_t     v;
+    } kv[9];
+    size_t used = 0u;
+    int    n;
+    int    i;
+    int    first = 1;
+
+    if (t == NULL || out == NULL || out_len == NULL || cap == 0u)
+        return IV_EINVAL;
+
+    kv[0].k = "hv"; kv[0].v = t->hv;
+    kv[1].k = "lv"; kv[1].v = t->lv;
+    kv[2].k = "ov"; kv[2].v = t->ov;
+    kv[3].k = "ld"; kv[3].v = t->ld;
+    kv[4].k = "sl"; kv[4].v = t->sl;
+    kv[5].k = "tu"; kv[5].v = t->tu;
+    kv[6].k = "tl"; kv[6].v = t->tl;
+    kv[7].k = "hu"; kv[7].v = t->hu;
+    kv[8].k = "hl"; kv[8].v = t->hl;
+
+    if (cap < 3u)
+        return IV_ERANGE;
+    out[used++] = '{';
+    for (i = 0; i < 9; i++) {
+        if (kv[i].v == 0)
+            continue; /* 0 ＝ 不设置：不下发该键 */
+        n = snprintf(out + used, cap - used, "%s\"%s\":%ld",
+                     first ? "" : ",", kv[i].k, (long)kv[i].v);
+        if (n < 0 || (size_t)n >= cap - used)
+            return IV_ERANGE;
+        used += (size_t)n;
+        first = 0;
+    }
+    if (used + 2u > cap)
+        return IV_ERANGE;
+    out[used++] = '}';
+    out[used]   = '\0';
+    if (first)
+        return IV_ESTATE; /* 九项全 0：没有可下发的内容 */
+    *out_len = used;
+    return IV_OK;
+}
+
+int iv_report_send_thresh(iv_report_t *rp, const char *json, size_t len, uint64_t now_ms)
+{
+    if (json == NULL || len == 0u)
+        return IV_EINVAL;
+    if (len > (size_t)IV_FRAME_DATA_MAX)
+        return IV_ERANGE;
+    return iv_report_send_cmd(rp, IV_FRAME_CMD_THRESH, json, (uint16_t)len, now_ms);
+}
+
 void iv_report_request_poll(iv_report_t *rp)
 {
     if (rp == NULL || !rp->opened)

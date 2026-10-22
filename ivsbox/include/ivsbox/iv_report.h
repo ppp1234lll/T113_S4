@@ -307,6 +307,60 @@ int iv_report_reconnect(iv_report_t *rp, uint64_t now_ms);
 int iv_report_send_cmd(iv_report_t *rp, uint8_t cmd, const void *data,
                        uint16_t len, uint64_t now_ms);
 
+/* ---------------------------------------------------------------------------
+ * 阈值下发（`0xF1`）：把 `elec.*` / `sensor.*` 九个配置键送到采集板
+ * ---------------------------------------------------------------------------
+ * ============================ 载荷是 JSON，不是 18 字节 ============================
+ * Excel《配置、控制》把 `0xF1` 的请求写成"9 参数 × 2B = 18B"二进制，但现网
+ * 单片机源码是**按 JSON 解析**的（键 `hv/lv/ov/ld/sl/tu/tl/hu/hl`）。用户
+ * 2026-10-08 已裁定：**取 JSON，Excel 该行作废**（见 `docs/修改记录.md`
+ * 该日条目的「协议冲突」段）。照二进制发出去，单片机收到的是 18 个不可解析
+ * 的字节 —— 而且帧长/CRC 全都自洽，现场只会表现为"阈值怎么改都不生效"。
+ *
+ * ============================ 值 0 ＝ 该项不设置 ============================
+ * 九个键的配置默认值都是 `0.0`，本模块**没有**"未设置"位可用。因此约定：
+ * **值为 0 的项不下发该键**（JSON 里根本不出现），采集板保持自己的现值。
+ * 反过来"把采集板某一项真的设成 0"就无法表达 —— 这是已知限制，登记在
+ * `docs/代码说明.adoc`，不是遗漏。
+ *
+ * 为什么不"用镜像补齐九项再整体下发"：镜像里的阈值同样来自采集板，补齐是
+ * 空操作；而一旦某项既没配置、镜像也没读到（首轮 0xE1 之前），补齐就得**猜**
+ * 一个 0 下发 —— 采集板会把"任何电压都超限"，比不发更糟。
+ * ------------------------------------------------------------------------- */
+
+/* 阈值九项（**顺序不重要**：下发用 JSON 键名；顺序沿用 0xE1 镜像的字段序，
+ * 只为读代码时两处能对上）。单位与量纲同 0xE1 应答：V/A/mA/℃/%/度。 */
+typedef struct {
+    int32_t hv; /* 高压        elec.volt_high   */
+    int32_t lv; /* 低压        elec.volt_low    */
+    int32_t ov; /* 过流        elec.over_current*/
+    int32_t ld; /* 漏电流      elec.leak_current*/
+    int32_t sl; /* 倾斜        sensor.tilt      */
+    int32_t tu; /* 温度上限    sensor.temp_high */
+    int32_t tl; /* 温度下限（可负） sensor.temp_low */
+    int32_t hu; /* 湿度上限    sensor.humi_high */
+    int32_t hl; /* 湿度下限    sensor.humi_low  */
+} iv_thresh_t;
+
+/*
+ * 纯函数：把 `t` 里**非 0** 的项拼成 `0xF1` 的 JSON 载荷（便于单测，不碰链路）。
+ * 键序固定为 `hv lv ov ld sl tu tl hu hl`（与单片机源码的解析顺序一致）。
+ *   IV_OK      成功，`*out_len` 为长度（不含 NUL；缓冲里同时留了 NUL 便于排查）
+ *   IV_EINVAL  `t`/`out`/`out_len` 为 NULL
+ *   IV_ERANGE  `cap` 不够
+ *   IV_ESTATE  **九项全为 0**（没有可下发的内容——"发了等于没发"，回错误让
+ *              调用方别记一条"已下发"的日志）
+ */
+int iv_report_build_thresh(const iv_thresh_t *t, char *out, size_t cap, size_t *out_len);
+
+/*
+ * 把 `iv_report_build_thresh()` 拼好的载荷作为 `0xF1` 下发。
+ * `0xF1` 是**幂等**的（同样的值写两遍结果一样），因此**允许 `iv_link` 重传**
+ * —— 与 `0xD1`/`0xD2` 那种"只能发一次"的控制命令不同，不必进免重传名单。
+ * 返回码同 `iv_report_send_cmd()`（`IV_EBUSY` 表示同 cmd 在飞，调用方稍后重试）。
+ */
+int iv_report_send_thresh(iv_report_t *rp, const char *json, size_t len, uint64_t now_ms);
+
 /*
  * 请求**立刻**下发一次 `0xE1` 全量查询（不等下一个 `poll_ms` 周期）。
  *

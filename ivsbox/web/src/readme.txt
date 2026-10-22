@@ -33,6 +33,21 @@ web/src  ——  ivsbox-web 进程源码目录（自研最小 HTTP/1.1 服务）
                    三道（逐段拒 `.`/`..` → realpath 前缀复核 → open(O_NOFOLLOW)）；
                    Range（含后缀区间）/ETag/If-Range；`?sha=1` 时附 X-SHA256。
                    2026-10-16 起改密闸门同样盖住这里（默认口令期不给下录像）。
+  iv_web_logs.c    2026-10-22 系统日志浏览/下载（对齐参考 web 的「打印日志」）：
+                   `GET /api/logs` 列 `<log_root>/<YYYY-MM-DD>/<HH>.log`（mtime 降序），
+                   `GET /api/logs/file?f=..` 走 `rsp->file_path` 流式下载（不进 wbuf）。
+                   **直接扫盘、不经本地通道**：日志是 web 自己能读的普通文件，为"列个
+                   目录"开协议只会把 32 KiB 响应上限套在列表上。围栏三道（形状白名单
+                   `<日期>/<1..2 位数字>.log` → realpath 前缀复核 → open(O_NOFOLLOW)
+                   ＋fstat）；`f` 必须自己 percent-decode（前端把 `/` 编成 `%2F`）。
+  iv_web_ota.c     2026-10-22 升级包分片上传 ＋ 请求安装：
+                   `POST /api/ota/chunk?name=..&off=N`（体＝本片，≤24 KiB）追加到
+                   `<ota_root>/<name>.part`；`finish` 核长度＋SHA-256 后 fsync→rename
+                   成正式包；`install` 只把绝对路径交给本地通道 `ota.request`
+                   （**不安装**，由 monitor.sh 拉起 ivsbox-updater）；`abort` 丢分片；
+                   `GET chunk` 给续传点。围栏＝包名正向白名单 ＋ O_NOFOLLOW ＋ 落点必须
+                   与 daemon 的 `<data_root>/ota/` 一致。偏移对不上回 409＋**实际**
+                   偏移（续传握手）。`sha256` 可选：纯 http 下浏览器没有 `crypto.subtle`。
   iv_web_pass.c    2026-10-16 账号与口令（**只存摘要**）：`iv_web_pass_hash()` 是
                    **域分隔**的 `sha256("ivsbox-web|1|" + user + "|" + pass)`；
                    `iv_web_pass_rule()` 要求 8-12 位且大写/小写/数字**都要有**，并
@@ -56,8 +71,13 @@ web/src  ——  ivsbox-web 进程源码目录（自研最小 HTTP/1.1 服务）
   make host / make arm    分别产出 build/host/ivsbox-web、build/arm/ivsbox-web
   运行：ivsbox-web [--port N] [--root DIR] [--chan PATH] [--user NAME] [--pass PW]
                    [--pass-file PATH] [--media-root DIR] [--media-bps N]
+                   [--log-root DIR] [--ota-root DIR]
                    [--cam-port N] [--cam-upstream N]
                    [--heartbeat PATH] [--heartbeat-ms N]
+  `--log-root`（默认 `/mnt/UDISK/log`）与 `--ota-root`（默认
+  `/mnt/UDISK/ivsbox/ota`）都可用 `IVSBOX_WEB_LOG_ROOT` / `IVSBOX_WEB_OTA_ROOT` 覆盖。
+  **`--ota-root` 必须与 ivsboxd 的 `<data_root>/ota/` 是同一个目录**：`ota.request`
+  只收该目录下的包，配错会直接被拒（刻意的围栏，不是 bug）。
   账号/口令（2026-10-16 起）：`--user` 默认 `admin`；`--pass` 默认出厂口令
   `88888888`，**启动日志不回显**（只打 `must_change` 与口令文件路径）。
   `--pass-file` 默认 `/mnt/UDISK/ivsbox/secure/web.passwd`；**传空值即"不落盘"**

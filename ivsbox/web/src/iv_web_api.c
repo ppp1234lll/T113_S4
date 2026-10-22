@@ -299,6 +299,14 @@ static int api_p_call(iv_web_ctx_t *ctx, const char *method, const char *p_json,
     return to_rsp(out, cap, out_len, rsp);
 }
 
+/* 同进程其它层用的 ctl 调用口（见 iv_web.h）。`ota.c` 用它发 `ota.request`：
+ * 自己再写一份 `{"m":..,"p":..}` 封装，等于让通道请求的外形有两处定义。 */
+int iv_web_api_call(iv_web_ctx_t *ctx, const char *method, const char *p_json,
+                    char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp)
+{
+    return api_p_call(ctx, method, p_json, out, cap, out_len, rsp);
+}
+
 static int api_config_get(iv_web_ctx_t *ctx, const iv_web_req_t *req,
                           char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp)
 {
@@ -564,6 +572,11 @@ int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
     if (strncmp(req->path, "/api/logs", 9u) == 0 &&
         (req->path[9] == '\0' || req->path[9] == '/'))
         return iv_web_logs_handle(ctx, req, out, cap, out_len, rsp);
+
+    /* 升级包上传/校验/请求安装（`iv_web_ota.c`）。同样必须在兜底 404 之前转出去。
+     * 只接 `/api/ota/<子路径>`：`/api/ota` 本身是状态查询，已在上面处理完了。 */
+    if (strncmp(req->path, "/api/ota/", 9u) == 0)
+        return iv_web_ota_handle(ctx, req, out, cap, out_len, rsp);
 
     *out_len = api_err(out, cap, IV_ENOENT, "no such api");
     rsp->status = 404;

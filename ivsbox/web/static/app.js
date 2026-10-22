@@ -1605,17 +1605,182 @@
     ops.appendChild(bar);
     root.appendChild(ops);
 
-    /* ---- 系统升级（`ota.status`，**只读**）----
-     * 参考 web 里的「升级有线/升级无线」是"设备自己去服务器下载"。本机没有下载器：
-     * 包由平台下发或随 U 盘落地，真正的安装由 monitor.sh 拉起 ivsbox-updater 完成
-     * （单写者原则，见 iv_upd.h）。所以这里**如实显示状态**，不摆一个按下去没反应
-     * 的"升级"按钮——那比没有按钮更糟。 */
+    /* ---- 系统升级（状态只读 ＋ 包上传 ＋ 安装请求）----
+     * 参考 web 里的「升级有线/升级无线」是"设备自己去服务器下载"，本机没有下载器：
+     * 包由浏览器（或平台/U 盘）送到设备上。分工写死在这里：
+     *   本页只做「把包传上去 + 落一个安装请求」；**真正改盘安装由 monitor.sh 拉起
+     *   ivsbox-updater 执行**（单写者原则，见 iv_upd.h）。所以状态区永远只读，
+     *   装没装成看 `ota.status` 的 state/最近事件，不是看本页的按钮。 */
     var up = el('div', 'card');
     up.appendChild(el('h3', null, '系统升级'));
     var upHint = el('p', 'hint', '读取中…');
     up.appendChild(upHint);
     var upGrid = el('div', 'grid');
     up.appendChild(upGrid);
+
+    /* ---- 上传升级包（分片）----
+     * 为什么非分片不可：`IV_WEB_BODY_MAX` 是 32 KiB，而版本包有几 MB —— 一次 POST 根本
+     * 传不进来。每片 24 KiB（与服务端 `IV_WEB_OTA_SLICE` 是同一个数，改要同时改），
+     * 断了能从续传点接上，不必从头再来（现场多半是 4G）。
+     * 传完只发**安装请求**：真正改盘由 monitor.sh 拉起 ivsbox-updater 执行（单写者），
+     * 所以按钮文案是"上传并请求安装"，不是"立即升级"。
+     * 浏览器侧的 SHA-256 在纯 http（非 localhost）下拿不到 `crypto.subtle`，故摘要交给
+     * 服务端算；完整性另有安装时的 Ed25519 验签兜底。 */
+    var OTA_SLICE = 24 * 1024;
+    var OTA_MAX = 64 * 1024 * 1024;
+    var otaFile = null;
+    var otaBusy = false;
+    var otaCancel = false;
+
+    var upPick = el('div', 'actions');
+    var fUp = document.createElement('input');
+    fUp.type = 'file';
+    fUp.id = 'ota-file';
+    upPick.appendChild(fUp);
+    up.appendChild(upPick);
+
+    var upFileInfo = el('p', 'hint', '未选择升级包');
+    up.appendChild(upFileInfo);
+    var upProg = el('p', 'hint', '');
+    up.appendChild(upProg);
+
+    var upAct = el('div', 'actions');
+    var bUpSend = el('button', 'ghost', '上传并请求安装');
+    bUpSend.type = 'button';
+    bUpSend.disabled = true;
+    var bUpAbort = el('button', 'ghost', '取消上传');
+    bUpAbort.type = 'button';
+    bUpAbort.disabled = true;
+    upAct.appendChild(bUpSend);
+    upAct.appendChild(bUpAbort);
+    up.appendChild(upAct);
+
+    fUp.addEventListener('change', function () {
+      otaFile = (fUp.files && fUp.files[0]) || null;
+      bUpSend.disabled = !otaFile || otaBusy;
+      upFileInfo.textContent = otaFile
+        ? ('已选：' + (otaFile.name || '(无名)') + '（' + fmtSize(otaFile.size) + '）')
+        : '未选择升级包';
+      upProg.textContent = '';
+    });
+
+    /* 包名只留安全字符：服务端按正向白名单判（`[A-Za-z0-9][A-Za-z0-9._-]*`），
+     * 这里先就地改一遍，免得用户选了个中文名/带空格的名字被拒还不知道为什么。 */
+    function otaSafeName(n) {
+      return String(n || 'pkg').replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\./, '_');
+    }
+
+    /* 分片体是二进制，走不了 api() 那套 JSON 封装，单独一条 fetch。 */
+    function otaChunk(name, off, blob) {
+      return fetch('/api/ota/chunk?name=' + encodeURIComponent(name) + '&off=' + off, {
+        method: 'POST',
+        credentials: 'same-origin',
+        body: blob,
+        headers: { 'Content-Type': 'application/octet-stream' }
+      }).then(function (r) {
+        return r.text().then(function (t) {
+          var j;
+          try { j = JSON.parse(t); } catch (e) { j = { ok: false, e: -1, msg: '响应不是 JSON' }; }
+          j._status = r.status;
+          return j;
+        });
+      });
+    }
+
+    function otaSettle(msg, kind) {
+      otaBusy = false;
+      bUpSend.disabled = !otaFile;
+      bUpAbort.disabled = true;
+      if (msg) {
+        upProg.textContent = msg;
+        toast(msg, kind || 'err');
+      }
+    }
+
+    function uploadFrom(name, off) {
+      if (otaCancel) return Promise.resolve(otaSettle('已取消上传'));
+      if (off >= otaFile.size) return otaFinish(name);
+      var end = Math.min(off + OTA_SLICE, otaFile.size);
+      var blob = otaFile.slice(off, end);
+      return otaChunk(name, off, blob).then(function (r) {
+        /* 服务端说偏移对不上：按它给的实际值接（它才是真相，别自己猜） */
+        if (r._status === 409 && r.d && typeof r.d.off === 'number') {
+          upProg.textContent = '偏移对不上，按服务端的 ' + fmtSize(r.d.off) + ' 续传…';
+          return uploadFrom(name, r.d.off);
+        }
+        if (!r.ok) throw new Error(r.msg || ('分片失败 e=' + r.e));
+        var done = (r.d && r.d.next) || end;
+        var pct = otaFile.size ? Math.min(100, Math.round(done * 100 / otaFile.size)) : 100;
+        upProg.textContent = '已上传 ' + fmtSize(done) + ' / ' + fmtSize(otaFile.size) +
+          '（' + pct + '%）';
+        return uploadFrom(name, done);
+      });
+    }
+
+    function otaFinish(name) {
+      upProg.textContent = '校验并落位…';
+      return api('/api/ota/finish', { method: 'POST', body: { name: name, size: otaFile.size } })
+        .then(function (r) {
+          if (!r.ok) {
+            var d = r.d || {};
+            var extra = (d.got != null) ? ('（服务端收到 ' + fmtSize(d.got) + '）') : '';
+            return otaSettle('包校验失败：' + (r.msg || r.e) + extra);
+          }
+          var ok = r.d || {};
+          upProg.textContent = '包已就位（' + fmtSize(ok.size) + '），摘要 ' + (ok.sha256 || '—') +
+            '，正在请求安装…';
+          return api('/api/ota/install', { method: 'POST', body: { name: name, restart: 1 } })
+            .then(function (ir) {
+              if (!ir.ok) return otaSettle('安装请求失败：' + (ir.msg || ir.e));
+              otaSettle('已请求安装：由 monitor.sh 拉起 ivsbox-updater 执行，进度看上面的状态',
+                'ok');
+              setTimeout(loadOta, 1500);
+            });
+        })
+        .catch(function (e) {
+          otaSettle('上传中断：' + (e && e.message ? e.message : e) + '（可重试，会从续传点接上）');
+        });
+    }
+
+    bUpSend.addEventListener('click', function () {
+      if (otaBusy || !otaFile) return;
+      if (!otaFile.size) { toast('空文件不能作为升级包', 'err'); return; }
+      if (otaFile.size > OTA_MAX) {
+        toast('包超过上限 ' + fmtSize(OTA_MAX), 'err');
+        return;
+      }
+      var name = otaSafeName(otaFile.name);
+      if (name !== otaFile.name) toast('包名含特殊字符，按 ' + name + ' 保存', 'warn');
+      otaBusy = true;
+      otaCancel = false;
+      bUpSend.disabled = true;
+      bUpAbort.disabled = false;
+      upProg.textContent = '查询续传点…';
+      api('/api/ota/chunk?name=' + encodeURIComponent(name)).then(function (r) {
+        var off = (r.ok && r.d && typeof r.d.off === 'number') ? r.d.off : 0;
+        if (off >= otaFile.size) off = 0;  /* 服务端那份不比当前文件小 ⇒ 从头传 */
+        if (off > 0) upProg.textContent = '检测到未完成的上传，从 ' + fmtSize(off) + ' 续传…';
+        return uploadFrom(name, off);
+      }).catch(function (e) {
+        otaSettle('续传点查询失败：' + (e && e.message ? e.message : e));
+      });
+    });
+
+    bUpAbort.addEventListener('click', function () {
+      if (!otaBusy) return;
+      otaCancel = true;
+      bUpAbort.disabled = true;
+      upProg.textContent = '正在取消…';
+      if (otaFile) {
+        api('/api/ota/abort', {
+          method: 'POST',
+          body: { name: otaSafeName(otaFile.name) }
+        }).then(function () { otaSettle('已取消，未完成的分片已丢弃'); });
+      } else {
+        otaSettle('已取消');
+      }
+    });
+
     var upBar = el('div', 'actions');
     var bUpRefresh = el('button', 'ghost', '刷新升级状态');
     bUpRefresh.type = 'button';

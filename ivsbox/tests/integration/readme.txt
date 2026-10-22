@@ -124,6 +124,19 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
                        **诚实边界**：`SIGKILL` 只近似"进程未及清理就消失"，**不等于真掉电**
                        （page cache 里的数据仍会写回）；真拔电只能在板端做，见
                        `tests/fault-inject.sh` 的 MANUAL 项 m6/m7/m8。无需任何外部服务。
+  ota_install_e2e.py   升级包「上传 → 请求安装」的**接线**取证（Python；真 ivsboxd ＋
+                       真 ivsbox-web）。为什么非它不可：`tests/web/ota_e2e.py` 证明了
+                       字节能传、SHA 能核、包能就位，但它跑的时候没有 daemon，`install`
+                       那一步只能断言"回了 ivsboxd not running"。真正要证的是**装配**：
+                       Web 把包名翻成绝对路径 → 本地通道 `ota.request` → ivsboxd 落下
+                       `<data_root>/ota/request`（monitor.sh 见到它才拉起
+                       ivsbox-updater）。判据是**盘上的请求文件内容**，不是 HTTP 响应 ——
+                       "响应说已接受、盘上什么也没有"是这类接线最典型的假成功。覆盖：
+                       两片上传＋finish 后包就位；install 后请求文件出现且内容恰为
+                       `<包绝对路径> 1\n`；不带 restart 时写 0；包名带 `..` 时 Web 就拒、
+                       盘上不落文件。**需 root**（ctl 是 root:root 0660）与可写
+                       `/mnt/UDISK/ivsbox/ota`；自己起/收 daemon 与 web，跑之前不能有
+                       别的 ivsboxd 在跑。
   thresh_e2e.py        阈值下发 0xF1 的**装配层接线**取证（Python；本目录唯一的非 C 用例）。
                        为什么非它不可：`iv_agent_apply_thresh()` 的单测与
                        `test_agent_board` b06b 只证明"给它一份阈值能发对帧"，而
@@ -161,6 +174,10 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
   # thresh_e2e.py：装配层接线取证。自己起/收 daemon（**跑之前不能有 ivsboxd 在跑**）
   sudo mkdir -p /mnt/UDISK/log
   sudo python3 tests/integration/thresh_e2e.py
+
+  # ota_install_e2e.py：同上口径，验的是 `<data_root>/ota/request` 有没有真的落下
+  sudo mkdir -p /mnt/UDISK/ivsbox/ota
+  sudo python3 tests/integration/ota_install_e2e.py
 
 【约定与注意事项】
   - 本目录**刻意不并入 make test**：目录里既有"需外部服务"的用例，并进去会让 CI 因

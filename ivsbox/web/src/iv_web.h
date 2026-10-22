@@ -103,6 +103,24 @@ extern "C" {
  * 默认值与 S65ivsboxd 的心跳/日志目录同源（`/mnt/UDISK/log`）。 */
 #define IV_WEB_LOG_ROOT_DEFAULT "/mnt/UDISK/log"
 #define IV_WEB_LOG_ROOT_MAX     256u
+
+/* ---- 升级包分片上传（对齐参考 web 的「升级有线/无线」的**反向**）----
+ * 参考实现是"设备自己去服务器下载"；本机没有下载器，包只能由浏览器（或平台/U 盘）
+ * 送到设备上。落点必须与 ivsboxd 侧 `iv_upd_request_write()` 的围栏一致 —— 它只
+ * 接受**位于 `<data_root>/ota/` 之下**的已存在普通文件（默认 data_root 就是
+ * `/mnt/UDISK/ivsbox`），所以这里默认值取它的 ota 子目录，两边对不上时 ctl 会拒绝，
+ * 而不会静默装错包。 */
+#define IV_WEB_OTA_ROOT_DEFAULT "/mnt/UDISK/ivsbox/ota"
+#define IV_WEB_OTA_ROOT_MAX     256u
+/* 单片上限。请求体总上限是 `IV_WEB_BODY_MAX`（32 KiB），这里取 24 KiB 给请求头与
+ * 未来加参数留余量。**前端必须用同一个数**（`app.js` 的 `OTA_SLICE`）。 */
+#define IV_WEB_OTA_SLICE        (24u * 1024u)
+/* 包名上限（含 `.part` 后缀前的本体）；整包体积上限（远大于实际版本包，防误传大文件
+ * 把 UDISK 填满）。 */
+#define IV_WEB_OTA_NAME_MAX     64u
+#define IV_WEB_OTA_PKG_MAX      (64u * 1024u * 1024u)
+/* 起传前要求的空闲余量：留出解压暂存（`<data_root>/ota/staging/`）的空间。 */
+#define IV_WEB_OTA_FREE_MIN     (32u * 1024u * 1024u)
 /* 限速窗口（ms）与"配额用完先等这么久" */
 #define IV_WEB_RL_WIN_MS   1000u
 #define IV_WEB_RL_WAIT_MS  20u
@@ -213,6 +231,11 @@ typedef struct {
     /* 系统日志浏览/下载（值语义，同上）。空串 = 用 IV_WEB_LOG_ROOT_DEFAULT。 */
     char          log_root[IV_WEB_LOG_ROOT_MAX];
 
+    /* 升级包上传落点（值语义，同上）。空串 = 用 IV_WEB_OTA_ROOT_DEFAULT。
+     * **必须与 ivsboxd 的 `<data_root>/ota/` 同一个目录**，否则 `ota.request` 会被
+     * iv_upd 的围栏拒掉（那是刻意的：谁都不许让安装器吃任意路径）。 */
+    char          ota_root[IV_WEB_OTA_ROOT_MAX];
+
     /* S8.5 摄像机受控代理：cam_port 为**本机代理监听口**（只绑 127.0.0.1；0 = 未开），
      * 用作"目标是代理自己"的环回护栏；cam_upstream 是**摄像机侧的 Web 端口**（唯一
      * 允许被代理的端口，默认 80）。两者都来自命令行/环境变量 —— Web 不读配置。 */
@@ -301,6 +324,29 @@ int iv_web_media_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
  * -------------------------------------------------------------------------- */
 int iv_web_logs_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
                        char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp);
+
+/* --------------------------------------------------------------------------
+ * api.c —— 给同工程其它层用的 ctl 调用口
+ * 把 `{m,p}` 包一层发给 ivsboxd，并把响应原样搬进 out（与 api 层自己用的一致）。
+ * 暴露出来是为了让 logs/ota 这类同进程模块**不必各写一份**通道封装 ——
+ * 两处各写一遍，迟早只有一处跟上新的头/错误语义。
+ * -------------------------------------------------------------------------- */
+int iv_web_api_call(iv_web_ctx_t *ctx, const char *method, const char *p_json,
+                    char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp);
+
+/* --------------------------------------------------------------------------
+ * ota.c —— 升级包分片上传 / 校验 / 请求安装（2026-10-22）
+ *   POST /api/ota/chunk?name=..&off=N   体＝本片字节 → 追加到 `<name>.part`
+ *   POST /api/ota/finish   {"name","size","sha256"} → 校验并 rename 成正式包
+ *   POST /api/ota/install  {"name","restart"} → 本地通道 `ota.request`（**不安装**，
+ *                                              安装由 monitor.sh 拉起 updater）
+ *   POST /api/ota/abort    {"name"}            → 丢弃未完成的分片文件
+ *   GET  /api/ota/chunk?name=..                → 未完成上传的续传点
+ * 返回口径与 api/media/logs 相同：IV_OK = 已填响应；IV_ENOTSUP = 路径不归我。
+ * 鉴权不在这里做：本层只被 `iv_web_api_handle()` 在会话闸门**之后**转交过来。
+ * -------------------------------------------------------------------------- */
+int iv_web_ota_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
+                      char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp);
 
 /* --------------------------------------------------------------------------
  * cam.c —— S8.5 摄像机受控代理（架构 §9.3）

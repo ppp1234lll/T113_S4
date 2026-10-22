@@ -44,6 +44,24 @@ logs_e2e.py
     POST ⇒ 405、`/api/logsXYZ` 不归本层、日志根不存在 ⇒ 空列表。共 21 条断言。
     需要 python3（VM 上没有 node，所以这一半只能在 VM 上跑）。
 
+ui_ops_ota.mjs
+    运维页「系统升级」卡里的**分片上传**：选文件后才解除按钮禁用、每片 24 KiB
+    （服务端硬上限，超一片就 413）、`off` 是"已上传字节数"而不是每片都从 0 开始、
+    分片体按 `application/octet-stream` 发（不当 JSON 序列化）、传完先 finish 再
+    install（`restart=1`）、**不带 sha256**（纯 http 下浏览器拿不到
+    `crypto.subtle`，摘要交服务端算）、服务端 409 带实际偏移时按**服务端的值**接、
+    校验失败不发安装请求、取消会调 `/api/ota/abort` 丢掉半截分片。共 30 条断言。
+
+ota_e2e.py
+    **不是 jsdom**，是真进程：起 `build/host/ivsbox-web`（`--ota-root` 指到 /tmp），
+    走真 HTTP 取证上传链路：三片拼成 60000 B 与源文件逐字节相同、偏移不连续 ⇒ 409
+    且回实际偏移、GET 续传点、size/sha 不符 ⇒ 409（sha 不符时回真实摘要）、
+    正确后 `.part` 原子改名为正式包、包名围栏（`../`、`/abs`、首字符 `.`、含 `/`）
+    一律 403、单片 >24 KiB ⇒ 413（不静默截断）、abort 删分片、无 Cookie ⇒ 401、
+    缺 name/off ⇒ 400（**off 不默认 0**，免得手滑清掉已有分片）。共 37 条断言。
+    不需要 ivsboxd；**「装没装」那半条在
+    `tests/integration/ota_install_e2e.py`**（要真 daemon 才验得到 monitor 请求文件）。
+
 怎么跑
 ------
 jsdom **不是工程依赖**（不想把 node 生态塞进构建链），所以要单独准备：
@@ -61,6 +79,7 @@ jsdom **不是工程依赖**（不想把 node 生态塞进构建链），所以�
 端到端那条（在 ivsbox/ 目录下、先 `make` 出 build/host/ivsbox-web）：
 
     python3 tests/web/logs_e2e.py
+    python3 tests/web/ota_e2e.py
 
 退出码：0 通过（或 SKIP），1 有断言失败，2 用例自身崩了。
 

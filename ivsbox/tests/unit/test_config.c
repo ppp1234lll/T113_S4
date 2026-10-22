@@ -633,8 +633,11 @@ static void case_parent_scalar_rejected(void)
  * ========================================================================= */
 static void case_atomic_replace(void)
 {
+    /* `net.ip` 现在是**受校验**的键（必须以合法的 IPv4 字面量出现，见
+     * iv_config.c 的 is_ip_key/ip_ok），所以这里不能再用 "OLD"/"NEW" 这种
+     * 随手编的串 —— 换成两个真实地址，语义仍是"存前存后内容必须不同"。 */
     static const char SEED[] =
-        "{\"_meta\":{\"version\":2},\"net\":{\"ip\":\"OLD\"}}\n";
+        "{\"_meta\":{\"version\":2},\"net\":{\"ip\":\"10.0.0.1\"}}\n";
     char         pf[200];
     char         tmpf[200];
     char         buf[2048];
@@ -656,17 +659,18 @@ static void case_atomic_replace(void)
     {
         const char *s = NULL;
 
-        chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "OLD") == 0,
+        chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "10.0.0.1") == 0,
             "c7: a half-written tmp is NOT used as the config");
     }
 
     old_fd = open(pf, O_RDONLY | O_CLOEXEC);
     chk(old_fd >= 0, "c7: hold the pre-save inode open");
 
-    chk(iv_config_set_str(c, "net.ip", "NEW") == IV_OK, "c7: set ip=NEW");
+    chk(iv_config_set_str(c, "net.ip", "10.0.0.2") == IV_OK, "c7: set ip=10.0.0.2");
     chk(iv_config_save(c, NULL, 0u) == IV_OK, "c7: save");
 
-    chk(read_file(pf, buf, sizeof(buf)) > 0 && contains(buf, "NEW") && !contains(buf, "OLD"),
+    chk(read_file(pf, buf, sizeof(buf)) > 0 && contains(buf, "10.0.0.2") &&
+            !contains(buf, "10.0.0.1"),
         "c7: the path now holds the new content");
 
     if (old_fd >= 0) {
@@ -674,7 +678,7 @@ static void case_atomic_replace(void)
         if (n < 0)
             n = 0;
         oldbuf[n] = '\0';
-        chk(contains(oldbuf, "OLD") && !contains(oldbuf, "NEW"),
+        chk(contains(oldbuf, "10.0.0.1") && !contains(oldbuf, "10.0.0.2"),
             "c7: the pre-save inode still holds the OLD content (rename, not in-place write)");
         (void)close(old_fd);
     }
@@ -1714,6 +1718,60 @@ static void case_snmp_oid_keys(void)
     (void)unlink(pf);
 }
 
+/* ===========================================================================
+ * R-05：IP 类键必须是合法的 IPv4 字面量
+ *   - `net.ip` / `camera.ch.N.ip` / `switch.ip`：末段为 `ip` 的键；
+ *   - 空串合法（默认值就是空，语义 = 未配置 / DHCP）；
+ *   - 写入侧就拒（`set_str` 回 IV_EINVAL，坏值进不了内存）；
+ *   - 文件里出现的坏值在加载时被判非法、该键回落默认（与整数越界同口径）。
+ * 反向证伪：去掉 `item_check()` 里那条 `is_ip_key/is_ip_ok`，
+ * 第一段断言立刻变红（999.1.1.1 会被原样读进内存）。
+ * ========================================================================= */
+static void case_ip_keys(void)
+{
+    static const char SEED[] =
+        "{\"_meta\":{\"version\":1},\"net\":{\"ip\":\"999.1.1.1\"},"
+        " \"camera\":{\"ch\":[{\"ip\":\"192.168.2.10\"}]}}\n";
+    char         pf[200];
+    char         tmpf[200];
+    iv_config_t *c;
+    const char  *s = NULL;
+
+    cfg_path(pf, sizeof(pf));
+    path_of(tmpf, sizeof(tmpf), "ivsbox.json.tmp");
+    chk(write_file(pf, SEED, 0644u) == 0, "c30: seed ivsbox.json");
+
+    c = reopen_cfg();
+    chk(c != NULL, "c30: open");
+    if (c == NULL)
+        return;
+
+    chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && s[0] == '\0',
+        "c30a: a bogus ip in the file falls back to the default (empty)");
+    chk(iv_config_get_str(c, "camera.ch.0.ip", &s) == IV_OK &&
+            strcmp(s, "192.168.2.10") == 0,
+        "c30b: a valid ip survives the load");
+
+    /* 反例：一律在写入侧拒掉 */
+    chk(iv_config_set_str(c, "net.ip", "999.1.1.1") == IV_EINVAL, "c30c: 999.1.1.1 rejected");
+    chk(iv_config_set_str(c, "net.ip", "192.168.2") == IV_EINVAL, "c30d: 3-octet rejected");
+    chk(iv_config_set_str(c, "net.ip", "1.2.3.4.5") == IV_EINVAL, "c30e: 5-octet rejected");
+    chk(iv_config_set_str(c, "net.ip", "abc") == IV_EINVAL, "c30f: non-numeric rejected");
+    chk(iv_config_set_str(c, "camera.ch.0.ip", "10.0.0.300") == IV_EINVAL,
+        "c30g: camera channel ip also validated");
+    chk(iv_config_set_str(c, "switch.ip", "10.1.1.1x") == IV_EINVAL,
+        "c30h: switch.ip also validated");
+
+    /* 正例：合法地址与空串都收 */
+    chk(iv_config_set_str(c, "net.ip", "10.0.0.1") == IV_OK, "c30i: a valid ip accepted");
+    chk(iv_config_set_str(c, "net.ip", "") == IV_OK, "c30j: empty (unset) accepted");
+    chk(iv_config_set_str(c, "switch.ip", "10.1.1.1") == IV_OK,
+        "c30k: switch.ip accepts a valid address");
+    chk(iv_config_save(c, NULL, 0u) == IV_OK, "c30l: save after valid writes");
+
+    iv_config_close(c);
+}
+
 int main(void)
 {
     char   tmpl[] = "/tmp/ivcfg_XXXXXX";
@@ -1755,6 +1813,7 @@ int main(void)
     case_dir_autocreate();
     case_dir_recursive_create();
     case_snmp_oid_keys();
+    case_ip_keys();
 
     cleanup();
 
@@ -1764,6 +1823,6 @@ int main(void)
     }
     printf("test_config passed (S8 F1-F7 + S8.1 single-file/8-class/array/double/"
            "comment-roundtrip/per-class transaction + G20 dir-recursive-create + "
-           "S4.3 snmp-oid-slots)\n");
+           "S4.3 snmp-oid-slots + ip-literal validation)\n");
     return 0;
 }

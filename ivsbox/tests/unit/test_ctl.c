@@ -486,6 +486,46 @@ int main(void)
             "c12: value not clobbered by rejected apply");
     }
 
+    /* -------- c12c 超长字符串 / 非法 IP：必须**报错**，不许 ok:true 却没写 --------
+     * R-03 病根：预检只查"键存在 + 类型对"，长度交给写入阶段，而写入阶段把
+     * setter 的返回值 `(void)` 丢弃 ⇒ 超长值被 IV_ERANGE 静默拒掉，接口照样回
+     * `ok:true applied:1`，网页显示保存成功、回读还是旧值。 */
+    {
+        char     req[640];
+        uint64_t v = iv_config_version(cfg);
+        const char *s = NULL;
+        size_t   i;
+        size_t   pos;
+
+        pos = (size_t)snprintf(req, sizeof(req),
+                               "{\"m\":\"config.apply\",\"p\":{\"ver\":%llu,\"items\":"
+                               "{\"net.server.wired.host\":\"",
+                               (unsigned long long)v);
+        for (i = 0; i < 200u && pos + 3u < sizeof(req); i++)
+            req[pos++] = 'a';
+        (void)snprintf(req + pos, sizeof(req) - pos, "\"}}}");
+
+        j = call(&ctx, req, &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && joerr(j) == IV_ERANGE, "c12c: over-long string rejected");
+        if (j != NULL)
+            json_object_put(j);
+        chk(iv_config_get_str(cfg, "net.server.wired.host", &s) == IV_OK && s != NULL &&
+                strcmp(s, "10.9.9.9") == 0,
+            "c12d: over-long value did not clobber the current one");
+        chk(iv_config_version(cfg) == v, "c12e: version unchanged by the rejected write");
+
+        /* R-05 经 ctl 这条路：非法 IP 必须在写入侧被拒、且不落盘 */
+        (void)snprintf(req, sizeof(req),
+                       "{\"m\":\"config.apply\",\"p\":{\"ver\":%llu,\"items\":"
+                       "{\"net.ip\":\"999.1.1.1\"}}}", (unsigned long long)v);
+        j = call(&ctx, req, &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && joerr(j) == IV_EINVAL, "c12f: bogus ip rejected");
+        if (j != NULL)
+            json_object_put(j);
+        chk(iv_config_get_str(cfg, "net.ip", &s) == IV_OK && s != NULL && s[0] == '\0',
+            "c12g: bogus ip left the key at its default");
+    }
+
     /* ---------------- c13 agent 缺失时降级 ---------------- */
     j = call(&ctx, "{\"m\":\"device.list\"}", &rc, raw, sizeof(raw));
     chk(rc == IV_OK && joerr(j) == IV_ESTATE, "c13: device.list without agent -> IV_ESTATE");

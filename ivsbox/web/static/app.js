@@ -1564,13 +1564,19 @@
       api('/api/snmp?which=' + which).then(function (r) {
         box.innerHTML = '';
         if (!r.ok) { box.appendChild(el('p', 'msg', r.msg || '读取失败')); return; }
-        box.appendChild(el('p', 'hint', '状态：' + (SNMP_STATE[r.d.state] || r.d.state)));
-        if (!r.d.slots.length) { box.appendChild(el('p', 'hint', '尚无采集结果')); return; }
+        /* `d`/`slots` 逐层兜底（R-07）：服务端回 `ok:true` 但缺字段时（旧版
+         * 守护进程、或 /api/snmp 还没接上），原先 `r.d.slots.length` 直接抛
+         * TypeError，异常把整个页面的后续渲染一起带走 —— 页面看着"点了一下就
+         * 白了"，控制台只有一句 cannot read property。 */
+        var d = r.d || {};
+        var slots = d.slots || [];
+        box.appendChild(el('p', 'hint', '状态：' + (SNMP_STATE[d.state] || d.state)));
+        if (!slots.length) { box.appendChild(el('p', 'hint', '尚无采集结果')); return; }
         var t = el('table');
         var head = el('tr');
         ['槽位', 'OID', '行数', '取值'].forEach(function (h) { head.appendChild(el('th', null, h)); });
         t.appendChild(head);
-        r.d.slots.forEach(function (s) {
+        slots.forEach(function (s) {
           var tr = el('tr');
           tr.appendChild(el('td', null, s.name));
           tr.appendChild(el('td', null, s.oid));

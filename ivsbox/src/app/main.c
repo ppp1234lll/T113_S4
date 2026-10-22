@@ -1637,6 +1637,116 @@ static int agent_setup(void)
 /* ---------------------------------------------------------------------------
  * 骨架初始化
  * ------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+ * 非正常退出取证（R-08）
+ *
+ * 背景：2026-10-22 板端 17:15:42 出现一次**无预兆重启** —— 日志尾部有 763 个
+ * NUL 字节、没有任何 shutdown/signal 记录、`/tmp` 被整片清空（那是 tmpfs），
+ * 但 `boot_id` 没变。事后两次定向复现（重跑坏包 install、只跑 updater status）
+ * 都没重现，**根因未定位**。没定位就不能说"修好了"，能做的只有一件事：
+ * 让下一次发生时**当场留下判据**。
+ *
+ * 做法＝经典的双态标记（不需要额外硬件、掉电也不撒谎）：
+ *   - 启动最早期读 `run.state`：内容是 `clean` ⇒ 上次是**自己走完 app_shutdown()
+ *     退出的**（SIGTERM / init 停止）；是 `dirty` 或空 ⇒ 上次**没走完正常退出**
+ *     —— 掉电、硬复位、内核 panic、`kill -9`、看门狗复位都会落到这一支；
+ *   - 读完立刻改写成 `dirty`，正常退出时再改成 `clean`；
+ *   - 同时把 `/proc/sys/kernel/random/boot_id` 打进日志：**boot_id 变** ⇒ 真重启；
+ *     **boot_id 不变** ⇒ 只是进程被重新拉起（那一夜的现象正是这一种）。
+ *
+ * 文件放 UDISK（跨掉电保留）；UDSIK 不可写时退到 /tmp —— 那只能判"同一次开机
+ * 内的进程重启"，日志里会体现（路径就在日志里）。路径可用 IVSBOX_RUN_STATE
+ * 覆盖，测试/工装用。
+ * ------------------------------------------------------------------------- */
+#define APP_RUN_STATE_UDISK "/mnt/UDISK/ivsbox/run.state"
+#define APP_RUN_STATE_TMP "/tmp/ivsbox-run.state"
+
+static const char *run_state_path(void)
+{
+    const char *p = getenv("IVSBOX_RUN_STATE");
+
+    if (p != NULL && p[0] != '\0')
+        return p;
+    if (access("/mnt/UDISK/ivsbox", W_OK) == 0)
+        return APP_RUN_STATE_UDISK;
+    return APP_RUN_STATE_TMP;
+}
+
+static void run_state_write(const char *what)
+{
+    const char *path = run_state_path();
+    int         fd;
+
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        IV_LOG_W(APP_MOD, "run state write failed: %s (%s)", path, strerror(errno));
+        return;
+    }
+    if (write(fd, what, strlen(what)) != (ssize_t)strlen(what))
+        IV_LOG_W(APP_MOD, "run state short write: %s", path);
+    else
+        (void)fsync(fd); /* 掉电判据必须落盘，不能停在页缓存里 */
+    (void)close(fd);
+}
+
+/* 把 boot_id 打进日志：区分"整机重启"与"进程被重新拉起"的唯一廉价判据。 */
+static void boot_id_log(void)
+{
+    char    buf[80];
+    int     fd;
+    ssize_t n;
+
+    fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        IV_LOG_W(APP_MOD, "boot_id unavailable (%s)", strerror(errno));
+        return;
+    }
+    n = read(fd, buf, sizeof(buf) - 1u);
+    (void)close(fd);
+    if (n <= 0) {
+        IV_LOG_W(APP_MOD, "boot_id read failed (%s)", strerror(errno));
+        return;
+    }
+    buf[n] = '\0';
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+        buf[--n] = '\0';
+    IV_LOG_I(APP_MOD, "boot_id=%s", buf);
+}
+
+/* 启动最早期调用一次（日志起来之后、其余装配之前）。 */
+static void run_state_check(void)
+{
+    const char *path = run_state_path();
+    char        buf[32];
+    int         fd;
+    ssize_t     n;
+
+    boot_id_log();
+
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        IV_LOG_I(APP_MOD, "run state: no previous marker (%s) -- first run or fresh flash",
+                 path);
+        run_state_write("dirty\n");
+        return;
+    }
+    n = read(fd, buf, sizeof(buf) - 1u);
+    (void)close(fd);
+    if (n < 0)
+        n = 0;
+    buf[n] = '\0';
+
+    if (strncmp(buf, "clean", 5u) == 0) {
+        IV_LOG_I(APP_MOD, "previous shutdown was clean (%s)", path);
+    } else {
+        /* 这一行是给"下一次无预兆重启"用的：它证明上一个进程没走完退出路径。 */
+        IV_LOG_W(APP_MOD,
+                 "unclean shutdown detected: prev state='%s' (%s) -- power loss / "
+                 "hard reset / kill -9 / watchdog reset 都会落到这里", buf, path);
+    }
+    run_state_write("dirty\n");
+}
+
 static int app_init(void)
 {
     int cfg_wfd;
@@ -1646,6 +1756,7 @@ static int app_init(void)
         return -1;
 
     IV_LOG_I(APP_MOD, "ivsboxd starting, version %s", iv_version_string());
+    run_state_check();
 
     /* 1. 配置 */
     g_cfg = iv_config_open(NULL, "ivsbox");
@@ -1861,5 +1972,9 @@ int main(int argc, char *argv[])
     (void)iv_reactor_run(g_reactor);
 
     app_shutdown();
+    /* 走到这里＝**收到 SIGTERM/SIGINT 并走完了退出路径**，把标记改成 clean；
+     * 没走到这里（掉电/硬复位/被 SIGKILL）标记会停在 dirty ⇒ 下次开机日志里
+     * 会出现 "unclean shutdown detected"（见 run_state_check()，R-08）。 */
+    run_state_write("clean\n");
     return 0;
 }

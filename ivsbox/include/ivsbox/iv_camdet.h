@@ -109,8 +109,23 @@ extern "C" {
 #define IV_CAMDET_PING_TIMEOUT_MS  5000u
 #define IV_CAMDET_PING_SAMPLES     4u
 
-/* 延时判定阈值默认值：现网 `DEFALUT_NETWORK_DELAY` = 200 ms。 */
+/* 延时判定阈值默认值：现网 `DEFALUT_NETWORK_DELAY` = 200 ms。
+ *
+ * ⚠ **RTT 的采样分辨率＝调用方 tick 周期**（`IV_AGENT_PROBE_TICK_MS`，200 ms）：
+ * 本模块没有自己的事件循环，ICMP 回包只在 `iv_camdet_tick()` 里被读走，所以
+ * 测得的 RTT 只能是 tick 的整数倍（0 / 200 / 400 …），不是真实往返时延。
+ * 因此：
+ *   - 判定用**严格大于**（`avg > thr`）：局域网摄像机在一个 tick 内应答 ⇒ 正常；
+ *   - 把阈值配成 <= 一个 tick 没有意义（任何应答都会被判延时，日志里会告警）；
+ *   - 要亚毫秒级 RTT 就必须把 ICMP fd 挂进事件循环（当前**不做**，见
+ *     `src/modules/probe/iv_camdet.c` 的 `ping_verdict()` 说明）。
+ */
 #define IV_CAMDET_RTT_THR_MS_DEFAULT 200u
+
+/* 典型调用方 tick（agent 巡检周期 `IV_AGENT_PROBE_TICK_MS`）——只用来判"阈值配得
+ * 有没有意义"并告警，**不参与判定**（判定只看 cfg.rtt_thr_ms）。本模块不依赖
+ * agent，所以这里复写一份常量而不是 include agent 头。 */
+#define IV_CAMDET_TICK_RESOLUTION_MS 200u
 
 /* 扫描 / RTSP：轮间隔与单步超时（对齐现网 30 s 轮、1 s 超时）。 */
 #define IV_CAMDET_ROUND_MS_DEFAULT 30000u

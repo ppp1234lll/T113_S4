@@ -124,6 +124,23 @@ static const iv_camdet_iops_t *iops_of(const iv_camdet_t *d)
     return (d->cfg.iops != NULL) ? d->cfg.iops : iv_camdet_default_iops();
 }
 
+/* 阈值 <= 一个 tick 时，任何应答都会被判"延时"（原因见 iv_camdet.h 里
+ * IV_CAMDET_RTT_THR_MS_DEFAULT 上方那段分辨率说明）。这种配法现场配完看到
+ * 全通道红色，日志里却什么都没说 —— 所以开机和热更新时各告警一次，不静默。 */
+static void warn_rtt_thr(const iv_camdet_t *d)
+{
+    if (d->cfg.rtt_thr_ms == 0u)
+        return;
+    if (d->cfg.rtt_thr_ms > IV_CAMDET_TICK_RESOLUTION_MS)
+        return;
+    IV_LOG_W(CD_MOD,
+             "rtt_thr=%ums <= one tick (%ums): a LAN camera answering within one "
+             "tick still reads as DELAY; raise camera.detect.rtt_ms above %ums",
+             (unsigned)d->cfg.rtt_thr_ms,
+             (unsigned)IV_CAMDET_TICK_RESOLUTION_MS,
+             (unsigned)IV_CAMDET_TICK_RESOLUTION_MS);
+}
+
 /* ---------------------------------------------------------------------------
  * 生命周期
  * ------------------------------------------------------------------------- */
@@ -249,6 +266,7 @@ int iv_camdet_open(iv_camdet_t *d, const iv_camdet_cfg_t *cfg, uint64_t now_ms)
     IV_LOG_I(CD_MOD, "open: mode=%s rtt_thr=%ums round=%ums",
              iv_camdet_mode_name(d->cfg.mode), (unsigned)d->cfg.rtt_thr_ms,
              (unsigned)round_ms_of(d));
+    warn_rtt_thr(d);
     return IV_OK;
 }
 
@@ -433,9 +451,19 @@ static void ring_clear(iv_camdet_t *d, int ch)
 
 /*
  * 本轮（4 个样本）→ 五态。与现网 lwip_ping_multi_result_to_status() 同判据：
- *   全应答 → 平均 RTT ≥ 阈值 ? 延时(4) : 正常(1)
+ *   全应答 → 平均 RTT > 阈值 ? 延时(4) : 正常(1)
  *   部分应答 → 丢包(5)
  *   全无应答 → 故障(2)
+ *
+ * ⚠ 边界从 `>=` 改成 `>`（R-02，2026-10-22 板端实测）：RTT 是**按调用方 tick
+ * 采样**的 —— 本层没有自己的事件循环，回包只能在 `iv_camdet_tick()` 里被读走，
+ * 而 tick 周期是 `IV_AGENT_PROBE_TICK_MS`（200 ms）。所以本机测得的 RTT 是
+ * **200 ms 的整数倍**：0.47 ms 的局域网摄像机，回包要等到下一个 tick 才被读，
+ * rtt 就是 **200**；阈值默认也是 200，`>=` 于是恒判"延时" —— 现场看到的正是
+ * "ping 明明是 0.5 ms，页面报延时(4)"。
+ * 改判据为严格大于之后：一个 tick 内应答（本机可测的最好情况）⇒ 正常；
+ * 两个 tick 才有回包 ⇒ 400 > 200 ⇒ 延时。分辨率仍是一个 tick，这一点写在
+ * `iv_camdet.h` 的阈值常量旁边，不夸大成"毫秒级测量"。
  */
 static iv_camdet_status_t ping_verdict(const iv_camdet_t *d, int ch)
 {
@@ -455,7 +483,8 @@ static iv_camdet_status_t ping_verdict(const iv_camdet_t *d, int ch)
     if (acked < (int)IV_CAMDET_PING_SAMPLES)
         return IV_CAMDET_LOSS;
     avg = sum / (uint32_t)acked;
-    if (d->cfg.rtt_thr_ms != 0u && avg >= d->cfg.rtt_thr_ms)
+    /* 严格大于：见函数头关于"采样分辨率＝一个 tick"的说明 */
+    if (d->cfg.rtt_thr_ms != 0u && avg > d->cfg.rtt_thr_ms)
         return IV_CAMDET_DELAY;
     return IV_CAMDET_NORMAL;
 }
@@ -555,25 +584,48 @@ static int start_connect(iv_camdet_t *d, uint64_t now_ms)
     return 1;
 }
 
-/* 连接结果轮询；返回 0 = 成功；1 = 仍在进行；-1 = 失败 */
+/* 连接结果轮询；返回 0 = 成功；1 = 仍在进行；-1 = 失败。
+ *
+ * ⚠ 判"连上没有"**不能看 `getsockopt(SO_ERROR)` 是否为 0**（R-02，2026-10-22
+ * 板端实测）：非阻塞 connect 处于 SYN_SENT 期间，SO_ERROR 一直是 0，只有
+ * **已经失败**时里面才留下错误码。于是"对端不可达、ARP 都解析不出来"这种
+ * **永远连不上**的目标会被判成连接成功 —— 端口扫描那一路因此在整轮里恒报
+ * NORMAL，现场表现是"把摄像机网线拔了，页面上依然显示网络正常"。
+ *
+ * 正确判据是**对同一个目标再 connect 一次**（Linux 语义）：返回 0 或
+ * `EISCONN` = 已完成；`EALREADY`/`EINPROGRESS` = 仍在进行；其余 errno 就是
+ * 这次连接的真实失败原因。仍只走注入点里已有的 `connect`，单测照样能造这三种
+ * 结果，不必给 `iv_camdet_iops_t` 加 `poll`。
+ */
 static int poll_connect(iv_camdet_t *d, uint64_t now_ms)
 {
     const iv_camdet_iops_t *io = iops_of(d);
-    int                     err = 0;
-    socklen_t               el  = (socklen_t)sizeof(err);
+    struct sockaddr_in      sa;
 
     if (now_ms >= d->fd_deadline_ms) {
         close_fd(d);
         return -1;
     }
-    if (io->getsockopt(d->fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0) {
-        close_fd(d);
-        return -1;
-    }
-    if (err == 0)
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family      = AF_INET;
+    sa.sin_port        = htons(current_port(d));
+    sa.sin_addr.s_addr = d->ch_ip_be[d->sc_ch];
+
+    if (io->connect(d->fd, (const struct sockaddr *)&sa, (socklen_t)sizeof(sa)) == 0)
         return 0;
-    if (err == EINPROGRESS || err == EALREADY)
+
+    switch (errno) {
+    case EISCONN:
+        return 0;
+    case EALREADY:
+    case EINPROGRESS:
+    case EINTR:
         return 1;
+    default:
+        break;
+    }
+    /* 走到这里＝这次连接真的失败了（ECONNREFUSED / EHOSTUNREACH / ETIMEDOUT…） */
     close_fd(d);
     return -1;
 }
@@ -837,6 +889,7 @@ int iv_camdet_set_rtt_thr(iv_camdet_t *d, uint32_t ms)
     /* 结论不在这里重算：ping_verdict() 在"一轮 4 包结算"时才跑，改了阈值立刻
      * 回写结论等于用旧样本套新阈值，还不如等下一轮（≤20 s）干净。 */
     IV_LOG_I(CD_MOD, "rtt threshold -> %u ms", (unsigned)ms);
+    warn_rtt_thr(d); /* 配到 <= 一个 tick 时当场告警，别让现场看"全红"猜 */
     return IV_OK;
 }
 

@@ -220,6 +220,14 @@ struct iv_probe {
     int             started;
     int             icmp_fd;       /* 引擎级共享 ICMP socket，-1 = 无 */
     int             icmp_disabled; /* 1 = raw ICMP 不可用（降级，见文件头） */
+    /* ICMP echo 序号**引擎级**单调递增（2026-10-22 起）。
+     * 病根：序号原先挂在项上、每项各自从 0 起，于是同一引擎的两个 ICMP 项
+     * 发出的回显请求**序号一模一样**，而回包只按 `seq + inflight` 认领
+     * （`icmp_find_by_seq()`）⇒ 两路一旦错拍，A 的回包会被记到 B 头上，
+     * RTT 算成 `now - B.sent_at` 可能为负、转成 uint32 后是个天文数字，
+     * 现场表现就是"0.47 ms 的摄像机被判定延时 4"。改成引擎级共享计数器后，
+     * 同一时刻在飞的两个请求序号必不相同，认领唯一。 */
+    uint32_t        icmp_seq_next;
     int             link_ifindex[IV_PROBE_MAX_LINKS]; /* 0 = 空槽 */
     uint8_t         link_up[IV_PROBE_MAX_LINKS];
 };

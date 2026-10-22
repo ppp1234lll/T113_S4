@@ -112,11 +112,66 @@ static json_object *body_json(const iv_web_req_t *req)
     return o;
 }
 
+/* 把 JSON 体里的 `"e":<int>` 映射成 HTTP 状态码（R-06）。
+ *
+ * 病根：原先**一律 200**，靠体内 `ok:false` 表达失败。浏览器里没区别（前端
+ * 只看 `j.ok`），但任何不带业务逻辑的观察者对错误完全无感 —— curl、反代访问
+ * 日志、探针都显示 200，现场排障时"接口通了没有"和"业务成功没有"分不开。
+ *
+ * 只改**状态码**，响应体一字不动（前端 `api()` 对非 2xx 仍按 JSON 解析，
+ * 唯一例外是既有的 403＝必须改密那条路）。
+ * 找不到 `ok:false` ⇒ 200；错误码认不出 ⇒ 500（宁可让人看见"有错"）。 */
+static int status_of(const char *body)
+{
+    const char *e = strstr(body, "\"ok\":false");
+    const char *p;
+    int         code = 0;
+    int         sign = 1;
+
+    if (e == NULL)
+        return 200;
+    p = strstr(e, "\"e\":");
+    if (p == NULL)
+        return 400;
+    p += 4;
+    while (*p == ' ')
+        p++;
+    if (*p == '-') {
+        sign = -1;
+        p++;
+    }
+    while (*p >= '0' && *p <= '9')
+        code = code * 10 + (*p++ - '0');
+    code *= sign;
+
+    switch (code) {
+    case IV_EINVAL:
+    case IV_EPROTO:
+    case IV_ERANGE:
+        return 400;
+    case IV_EAUTH:
+        return 403;
+    case IV_ENOENT:
+        return 404;
+    case IV_EBUSY:
+    case IV_EEXIST:
+    case IV_ESTATE:
+    case IV_ECANCELED:
+        return 409;
+    case IV_ENOSPC:
+        return 507;
+    case IV_ENOTSUP:
+        return 501;
+    default:
+        return 500;
+    }
+}
+
 /* 统一把通道响应搬进 out，并设好 Content-Type。 */
 static int to_rsp(char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp)
 {
     *out_len = strlen(out);
-    rsp->status = 200;
+    rsp->status = status_of(out);
     (void)snprintf(rsp->ctype, sizeof(rsp->ctype), "application/json");
     rsp->len = *out_len;
     (void)cap;

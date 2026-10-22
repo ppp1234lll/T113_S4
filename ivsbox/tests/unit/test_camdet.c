@@ -151,6 +151,13 @@ static int     g_so_err     = 0;         /* getsockopt(SO_ERROR) 报的值 */
 static int     g_recv_mode  = 1;         /* 0=EAGAIN 1=有响应 2=对端关闭 3=错误 */
 static int     g_send_calls;
 
+/* 第二次及以后的 connect（poll_connect 用"再 connect 一次"判结果）：
+ * 默认 EISCONN = 已连上。要造"一直连不上"就把 poll_errno 设成 EALREADY。 */
+static int     g_poll_ret    = -1;
+static int     g_poll_errno  = EISCONN;
+static int     g_conn_fd     = -1;        /* 上一次 connect 的 fd */
+static int     g_conn_calls  = 0;         /* 该 fd 上的 connect 次数 */
+
 static int cd_socket(int d, int t, int p)
 {
     (void)d;
@@ -161,12 +168,21 @@ static int cd_socket(int d, int t, int p)
 
 static int cd_connect(int fd, const struct sockaddr *a, socklen_t l)
 {
-    (void)fd;
     (void)a;
     (void)l;
-    if (g_conn_ret < 0)
-        errno = g_conn_errno;
-    return g_conn_ret;
+    if (fd != g_conn_fd) { /* 换了一条新 socket：重新计次 */
+        g_conn_fd    = fd;
+        g_conn_calls = 0;
+    }
+    g_conn_calls++;
+    if (g_conn_calls == 1) { /* 发起连接的那一次 */
+        if (g_conn_ret < 0)
+            errno = g_conn_errno;
+        return g_conn_ret;
+    }
+    if (g_poll_ret < 0) /* 之后的"探结果" */
+        errno = g_poll_errno;
+    return g_poll_ret;
 }
 
 static int cd_getsockopt(int fd, int level, int optname, void *val, socklen_t *vlen)
@@ -255,6 +271,12 @@ static void fx_open(fx_t *f, int mode, uint32_t rtt_thr)
     g_pend_len  = 0;
     g_send_calls = 0;
     g_pb_close_cnt = 0;
+    /* "探连接结果"的默认口径：再 connect 一次得到 EISCONN（已连上）。各用例
+     * 只按需改 g_conn_ret/g_conn_errno/g_poll_errno，不再逐条复位。 */
+    g_poll_ret   = -1;
+    g_poll_errno = EISCONN;
+    g_conn_fd    = -1;
+    g_conn_calls = 0;
 
     iv_camdet_cfg_default(&cfg);
     cfg.mode       = mode;
@@ -366,7 +388,12 @@ static void c02_ping_normal(void)
 }
 
 /* ---------------------------------------------------------------------------
- * c03 延时：平均 RTT >= 阈值（边界取等号，与现网 >= 一致）
+ * c03 延时判定边界：严格大于（R-02c）
+ *
+ * 判据从"平均 RTT >= 阈值"改成"> 阈值"：平均 RTT 只能是调用方 tick 的整数倍
+ * （本层没有自己的事件循环，回包在 tick 里才被读走），默认阈值 200 恰好等于一个
+ * tick ⇒ `>=` 会让"一个 tick 内就应答的局域网摄像机"恒判延时(4)。板端实测的
+ * 现场症状就是 ping 0.5 ms、页面报延时。
  * ------------------------------------------------------------------------- */
 static void c03_ping_delay_boundary(void)
 {
@@ -375,23 +402,40 @@ static void c03_ping_delay_boundary(void)
     uint64_t t = 1000u;
     int      i;
 
+    /* 平均 == 阈值 → 正常（这就是 R-02c 的现场形态：thr=200、测得 200） */
     fx_open(&f, IV_CAMDET_MODE_PING, 100u); /* 阈值 100 */
     one_cam(ips);
     (void)iv_camdet_set_channels(&f.d, ips, 1000u);
     for (i = 0; i < 4; i++)
-        ping_pkt(&f, &t, 1, 100); /* avg == 100 == 阈值 → 延时 */
+        ping_pkt(&f, &t, 1, 100); /* avg == 100 == 阈值 → 正常（严格大于） */
 
-    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_DELAY, "avg==thr -> delay(4)");
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL, "avg==thr -> normal (R-02c)");
     iv_camdet_close(&f.d);
 
-    /* 阈值 101：同样的 100ms 平均值 → 正常 */
-    fx_open(&f, IV_CAMDET_MODE_PING, 101u);
+    /* 平均只超 1 ms → 延时，证明不是把判定整条撤了 */
+    fx_open(&f, IV_CAMDET_MODE_PING, 99u); /* 阈值 99 */
     one_cam(ips);
     (void)iv_camdet_set_channels(&f.d, ips, 1000u);
     t = 1000u;
     for (i = 0; i < 4; i++)
         ping_pkt(&f, &t, 1, 100);
-    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL, "avg<thr -> normal");
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_DELAY, "avg>thr -> delay(4)");
+    iv_camdet_close(&f.d);
+
+    /* 现场形态原样复刻：默认阈值 200 ＋ 一个 tick 的 RTT 200 → 必须正常 */
+    fx_open(&f, IV_CAMDET_MODE_PING, IV_CAMDET_RTT_THR_MS_DEFAULT);
+    one_cam(ips);
+    (void)iv_camdet_set_channels(&f.d, ips, 1000u);
+    t = 1000u;
+    for (i = 0; i < 4; i++)
+        ping_pkt(&f, &t, 1, (int)IV_CAMDET_TICK_RESOLUTION_MS);
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL,
+        "rtt==one tick under default thr -> normal (board case)");
+
+    /* 两个 tick 才有回包（400 > 200）→ 延时，阈值仍然有效 */
+    for (i = 0; i < 4; i++)
+        ping_pkt(&f, &t, 1, (int)(2u * IV_CAMDET_TICK_RESOLUTION_MS));
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_DELAY, "two ticks -> delay");
     iv_camdet_close(&f.d);
 }
 
@@ -523,9 +567,11 @@ static void c08_port_scan(void)
     chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_FAULT, "all ports closed -> fault");
     iv_camdet_close(&f.d);
 
-    /* 等连接结果（EINPROGRESS）→ 下一 tick SO_ERROR=0 视为连通 */
+    /* 等连接结果（EINPROGRESS）→ 下一 tick 再 connect 回 EISCONN 视为连通。
+     * 判"连上没有"靠的是**再 connect 一次**的 errno，不再看 SO_ERROR —— 见下一条。 */
     g_conn_ret   = -1;
     g_conn_errno = EINPROGRESS;
+    g_poll_errno = EISCONN;
     g_so_err     = 0;
     fx_open(&f, IV_CAMDET_MODE_PORT, 0u);
     one_cam(ips);
@@ -541,6 +587,31 @@ static void c08_port_scan(void)
     }
     chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL,
         "async connect ok -> normal");
+    iv_camdet_close(&f.d);
+
+    /* ⚠ R-02 回归：对端不可达（连接一直在 SYN_SENT，永远等不到结果）必须判 FAULT。
+     * 病根：旧实现拿 `getsockopt(SO_ERROR)==0` 当"连上了"，而 SYN_SENT 期间
+     * SO_ERROR 本来就是 0 ⇒ 拔了网线的摄像机整轮恒报 NORMAL(1)。
+     * 时间步必须**小于端口超时**（100 ms < 1000 ms），让"探结果"真的发生若干次；
+     * 一步跨过超时就只会走 deadline 分支，反而测不到这条病根（踩过）。 */
+    fx_open(&f, IV_CAMDET_MODE_PORT, 0u);
+    g_conn_ret   = -1;
+    g_conn_errno = EINPROGRESS;
+    g_poll_ret   = -1;
+    g_poll_errno = EALREADY; /* 一直"仍在进行"，直到超时 */
+    one_cam(ips);
+    (void)iv_camdet_set_channels(&f.d, ips, 1000u);
+    {
+        uint64_t at = 1000u;
+        int      k;
+
+        for (k = 0; k < 110; k++) { /* 7 端口 × (发起 + 约 10 次探结果) */
+            (void)iv_camdet_tick(&f.d, at);
+            at += 100u;
+        }
+    }
+    chk(iv_camdet_verdict(&f.d, 0) == IV_CAMDET_FAULT, "unreachable -> not normal");
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_FAULT, "unreachable -> fault(2)");
     iv_camdet_close(&f.d);
 
     /* 未配 IP 的通道在扫描方式下仍是 0 */

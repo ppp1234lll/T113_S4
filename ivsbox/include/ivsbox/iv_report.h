@@ -282,6 +282,11 @@ int iv_report_trigger(iv_report_t *rp, uint64_t now_ms);
  * 先用 `iv_report_set_server()` 换成"当前活动出口"对应的那条地址（`net.server.
  * wired.*` / `.wireless.*`），即"**按活动出口选平台地址**"。
  *   IV_OK ；IV_EINVAL（rp 为 NULL）；IV_ESTATE（未 open 或目标地址未配置/已清空）
+ *
+ * ⚠ **目标地址为空时会把在用连接关掉**（2026-10-22 起，R-01）：语义是
+ * "重连到一个空地址 ＝ 断开"。装配层清空 `net.server.*.host` 走的就是这条路径，
+ * 若这里不断，旧 TCP 会一直 ESTAB、上报继续发往旧平台（板端实测过）。
+ * 关的只是传输层，串口/队列/协议层与正常重连保持一致。
  */
 int iv_report_reconnect(iv_report_t *rp, uint64_t now_ms);
 
@@ -378,7 +383,8 @@ void iv_report_request_poll(iv_report_t *rp);
 /*
  * 设置**下一次建连**使用的平台地址（**不主动断连**：在用连接原样保留，
  * 由 `iv_report_reconnect()` 关闭并按新址重开）。`host` 为空 / `port` 为 0
- * ⇒ 清空目标地址（此后 `iv_report_reconnect()` 返回 IV_ESTATE）。
+ * ⇒ 清空目标地址（此后 `iv_report_reconnect()` 返回 IV_ESTATE **并关掉在用
+ * 连接**，见该函数说明）。
  * 改写的是本层自持副本，**不动** `cfg.server_host`。
  *   IV_OK ；IV_EINVAL（rp 为 NULL 或未 open）；IV_ERANGE（host 超长）
  */

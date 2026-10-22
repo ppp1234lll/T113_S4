@@ -34,6 +34,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <arpa/inet.h> /* inet_pton：IP 类配置键的字面量校验 */
+
 #include <json-c/json.h> /* 仅模块层允许依赖 json-c（core/hal 不允许） */
 
 #include "ivsbox/iv_crc.h"
@@ -872,6 +874,28 @@ static int is_default_parent(const char *key)
     return 0;
 }
 
+/* 值是 IPv4 点分十进制的键：末段为 `ip`（`net.ip` / `camera.ch.N.ip` /
+ * `switch.ip`）。空串合法 —— 这批键的默认值就是空串，语义是"未配置/DHCP"。 */
+static int is_ip_key(const char *key)
+{
+    size_t n = strlen(key);
+
+    if (n >= 3u && strcmp(key + n - 3u, ".ip") == 0)
+        return 1;
+    return (strcmp(key, "ip") == 0);
+}
+
+/* IPv4 字面量校验（R-05）。拒绝 `999.1.1.1`、`192.168.2`、`1.2.3.4.5` 这类
+ * "能存进去、到消费方手里静默变成 0 地址"的值。空串放行（＝未配置）。 */
+static int ip_ok(const char *s)
+{
+    struct in_addr a;
+
+    if (s == NULL || s[0] == '\0')
+        return 1;
+    return inet_pton(AF_INET, s, &a) == 1;
+}
+
 /* ---------------------------------------------------------------------------
  * 值合法性：已知键查类型/范围/枚举；未知键只认类型（向前兼容，不做业务校验）。
  * 三条**必须拒绝**的形态（任一条放过都会造成静默数据损坏）：
@@ -983,6 +1007,10 @@ static int item_check(const iv_config_t *c, const cfg_item_t *it, int strict, co
     }
     if (d->type == IV_CFG_T_STR && !enum_ok(d, it->v.s)) {
         *why = "not in enum";
+        return 0;
+    }
+    if (d->type == IV_CFG_T_STR && is_ip_key(it->key) && !ip_ok(it->v.s)) {
+        *why = "not an ipv4 address";
         return 0;
     }
     return 1;
@@ -2363,6 +2391,12 @@ int iv_config_set_str(iv_config_t *c, const char *key, const char *val)
         return IV_EINVAL;
     if (strlen(val) >= (size_t)IV_CFG_STR_MAX)
         return IV_ERANGE;
+    /* IP 类键（`net.ip` / `camera.ch.N.ip` / `switch.ip`）在**写入侧**就拦住
+     * 非法字面量（R-05）：与"超长串"同一层同一口径 —— 坏值根本进不了内存，
+     * 不必等 save 时被 items_check 整表拒掉（那时错误只能落在 detail 里，
+     * 调用方拿到的是一句没法定位的"save failed"）。 */
+    if (is_ip_key(key) && !ip_ok(val))
+        return IV_EINVAL;
     it = item_find(c, key);
     if (it != NULL && it->type == IV_CFG_T_STR && strcmp(it->v.s, val) == 0) {
         it->origin = (uint8_t)IV_CFG_FROM_FILE;

@@ -441,6 +441,18 @@ int main(void)
         /* 清空：两路地址都没配时不建链（装配层把地址全清掉的语义） */
         chk(iv_report_set_server(&rp, "", 0u) == IV_OK, "c10 clear ok");
         chk(iv_report_reconnect(&rp, 0u) == IV_ESTATE, "c10 cleared -> no reconnect");
+        /* R-01：**"不重连"必须同时"把在用连接断掉"**。
+         * 病根：原先这里只 return IV_ESTATE，旧 TCP 一直 ESTAB，上报照旧发往
+         * 旧平台 —— 板端实测把 `net.server.*.host` 清空后平台仍收到数据。 */
+        chk(rp.tr.opened == 0, "c10 cleared -> live transport closed (R-01)");
+        chk(rp.tr.state == IV_TRANSPORT_CLOSED,
+            "c10 cleared -> transport state is CLOSED (R-01)");
+
+        /* 地址回来之后还能重新建链（清空不是单向的终点） */
+        chk(iv_report_set_server(&rp, "127.0.0.3", 3u) == IV_OK, "c10 re-set ok");
+        chk(iv_report_reconnect(&rp, 0u) == IV_OK, "c10 re-set -> reconnect ok");
+        chk(strcmp(rp.tr.host, "127.0.0.3") == 0 && rp.tr.opened == 1,
+            "c10 re-set -> transport reopened on the new address");
 
         iv_report_close(&rp);
     }

@@ -1206,25 +1206,25 @@ static int json_matches_type(json_object *v, iv_cfg_type_t want)
 
 /* 入参刻意非 const：本函数会经 iv_config_set_* 写回内存配置（回滚亦同）。
  * 先前写成 `const iv_config_t *` 被 -Werror=discarded-qualifiers 挡下 —— 那次
- * 编译失败正好证明"改配置"这条路径没有被 const 悄悄绕开。 */
-static void apply_set(iv_config_t *cfg, const char *key, iv_cfg_type_t t,
-                      json_object *v)
+ * 编译失败正好证明"改配置"这条路径没有被 const 悄悄绕开。
+ *
+ * 返回 setter 的错误码（R-03）：原先这里一律 `(void)` 丢弃返回值，于是
+ * 超长字符串被 `iv_config_set_str()` 以 IV_ERANGE 拒绝、调用方却照样回
+ * `ok:true applied:N`，网页显示"保存成功"而回读是空的。 */
+static int apply_set(iv_config_t *cfg, const char *key, iv_cfg_type_t t,
+                     json_object *v)
 {
     switch (t) {
     case IV_CFG_T_STR:
-        (void)iv_config_set_str(cfg, key, json_object_get_string(v));
-        break;
+        return iv_config_set_str(cfg, key, json_object_get_string(v));
     case IV_CFG_T_INT:
-        (void)iv_config_set_int(cfg, key, (int64_t)json_object_get_int64(v));
-        break;
+        return iv_config_set_int(cfg, key, (int64_t)json_object_get_int64(v));
     case IV_CFG_T_BOOL:
-        (void)iv_config_set_bool(cfg, key, json_object_get_boolean(v));
-        break;
+        return iv_config_set_bool(cfg, key, json_object_get_boolean(v));
     case IV_CFG_T_DBL:
-        (void)iv_config_set_dbl(cfg, key, json_object_get_double(v));
-        break;
+        return iv_config_set_dbl(cfg, key, json_object_get_double(v));
     default:
-        break;
+        return IV_EINVAL;
     }
 }
 
@@ -1285,6 +1285,13 @@ static int m_config_apply(const iv_ctl_ctx_t *ctx, json_object *p,
                 return rsp_err(IV_ENOENT, "unknown key for web write", out, cap, out_len);
             if (!json_matches_type(v, want))
                 return rsp_err(IV_EPROTO, "item type mismatch", out, cap, out_len);
+            /* 字符串长度预检（R-03）：`iv_config_set_str()` 对 >= IV_CFG_STR_MAX
+             * 的值返回 IV_ERANGE 并**保持原值**，但预检原先只查"键存在+类型对"，
+             * 于是超长值一路走到写入阶段被静默拒掉，接口还回 `ok:true applied:N`。
+             * 长度上限与 setter 严格同源（同一常量），避免两处各写一个数。 */
+            if (want == IV_CFG_T_STR &&
+                strlen(json_object_get_string(v)) >= IV_CFG_STR_MAX)
+                return rsp_err(IV_ERANGE, "string too long", out, cap, out_len);
 
             (void)snprintf(s_bak[n].key, sizeof(s_bak[n].key), "%.*s",
                            (int)sizeof(s_bak[n].key) - 1, k);
@@ -1318,13 +1325,31 @@ static int m_config_apply(const iv_ctl_ctx_t *ctx, json_object *p,
         }
     }
 
-    /* ③ 写入内存 */
-    json_object_object_foreach(items, k, v) {
-        iv_cfg_type_t want = IV_CFG_T_STR;
-        char          dtxt[IV_CFG_STR_MAX];
+    /* ③ 写入内存。任一条被 setter 拒绝（区间/枚举越界等）就**整条回滚**并报错：
+     * 只报"成功"却不写、"写了一半"两种情形都不允许 —— 前者的现场表现是
+     * "保存成功但值没变"，后者更要命（半套配置已生效，页面上却是一份失败）。 */
+    {
+        int applied = 0;
 
-        (void)iv_config_default_get(IV_CFG_NAME, k, &want, dtxt, sizeof(dtxt));
-        apply_set(ctx->cfg, k, want, v);
+        json_object_object_foreach(items, k, v) {
+            iv_cfg_type_t want = IV_CFG_T_STR;
+            char          dtxt[IV_CFG_STR_MAX];
+            int           wrc;
+
+            (void)iv_config_default_get(IV_CFG_NAME, k, &want, dtxt, sizeof(dtxt));
+            wrc = apply_set(ctx->cfg, k, want, v);
+            if (wrc != IV_OK) {
+                int j;
+
+                /* 手头这一条已经被拒（原值未动），只需回滚前面写成功的 */
+                for (j = 0; j < applied; j++)
+                    apply_restore(ctx->cfg, &s_bak[j]);
+                return rsp_err(wrc, "item rejected by config layer", out, cap,
+                               out_len);
+            }
+            applied++;
+        }
+        n = applied;
     }
 
     /* ④ 落盘；失败回滚内存，保证"失败保留旧配置" */

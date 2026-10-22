@@ -657,8 +657,23 @@ int iv_report_reconnect(iv_report_t *rp, uint64_t now_ms)
         return IV_EINVAL;
     if (!rp->opened)
         return IV_ESTATE;
-    if (rp->srv_host[0] == '\0' || rp->srv_port == 0u)
-        return IV_ESTATE; /* 目标地址未配置/已清空 → 无可重连 */
+    if (rp->srv_host[0] == '\0' || rp->srv_port == 0u) {
+        /* 目标地址未配置/已清空 ⇒ **这里就是"断开在用连接"的那一步**。
+         *
+         * 病根（R-01，2026-10-22 板端实测）：原先这行直接 `return IV_ESTATE`
+         * 就走，而装配层清空平台地址时正是走这条路径 ——
+         * `iv_agent_reload_server()` 拿到 `iv_agent_pick_host()==NULL`，
+         * 只把 `srv_host`/`srv_port` 副本清掉就调本函数，本函数又"无可重连"直接
+         * 返回，于是**旧 TCP 一直 ESTAB、`transport` 恒 up、上报照旧发往旧平台**。
+         * 现场把网页上的平台地址清空后平台仍照收数据，两个地址之间也切不开。
+         *
+         * 语义定为「重连到一个空地址 ＝ 断开」：只关传输层，串口/队列/协议层
+         * 原样保留（与正常重连同口径），队列里未确认的数据等地址回来后再补传。 */
+        (void)iv_transport_close(&rp->tr);
+        rp->now_ms = now_ms;
+        IV_LOG_I(REP_MOD, "server addr cleared, transport closed (if any)");
+        return IV_ESTATE;
+    }
 
     (void)iv_transport_close(&rp->tr);
 

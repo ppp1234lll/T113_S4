@@ -63,6 +63,10 @@ static size_t   g_pend_len     = 0;
 static uint8_t  g_sent[512];
 static size_t   g_sent_len     = 0;
 
+/* 所有发出过的 ICMP echo 序号（c14 用：验证多项目序号不撞号） */
+static uint16_t g_seqs[8];
+static int      g_seq_n        = 0;
+
 static int mk_socket(int d, int t, int p)
 {
     (void)d;
@@ -101,6 +105,12 @@ static ssize_t mk_sendto(int fd, const void *buf, size_t len, int flags,
     if (buf != NULL && len <= sizeof(g_sent)) {
         memcpy(g_sent, buf, len); /* 留底：供字节级校验 */
         g_sent_len = len;
+    }
+    if (buf != NULL && len >= sizeof(struct icmphdr) && g_seq_n < (int)(sizeof(g_seqs) / sizeof(g_seqs[0]))) {
+        const struct icmphdr *ih = (const struct icmphdr *)buf;
+
+        if (ih->type == ICMP_ECHO)
+            g_seqs[g_seq_n++] = ntohs(ih->un.echo.sequence);
     }
     return g_sendto_ret > 0 ? g_sendto_ret : (ssize_t)len;
 }
@@ -174,6 +184,7 @@ static void mock_reset(void)
     g_now           = 1000;
     g_pend_len      = 0;
     g_sent_len      = 0;
+    g_seq_n         = 0;
 }
 
 /* 构造 ICMP echo reply 字节流（IP 头 + ICMP 头），返回总长 */
@@ -692,6 +703,50 @@ static void c13_retune(void)
     (void)iv_probe_stop(&p);
 }
 
+/* ---------------------------------------------------------------------------
+ * c14 多路 ICMP：序号必须**全引擎唯一**（R-02）
+ *
+ * 病根（2026-10-22 板端 F-01 实测）：序号原先挂在**项**上、每项各自从 0 起，
+ * 同一引擎的两路摄像机因此同拍发出**同号** echo。回包只能按 (id, seq) 认领，
+ * 于是两路一旦错拍，A 的回包就被记到 B 名下；`now - B.sent_at` 还可能为负，
+ * 转成 uint32 后是个天文数字 ⇒ 0.47 ms 的摄像机被判成「延时(4)」。
+ * ------------------------------------------------------------------------- */
+static void c14_icmp_seq_engine_unique(void)
+{
+    iv_probe_t      p;
+    iv_probe_cfg_t  c = mk_cfg();
+    iv_probe_stat_t st;
+    int             a;
+    int             b;
+
+    mock_reset();
+    (void)iv_probe_init(&p, &c);
+    a = iv_probe_add_icmp(&p, DST, 0, "a");
+    b = iv_probe_add_icmp(&p, DST + 1u, 0, "b");
+    (void)iv_probe_start(&p, g_now);
+
+    (void)iv_probe_tick(&p, 5000); /* 同一拍，两路各发一个 */
+    chk(a == 0 && b == 1, "c14 two icmp items added");
+    chk(g_seq_n == 2, "c14 both echoes sent in one tick");
+    chk(g_seqs[0] != g_seqs[1], "c14 seq unique across items");
+
+    /* 回**第二路**的包：只能记到 b 名下，a 一点都不能动 */
+    g_pend_len = mk_icmp_reply(g_pend, 0x4950u, g_seqs[1]);
+    chk(iv_probe_on_readable(&p, iv_probe_fd_at(&p, 0), 5100) == 1, "c14 b reply handled");
+    (void)iv_probe_stat_get(&p, b, &st);
+    chk(st.sent == 1 && st.lost == 0, "c14 reply credited to its own item");
+    chk(st.last_rtt_ms == 100, "c14 rtt sane (no negative wrap)");
+    (void)iv_probe_stat_get(&p, a, &st);
+    chk(st.sent == 0 && st.lost == 0, "c14 other item untouched");
+
+    /* a 一直没回：按自己的超时判负，且不能留一个来路不明的 RTT */
+    (void)iv_probe_tick(&p, 12000);
+    (void)iv_probe_stat_get(&p, a, &st);
+    chk(st.lost == 1, "c14 a timed out on its own");
+    chk(st.last_rtt_ms == 0, "c14 no bogus rtt on timeout");
+    (void)iv_probe_stop(&p);
+}
+
 int main(void)
 {
     c01_args_and_guards();
@@ -707,12 +762,14 @@ int main(void)
     c11_lifecycle_guards();
     c12_icmp_packet_bytes();
     c13_retune();
+    c14_icmp_seq_engine_unique();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_probe FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_probe passed (args, stat window, hysteresis, degrade, link event, "
-           "icmp disable/reply/packet-bytes, tcp result, timeout, lifecycle, retune)\n");
+           "icmp disable/reply/packet-bytes/seq-unique, tcp result, timeout, lifecycle, "
+           "retune)\n");
     return 0;
 }

@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T113 运维终端（ivsbox）功能测试报告 · 2026-10-22</title>
+<style>
+  :root{
+    --ink:#1f2328; --sub:#5b6570; --line:#d7dee6; --head:#eef3f9;
+    --accent:#0b5cad; --bg:#f5f7fa; --card:#ffffff;
+    --ok:#1a7f37; --okbg:#e8f5ec; --warn:#9a5b00; --warnbg:#fff4e2; --risk:#a4273a; --riskbg:#fdecef;
+    --idle:#5b6570; --idlebg:#eceff3;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1200px;margin:0 auto;background:var(--card);padding:36px 40px 72px;
+        box-shadow:0 1px 3px rgba(16,24,40,.06)}
+  header{border-bottom:2px solid var(--accent);padding-bottom:18px;margin-bottom:8px}
+  h1{font-size:24px;margin:0 0 6px;letter-spacing:.2px}
+  .sub{color:var(--sub);font-size:13px}
+  .cards{display:flex;gap:12px;flex-wrap:wrap;margin:20px 0 8px}
+  .card{flex:1 1 150px;border:1px solid var(--line);border-radius:8px;padding:12px 14px;background:#fbfcfe}
+  .card b{display:block;font-size:20px;line-height:1.3;color:var(--accent)}
+  .card.g b{color:var(--ok)} .card.i b{color:var(--idle)} .card.w b{color:var(--warn)} .card.r b{color:var(--risk)}
+  .card span{color:var(--sub);font-size:12px}
+  h2{font-size:18px;margin:34px 0 10px;padding-left:10px;border-left:4px solid var(--accent)}
+  h3{font-size:15px;margin:24px 0 8px;color:#123}
+  p{margin:8px 0}
+  ul,ol{margin:8px 0 8px 22px;padding:0}
+  li{margin:3px 0}
+  table{border-collapse:collapse;width:100%;margin:8px 0 4px;font-size:13px}
+  th,td{border:1px solid var(--line);padding:6px 8px;vertical-align:top;text-align:left}
+  th{background:var(--head);font-weight:600;white-space:nowrap}
+  tbody tr:nth-child(even) td{background:#fbfcfd}
+  td.id{white-space:nowrap;font-family:Consolas,"Courier New",monospace;font-size:12px;color:#123}
+  td.num{text-align:center;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .tag{display:inline-block;padding:0 6px;border-radius:3px;font-size:12px;white-space:nowrap}
+  .st-p{background:var(--okbg);color:var(--ok);font-weight:600}
+  .st-n{background:var(--idlebg);color:var(--idle)}
+  .st-b{background:var(--warnbg);color:var(--warn);font-weight:600}
+  .st-f{background:var(--riskbg);color:var(--risk);font-weight:600}
+  .note{background:#f8fafc;border-left:3px solid var(--accent);padding:10px 14px;margin:12px 0;font-size:13px}
+  .note b{color:#123}
+  .note.w{border-left-color:var(--warn);background:#fffaf0}
+  .note.r{border-left-color:var(--risk);background:#fdf2f4}
+  code{background:#f1f3f6;padding:1px 5px;border-radius:3px;font-family:Consolas,"Courier New",monospace;font-size:12.5px}
+  .foot{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);color:var(--sub);font-size:12px}
+  .ev{font-family:Consolas,"Courier New",monospace;font-size:12px;color:#334;background:#f6f8fa;padding:8px 10px;border-radius:4px;white-space:pre-wrap;margin:6px 0}
+  @media print{body{background:#fff}.wrap{box-shadow:none;padding:0 8mm}h2{page-break-after:avoid}tr{page-break-inside:avoid}thead{display:table-header-group}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>T113 运维终端（ivsbox）功能测试报告</h1>
+  <div class="sub">
+    被测基线：<code>main @ aa8f7b0</code>（2026-10-22 构建，ARM 产物 md5 <code>72624c0f5e2bd0b6c59f92f0a5780d50</code>，已投递板端）
+    &nbsp;·&nbsp; 执行日期 <b>2026-10-22</b> &nbsp;·&nbsp; 依据《功能测试计划》97 条用例（14 组）＋ 架构 §16.2 十场景
+  </div>
+</header>
+
+<div class="cards">
+  <div class="card"><b>97</b><span>用例总数（14 组）</span></div>
+  <div class="card g"><b>53</b><span>通过（含原 20 条）</span></div>
+  <div class="card r"><b>4</b><span>失败</span></div>
+  <div class="card i"><b>40</b><span>阻塞 / 不可测</span></div>
+  <div class="card w"><b>8</b><span>本轮新开缺陷</span></div>
+</div>
+
+<div class="note">
+  <b>本次做了什么</b>：把测试计划里 77 条「未测 69 ＋ 阻塞 8」逐条过了一遍——能在实验室/VM/板端真实执行的都真跑了，
+  含自动化六层（单测 / ASan / TSan / 交叉编译 / 静态分析 / 模糊）、集成层 16 条、装配层 Python e2e 5 个（102 断言）、
+  前端 jsdom 5 个 + 真 HTTP e2e 2 个，以及板端 A/B/D/E/F/G/H/I/J/K/M/N 十三组手工与脚本用例。
+  <b>不能执行的（缺外设 / 需断电 / 需现场同意 / 卡外部下发）全部给出原因与复测条件，不含糊过关。</b>
+</div>
+
+<h2>0. 复测更新（2026-10-22 18:35 · 修复后）</h2>
+<div class="note" style="border-left-color:#2e7d32">
+  本节是原报告写完之后追加的：§5 的 8 条缺陷已按 §7 的口径（<b>先写会红的用例，再改代码</b>）全部处置，
+  逐条做了反向证伪，并在板端复测。下表是<b>当前</b>状态；下面 §1~§7 保持报告当日原样（作为当时证据），不再改写。
+  改动明细见 <code>docs/修改记录.md</code> 2026-10-22 18:35 条与 <code>docs/代码说明.adoc</code> 同名小节。
+</div>
+<table>
+  <thead><tr><th>编号</th><th>级别</th><th>处理</th><th>复测结论</th></tr></thead>
+  <tbody>
+    <tr><td class="id">R-01</td><td>P1</td><td><span class="tag st-p">已修</span> 目标地址为空 ⇒ <code>iv_report_reconnect()</code> 关传输层（语义＝重连到空地址即断开）</td><td>板端：清空两口地址 12 s 后 <code>transport=closed</code>、<code>ss -tn | grep 6013</code> <b>0 行</b>；写回后 <code>transport=up</code></td></tr>
+    <tr><td class="id">R-02a</td><td>P1</td><td><span class="tag st-p">已修</span> <code>poll_connect()</code> 改成"再 connect 一次"看 <code>EISCONN</code>/<code>EALREADY</code>（不再读 <code>SO_ERROR</code>）</td><td>板端 PORT：<code>cns=[1,2]</code> 八次采样不变（修复前恒 <code>[1,1]</code>）</td></tr>
+    <tr><td class="id">R-02b</td><td>P1</td><td><span class="tag st-p">已修</span> ICMP 序号改<b>引擎级</b>唯一 ＋ <code>rtt_since()</code> 防无符号回绕</td><td>单测 <code>c14</code>（两路同拍不串包）；证伪撤掉后 6 条红</td></tr>
+    <tr><td class="id">R-02c</td><td>P1</td><td><span class="tag st-p">已修</span> 延时判据 <code>&gt;=</code> → <code>&gt;</code>；口径写进 <code>iv_camdet.h</code>（RTT 分辨率＝一个 tick）＋ 阈值配到 <code>&lt;= tick</code> 时告警</td><td>板端 PING：<code>cns=[1,2]</code>，ch0 稳定正常(1)（修复前 4）</td></tr>
+    <tr><td class="id">R-03</td><td>P2</td><td><span class="tag st-p">已修</span> 预检加 STR 长度上限 ＋ <code>apply_set()</code> 如实返回、失败整条回滚 ＋ <code>applied</code> 用真实写入条数</td><td>单测 <code>c12c~c12g</code>：超长串/坏 IP 必须 <code>ok:false</code> 且 <b>version 不前</b></td></tr>
+    <tr><td class="id">R-04</td><td>P2</td><td><span class="tag st-p">已修</span> 改走 <code>inet_ntop()</code>；<b>用例侧同错一并修</b>（原先手写 <code>0x0A000001</code>）</td><td>单测 <code>s02c/s02f</code>：写 <code>192.168.1.200</code> 读回逐字节相等</td></tr>
+    <tr><td class="id">R-05</td><td>P3</td><td><span class="tag st-p">已修</span> 按"改代码"处置：<code>inet_pton</code> 校验，加载侧回落默认 ＋ 写入侧 <code>IV_EINVAL</code></td><td>单测 <code>c30a~c30l</code> 11 条（<code>999.1.1.1</code>/3 段/5 段/非数字/<code>.300</code>/尾随字母全拒，空串合法）</td></tr>
+    <tr><td class="id">R-06</td><td>P3</td><td><span class="tag st-p">已修</span> 按"改代码"处置：新增 <code>status_of()</code> 按 <code>e</code> 映射 400/403/404/409/501/507/500</td><td>前端仍按 <code>ok</code> 判断，jsdom 5 个用例全过；覆盖面仅 JSON 分支</td></tr>
+    <tr><td class="id">R-07</td><td>P3</td><td><span class="tag st-p">已修</span> 桩补 <code>/api/snmp</code> ＋ <code>app.js</code> 逐层兜底 ＋ 控件改按 <code>title</code>/<code>placeholder</code> 定位</td><td><code>ui_camera_slot</code> <b>21 条</b>全过（含新增 u07a/u07b）</td></tr>
+    <tr><td class="id">R-08</td><td>P0</td><td><span class="tag st-b">已取证，未定因</span> 落 <code>run.state</code>（clean/dirty）＋ <code>boot_id</code> 日志</td><td>板端已见：首次 <code>no previous marker</code>、换版后 <code>previous shutdown was clean</code>；根因要等下一次现场</td></tr>
+  </tbody>
+</table>
+<div class="note">
+  <b>一处需要纠正原报告</b>：R-02 里"可达的 ch0 在 RTSP 模式报 FAULT(2)"——本轮实测
+  <code>192.168.2.102:554</code> <b>拒绝连接</b>（该地址根本不是摄像机/无 RTSP 服务），
+  所以判 FAULT 是<b>对的</b>，不是缺陷。RTSP 侧真正要复测的是"有 RTSP 服务的摄像机"，
+  仍卡 H-02/I-08 的凭据。
+</div>
+<div class="note">
+  复测门禁（VM <code>~/wbnet/ivsbox</code>）：<code>test</code> 42/42、<code>arm</code>、<code>analyze</code>、
+  <code>asan</code> 42/42 零报告、<code>setarch -R make tsan</code> 42/42 零报告、<code>fuzz</code> 3×10 s 零报告，
+  全程 <code>error:|warning:</code> 计数 <b>0</b>；<code>itest</code> 15 通过 ＋ 1 SKIP；前端 jsdom <b>104</b> 条断言全过。
+  <b>反向证伪 7 条全部成立</b>（撤掉修复 ⇒ 2/2/6/2/3/5/7 条变红 ⇒ 还原复绿）。
+  被测产物：<code>ivsboxd</code> md5 <code>01ff76959ba4bd5a162e0eb70fd29fd4</code>、<code>ivsbox-web</code>
+  <code>42092f849d35c46221601e4d356298dd</code>、<code>app.js</code> <code>278be428e9726b691bcceb5401b96f2f</code>（板端与 VM 逐字节一致）。
+</div>
+
+<h2>1. 结论摘要</h2>
+<table>
+  <thead><tr><th>维度</th><th>结论</th></tr></thead>
+  <tbody>
+    <tr><td>自动化层</td><td><span class="tag st-p">全绿</span> 单测 42/42、ASan/TSan 0 报告、<code>make arm</code> 0 告警、<code>analyze</code> 0 告警、fuzz 3 harness 真跑零报告、itest 15/16（1 SKIP）、装配层 e2e 102 断言全过</td></tr>
+    <tr><td>本轮新发现的缺陷</td><td><span class="tag st-f">P0 待查 1 · P1 2 · P2 2 · P3 3</span>（R-01～R-08，见 §5）</td></tr>
+    <tr><td>能否准出</td><td><span class="tag st-f">不能</span> 存在 2 条 P1：清空平台地址后仍向旧地址上报（R-01）、摄像机 PORT/PING 探测结论错误（R-02）</td></tr>
+    <tr><td>可给现场试用的部分</td><td>平台上报节拍、双 WAN 切换与补传、采集板串口、GPS 降级、Web 鉴权/审计/下载、平台 E1/E2/E3/E4/F3/F5/A5、OTA 拒绝路径、数据库读写</td></tr>
+    <tr><td>明确不可宣称通过</td><td>摄像机探测三方式的结论正确性、平台地址停用、媒体抓图/录像全链路、远程通道端到端、设备身份工装、72 h 长稳</td></tr>
+  </tbody>
+</table>
+
+<h2>2. 环境与基线</h2>
+<table>
+  <thead><tr><th>项</th><th>实测值</th></tr></thead>
+  <tbody>
+    <tr><td>板端</td><td>T113（armv7l）· Linux 5.4.61-rt37 · 192.168.2.120/24 · eth0 + usb0（4G，10.62.35.221）</td></tr>
+    <tr><td>部署</td><td>本轮把 VM 新构建的 ARM 产物与前端投到板端（原板端为 r35 旧版）：<code>ivsboxd</code> md5 <code>72624c0f…</code>、<code>ivsbox-web</code> <code>0514246…</code>、<code>app.js</code> <code>1c8ad41…</code>，与 VM 产物一致</td></tr>
+    <tr><td>编译 VM</td><td><code>embedsky@192.168.2.115</code> · gcc 11.4.0 · <b>单核</b></td></tr>
+    <tr><td>外设现状</td><td>SD 卡 30 GB 已挂 <code>/mnt/sdcard</code>（含历史 mp4/jpg）；本地视频设备 <code>/dev/video4</code>；采集板 <code>ttySAC5</code>；4G AT 口 <code>ttyUSB1</code>；<b>GPS 无天线</b>；<b>无 SNMP 交换机</b>；<b>无 frps / 无量产公钥</b></td></tr>
+    <tr><td>摄像机</td><td>网内实测可发现 6 条档案：海康 4（含 192.168.2.102 可达、RTT 0.47 ms）＋ 海康 UDP 1 ＋ 大华组播 1</td></tr>
+    <tr><td>工具</td><td>板端有 <code>sqlite3</code>/<code>python3</code>/<code>tc</code>/<code>iptables</code>，<b>无</b> <code>curl</code>/<code>nc</code>/<code>snmpwalk</code>/<code>ffprobe</code>；本机 ffprobe 可用</td></tr>
+  </tbody>
+</table>
+
+<h2>3. 自动化层（本轮全部真跑）</h2>
+<table>
+  <thead><tr><th>层</th><th>命令</th><th>结果</th><th>结论</th></tr></thead>
+  <tbody>
+    <tr><td>单元</td><td><code>make test</code></td><td>rc=0；42 个程序全 PASS（1 处 SKIP：<code>no IFF_UP-clear iface to probe</code>）</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td>交叉编译</td><td><code>make arm</code></td><td>rc=0，0 告警，ELF32 ARM；<code>ivsboxd</code> md5 与板端新投递一致</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td>静态分析</td><td><code>make analyze</code></td><td><b>0 条告警</b></td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td>内存</td><td><code>make asan</code></td><td>rc=0，42 程序在 ASan/UBSan 下跑完，0 报告</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td>线程</td><td><code>setarch -R make tsan</code></td><td>rc=0，0 条 ThreadSanitizer 报告</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td>模糊</td><td><code>FUZZ_SEC=10 make fuzz</code></td><td>3 harness 真跑：<code>fuzz_frame</code> 501 MB / <code>fuzz_link</code> 91 万事件 / <code>fuzz_netlink</code> 1.29 GB、2911 万条，零报告</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td>集成</td><td><code>make itest</code>（root＋daemon）</td><td>16 条：15 通过 ＋ 1 SKIP（<code>test_tunnel_e2e</code> 缺设备身份）</td><td><span class="tag st-p">通过（15/16）</span></td></tr>
+    <tr><td>装配层 e2e</td><td><code>thresh/ota_install/camtest/netthr/netsrv_e2e.py</code></td><td>12 + 13 + 19 + 33 + 25 = <b>102 断言全过</b></td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td>前端（真 HTTP）</td><td><code>logs_e2e.py</code> / <code>ota_e2e.py</code></td><td>21 + 37 = 58 断言全过</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td>前端（jsdom）</td><td><code>tests/web/ui_*.mjs</code></td><td>4/5 通过（15+16+30+22＝83 断言）；<b><code>ui_camera_slot</code> 抛 TypeError</b></td><td><span class="tag st-f">1 个用例失败</span></td></tr>
+    <tr><td>升级链路</td><td><code>sh tests/upgrade-boot.sh</code></td><td>u1~u6 全 PASS（含 bootcount 超限回滚、自检超时回滚＋KILL）</td><td><span class="tag st-p">通过</span></td></tr>
+  </tbody>
+</table>
+<div class="note w"><b>唯一红的自动化项</b>：<code>ui_camera_slot.mjs</code> 进入摄像机页即抛
+<code>TypeError: Cannot read properties of undefined (reading 'length')</code>（<code>app.js</code> 的 <code>r.d.slots.length</code>）。
+真因是<b>该用例的桩没有 <code>/api/snmp</code> 分支</b>：摄像机页后来加了「查摄像机 SNMP」卡片，而桩没跟着补（<code>ui_camera_test.mjs</code> 补了，这个没补）。
+真接口实测返回了 <code>slots</code> 数组（见 §4 G-01b），故产品功能未坏，属<b>用例欠账 + 前端缺防御</b>（R-07）。</div>
+
+<h2>4. 逐组执行结果</h2>
+
+<h3>4.1 A 组 · 系统启动与进程守护</h3>
+<table>
+  <thead><tr><th>编号</th><th>项</th><th>实测</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">A-01</td><td>冷启动就绪</td><td>板端复位后 <code>ivsboxd starting</code> → <code>/tmp/ivsbox-ready</code> 出现共 <b>14 s</b>，web 同秒监听 :80</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">A-02</td><td>主控被 kill -9 自愈</td><td>旧 pid 1856 → 新 pid 2066，<b>3 s</b> 拉起；ready 标记重建，<code>queue=0</code> 未丢</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">A-03</td><td>Web 卡死只重启 Web</td><td><code>kill -STOP</code> web(1888) → <b>33 s</b> 后新 web(2347)；<b>主控 pid 2066 不变</b></td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">A-04</td><td>媒体卡死只重启媒体</td><td><code>ivsbox-media</code> 是<b>按需拉起</b>、当时未运行，无法制造"卡死"；且 <code>ivsbox-media --help</code> 不认参数、直接进主循环并阻塞（需先 <code>kill monitor-media.sh</code>）</td><td><span class="tag st-n">未测</span></td></tr>
+    <tr><td class="id">A-05</td><td>看门狗 16 s 复位</td><td>需在串口观察下执行，属危险项</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td class="id">A-06</td><td>优雅退出</td><td><code>kill -TERM</code> → <b>1 s</b> 内退出；日志 <code>signal 15 received, stopping</code> → <code>shutting down ivsboxd</code> → <code>taskpool destroyed</code>；随后 monitor 2 s 内拉起</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">A-07</td><td>反复上下电 ×10</td><td>需物理断电</td><td><span class="tag st-b">阻塞</span></td></tr>
+  </tbody>
+</table>
+
+<h3>4.2 B 组 · 配置与热更新</h3>
+<table>
+  <thead><tr><th>编号</th><th>项</th><th>实测</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">B-02</td><td>非法值拒绝（7 个子项）</td><td>拒绝 ✅：<code>interval_s=0</code>（<code>out of range</code>）、<code>=99999</code>、未知键（<code>e=-10</code>）、类型不符（<code>e=-21</code>）、枚举外（<code>camera.search=bogus</code> → <code>not in enum</code>）；<br><b>未拒绝 ❌：<code>net.ip="999.1.1.1"</code> 保存成功；<code>sys.device.name</code> 200 字符 → 应答 <code>ok:true, version+1, applied:1</code> 但回读仍是空串</b></td><td><span class="tag st-f">部分失败</span></td></tr>
+    <tr><td class="id">B-03</td><td>并发双写</td><td>两个线程持同一 <code>ver</code> 同时提交：一个成功（ver 44→45），另一个 <code>e=-3 version conflict</code>；未互相覆盖</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">B-06</td><td>写配置中断电</td><td>需硬断电</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td colspan="4" style="color:#5b6570">B-01 / B-04 / B-05 已有板端证据（<span class="tag st-p">P</span>），本轮复测一致：<code>config.all</code> 正常下发、空值语义不变、上报间隔热更生效。</td></tr>
+  </tbody>
+</table>
+
+<h3>4.3 C 组 · 采集板串口</h3>
+<table>
+  <thead><tr><th>编号</th><th>项</th><th>实测</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">C-01</td><td>帧解析健壮性</td><td><code>make test</code> 的 <code>test_frame</code>/<code>test_serial</code>/<code>test_report</code> ＋ <code>make fuzz</code>：半包/粘包/坏 CRC/超长共 <b>501 MB</b> 随机流零崩溃零越界（<code>crc_err=112 tail_err=0 too_long=7410</code> 均为预期丢弃）</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">C-07</td><td>重复 / 乱序帧</td><td>由 <code>test_report</code>（pump-order-ack、drop-repull）与 <code>test_serial</code>（exclusive lock、eagain、closed fd）覆盖，无重复动作断言全过</td><td><span class="tag st-p">通过（单测）</span></td></tr>
+    <tr><td class="id">C-03<br>C-04</td><td>DS / RELAY 极性</td><td>需真实继电器动作，<b>会让现场设备断电</b>，须书面同意</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td class="id">C-05</td><td>0xD1 应答超时</td><td>需让采集板停止应答，无可控手段（无串口注入工具）</td><td><span class="tag st-n">未测</span></td></tr>
+    <tr><td class="id">C-06</td><td>串口拔插</td><td>物理操作</td><td><span class="tag st-b">阻塞</span></td></tr>
+  </tbody>
+</table>
+
+<h3>4.4 D 组 · GPS</h3>
+<table>
+  <thead><tr><th>编号</th><th>项</th><th>实测</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">D-01</td><td>定位有效</td><td><code>link.open=true</code>、NMEA 解析正常，但 <code>fix.valid=false / satellites=0 / lat=lon=null</code>（<b>实验室无天线</b>）</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td class="id">D-03</td><td>串口不占用</td><td>GPS 路径<b>只由 <code>IVSBOX_GPS_DEV</code> 控制，不是配置键</b>（架构冻结口径）；置空需改启动方式重启，本轮未做</td><td><span class="tag st-n">未测</span></td></tr>
+    <tr><td class="id">D-04</td><td>时间跳变</td><td><code>system.time +120 s</code> 生效；跳变前后 report 间隔 <b>180/181/179 s</b> 稳定，无集中补发。节拍源为 reactor <code>monotonic</code>（<code>iv_report.c</code> 头注释），墙钟跳变不影响周期</td><td><span class="tag st-p">通过</span></td></tr>
+  </tbody>
+</table>
+
+<h3>4.5 E 组 · 双 WAN、平台上报</h3>
+<table>
+  <thead><tr><th>编号</th><th>项</th><th>实测</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">E-07</td><td>平台地址为空</td><td>清空 <code>net.server.{wireless,wired}.host</code> 后：<code>server="" port=0</code>、<code>queue=0</code>（不堆积），<b>但 <code>transport</code> 恒为 <code>up</code> 230 s 不变，且 17:09:24 仍产生 <code>report #6</code> 发往旧地址 47.104.250.225:6013</b>；<code>ss</code> 显示该连接仍 ESTAB</td><td><span class="tag st-f">不通过</span></td></tr>
+    <tr><td class="id">E-05</td><td>双断</td><td>断 eth0 会切断唯一管理通路（无带外），未执行</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td class="id">E-06</td><td>4G 数据面</td><td>自愈逻辑已单独验（计划 §5.15：停 usb0 后 120 s 内重拨）；本轮未重复停 usb0 以免中断测试链路</td><td><span class="tag st-n">未测</span></td></tr>
+    <tr><td class="id">E-08</td><td>弱网</td><td><code>tc qdisc add … netem</code> → <b>RTNETLINK: Operation not supported</b>（板端内核未编 netem）</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td class="id">E-09</td><td>重启网络恢复</td><td>等含 <code>gateway=192.168.1.1</code> 的新镜像</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td colspan="4" style="color:#5b6570">E-01/E-02/E-03/E-04 已有板端证据，本轮状态读数一致（<code>state=WIRELESS_UP</code>、<code>active_wan=wireless</code>、<code>queue=0</code>、<code>bound=usb0</code>）。</td></tr>
+  </tbody>
+</table>
+
+<h3>4.6 F 组 · 设备管理（本轮重点）</h3>
+<table>
+  <thead><tr><th>编号</th><th>项</th><th>实测</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">F-01</td><td>探测三方式</td><td>建两路：ch0=192.168.2.102（可达，ping RTT <b>0.468 ms</b>）、ch1=192.168.2.199（<b>100% 丢包、ARP 未解析</b>）。<br>
+      <b>PING</b>：<code>cns=[4,0]</code> → ch0 被判 <b>DELAY(4)</b>（阈值 200 ms，实测 0.47 ms）；单路重测后 <code>[4,2]</code>；<br>
+      <b>PORT</b>：<code>cns=[1,1]</code>，<b>50 s 连续 10 次采样恒为 [1,1]</b>——完全不可达的 ch1 被判 <b>NORMAL(1)</b>；<br>
+      <b>RTSP</b>：<code>cns=[2,2]</code>，可达的 ch0 被判 FAULT(2)</td><td><span class="tag st-f">不通过</span></td></tr>
+    <tr><td class="id">F-02</td><td>多品牌发现</td><td>发现 6 条：海康 SADP 4 路（含 IP 192.168.2.102/.18、192.168.1.78/.200）＋ 海康 UDP 1 ＋ 大华组播 1；日志 <code>search done, 6 found</code>。UNV / ONVIF 网内无样机</td><td><span class="tag st-p">部分通过</span></td></tr>
+    <tr><td class="id">F-03</td><td>档案持久化</td><td>板端复位后 <code>device.list</code> 仍为 6 条，通道/端口/凭据字段在</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">F-04<br>F-05</td><td>SNMP 旁证 / 改 OID</td><td>实验室无支持 SNMP 的交换机，<code>camera.snmp.enable=false</code>、无目标 IP</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td class="id">F-06<br>F-07</td><td>故障重启 / 限次熔断</td><td>需断真实摄像机供电（危险项）</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td class="id">F-08</td><td>箱门抓拍</td><td>需开箱门触发采集板 0xC1</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td class="id">F-09</td><td>主网故障沿</td><td>危险项（会触发断电重启）</td><td><span class="tag st-b">阻塞</span></td></tr>
+  </tbody>
+</table>
+
+<h3>4.7 G 组 · Web 页面、鉴权与代理（本轮重点）</h3>
+<table>
+  <thead><tr><th>编号</th><th>项</th><th>实测</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">G-01</td><td>八页依赖接口</td><td>11 个接口全部 200 + <code>ok:true</code>：<code>/api/overview</code>、<code>/devices</code>、<code>/config?cls=sys</code>、<code>/config?defaults=1</code>、<code>/board</code>、<code>/gps</code>、<code>/cell</code>、<code>/snmp?which=cam|sw</code>、<code>/ota</code>、<code>/logs?max=5</code>；日志文件下载 200（33 780 B）</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">G-01b</td><td>SNMP 响应结构</td><td><code>/api/snmp?which=cam</code> 返回 <code>slots</code> 数组（5 个槽位，含 <code>sysDescr</code>/<code>devStatus</code>/<code>cpuPercent</code>…）——证明 jsdom 崩溃是桩问题</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">G-05</td><td>口令文件保护</td><td><code>/mnt/UDISK/ivsbox/secure/web.passwd</code> 权限 <b>600 root:root</b></td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">G-06</td><td>写操作审计</td><td>一次 <code>config.apply</code> → <code>audit</code> 表 53→54，最新记录 <code>config.apply|items=1</code>；<code>system.time</code> 审计亦在库（<code>wall=1792659392</code>）</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">G-07</td><td>媒体下载鉴权</td><td>无 Cookie → 401；带 Cookie + Range → <b>206</b> + <code>Content-Range: bytes 0-99/36344</code></td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">G-08</td><td>摄像机代理边界</td><td><code>/cam/0/</code>、<code>/cam/9/</code>、<code>/cam/-1/</code>、<code>/cam/abc/</code>、<code>/cam/0/../../etc/passwd</code> <b>全部 404</b>；<code>/media/../../../etc/passwd</code> → 403 <code>forbidden path</code></td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">G-09</td><td>输入健壮性</td><td>超长 URL 8 KB → 400；超大 body 40 KB → 400；畸形 JSON → 401；<code>apply</code> body=<code>[]</code> → <code>{"ok":false,"e":-2,"msg":"missing ver"}</code>；<code>cls=nosuch</code> → <code>unknown class</code>。<b>但 HTTP 状态码一律 200</b>（错误放在 body 的 <code>ok/e</code>），与计划判据"稳定 4xx"不符</td><td><span class="tag st-p">通过（口径偏差）</span></td></tr>
+    <tr><td class="id">G-10</td><td>并发压测</td><td>20 并发 × 30 = 600 请求，3.4 s；<b>fd 7→7 无泄漏</b>；响应码 <code>{200:383, 503:216, reset:1}</code>。503 是<b>设计行为</b>：<code>web/src/main.c</code> 只有 8 个连接槽，满了直接回 503 不排队</td><td><span class="tag st-p">通过（设计约束）</span></td></tr>
+    <tr><td class="id">G-04</td><td>首次强制改密</td><td>改动 <code>web.passwd</code> 违反"绝不改用户现场凭据"红线，未执行</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td colspan="4" style="color:#5b6570">G-02（登录失败口径）、G-03（未登录拦截）复测一致：错账号/错口令 body 与状态码完全相同（不泄露账号存在）；未登录 <code>/api/</code>、<code>/media/</code> 均 401，<code>/</code> 200。</td></tr>
+  </tbody>
+</table>
+
+<h3>4.8 H 组 · 媒体与 SD</h3>
+<table>
+  <thead><tr><th>编号</th><th>项</th><th>实测</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">H-04</td><td>回放与下载</td><td>经 8080 下载 <code>/media/video/20260918/channel0_105701.mp4</code>：200、63 681 B、<b>md5 与板端一致 <code>c9f44e56…</code></b>；Range <code>0-1023</code> / <code>1024-2047</code> 均 206 且 <code>Content-Range</code> 正确（断点续传可用）；<b>ffprobe 可解析：hevc 704×576，时长 1.96 s</b></td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">H-03</td><td>路数上限</td><td>建 ch6/ch7 槽位后 CNS 仍只报 6 路（<code>[2,2,0,0,0,0]</code>），"7/8 路只录不探测"成立；<b>8 路同时录像未验</b></td><td><span class="tag st-p">部分通过</span></td></tr>
+    <tr><td class="id">H-01</td><td>抓图 ×20</td><td><code>ivsbox-media</code> 未运行；该二进制不认 <code>--help</code>、启动即进主循环并阻塞会话，需按 <code>monitor-media.sh</code> 口径拉起，本轮未做</td><td><span class="tag st-n">未测</span></td></tr>
+    <tr><td class="id">H-02</td><td>断网录像</td><td>需摄像机 RTSP 凭据（现场未提供），仅端口可达性可测</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td class="id">H-05<br>H-07</td><td>水位分级 / 写满</td><td>需灌数据；当前 <code>level=0 ok</code>、<code>used_pct=0</code>、<code>rounds</code> 递增</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td class="id">H-06</td><td>拔卡</td><td>物理操作（备用卡未到）</td><td><span class="tag st-b">阻塞</span></td></tr>
+  </tbody>
+</table>
+
+<h3>4.9 I 组 · OTA 升级与回滚</h3>
+<table>
+  <thead><tr><th>编号</th><th>项</th><th>实测</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">I-01</td><td>未签名包</td><td>结构合法但签名 64 B 全 0 → <code>install: failed (bad-package/EAUTH) rc=-23</code>；<code>ota/events.log</code> 记 <code>reject</code></td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">I-03</td><td>包结构非法</td><td>magic 错（<code>XXXXBAD!</code>）与截断（10 B）均 <code>failed (bad-package/EAUTH)</code>，events.log 三条 <code>reject 0.0.0 - bad-format</code>，未落盘</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">I-02</td><td>型号不匹配</td><td>由 <code>test_upd</code> 单测覆盖（all passed），板端需联调公钥造合法签名包，未单独跑</td><td><span class="tag st-p">通过（单测）</span></td></tr>
+    <tr><td class="id">I-06<br>I-07</td><td>自检超时回滚 / bootcount 超限</td><td><code>upgrade-boot.sh</code>：u4（bootcount 超限自动回滚、状态 <code>rolled-back</code>、原因可查）、u5（自检超时回滚＋忽略 TERM 的实例被 KILL）全 PASS</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">I-04</td><td>正常升级</td><td>量产公钥未部署，<code>fail-closed</code> 拒绝一切包；<code>status</code>：<code>version=0.0.0 current=- bootcount=0</code></td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td class="id">I-05</td><td>升级中断电</td><td>危险项</td><td><span class="tag st-b">阻塞</span></td></tr>
+    <tr><td class="id">I-08</td><td>升级期间业务</td><td>需录像在跑（摄像机凭据缺失）</td><td><span class="tag st-b">阻塞</span></td></tr>
+  </tbody>
+</table>
+
+<h3>4.10 J 组 · 远程通道与受控代理</h3>
+<table>
+  <thead><tr><th>编号</th><th>项</th><th>实测</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">J-03</td><td>开关与到期</td><td><code>tunnel.status</code>：<code>on=false enabled=false sn="" server="" svcs=[]</code>，<code>ttl_s=0</code>——无身份/无 frps 时 fail-closed</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">J-01<br>J-05</td><td>白名单 / 摄像机 IP 隔离</td><td><code>tunnel.enable</code> 被拒；<code>/etc/frp/frpc.toml</code> 与 <code>secure/frpc.toml</code> <b>均不存在</b>（"全部拒绝、不生成配置文件"成立；自然也不含摄像机 IP）</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">J-02</td><td>钥匙派生一致性</td><td><code>test_tunnel</code> 单测（黄金向量）通过</td><td><span class="tag st-p">通过（单测）</span></td></tr>
+    <tr><td class="id">J-04</td><td>主控退出即关</td><td>通道从未开启（无身份），无法构造"开启后 kill"</td><td><span class="tag st-n">未测</span></td></tr>
+    <tr><td class="id">J-06</td><td>端到端连通</td><td>frps 地址/端口/令牌未下发</td><td><span class="tag st-b">阻塞</span></td></tr>
+  </tbody>
+</table>
+
+<h3>4.11 K 组 · 数据与审计</h3>
+<table>
+  <thead><tr><th>编号</th><th>项</th><th>实测</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">K-01</td><td>四表可用</td><td><code>journal_mode=wal</code>；<code>device=7 snmp_latest=0 audit=70 net_event=22</code>；外部 <code>sqlite3</code> 写 net_event 22→23→22 成功（可读写）</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">K-02</td><td>行数不变量</td><td><b><code>device</code> 表的 <code>ip</code> 列全部字节序反转</b>：<code>200.1.168.192</code>（应为 .1.200）、<code>78.1.168.192</code>、<code>18.2.168.192</code>、<code>102.2.168.192</code>；另有 3 行 IP 为空（UDP/组播发现）。Web <code>/api/devices</code> 的 IP <b>正确</b>（走内存），错值只在落库</td><td><span class="tag st-f">不通过</span></td></tr>
+    <tr><td class="id">K-03<br>K-04</td><td>SIGKILL / 断电后数据库</td><td><code>integrity_check=ok</code>；零长库可打开（<code>sqlite_master</code> 计数 0）；<code>test_fault_db_power</code> 单测通过</td><td><span class="tag st-p">通过</span></td></tr>
+  </tbody>
+</table>
+
+<h3>4.12 L 组 · 设备身份与出厂工装</h3>
+<p><span class="tag st-b">整组阻塞</span> 依赖"含 <code>gateway=192.168.1.1</code> ＋ <code>mac_mode=fixed</code> 的新镜像"；当前身份分区 <code>devid=000001</code>、SN <code>0B2CC1</code>（来源 factory）。组播下发会改写工厂身份分区，未在新镜像口径确认前不动。</p>
+
+<h3>4.13 M 组 · 版本、日志与运维接口</h3>
+<table>
+  <thead><tr><th>编号</th><th>项</th><th>实测</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">M-01</td><td>版本查询</td><td><code>ivsboxd --version</code> → <code>ivsboxd 1.0.0+gunknown</code>，与 ctl <code>version</code> 一致；<code>sn=0B2CC1 sn_source=factory</code>、<code>eth0_mac=2e:a2:9e:ef:43:43</code>。<b>注意 <code>+gunknown</code></b>（VM 构建目录非 git 仓）</td><td><span class="tag st-p">通过（含 D-11 欠账）</span></td></tr>
+    <tr><td class="id">M-04</td><td>校时与时区</td><td><code>/etc/localtime → Asia/Shanghai</code>；<code>system.time</code> 校时生效；<b>RTC 存在</b>（<code>/dev/rtc0</code>，<code>hwclock -r</code> 与系统时间一致）；复位后时间保持。另验 <code>system.reboot</code> 二次确认门：无 <code>confirm</code>/<code>confirm=false</code> 均 <code>e=-21 confirm required</code></td><td><span class="tag st-p">通过</span></td></tr>
+  </tbody>
+</table>
+
+<h3>4.14 N 组 · 平台协议指令</h3>
+<table>
+  <thead><tr><th>编号</th><th>命令</th><th>实测应答</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td class="id">N-04</td><td><code>0xE4</code> 搜索摄像机</td><td><code>ACK 0x01</code>（起一轮发现，无 JSON 正文—schema 仍未冻结）</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">N-05</td><td><code>0xE7</code> 查 SNMP</td><td><code>ACK 0x74</code>（SNMP 未启用⇒无目标 IP，start 失败）</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">N-06</td><td><code>0xE8</code> 查 PING</td><td><code>ACK 0x74</code>（未实现）</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">N-10</td><td><code>0xFF</code> 心跳</td><td><b>无应答</b>（只更新链路活性，不自激）</td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td class="id">N-12</td><td><code>0xF3</code> 配传输模式</td><td>同值（4）→ <code>ACK 0x01</code> 且 <code>sys.transport.mode</code> 仍为 4、未触发重连；越界 <code>0x00</code>/<code>0x05</code> → <code>ACK 0x74</code></td><td><span class="tag st-p">通过</span></td></tr>
+    <tr><td colspan="4" style="color:#5b6570">N-01/N-02/N-03/N-07/N-08/N-09/N-11 已有板端证据，本轮工装复测口径一致（工装连上后先排空心跳/上报，逐条 3 s 窗口）。</td></tr>
+  </tbody>
+</table>
+
+<h2>5. 缺陷清单与处理方案</h2>
+
+<h3>R-01 · P1 · 清空平台地址后仍向旧地址上报</h3>
+<table>
+  <thead><tr><th>项</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td>用例</td><td>E-07「平台地址为空」</td></tr>
+    <tr><td>现象</td><td>清空 <code>net.server.wireless.host</code> / <code>wired.host</code> 后 230 s 内 <code>transport</code> 恒 <code>up</code>，17:09:24 仍产生 <code>report #6</code>；<code>ss -tn</code> 显示 <code>10.62.35.221:49780 → 47.104.250.225:6013 ESTAB</code></td></tr>
+    <tr><td>根因</td><td><code>iv_report_set_server()</code> 清空分支只清 <code>srv_host/srv_port</code>，注释明确"在用连接不动，<b>是否断由调用方决定</b>"；而 <code>agent_reload_server()</code>（<code>iv_agent.c:1309</code>）在 <code>iv_agent_pick_host()</code> 返回 <code>NULL</code> 时只调了 <code>iv_report_set_server(rp, NULL, 0)</code>，<b>没有做"断"这个决定</b></td></tr>
+    <tr><td>影响</td><td>运维想停上报（或换平台时先清空）时，设备会继续把状态数据发往旧地址，直到 TCP 自然断开（可长达数小时）。属数据外发不可控</td></tr>
+    <tr><td>方案</td><td>① <code>iv_report</code> 增加 <code>iv_report_disconnect()</code>（复用重连路径里的 close）；② <code>agent_reload_server()</code> 在 <code>h == NULL</code> 时调用它，并把 <code>transport</code> 置 <code>idle</code>；③ 补一条单测：<code>set_server(NULL,0)</code> 后断言 <code>fd &lt; 0</code>、<code>state != up</code>；④ 板端回归 E-07（清空后 200 s 内不得出现新 <code>report</code>）</td></tr>
+  </tbody>
+</table>
+
+<h3>R-02 · P1 · 摄像机探测结论错误（PORT 恒正常、PING 误判延时）</h3>
+<table>
+  <thead><tr><th>项</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td>用例</td><td>F-01「探测三方式」</td></tr>
+    <tr><td>现象</td><td>ch0=<code>192.168.2.102</code>（PING 0.468 ms、可达）；ch1=<code>192.168.2.199</code>（100% 丢包、ARP 未解析）。<br>
+      · PORT 模式：<b>50 s × 10 次采样恒 <code>cns=[1,1]</code></b>，不可达的 ch1 报 NORMAL(1)；<br>
+      · PING 模式：ch0 报 <b>DELAY(4)</b>（阈值 200 ms，实测 0.47 ms）；<br>
+      · RTSP 模式：可达的 ch0 报 FAULT(2)</td></tr>
+    <tr><td>根因方向</td><td><code>port_tick()</code> 把结论写进 <code>vd[]</code>（<code>sc_bits!=0 ? NORMAL : FAULT</code>），CNS 读的是 <code>st[]</code>，两者由 <code>refresh()</code> 同步；实测 <code>st</code> 停在初值 1 ⇒ <b>PORT 模式的轮次没有真正跑完 / 结论没有落进 <code>vd</code></b>，需加 <code>port_tick</code> 入口与 <code>round_begin()</code> 返回值的调试日志确认。PING 的 DELAY 需核 <code>pk_rtt[]</code> 记录的值与实际 0.47 ms 的对应关系（单位或首次 ARP 耗时被计入）</td></tr>
+    <tr><td>影响</td><td><b>摄像机断线时平台仍看到"正常"</b>（漏报故障，最坏情况运维完全失去监控意义）；PING 模式则相反，会把正常摄像机报成延时</td></tr>
+    <tr><td>方案</td><td>① 先补一条 <b>会失败的</b> 单测：<code>iv_camdet</code> 配置一个不可达 IP，PORT 模式跑满一轮后断言 <code>verdict==FAULT</code>（现在 <code>test_camdet</code> 只覆盖 PING 与 §c13，故单测全绿而板端错）；② 修 <code>port_tick</code> 的状态回写；③ PING 侧用抓包/日志打印 <code>pk_rtt[]</code> 原值，检查阈值单位；④ 回归：三方式各跑 60 s，两路结论必须分别等于地面真值</td></tr>
+  </tbody>
+</table>
+
+<h3>R-03 · P2 · 超长字符串"报成功但没写入"</h3>
+<table>
+  <thead><tr><th>项</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td>用例</td><td>B-02（<code>sys.device.name</code> 200 字符）</td></tr>
+    <tr><td>现象</td><td>应答 <code>{"ok":true,"d":{"version":41,"applied":1}}</code>，但回读值仍是原值（空串）——版本号前进、<code>applied</code> 计数 +1，实际没写</td></tr>
+    <tr><td>根因</td><td><code>m_config_apply()</code> 的②预检只校验"键存在 + 类型匹配"，<b>不校验字符串长度</b>；③写入阶段 <code>iv_config_set_str()</code> 因 <code>strlen >= IV_CFG_STR_MAX(160)</code> 返回 <code>IV_ERANGE</code>，而 <code>apply_set()</code> 的返回值被 <code>(void)</code> 丢弃；<code>applied</code> 用的是预检计数 <code>n</code></td></tr>
+    <tr><td>影响</td><td>所有 STR 键（设备名、平台地址、录像 URL 等）：填超长值时界面提示保存成功，实际未生效，属"配置骗人"</td></tr>
+    <tr><td>方案</td><td>① 预检加一项：<code>want==STR &amp;&amp; strlen(json_get_string(v)) >= IV_CFG_STR_MAX</code> → <code>IV_ERANGE "value too long"</code>；② <code>apply_set()</code> 返回 rc 并在非 <code>IV_OK</code> 时回滚整条；③ 单测：超长串必须 <code>ok:false</code> 且 <code>version</code> 不变</td></tr>
+  </tbody>
+</table>
+
+<h3>R-04 · P2 · <code>device</code> 表 IP 落库字节序反转</h3>
+<table>
+  <thead><tr><th>项</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td>用例</td><td>K-02「行数不变量」（顺带发现）</td></tr>
+    <tr><td>现象</td><td><code>select ip from device</code> 得 <code>200.1.168.192</code>、<code>78.1.168.192</code>、<code>18.2.168.192</code>、<code>102.2.168.192</code>；正确值应为 <code>192.168.1.200 / .1.78 / 192.168.2.18 / 192.168.2.102</code>。Web <code>/api/devices</code> 显示<b>正确</b>（走内存结构），仅 DB 错</td></tr>
+    <tr><td>根因方向</td><td><code>ip</code> 以 <code>uint32</code> 网络序存储，读回后按主机序 <code>inet_ntop</code>/手写格式化。项目已有同类教训（"<code>_be</code> 是原样字节序 ⇒ 打印用 <code>inet_ntop()</code>"）</td></tr>
+    <tr><td>影响</td><td>任何按 DB 查询/导出/第三方对账拿到的摄像机 IP 全是错的；当前页面不读该列，故未被发现</td></tr>
+    <tr><td>方案</td><td>① 统一"存 <code>_be</code>、读时 <code>inet_ntop</code>"，或直接存点分十进制字符串；② 加单测：写 <code>192.168.1.200</code> 读回必须逐字节相等；③ 修复后清一次历史错值（或加 schema 版本迁移）</td></tr>
+  </tbody>
+</table>
+
+<h3>R-05 · P3 · <code>net.ip</code> 无 IP 格式校验</h3>
+<p><code>net.ip="999.1.1.1"</code> 保存成功。该键<b>目前没有任何消费者</b>（<code>net.ip/mask/gateway</code> 全仓只有默认表与注释，实际地址由系统/DHCP 决定），所以不影响运行；但 Web 上填垃圾值能保存，容易误导排障。
+<b>方案</b>：给三个键加 IP 校验器，或在页面标注"仅记录，不改变系统地址"。</p>
+
+<h3>R-06 · P3 · 错误响应一律 HTTP 200</h3>
+<p><code>apply body=[]</code>、<code>cls=nosuch</code>、<code>login 畸形 JSON</code> 均返回 HTTP 200 + <code>{"ok":false,"e":…}</code>（登录失败是 401）。前端按 <code>ok</code> 判断，功能正常，但与计划 G-09 的判据"稳定 4xx"不符。
+<b>方案</b>：二选一——把判据改成"稳定返回 <code>ok:false</code> 且不崩"，或按 REST 惯例回 400/422；不要两边都不改，否则每轮都会"报红"。</p>
+
+<h3>R-07 · P3 · <code>ui_camera_slot</code> 用例桩缺 <code>/api/snmp</code></h3>
+<p>摄像机页新增「查摄像机 SNMP」卡后，该用例的桩没补对应分支，默认桩返回 <code>{ok:true,d:{}}</code> ⇒ <code>r.d.slots.length</code> 抛 TypeError，用例整体中断（19 条断言全部未跑）。
+<b>方案</b>：① 桩补 <code>/api/snmp?which=</code> 分支（照抄 <code>ui_camera_test.mjs</code> 的 <code>slots</code> 结构）；② 顺手把 <code>app.js</code> 的 <code>r.d.slots.length</code> 改成 <code>(r.d.slots || []).length</code>，避免后端异常响应把整页渲染打断。</p>
+
+<h3>R-08 · P0（待定位）· 一次非预期重启</h3>
+<table>
+  <thead><tr><th>项</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td>现象</td><td>17:15:20 最后一条日志（<code>channel client connected</code>）之后，<code>17.log</code> 出现 <b>763 个 NUL 字节</b>（掉电/硬复位特征，无 <code>signal</code>、无 <code>shutting down</code>）；17:15:42 重新启动，17:16:00 就绪；<code>probe.log</code> 里该时刻前 <code>up=304</code> 与重启后 <code>boot_id</code> 一致</td></tr>
+    <tr><td>时间线索</td><td>当时正在执行 K 组脚本（含 3 次 <code>ivsbox-updater install</code> 坏包 + <code>sqlite3</code> 写 <code>control.db</code>）。<b>两次定向复现（再跑 install 坏包、只跑 updater status）都没有重现</b>，<code>boot_id</code> 未变</td></tr>
+    <tr><td>影响</td><td>若为看门狗复位：任何能让主循环阻塞 &gt;16 s 的操作都会重启设备，属 P0；若是升级/DB 争用引起，则运维在 OTA 期间会掉线</td></tr>
+    <tr><td>方案</td><td>① 把 <code>/dev/watchdog</code> 喂狗点与主循环进度绑定并打点（<code>watchdog keepalive failed N</code> 已有日志级别，但当日 <code>ERROR=0</code>，说明没走到）；② 复现时同时抓 <code>串口 COM28</code> 输出与 <code>dmesg</code>，确认是 WDT 复位还是电源；③ 若确认 install 期间有 UDISK 长阻塞，把 <code>updater</code> 的 staging 写入与 ivsboxd 日志落盘错峰；④ 72 h 长稳把"非预期重启"列为必查项</td></tr>
+  </tbody>
+</table>
+
+<h2>6. 准出条件对照（计划 §6）</h2>
+<table>
+  <thead><tr><th>条件</th><th>状态</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>P0 = 0，P1 = 0，P2 ≤ 3</td><td><span class="tag st-f">不满足</span></td><td>P0 待定位 1（R-08）、P1 2（R-01 / R-02）、P2 2（R-03 / R-04）</td></tr>
+    <tr><td>自动化层全绿</td><td><span class="tag st-f">不满足</span></td><td>六层全绿，但前端 jsdom 有 1 个用例（<code>ui_camera_slot</code>）失败，且 itest 仍有 1 条 SKIP</td></tr>
+    <tr><td>§16.2 十场景逐条有结论</td><td><span class="tag st-b">未完成</span></td><td>场景 1/2（双 WAN、补传）、7（守护）有结论；3/4/5/8/9 缺外设或危险项；6/10 部分</td></tr>
+    <tr><td>72 h 长稳</td><td><span class="tag st-b">未执行</span></td><td>本轮发生 1 次非预期重启（R-08），长稳更不可省</td></tr>
+    <tr><td>§8 遗留项单独登记</td><td><span class="tag st-p">已满足</span></td><td>R-01～R-08 均单列，与阻塞项分开</td></tr>
+  </tbody>
+</table>
+
+<h2>7. 建议的下一步（按优先级）</h2>
+<ol>
+  <li><b>修 R-01、R-02</b>（两条 P1）。都建议"先写会红的用例再改代码"：E-07 补"清空后不得有新 report"断言，F-01 补"不可达 IP 在 PORT 模式必须判 FAULT"。这两条当前<b>没有任何自动化用例覆盖</b>，所以一直是绿的。</li>
+  <li><b>定位 R-08</b>：拉串口 COM28 抓一次完整复位现场，确认 WDT 还是电源；确认后在 72 h soak 里加"重启计数器"。</li>
+  <li>修 R-03、R-04（P2），顺手把 R-07 的用例桩补上，让前端 5 个 jsdom 用例真正全绿。</li>
+  <li>R-05 / R-06 是口径问题，建议<b>改文档而不是改代码</b>，把判据与实现对齐，避免下轮重复"报红"。</li>
+  <li>需外部条件的 40 条：等摄像机 RTSP 凭据（H-02/I-08）、SNMP 交换机（F-04/F-05）、新镜像（E-09/L 组）、frps 与量产公钥（J-06/I-04）、物理/危险项签字（A-05/A-07/B-06/C-03/C-04/C-06/F-06~F-09/H-06/I-05）。</li>
+</ol>
+
+<div class="foot">
+  证据来源：VM <code>tqt113</code> 的 <code>/tmp/auto.log</code>、<code>/tmp/itest.log</code>、<code>/tmp/upg.log</code>；板端 <code>/mnt/UDISK/log/2026-10-22/*.log</code>、
+  <code>/tmp/a_group.log</code>、<code>/tmp/e1.log</code>、<code>/tmp/e2.log</code>、<code>/tmp/nt.log</code>、<code>/tmp/f1.log</code>、<code>/mnt/UDISK/f3.log</code>、
+  <code>/mnt/UDISK/probe.log</code>、<code>/mnt/UDISK/probe2.log</code>、<code>/mnt/UDISK/ivsbox/ota/events.log</code>、<code>control.db</code>。<br>
+  被测产物：<code>ivsboxd</code> md5 <code>72624c0f5e2bd0b6c59f92f0a5780d50</code>（VM 与板端逐字节一致）。测试期间口令未改动，未操作继电器与设备电源。<br>
+  编制 2026-10-22 18:20 · 依据《功能测试计划》97 条用例编号，报告与缺陷单沿用同一编号。
+</div>
+
+</div>
+</body>
+</html>

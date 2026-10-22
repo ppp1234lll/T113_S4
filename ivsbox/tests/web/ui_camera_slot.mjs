@@ -79,6 +79,8 @@ window.fetch = function (u, o) {
         return Promise.resolve(rsp({ ok: true, d: { version: ver, items: {} } }));
     if (u.indexOf('/api/config?cls=camera') === 0)
         return Promise.resolve(rsp({ ok: true, d: { version: ver, items: items } }));
+    if (u.indexOf('/api/snmp') === 0)
+        return Promise.resolve(rsp({ ok: true, d: { state: 2, slots: [] } }));
     if (u.indexOf('/api/config/apply') === 0) {
         const body = JSON.parse(o.body);
 
@@ -101,6 +103,11 @@ window.fetch = function (u, o) {
         ver += 1;
         return Promise.resolve(rsp({ ok: true, d: { version: ver, applied: Object.keys(body.items).length } }));
     }
+    /* 兜底：没单独写桩的接口一律回空 d。**不要**指望这条兜底能顶替真桩——
+     * R-07 就是这么来的：`/api/snmp` 没有桩，兜底回 `d:{}`，页面里
+     * `r.d.slots.length` 抛 TypeError，异常把整页后续渲染带走，而用例因为
+     * 没人断言那块内容照样"全绿"。所以这里打一行警告，露出来。 */
+    console.log('  WARN unstubbed api: ' + u);
     return Promise.resolve(rsp({ ok: true, d: {} }));
 };
 
@@ -131,8 +138,11 @@ const main = async () => {
 
     const content = doc.getElementById('content');
     const btn = byText(content, 'button', '建立该路通道');
-    const sel = content.querySelector('select');
-    const ipInp = content.querySelector('input[type="text"]');
+    /* 页面上还有别的 select/input（检测方式、RTSP 拉流、SNMP 槽位…），
+     * 按"第几个元素"取会随卡片增删而错位 —— 用控件自身的 title/placeholder 定位
+     * （这两个属性在 cameraSlotCard() 里是写死的，见 app.js）。 */
+    const sel = content.querySelector('select[title="通道序号"]');
+    const ipInp = content.querySelector('input[placeholder^="摄像机 IP"]');
 
     chk(btn !== null, 'u01b: 摄像机页出现「建立该路通道」按钮');
     chk(sel !== null, 'u01c: 出现通道序号下拉');
@@ -184,10 +194,17 @@ const main = async () => {
         'u06b: 版本号已跟上 u03 的返回值（ver=1）');
     chk(applyCalls[1] !== undefined && applyCalls[1].items['camera.ch.2.ip'] === '10.0.0.10',
         'u06c: 新 IP 已发出');
+
+    console.log('u07 「查摄像机（SNMP）」卡片：接口回空 slots 时不得抛异常（R-07）');
+    /* 原先这里 `r.d.slots.length` 直接取值：桩缺 /api/snmp 时兜底回 `d:{}`，
+     * 于是抛 TypeError，整页后续渲染被带走，而用例因为没人断言这块内容照样全绿。 */
+    chk(byText(content, 'p', '尚无采集结果') !== null,
+        'u07a: SNMP 卡片渲染「尚无采集结果」（旧代码此处 TypeError）');
+    chk(byText(content, 'p', '读取中…') === null, 'u07b: 卡片已走完「读取中…」');
 };
 
 main().then(() => {
-    console.log(fail === 0 ? 'ui_camera_slot passed (19 assertions)' : fail + ' FAILED');
+    console.log(fail === 0 ? 'ui_camera_slot passed (21 assertions)' : fail + ' FAILED');
     process.exit(fail === 0 ? 0 : 1);
 }).catch((e) => {
     console.error('HARNESS ERROR', e);

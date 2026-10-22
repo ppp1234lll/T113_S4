@@ -5191,3 +5191,207 @@ credit 重置回满额。
 * `snmp.*`、`camera.ch.N` 除 `.ip` 外 7 键的热生效仍欠（与上一轮相同）。
 
 
+== 2026-10-22 18:35 功能测试报告 R-01~R-08 闭环（八条缺陷）
+
+来源：`docs/测试报告-2026-10-22.html` §5。口径按报告 §7 的要求 ——
+**先写会红的用例，再改代码**；每条都要能被"撤掉修复"证伪（见文末「反向证伪」）。
+
+=== 八条一览
+
+[cols="1,1,3,4"]
+|===
+| 编号 | 级别 | 症状 | 根因（一句话）
+
+| R-01 | P1
+| 清空平台地址后 `transport` 恒 `up`，还在往旧地址 `report`
+| `iv_report_reconnect()` 见目标地址为空直接 `return IV_ESTATE`，**"断"这个动作从来没人做**
+
+| R-02a | P1
+| PORT 模式对不可达摄像机恒报"正常"
+| `poll_connect()` 用 `getsockopt(SO_ERROR)` 判连接结果 —— 该值在 `SYN_SENT` 期间**恒为 0**
+
+| R-02b | P1
+| 两路同拍 PING 时 RTT 变成天文数字、结论乱跳
+| ICMP 序号**每项各自**从 1 递增，而 raw socket 与 `id` 是引擎共享的 ⇒ `(id, seq)` 撞车、回包串项
+
+| R-02c | P1
+| 0.47 ms 的摄像机在 PING 模式被判"延时(4)"
+| 判据 `avg >= thr` ＋ **RTT 分辨率＝一个 tick（200 ms）** ＋ 默认阈值也是 200 ⇒ 恒成立
+
+| R-03 | P2
+| 超长字符串"报成功但没写入"，版本号还前进了
+| `apply_set()` 的返回值被 `(void)` 丢弃；`applied` 用的是预检计数
+
+| R-04 | P2
+| `device` 表里 IP 落库成 `200.1.168.192`
+| `ip_be` 是 `in_addr.s_addr` 语义，手写 `>>24` 在小端上取的是**末字节**（用例同错，所以一直是绿的）
+
+| R-05 | P3
+| `net.ip="999.1.1.1"` 能存
+| 配置层对 IP 类键没有任何格式校验
+
+| R-06 | P3
+| 错误响应一律 HTTP 200
+| `to_rsp()` 的状态码是常量，没看响应体里的 `e`
+
+| R-07 | P3
+| 摄像机页 SNMP 卡片一渲染就 `TypeError`，整页中断
+| `app.js` 直接取 `r.d.slots.length`，后端少给字段即炸
+
+| R-08 | P0
+| 一次无预兆重启（日志尾部 763 个 NUL 字节）
+| **未定位**（两次定向复现都没重现）⇒ 本轮只补取证手段
+
+|===
+
+=== R-02c 单独说：RTT 分辨率
+
+这条最容易"修错方向"。板上 `ping` 明明是 0.47 ms，配置阈值 200 ms，却判延时 ——
+第一反应是"单位搞错了"或"阈值配小了"，其实都不是：
+
+[source,c]
+----
+iv_camdet 没有自己的事件循环
+  ICMP 回包只能在 iv_camdet_tick() 里被读走
+  tick 周期 = IV_AGENT_PROBE_TICK_MS = 200 ms
+  => 测得的 RTT 只能是 200 的整数倍：0 / 200 / 400 ...
+  0.47 ms 的摄像机，回包等到下一个 tick 才被读，rtt 记成 200
+  默认阈值也是 200，判据 >=  =>  200 >= 200 恒成立  =>  永远"延时"
+----
+
+改判据为**严格大于**：一个 tick 内应答（本机可测的最好情况）⇒ 正常；两个 tick 才有回包
+（400 > 200）⇒ 延时。分辨率仍是一个 tick，这点写在 `iv_camdet.h` 的
+`IV_CAMDET_RTT_THR_MS_DEFAULT` 上方，不夸大成"毫秒级测量"；同时给
+"阈值配到 <= 一个 tick"加了 `warn_rtt_thr()` 告警（`iv_camdet_open()` 与
+`iv_camdet_set_rtt_thr()` 各一次），现场配完看到全通道红色时日志里能直接读到原因。
+
+要亚毫秒级 RTT 只有一个正路：把 ICMP fd 挂进事件循环。**本轮不做**，登记在「未做」。
+
+=== R-01 为什么改 `reconnect()` 而不是新加 `disconnect()`
+
+装配层的路径是：`iv_agent_pick_host()` 返回 `NULL` ⇒ `iv_report_set_server(rp, NULL, 0)`
+⇒ `iv_report_reconnect()`。**"要不要断"这个决定本来就该在 `reconnect()` 里做** ——
+再开一个 `iv_report_disconnect()` 只是多一个"可能忘记调"的入口。现在语义是：
+
+* 目标地址为空 ＝ 重连到一个"空地址" ＝ **断开**（关传输层、`state` 回 `CLOSED`）；
+* 返回值仍是 `IV_ESTATE`（"这次重连没成功"），但副作用已经发生；
+* 地址回来之后再 `reconnect()` 能正常重开（用例 `c10` 末尾钉住这条）。
+
+`iv_report.h` 的两处契约注释同步改写。板端实测：清空两口地址 12 s 后
+`transport=closed`、`server=:0`、`ss -tn | grep 6013` **0 行**。
+
+=== R-04 的 `_be` 口径（再记一次）
+
+全工程 `_be` 的语义是"**值 ＝ `struct in_addr.s_addr`**"（内存 4 字节即网络序）：
+
+[source,c]
+----
+取首字节：  ntohl(ip_be) >> 24          // 对
+            ip_be >> 24                 // 错：小端上是取末字节
+打印：      inet_ntop(AF_INET, &ip_be, buf, sizeof buf)   // 一步到位，最不容易再错
+----
+
+`iv_tunnel.c` 的 `is_loopback()` 看着像同一个 bug，**核对后不是** —— 那边的 resolver
+写的就是数值大端 `*ip_be = 0x7f000001u`，与 `>> 24` 自洽。改动已回退，不在本轮。
+
+**用例侧同错**：`test_store` 原先用 `0x0A000001u` 表达 `10.0.0.1`（小端存储后其实是
+`1.0.0.10`），测试和实现一起错 ⇒ 这条缺陷一直全绿。现改用 `inet_pton()` 组地址。
+这条与「`_be` 是原样字节序 ⇒ 打印用 `inet_ntop()`」是同一条教训的第二次复发。
+
+=== R-07：前端"少一个字段就整页断"
+
+[source,js]
+----
+// 旧：后端少给 d 或 d.slots，这里就抛 TypeError，后面的渲染全不执行
+r.d.slots.forEach(...)
+
+// 新：逐层兜底，缺什么给什么提示
+var d = r.d || {};
+var slots = d.slots || [];
+if (!slots.length) { box.appendChild(el('p', 'hint', '尚无采集结果')); return; }
+----
+
+用例侧同批修：`ui_camera_slot.mjs` 补 `/api/snmp` 桩；控件定位从"第 0 个
+`select`/`input`"改成按 `title` / `placeholder` —— 页面一加卡片就错位，本轮 10 条
+误红正是这么来的（用例靠"序号"定位，等于把版式写死进了断言）。
+
+=== 反向证伪（7 条，全部成立）
+
+判据：逐条撤掉修复 ⇒ `make` 必须编译干净（撞 `-Werror` 的证伪是假证伪）⇒ 对应用例必须
+变红 ⇒ 还原后 `make test` 复绿。
+
+[cols="3,1,3"]
+|===
+| 撤掉什么 | 变红 | 例句
+
+| R-01 `reconnect()` 不再关传输层 | 2 条 | `c10 cleared -> live transport closed (R-01)`
+| R-02a 把 `EALREADY` 当已连上 | 2 条 | `unreachable -> not normal`
+| R-02b 序号回到每项各自递增 | 6 条 | `c14 seq unique across items`
+| R-02c 判据回到 `avg >= thr` | 2 条 | `avg==thr -> normal (R-02c)`
+| R-03 丢弃 setter 返回值/不查长度 | 3 条 | `c12c: over-long string rejected`
+| R-04 `device.ip` 回到 `>>24` | 5 条 | `s02c: ip_be rendered as dotted text`
+| R-05 不再校验 IP 字面量 | 7 条 | `c30a: a bogus ip in the file falls back to the default`
+|===
+
+⚠ **R-02a 第一版证伪显示 GREEN（用例没有区分力）**：原回归段每 tick 推 1 s，直接跨过
+1000 ms 的端口超时，走的是 deadline 分支而不是"再 connect 一次"那条分支。改成
+**110 次 × 100 ms**（< 超时）之后才真正红。教训：**用例走不到要测的分支时，全绿毫无意义**
+—— 证伪是唯一能发现这点的动作。
+
+=== 验证
+
+* VM `~/wbnet/ivsbox`：`test` **42/42**、`arm`、`analyze`、`asan` 42/42 零报告、
+  `setarch -R make tsan` 42/42 零报告、`fuzz` 3×10 s 零报告，全程 `error:|warning:` 计数 **0**；
+  `itest` 16 条 ＝ **15 通过 ＋ 1 SKIP**（`test_tunnel_e2e` 缺设备身份，同基线；
+  `test_ctl_snapshot` 需先起 daemon）。
+* 前端 jsdom 5 个用例：`ui_camera_slot` **21**（+u07a/u07b）、`ui_camera_test` 22、
+  `ui_device_name` 15、`ui_ops_log` 16、`ui_ops_ota` 30 ⇒ **104** 条断言全过。
+* 板端实测（新产物 `ivsboxd` md5 `01ff76959ba4bd5a162e0eb70fd29fd4`、
+  `ivsbox-web` `42092f849d35c46221601e4d356298dd`、`app.js` `278be428e9726b691bcceb5401b96f2f`）：
+
+[cols="1,3,2"]
+|===
+| 项 | 实测 | 结论
+
+| R-02 PORT
+| `cns=[1,2]`（ch0 `192.168.2.102` 可达 / ch1 `192.168.2.199` 不可达），8 次采样不变
+| 与地面真值一致（修复前恒 `[1,1]`）
+
+| R-02 PING
+| `cns=[1,2]`，60 s 内 ch0 稳定在正常(1)
+| **不再误判延时**（修复前 ch0=4）
+
+| R-02 RTSP
+| `cns=[2,2]`
+| ch1 判故障正确；ch0 也判故障**也是对的** —— 实测 `192.168.2.102:554` 拒绝连接。
+  报告里"可达 ch0 报 FAULT"这条本身判错了，本轮一并纠正
+
+| R-01
+| 清空两口地址 ⇒ `transport=closed`、`server=:0`、`ss -tn | grep 6013` 0 行；
+  写回地址后 `transport=up`
+| 断开与恢复都成立
+
+| R-08
+| 首次启动 `no previous marker`；换版重启后 `previous shutdown was clean`；
+  `boot_id=46596d69-…` 两次一致
+| 取证手段生效（**根因仍未定位**）
+
+|===
+
+收尾已复原现场：两路 `camera.ch.N.ip` 清空、`camera.detect.mode=1`、
+平台地址回 `47.104.250.225:6013`，`transport=up`、`queue=0`、`cns=[0,0,0,0,0,0]`。
+
+=== 未做
+
+* **R-08 的根因**：本轮只加了 `run.state`（`clean`/`dirty`）与 `boot_id` 日志，
+  判据要等下一次现场掉电/复位才能用 —— "换了 boot_id 但没有 `unclean shutdown`" ＝
+  进程自杀或看门狗；"有 `unclean shutdown` 且 boot_id 变了" ＝ 整机掉电。
+* **PING 的亚毫秒 RTT**：要把 ICMP fd 挂进 Reactor 事件循环，改的是运行时结构，
+  不在本轮范围内。
+* **历史错值迁移**：`device` 表里已被写成反转字节序的行没有做 schema 迁移
+  （当前页面不读该列，先不动）。
+* **R-06 的覆盖面**：`status_of()` 只作用于 `iv_web_api` 的 JSON 分支；
+  `/media/` 的流式响应与静态文件仍走原来的状态码。
+
+
+

@@ -9,7 +9,9 @@
  *    交出，由调用方挂自己的事件循环。时间一律由调用方传入（`now_ms`）。
  *
  * 2) **ICMP 是引擎共享的一条 raw socket**：多个 ICMP 项共用一个 fd，靠
- *    `(id, seq)` 匹配回包；`id` 取固定值 `IV_PROBE_ICMP_ID`，`seq` 每项各自递增。
+ *    `(id, seq)` 匹配回包；`id` 取固定值 `IV_PROBE_ICMP_ID`，`seq` 由**引擎级**
+ *    计数器统一发放（`p->icmp_seq_next`，不是各项自己从 0 起 —— 那样多路会撞号，
+ *    回包记到别人头上，见 `icmp_seq_next` 字段说明）。
  *    开不出 raw socket（EPERM/EACCES）时不报错，置 `icmp_disabled` 降级。
  *
  * 3) **TCP 是"一问一拆"**：每发起一次 TCP 探测开一条非阻塞 socket、connect，
@@ -278,6 +280,17 @@ static void tcp_finish(const iv_probe_iops_t *io, iv_probe_item_t *it)
         it->fd = -1;
     }
     it->inflight = 0;
+}
+
+/* 本次成功探测的 RTT（ms）。`now < sent_at` 说明这对"发起时刻/到达时刻"不是
+ * 同一次探测（`sent_at_ms` 被新一轮覆盖、或历史上有过回包认领串台），
+ * 直接相减会得到负数、转 uint32 后变成天文数字，下游按"延时"判死。
+ * 这种样本宁可按 0 记（不影响连通性结论，也不会把均值拉飞）。 */
+static uint32_t rtt_since(const iv_probe_item_t *it, uint64_t now_ms)
+{
+    if (now_ms < it->sent_at_ms)
+        return 0u;
+    return (uint32_t)(now_ms - it->sent_at_ms);
 }
 
 /* ---------------------------------------------------------------------------
@@ -590,7 +603,11 @@ static void start_icmp(iv_probe_t *p, iv_probe_item_t *it, uint64_t now)
     pkt.hdr.type             = ICMP_ECHO;
     pkt.hdr.code             = 0;
     pkt.hdr.un.echo.id       = htons(IV_PROBE_ICMP_ID);
-    it->icmp_echo_seq        = (uint16_t)(it->icmp_echo_seq + 1u);
+    /* 序号取**引擎级**计数器（不是项自己的）：同引擎多个 ICMP 项共用一个
+     * raw socket、一个 ID，回包只能靠 seq 认领（`icmp_find_by_seq()`）；
+     * 各项各自从 0 起编号会让两路请求撞号，回包被记到别人头上
+     * —— 详见 iv_probe.h 里 `icmp_seq_next` 的说明。 */
+    it->icmp_echo_seq        = (uint16_t)(++p->icmp_seq_next);
     pkt.hdr.un.echo.sequence = htons(it->icmp_echo_seq);
     /* icmp_checksum() 按大端字求得的 16 位校验和是主机序整数，而
      * icmphdr.checksum 是 __be16（网络序字段）=> 必须 htons 后再落字段。
@@ -707,7 +724,7 @@ int iv_probe_on_readable(iv_probe_t *p, int fd, uint64_t now_ms)
         if (it == NULL)
             continue; /* 迟到的回包（已超时判负） */
         it->inflight = 0;
-        note(p, it, 1, (uint32_t)(now_ms - it->sent_at_ms), IV_PROBE_R_NONE, now_ms);
+        note(p, it, 1, rtt_since(it, now_ms), IV_PROBE_R_NONE, now_ms);
         it->next_due_ms = now_ms + it->interval_ms;
         handled++;
     }
@@ -732,7 +749,7 @@ int iv_probe_on_writable(iv_probe_t *p, int fd, uint64_t now_ms)
             sockerr = errno;
         tcp_finish(p->cfg.iops, it);
         if (sockerr == 0)
-            note(p, it, 1, (uint32_t)(now_ms - it->sent_at_ms), IV_PROBE_R_NONE, now_ms);
+            note(p, it, 1, rtt_since(it, now_ms), IV_PROBE_R_NONE, now_ms);
         else
             note(p, it, 0, 0u, errno_reason(sockerr), now_ms);
         it->next_due_ms = now_ms + it->interval_ms;

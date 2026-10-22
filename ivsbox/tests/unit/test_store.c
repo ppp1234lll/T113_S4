@@ -13,6 +13,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <arpa/inet.h> /* inet_pton：见 ip_of() 的说明 */
+
 #include <sqlite3.h>
 
 #include "ivsbox/iv_db.h"
@@ -37,6 +39,17 @@ static int64_t row_count(iv_db_t *db, const char *sql)
     if (iv_db_scalar_int(db, sql, &v) != IV_OK)
         return -1;
     return v;
+}
+
+/* 点分十进制 → ip_be。**必须**走 inet_pton：`iv_dev_desc_t.ip_be` 与全工程
+ * 一致，语义是 `struct in_addr.s_addr`（内存里 4 个字节即网络序），
+ * 手写 `0x0A000001` 在小端机上其实是 1.0.0.10 —— 这正是 R-04 一半的成因：
+ * 生产代码按"数值大端"读，测试也按"数值大端"写，两边互相印证着一起错。 */
+static uint32_t ip_of(const char *s)
+{
+    struct in_addr a;
+
+    return (inet_pton(AF_INET, s, &a) == 1) ? a.s_addr : 0u;
 }
 
 static void fill_desc(iv_dev_desc_t *d, const uint8_t mac[6], uint32_t ip_be,
@@ -93,7 +106,7 @@ int main(void)
         char          ip[32];
 
         fill_desc(&d, (const uint8_t *)"\x11\x22\x33\x44\x55\x66",
-                  0x0A000001u, "DS-2CD3T25");
+                  ip_of("10.0.0.1"), "DS-2CD3T25");
         chk(iv_store_device_upsert(st, &d, 1000) == IV_OK, "s02a: first insert");
         {
             int64_t dn = 0;
@@ -105,7 +118,7 @@ int main(void)
             strcmp(ip, "10.0.0.1") == 0,
             "s02c: ip_be rendered as dotted text");
 
-        d.ip_be = 0x0A0000C8u; /* 10.0.0.200：改 IP 不重复建档 */
+        d.ip_be = ip_of("10.0.0.200"); /* 改 IP 不重复建档 */
         chk(iv_store_device_upsert(st, &d, 2000) == IV_OK, "s02d: re-upsert ok");
         {
             int64_t dn = 0;

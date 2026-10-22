@@ -192,24 +192,23 @@ int iv_store_device_upsert(iv_store_t *st, const iv_dev_desc_t *d, int64_t now_s
 {
     sqlite3_stmt *stmt = NULL;
     char          mactxt[18];
-    char          iptxt[16];
-    struct in_addr in;
+    char          iptxt[INET_ADDRSTRLEN];
     int           rc;
 
     if (st == NULL || d == NULL)
         return IV_EINVAL;
     mac_to_text(d->mac, mactxt, sizeof mactxt);
 
-    /* ip_be 是"数值按大端读"；in_addr 要内存序 ⇒ htonl。ip=0 ⇒ 空串（未知）。 */
-    in.s_addr = (d->ip_be != 0u) ? htonl(d->ip_be) : 0u;
-    iptxt[0]  = '\0';
-    if (d->ip_be != 0u) {
-        /* 数值大端序逐字节文本化（ip_be >> 24 即首字节），不依赖 inet_ntoa */
-        (void)snprintf(iptxt, sizeof iptxt, "%u.%u.%u.%u",
-                       (d->ip_be >> 24) & 0xffu, (d->ip_be >> 16) & 0xffu,
-                       (d->ip_be >> 8) & 0xffu, d->ip_be & 0xffu);
-    }
-    (void)in;
+    /* IP 文本化（R-04）：`ip_be` 的语义是 **`in_addr.s_addr` 的值**（内存里那
+     * 4 个字节就是网络序），不是"把点分十进制当整数看"。原先按
+     * `ip_be >> 24` 取首字节，在小端板上等于**从最后一个字节开始读** ——
+     * control.db 里 192.168.2.102 被写成 `102.2.168.192`、192.168.1.200 写成
+     * `200.1.168.192`（板上实测四条全反）。内存里的 Web 走 inet_ntop 所以是对的，
+     * 于是"页面正确、库里错序"，只看页面永远发现不了。
+     * 统一交给 inet_ntop：它对 `&s_addr` 的解释就是"4 个网络序字节"，跨端序都对。 */
+    iptxt[0] = '\0';
+    if (d->ip_be != 0u)
+        (void)inet_ntop(AF_INET, &d->ip_be, iptxt, sizeof iptxt);
 
     /* UPDATE 优先、改不动（无此行）再 INSERT —— 不用 UPSERT 语法（板端 SQLite
      * 版本未知，UPSERT 要 ≥3.24）；first_seen 只在 INSERT 时写，UPDATE 分支

@@ -596,10 +596,12 @@
     BOTH_DOWN: '双链路断开'
   };
 
-  /* 构建时没注入 git 元数据，iv_version 会拼出 "1.0.0+gunknown"。
+  /* 构建时没注入 git 元数据，iv_version 会拼出 "1.0.0+nogit"（D-11 之前的版本串
+   * 是 "1.0.0+gunknown"，两种都要认 —— 板上跑着的旧产物还没换）。
    * 原样显示容易被当成版本号写错，这里点明是开发构建。 */
   function fmtVer(v) {
     if (!v) return '—';
+    if (v.indexOf('+nogit') >= 0) return v.replace('+nogit', '') + '（开发构建）';
     if (v.indexOf('+gunknown') >= 0) return v.replace('+gunknown', '') + '（开发构建）';
     return v;
   }

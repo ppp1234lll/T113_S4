@@ -3,8 +3,17 @@
  *
  * 语义版本号来自 ivsbox/ivsbox.h 的 IVSBOX_VERSION_*；
  * Git 短哈希由顶层 Makefile 在编译期注入 -DIV_GIT_VER="<short-sha>"。
- * 未注入时（例如手工 gcc 编译、或构建目录脱离 .git 的离线环境）退回
- * "unknown"，不会导致编译失败——降级由 iv_version_git_valid() 显式报告。
+ *
+ * ============================ 降级串为什么是 nogit（D-11） ============================
+ * 未注入时（手工 gcc 编译、或构建目录脱离 .git 的离线环境）**不会导致编译失败**，
+ * 但降级串**不能长得像哈希**：原来用 "unknown"，拼出来是 `1.0.0+gunknown`，
+ * 读起来像"哈希值恰好叫 unknown"，而不是"这次构建取不到哈希"。现在降级串是
+ * "nogit"，版本串为 `1.0.0+nogit`，一眼能看出缺的是什么。
+ *
+ * 但**降级只是把事实说清楚，不算解决**：真要让 `ivsboxd --version` 与实际提交
+ * 一致，构建时必须注入 —— `make arm GIT_VER=$(git rev-parse --short HEAD)`
+ * （Makefile 里 GIT_VER 是普通赋值，命令行优先）。VM 上的构建树不是 git 仓，
+ * 这条注入是**必须**做的，见 docs/代码说明.adoc。
  */
 #ifndef IVSBOX_IV_VERSION_H
 #define IVSBOX_IV_VERSION_H
@@ -14,14 +23,15 @@ extern "C" {
 #endif
 
 /*
- * 完整版本串，形如 "1.0.0+g1e2d781"；未注入哈希时为 "1.0.0+unknown"。
+ * 完整版本串，形如 "1.0.0+g1e2d781"；未注入哈希时为 "1.0.0+nogit"
+ * （**注意降级串没有 `g` 前缀**：`g` 专指 git 哈希，没有哈希就不该带着它）。
  * 返回值指向编译期常量字符串，生命周期同进程，调用方不得修改或释放；
  * 实现无任何运行期状态，多线程并发调用安全。
  */
 const char *iv_version_string(void);
 
 /*
- * 编译期注入的 Git 短哈希**原值**：未注入时为实现里的默认值 "unknown"。
+ * 编译期注入的 Git 短哈希**原值**：未注入时为实现里的默认值 "nogit"。
  * 这里刻意不做归一化——构建系统若注入了非法值（空串、非十六进制），原样返回，
  * 由 iv_version_git_valid() 报告可用性，iv_version_string() 负责降级显示。
  */

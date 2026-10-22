@@ -284,16 +284,102 @@ static json_object *cfg_value_json(const iv_config_t *cfg, const char *key, iv_c
 
 /* ============================ system.snapshot ============================ */
 
-/* **保持 S10 的老格式**（集成用例逐字断言了 method/status/version 三处）。 */
-static int m_snapshot(char *out, size_t cap, size_t *out_len)
+/* 开机时长（毫秒）。**只读内核事实**，与 sys.overview 读 `/proc/net/route`
+ * 同一口径：不过滤、不换算、不编造。取不到返回 -1，响应里给 null ——
+ * "没读到"和"刚开机 0 ms"必须能分开（与 add_or_null 的 null 口径一致）。
+ * `/proc/uptime` 第一列是秒、带两位小数，乘 1000 取整即毫秒。 */
+static long long proc_uptime_ms(void)
 {
-    int n = snprintf(out, cap,
-                     "{\"method\":\"system.snapshot\",\"version\":\"%s\",\"status\":\"ok\"}",
-                     iv_version_string());
+    FILE  *f;
+    double sec = -1.0;
 
-    if (n < 0 || (size_t)n >= cap)
+    f = fopen("/proc/uptime", "r");
+    if (f == NULL)
+        return -1;
+    if (fscanf(f, "%lf", &sec) != 1)
+        sec = -1.0;
+    (void)fclose(f);
+    if (!(sec >= 0.0))
+        return -1;
+    return (long long)(sec * 1000.0);
+}
+
+/*
+ * **保持 S10 的老三字段**（`test_ctl` c02 与集成用例 `test_ctl_snapshot` 都逐字
+ * 断言了 method/version/status，前端也在读 status），其后追加只读快照内容。
+ *
+ * ============================ D-08：为什么补内容而不是改名 ============================
+ * 方法名叫 snapshot，原实现却只回三个固定字段 —— 任何人拿到都会以为"快照在
+ * `d` 里"，实际什么都没有。改名（如 `system.info`）会让既有客户端、集成用例
+ * 与前端一起破；而**追加字段对 `strstr` 型断言与前端都是透明的**，所以选追加。
+ *
+ * ============================ 放什么、不放什么 ============================
+ * 只放"读一次就有、零成本、不改变任何状态"的东西：**开机时长** ＋ **配置诊断
+ * 快照**（就是 `iv_config_stat()` 那份只读诊断）。刻意**不放**媒体 / 代理 / 隧道
+ * —— 那三者各自有专门方法（`record.status` / `tunnel.status` / `snmp.result`），
+ * 在这里再抄一份必然两处不一致，而"同一个量两个接口两个答案"是现场最难查的
+ * 一类问题。
+ *
+ * `cfg` 段在 `ctx->cfg == NULL` 时**整个省略**，不写 null：`system.snapshot` 是
+ * 唯一允许无配置句柄的方法（见 iv_ctl.h 的 ctx 注释），省略比 null 少一种前端
+ * 分支，也避免伪造出 "items":0 这种会被误读成"一个键都没有"的假数。
+ */
+static int m_snapshot(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_t *out_len)
+{
+    json_object *d;
+    const char  *js;
+    size_t       n;
+    long long    up;
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+
+    json_object_object_add(d, "method", json_object_new_string("system.snapshot"));
+    json_object_object_add(d, "version", json_object_new_string(iv_version_string()));
+    json_object_object_add(d, "status", json_object_new_string("ok"));
+
+    up = proc_uptime_ms();
+    if (up >= 0)
+        json_object_object_add(d, "uptime_ms", json_object_new_int64(up));
+    else
+        json_object_object_add(d, "uptime_ms", NULL); /* JSON null：没读到 */
+
+    if (ctx != NULL && ctx->cfg != NULL) {
+        iv_cfg_stat_t st;
+        json_object  *c = json_object_new_object();
+
+        if (c != NULL && iv_config_stat(ctx->cfg, &st) == IV_OK) {
+            json_object_object_add(c, "version",
+                                   json_object_new_int64((int64_t)st.version));
+            json_object_object_add(c, "items", json_object_new_int((int)st.items));
+            json_object_object_add(c, "from_file",
+                                   json_object_new_int((int)st.from_file));
+            json_object_object_add(c, "from_default",
+                                   json_object_new_int((int)st.from_default));
+            json_object_object_add(c, "invalid", json_object_new_int((int)st.invalid));
+            json_object_object_add(c, "loaded",
+                                   json_object_new_boolean(st.loaded ? 1 : 0));
+            json_object_object_add(c, "crc_mismatch",
+                                   json_object_new_boolean(st.crc_mismatch ? 1 : 0));
+            json_object_object_add(c, "dirty", json_object_new_boolean(st.dirty ? 1 : 0));
+            json_object_object_add(d, "cfg", c);
+        } else if (c != NULL) {
+            json_object_put(c); /* 取不到诊断就不给这一段，不回半截对象 */
+        }
+    }
+
+    js = json_object_to_json_string_ext(d, JSON_C_TO_STRING_PLAIN);
+    n  = (js != NULL) ? strlen(js) : 0u;
+    if (js == NULL || n == 0u || n + 1u > cap) {
+        json_object_put(d);
         return IV_ERANGE;
-    *out_len = (size_t)n;
+    }
+    /* **先拷贝再 put**：`js` 指向 json_object 内部的缓冲，put 之后即悬空。 */
+    memcpy(out, js, n);
+    out[n] = '\0';
+    json_object_put(d);
+    *out_len = n;
     return IV_OK;
 }
 
@@ -2581,6 +2667,25 @@ static int m_media_record_stop(const iv_ctl_ctx_t *ctx, json_object *p,
     }
 }
 
+/*
+ * 查询某一路是否在录。
+ *
+ * ============================ D-10：三种"没在录"必须分开 ============================
+ * 原实现把 ops 的任何非 IV_OK 都当业务失败整体回 `{"ok":false,"e":<rc>}`，于是
+ * `IV_ECONN(-22)`（media 进程没起 / 桥连不上）到了页面上等于"参数错"，而错误码
+ * 表里 -22 的语义是"连不上"—— 两处都对不上，现场只会往摄像机配置上去查。
+ *
+ * 现在的口径（三种case分开）：
+ *   · 没接 ops（`ctx->media == NULL`）→ `IV_ENOTSUP`：**"能调但没接"**，与 media
+ *     完全没编进本固件是同一件事，必须与下面的运行时状态分开（见 iv_ctl.h 的
+ *     ctx 注释，这条口径全模块一致）。
+ *   · 接上了但桥查不到（`IV_ECONN` / `IV_ESTATE`）→ **`ok:true` ＋ `recording:false`
+ *     ＋ `known:false` ＋ `reason`**：查不到不等于出错，更不等于参数错。
+ *     `recording:false` 取**保守值**（不谎称在录）；`known:false` 才是真话——
+ *     "我们不知道"，页面据此显示"未获取"而不是"未在录"。
+ *   · 其它 rc 仍当业务失败（真出错要暴露）。
+ *   · `id` 越界仍 `IV_EINVAL`，且**根本不去调 ops**（先校验再动作）。
+ */
 static int m_media_record_status(const iv_ctl_ctx_t *ctx, json_object *p,
                                  char *out, size_t cap, size_t *out_len)
 {
@@ -2594,13 +2699,22 @@ static int m_media_record_status(const iv_ctl_ctx_t *ctx, json_object *p,
     if (param_i64(p, "id", &id) != IV_OK || id < 0 || id >= IV_MEDIA_CH_N)
         return rsp_err(IV_EINVAL, "bad id", out, cap, out_len);
     rc = ctx->media->record_status((int)id, &rec, ctx->media_arg);
-    if (rc != IV_OK)
+    if (rc != IV_OK && rc != IV_ECONN && rc != IV_ESTATE)
         return rsp_err(rc, "record status failed", out, cap, out_len);
+
     d = json_object_new_object();
     if (d == NULL)
         return IV_ENOMEM;
     json_object_object_add(d, "id", json_object_new_int((int)id));
-    json_object_object_add(d, "recording", json_object_new_boolean(rec));
+    json_object_object_add(d, "recording",
+                           json_object_new_boolean((rc == IV_OK && rec) ? 1 : 0));
+    json_object_object_add(d, "known", json_object_new_boolean(rc == IV_OK ? 1 : 0));
+    if (rc != IV_OK) {
+        /* 文案只描述**这一层知道的事实**，不替 media 猜原因（"进程没起"和
+         * "端口没监听"在 ctl 这层分不出来，猜错会把人带偏）。 */
+        json_object_object_add(d, "reason", json_object_new_string(
+            (rc == IV_ECONN) ? "media bridge unreachable" : "media not ready"));
+    }
     return rsp_data(d, out, cap, out_len);
 }
 
@@ -2928,7 +3042,7 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
     }
 
     if (strcmp(method, "system.snapshot") == 0)
-        rc = m_snapshot(out, out_cap, out_len);
+        rc = m_snapshot(ctx, out, out_cap, out_len);
     else if (strcmp(method, "sys.overview") == 0)
         rc = m_overview(ctx, out, out_cap, out_len);
     else if (strcmp(method, "config.get") == 0)

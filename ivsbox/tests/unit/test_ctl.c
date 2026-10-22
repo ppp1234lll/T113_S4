@@ -8,6 +8,10 @@
  *      这条被 tests/integration/test_ctl_snapshot.c 依赖，改了就整机集成红；
  *   ③ **S5.4 的版本门**：`config.apply` 带旧版本号必须被 IV_EBUSY 拦下，
  *      且**失败时版本不动、值不动**（回滚），这是"并发双写不互相覆盖"的全部依据。
+ *   ④ **D-08 / D-10 的两个语义**（2026-10-22）：`system.snapshot` 除老三字段外
+ *      必须带**真快照**（开机时长 ＋ 配置诊断）；`record.status` 的三种"没在录"
+ *      必须分开 —— 没接线＝ENOTSUP、桥查不到＝`ok:true`＋`known:false`、
+ *      id 越界＝EINVAL。
  *
  * 工作目录用 mkdtemp 造在 /tmp，退出前把文件与目录删干净（AGENTS.md 规则 6）；
  * 日志改走空 sink，不产生落盘副作用。
@@ -160,11 +164,18 @@ static int media_fake_stop(int id, void *arg)
     return IV_OK;
 }
 
+/* c27 要模拟"桥连不上"（D-10）：真实 iv_media_record_status() 在 media 进程
+ * 不可用时回 IV_ECONN，假 ops 必须能复现同一个码，否则测不到那条映射。
+ * **默认 IV_OK**，只有 c27 段临时改它，改完必须还原，免得影响后续块。 */
+static int g_status_rc = IV_OK;
+
 static int media_fake_status(int id, int *recording, void *arg)
 {
     (void)arg;
     (void)id;
     g_n_status++;
+    if (g_status_rc != IV_OK)
+        return g_status_rc;
     *recording = 1;
     return IV_OK;
 }
@@ -672,6 +683,211 @@ int main(void)
         chk(g_n_status == 1, "c16d: fake status called");
     }
 
+    /* ==================== c26 D-08：system.snapshot 必须带真快照内容 ====================
+     * 原实现只回 `{method,version,status}`（S10 兼容垫片），方法名与行为不符。
+     * 修法是**保留老三个字段**（c02 与集成用例 test_ctl_snapshot 逐字断言过，
+     * 前端也在读 status），在后面追加只读快照 —— 追加不破坏任何既有断言。
+     *
+     * f1 若又把快照内容删回空壳，c26b/c26c 会红；
+     * f2 若 cfg 段谎报版本号（不取 iv_config_version），c26d 会红；
+     * f3 若把 uptime 写成常量 0，c26a 的"类型 + 非负"抓不到 —— 故用两条：类型是
+     *    整数、且第二次调用不早于第一次（单调不减），常量 0 才无处可藏。 */
+    {
+        static const char req[] = "system.snapshot";
+        int64_t           up1 = -1;
+        int64_t           up2 = -1;
+        int               k;
+
+        for (k = 0; k < 2; k++) {
+            size_t       len = 0;
+            int          r;
+            json_object *j;
+            json_object *v = NULL;
+
+            memset(raw, 0, sizeof(raw));
+            r = iv_ctl_handle(&ctx, req, sizeof(req) - 1u, raw, sizeof(raw), &len);
+            chk(r == IV_OK, "c26a: snapshot returns OK");
+            /* 老格式原样保留（这三条是 S10 契约，不是本次新加的） */
+            chk(strstr(raw, "\"method\":\"system.snapshot\"") != NULL, "c26a: old method field kept");
+            chk(strstr(raw, "\"status\":\"ok\"") != NULL, "c26a: old status field kept");
+            chk(strstr(raw, "\"version\":\"") != NULL, "c26a: old version field kept");
+
+            j = json_tokener_parse(raw);
+            chk(j != NULL, "c26a: snapshot is valid JSON");
+            if (j != NULL) {
+                chk(json_object_object_get_ex(j, "uptime_ms", &v) &&
+                        json_object_get_type(v) == json_type_int,
+                    "c26a: uptime_ms present and integer");
+                if (v != NULL && json_object_get_type(v) == json_type_int)
+                    (k == 0) ? (up1 = json_object_get_int64(v))
+                             : (up2 = json_object_get_int64(v));
+                v = NULL;
+                chk(json_object_object_get_ex(j, "cfg", &v) &&
+                        json_object_get_type(v) == json_type_object,
+                    "c26b: cfg section present and object");
+                if (v != NULL && json_object_get_type(v) == json_type_object) {
+                    json_object *w = NULL;
+
+                    if (json_object_object_get_ex(v, "items", &w))
+                        chk(json_object_get_type(w) == json_type_int &&
+                                json_object_get_int64(w) > 0,
+                            "c26b: cfg.items is a positive integer");
+                    else
+                        chk(0, "c26b: cfg.items missing");
+                    w = NULL;
+                    if (json_object_object_get_ex(v, "version", &w))
+                        chk(json_object_get_type(w) == json_type_int &&
+                                (uint64_t)json_object_get_int64(w) == iv_config_version(cfg),
+                            "c26d: cfg.version equals the live config version (f2)");
+                    else
+                        chk(0, "c26d: cfg.version missing");
+                    w = NULL;
+                    if (json_object_object_get_ex(v, "dirty", &w))
+                        chk(json_object_get_type(w) == json_type_boolean,
+                            "c26b: cfg.dirty is boolean");
+                    else
+                        chk(0, "c26b: cfg.dirty missing");
+                    w = NULL;
+                    if (json_object_object_get_ex(v, "loaded", &w))
+                        chk(json_object_get_type(w) == json_type_boolean,
+                            "c26b: cfg.loaded is boolean");
+                    else
+                        chk(0, "c26b: cfg.loaded missing");
+                }
+                json_object_put(j);
+            }
+        }
+        chk(up1 >= 0 && up2 >= up1, "c26a: uptime_ms non-negative and monotonic (f3)");
+
+        /* c26e 没有配置句柄时（schedule 侧只借到半个 ctx）不许崩，也不许回 ESTATE
+         * —— system.snapshot 是唯一允许 cfg==NULL 的方法（见 iv_ctl.h 的 ctx 注释）。 */
+        {
+            iv_ctl_ctx_t bare;
+            size_t       len = 0;
+            int          r;
+
+            memset(&bare, 0, sizeof(bare));
+            memset(raw, 0, sizeof(raw));
+            r = iv_ctl_handle(&bare, req, sizeof(req) - 1u, raw, sizeof(raw), &len);
+            chk(r == IV_OK, "c26e: snapshot works without cfg");
+            chk(strstr(raw, "\"status\":\"ok\"") != NULL, "c26e: still status ok");
+            chk(strstr(raw, "\"items\"") == NULL, "c26e: no fabricated cfg numbers");
+        }
+    }
+
+    /* ==================== c27 D-10：record.status 的"查不到"≠"参数错" ====================
+     * 真实 iv_media_record_status() 在 media 进程不可用时回 IV_ECONN(-22)，
+     * 原实现把它当业务失败整体回 `{"ok":false,"e":-22,"msg":"record status failed"}`，
+     * 而 -22 在错误码表里是"连不上"，页面上被当参数错处理 —— 语义完全错位。
+     * 正确口径：
+     *   · 未接 ops（ctx->media==NULL）        ⇒ IV_ENOTSUP（"能调但没接"，不变）
+     *   · 接上了但桥查不到（IV_ECONN/ESTATE）⇒ **ok:true + recording:false + known:false**
+     *   · id 越界                            ⇒ IV_EINVAL 且**根本不调 ops**
+     *
+     * f4 若把"查不到"又变回 ok:false，c27b 会红；
+     * f5 若把 known 写成 true（谎称"确实没在录"），c27c 会红；
+     * f6 若 id 校验挪到 ops 调用之后，c27e 的计数器会动。 */
+    {
+        int n0;
+
+        /* c27a 没接 ops：仍是 ENOTSUP（与 c16a 同一口径，这里显式钉 record.status） */
+        {
+            iv_ctl_ctx_t      bare;
+            static const char req[] = "{\"m\":\"record.status\",\"p\":{\"id\":0}}";
+            size_t            len = 0;
+            json_object      *j;
+
+            memset(&bare, 0, sizeof(bare));
+            memset(raw, 0, sizeof(raw));
+            chk(iv_ctl_handle(&bare, req, sizeof(req) - 1u, raw, sizeof(raw), &len) == IV_OK,
+                "c27a: answered");
+            j = json_tokener_parse(raw);
+            chk(j != NULL && joerr(j) == IV_ENOTSUP,
+                "c27a: no ops -> ENOTSUP (distinguishable from ECONN)");
+            if (j != NULL)
+                json_object_put(j);
+        }
+
+        /* c27b/c27c 桥连不上 */
+        g_status_rc = IV_ECONN;
+        {
+            json_object *j;
+            json_object *d;
+            json_object *v = NULL;
+
+            memset(raw, 0, sizeof(raw));
+            j = call(&ctx, "{\"m\":\"record.status\",\"p\":{\"id\":0}}", &rc, raw, sizeof(raw));
+            chk(rc == IV_OK && jobool(j, "ok", 0) == 1,
+                "c27b: media unreachable still answers ok:true (f4)");
+            chk(j == NULL || joerr(j) == 0, "c27b: no error code for a mere unreachable bridge");
+            d = jodata(j);
+            chk(d != NULL, "c27b: data present");
+            if (d != NULL && json_object_object_get_ex(d, "recording", &v))
+                chk(json_object_get_boolean(v) == 0,
+                    "c27b: recording false (conservative: don't claim it's recording)");
+            else
+                chk(0, "c27b: recording field missing");
+            v = NULL;
+            if (d != NULL && json_object_object_get_ex(d, "known", &v))
+                chk(json_object_get_boolean(v) == 0, "c27c: known false (f5)");
+            else
+                chk(0, "c27c: known field missing");
+            v = NULL;
+            if (d != NULL && json_object_object_get_ex(d, "reason", &v))
+                chk(json_object_get_type(v) == json_type_string &&
+                        json_object_get_string_len(v) > 0,
+                    "c27c: reason explains why unknown");
+            else
+                chk(0, "c27c: reason field missing");
+            v = NULL;
+            if (d != NULL && json_object_object_get_ex(d, "id", &v))
+                chk(json_object_get_int(v) == 0, "c27c: id echoed");
+            else
+                chk(0, "c27c: id missing");
+            if (j != NULL)
+                json_object_put(j);
+        }
+
+        /* c27d 桥正常时 known:true，避免"永远 known:false"也能过 c27c */
+        g_status_rc = IV_OK;
+        {
+            json_object *j;
+            json_object *d;
+            json_object *v = NULL;
+
+            memset(raw, 0, sizeof(raw));
+            j = call(&ctx, "{\"m\":\"record.status\",\"p\":{\"id\":2}}", &rc, raw, sizeof(raw));
+            chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c27d: normal path ok");
+            d = jodata(j);
+            if (d != NULL && json_object_object_get_ex(d, "known", &v))
+                chk(json_object_get_boolean(v) == 1, "c27d: known true when bridge answers");
+            else
+                chk(0, "c27d: known field missing on the normal path");
+            v = NULL;
+            if (d != NULL && json_object_object_get_ex(d, "recording", &v))
+                chk(json_object_get_boolean(v) == 1, "c27d: recording from the bridge");
+            else
+                chk(0, "c27d: recording missing on the normal path");
+            if (j != NULL)
+                json_object_put(j);
+        }
+
+        /* c27e id 越界 ⇒ EINVAL 且 ops 一次都不该被调（f6） */
+        n0 = g_n_status;
+        {
+            json_object *j;
+
+            memset(raw, 0, sizeof(raw));
+            j = call(&ctx, "{\"m\":\"record.status\",\"p\":{\"id\":99}}", &rc, raw, sizeof(raw));
+            chk(rc == IV_OK && j != NULL && joerr(j) == IV_EINVAL,
+                "c27e: out-of-range id stays EINVAL");
+            if (j != NULL)
+                json_object_put(j);
+        }
+        chk(g_n_status == n0, "c27e: ops NOT called for an out-of-range id (f6)");
+        g_status_rc = IV_OK;
+    }
+
     /* ---------------- c18 状态：未开启时的外形（无钥匙、无令牌） ---------------- */
     j = call(&ctx, "{\"m\":\"tunnel.status\"}", &rc, raw, sizeof(raw));
     chk(rc == IV_OK && j != NULL, "c18: status answered");
@@ -895,6 +1111,6 @@ int main(void)
         return 1;
     }
     printf("test_ctl passed (protocol shape, silent unknown, version gate, apply rollback, "
-           "net.link carrier/gateway)\n");
+           "net.link carrier/gateway, snapshot content, record status known/unknown)\n");
     return 0;
 }

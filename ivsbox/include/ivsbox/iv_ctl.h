@@ -22,10 +22,16 @@
  *   2) JSON：`{"m":"<方法名>","p":{ ... 方法参数 ... }}`，`p` 可省略。
  *
  * 响应载荷：
- *   - `system.snapshot` **保持老格式**：
- *       `{"method":"system.snapshot","version":"<ver>","status":"ok"}`
- *     （既有集成用例逐字断言了 `"method":"system.snapshot"`、`"status":"ok"`、
- *      `"version":"` 三处，改了就是破坏兼容，别动。）
+ *   - `system.snapshot` **保持老格式并追加只读快照**（2026-10-22，D-08）：
+ *       `{"method":"system.snapshot","version":"<ver>","status":"ok",
+ *         "uptime_ms":<整数|null>,
+ *         "cfg":{"version":..,"items":..,"from_file":..,"from_default":..,
+ *                "invalid":..,"loaded":<bool>,"crc_mismatch":<bool>,"dirty":<bool>}}`
+ *     前三个字段是 S10 老格式，集成用例逐字断言了 `"method":"system.snapshot"`、
+ *     `"status":"ok"`、`"version":"` 三处 —— **只能往后追加，不能改、不能挪**。
+ *     追加的 `uptime_ms` 读 `/proc/uptime`，取不到给 JSON `null`（不拿 0 冒充）；
+ *     `cfg` 段就是 `iv_config_stat()` 的只读诊断，`ctx->cfg == NULL` 时**整段省略**
+ *     （不写 `items:0`，那会被误读成"一个键都没有"）。
  *   - 其余方法统一：成功 `{"ok":true,"d":<数据>}`；
  *     失败 `{"ok":false,"e":<负的 IV_* 码>,"msg":"<一句话>"}`。
  *
@@ -33,6 +39,9 @@
  * 由调用方（`main.c`）静默丢弃。这条口径来自 S10，且被集成用例钉死
  * （"an unknown method produces no response"）—— 不是随手定的：给探测脚本
  * 回一个"方法不存在"等于告诉对方本机在跑什么。
+ * ⚠ 注意它**不断连**（2026-10-22 实测核实，见功能测试计划 D-09）：同一条连接上
+ * 随后的合法请求照常应答。客户端要区分"方法名写错"与"主控挂了"，看的是连接
+ * 有没有被重置，不是有没有 body。
  *
  * ============================ 方法表 ============================
  *   system.snapshot    —                   进程与版本快照（老格式）
@@ -63,7 +72,10 @@
  *                                          则按媒体桥接默认目录自动命名）
  *   record.start       {"id":N,"url":"rtsp://..."}  开始录第 N 路（M6-S6.3）
  *   record.stop        {"id":N}            停第 N 路
- *   record.status      {"id":N}            第 N 路在录状态（兼对端保活）
+ *   record.status      {"id":N}            第 N 路在录状态（兼对端保活；回
+ *                                          `{id,recording,known[,reason]}` ——
+ *                                          `known:false` 表示"桥查不到，不知道"，
+ *                                          见 iv_ctl.c 的 D-10 说明）
  *   ota.status         —                   升级状态（pending/版本/bootcount/回滚次数；M7-S7.2）
  *   ota.request        {"path":"/...","restart":true}
  *                                          落一个"请装这个包"请求（M7-S7.2）。

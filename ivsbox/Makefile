@@ -20,13 +20,21 @@ include mk/rules.mk
 # -----------------------------------------------------------------------------
 # 版本注入（计划 M1-S2 第 4 件）
 # 把 Git 短哈希以 -DIV_GIT_VER="<sha>" 传给全部编译单元。
-# 脱离 .git 的离线构建（例如只把源码树拷到 VM 上编译）取不到哈希，退回 "unknown"，
-# iv_version 据此降级，不影响编译。
+#
+# 脱离 .git 的离线构建（例如只把源码树拷到 VM 上编译）取不到哈希，退回 "nogit"，
+# iv_version 据此降级成 `1.0.0+nogit`，不影响编译。
+#
+# **D-11：降级只是把事实说清楚，不是解决**。板端产物必须可追溯，所以在非 git 仓
+# 里构建**要显式注入**（GIT_VER 是普通赋值，命令行优先）：
+#     make arm GIT_VER=$(git rev-parse --short HEAD)
+# 忘了注入的后果不是编译失败，而是版本串变成 `+nogit`、`iv_version_git_valid()`
+# 为 0 —— 计划 M-01「版本串与实际一致」会判失败，且现场查不到对应提交。
+#
 # 注意引号写法：必须是 '"$(GIT_VER)"' —— 直接写 \"$(GIT_VER)\" 会被 shell 吃掉
 # 双引号，gcc 收到的是未加引号的 token，宏值就不是字符串字面量了。
 # -----------------------------------------------------------------------------
 GIT_VER := $(shell git rev-parse --short HEAD 2>/dev/null)
-GIT_VER := $(if $(strip $(GIT_VER)),$(strip $(GIT_VER)),unknown)
+GIT_VER := $(if $(strip $(GIT_VER)),$(strip $(GIT_VER)),nogit)
 CFLAGS  += -DIV_GIT_VER='"$(GIT_VER)"'
 
 # 构建日期（YYYYMMDD）。
@@ -53,6 +61,38 @@ CFLAGS += $(addprefix -I,$(THIRD_PARTY_INC))
 # 保留 `-Wall -Wextra` 只是为了看得见上游的警告（不阻塞构建）。
 # 用递归展开（`=`）而不是立即展开（`:=`）：这样后续任何对 CFLAGS 的追加都会带进来。
 CFLAGS_THIRD_PARTY = $(filter-out -Werror,$(CFLAGS))
+
+# -----------------------------------------------------------------------------
+# `-fanalyzer` **只分析我们自己的代码**（2026-10-22 修 `make analyze` 不可用）
+#
+# 第三方与上游子工程的源码一律剥掉 `-fanalyzer`，理由不是"省事"，是三条硬事实：
+#   ① **会 OOM**。`media/src/http/mongoose.c` 是单文件上万行的第三方 Web 服务器，
+#      GCC 10/11 的 -fanalyzer 在这类"大函数 + 大量分支"文件上内存占用是数量级
+#      放大。3.8 GiB 的构建 VM 上实测被内核 OOM killer 直接杀掉 cc1（日志只有
+#      一行 `gcc: fatal error: 已杀死 signal terminated program cc1`，
+#      `make analyze` 退出码 2）。这不是"慢"，是**跑不完**。
+#   ② **分析了也没人去修**。`-fanalyzer` 的价值在于"查出我们会改的代码里的缺陷"；
+#      上游代码我们不打算改（改了下次同步就冲突），它的告警只能被 ignore。
+#   ③ **判据会失真**。旧口径用 `grep -c 'warning:'` 当判据，而 OOM 时这个计数
+#      恰好是 0 —— 看起来"零告警"，其实一个文件都没分析完。这与 D-05
+#      （`fuzz:` 从不执行）是同一类"门禁形同虚设"。
+#
+# 反过来，`src/`（core/hal/modules/app）**保留** `-fanalyzer` —— 那才是我们要
+# 保证零缺陷的部分。`media/src/media/`、`media/src/http/http_server.c` 这类
+# 我们自己写的儿子工程代码同样保留，只剥 pure 第三方那几处。
+# -----------------------------------------------------------------------------
+ANALYZE_OFF_PATHS = \
+	$(BUILD_DIR)/media/src/http/mongoose.o \
+	$(BUILD_DIR)/media/third_party/%.o \
+	$(BUILD_DIR)/third_party/%.o
+
+# 用中间变量而不是自引用赋值：`CFLAGS = $(filter-out -fanalyzer,$(CFLAGS))` 这种
+# 写法要依赖 make 的"target-specific 右侧取全局值"规则才能成立，读起来像递归，
+# 换个人维护迟早改成死循环。立即展开一次存起来，语义一目了然。
+ANALYZE_CFLAGS_OFF := $(filter-out -fanalyzer,$(CFLAGS))
+
+$(ANALYZE_OFF_PATHS): CFLAGS = $(ANALYZE_CFLAGS_OFF)
+$(ANALYZE_OFF_PATHS): CFLAGS_THIRD_PARTY = $(filter-out -Werror,$(ANALYZE_CFLAGS_OFF))
 
 # -----------------------------------------------------------------------------
 # 源文件发现（非递归，按目录通配）

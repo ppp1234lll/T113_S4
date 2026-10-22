@@ -1841,7 +1841,12 @@ static int app_init(void)
     if (iv_log_init("ivsboxd") != 0)
         return -1;
 
-    IV_LOG_I(APP_MOD, "ivsboxd starting, version %s", iv_version_string());
+    /* 启动第一行就把"这版可不可追溯"说清楚（D-11）：
+     * `git=nogit valid=0` 表示这次构建没注入哈希 —— 不是出错，但现场排查时
+     * 一定要知道，否则"版本串与实际一致"永远对不上账。有注入时是
+     * `git=<sha> valid=1`。两个值都直接来自编译期常量，读一次零成本。 */
+    IV_LOG_I(APP_MOD, "ivsboxd starting, version %s (git=%s valid=%d)",
+            iv_version_string(), iv_version_git(), iv_version_git_valid());
     run_state_check();
 
     /* 1. 配置 */

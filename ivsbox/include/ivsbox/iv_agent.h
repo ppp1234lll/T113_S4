@@ -532,8 +532,11 @@ int iv_agent_reload_server(iv_agent_t *a);
  * ============================ 参数 ============================
  * 传的是**配置原始值**（`0` 表示"取默认"）。归一化只走 `probe_cfg_of()` 一处，
  * open 与 reload 共用，避免"加了新键只改 open、重载后悄悄回默认"。
- * `fail_n` 同时写进 `iv_probe` 与 `iv_netmgr`：同一个配置键喂两处判定，
- * 只热更一边会得出"探测说链路死了、状态机说还活着"。
+ *
+ * ⚠ 2026-10-22 起 `fail_n` **只喂 `iv_probe`**（判目标 DOWN）。状态机的切换门限
+ * （`iv_netmgr` 的 `cfg.fail_n`）改由 `netthr.loss_count` 提供，见
+ * `iv_agent_reload_netthr()` —— 架构 §10.2 明写「切换门限由 `netthr.*` 承担」。
+ * 在此之前两处同源，改 `probe.max_fail` 会把切换门限一起改掉。
  *
  * 未 open 返回 `IV_ESTATE`；`timeout_ms >= interval_ms` 等非法组合返回 `IV_EINVAL`
  * 且**不改任何东西**（半套生效比不生效更难查）。归一化后与现值完全一致时直接
@@ -625,6 +628,57 @@ const iv_camdet_t *iv_agent_camdet(const iv_agent_t *a);
 int iv_agent_reload_camdet(iv_agent_t *a, int mode, uint32_t rtt_ms,
                           const uint32_t *ip_be, uint64_t now_ms);
 int iv_agent_camdet_probe(iv_agent_t *a, int ch, uint64_t now_ms);
+
+/* ---------------------------------------------------------------------------
+ * 网络阈值热生效 ＋ 运行期读数（2026-10-22 补，对应 `netthr.*` 四个键）
+ *
+ * ============================ 修的是什么 ============================
+ * `netthr.*` 是"改配置不生效"清单上最后一块：
+ *   - `netthr.reboot_max` / `netthr.reboot_interval_s`：只在 `agent_setup()` 里读
+ *     一次，交给 `iv_agent_open()` 初始化 `iv_recovery` ⇒ 网页改完**必须重启主控**。
+ *   - `netthr.loss_count`：**零消费方**。状态机的切换门限一直是 `probe.max_fail`
+ *     在喂，而架构 §10.2 明写「切换门限由 `netthr.*` 承担」—— 界面上那个
+ *     「丢包次数上限」改了多少次都不影响切换。
+ *   - `netthr.timeout_ms`：同样零消费方，**本轮不硬接**（没有诚实的消费者：
+ *     ICMP 超时已有 `probe.timeout_ms`、平台链路没有可配超时）。它在默认值表里
+ *     保留为**保留键**，说明文字已改成"改后不生效"，别让界面骗人。
+ *
+ * ============================ 同值早返回是硬要求，不是优化 ============================
+ * `iv_recovery_set_limits()` 内部走 `limits_apply()`，它会**把每通道的
+ * `credit` 重置成 `reboot_max`**（这是它的规格：热更新限次就该重新发次数）。
+ * 但 `on_cfg_committed()` 是对整类配置的批量回调 —— 用户只改 `loss_count`
+ * 也会进来。没有同值早返回的话，"改个不相干的键"就等于把自愈次数偷偷补满，
+ * 现场会看到一台该停手的设备反复断电重启。所以这里**先算归一化后的有效值、
+ * 与现值逐项比对、全等就 `IV_OK` 返回且不碰任何模块**。
+ *
+ * ============================ 参数口径 ============================
+ * `reboot_max`：`< 0` ⇒ **跳过**（0 是合法值＝禁用自愈，不能当哨兵）。
+ * `cooldown_s`：`0` ⇒ 跳过（0 在 init 语境表示"取模块默认 60 s"，不是有效秒数）。
+ * `loss_count`：`0` ⇒ 跳过（默认值表的下界是 1）。
+ *
+ * 返回 `IV_OK`（已应用或同值）/ `IV_EINVAL`（参数全被跳过）/ `IV_ESTATE`（未 open）。
+ * 某一项失败不影响另一项，返回值取**第一个非 OK 的**，并各记一条日志。
+ * ------------------------------------------------------------------------- */
+int iv_agent_reload_netthr(iv_agent_t *a, int reboot_max, uint32_t cooldown_s,
+                           uint32_t loss_count);
+
+/* `netthr.*` 的**运行期真值**（诊断/取证/Web 展示）。
+ *
+ * 读的是模块内部实际生效的值，**不是配置里的值** —— 这两者曾经长期不一致
+ * （配置改了、模块还是旧的），那正是本组函数的修复对象。所以别改成读 config。
+ *
+ * 例：`netthr.status` ctl 方法就是它的 JSON 包装；集成用例也靠它断言热生效。 */
+typedef struct {
+    int      nm_fail_n;    /* iv_netmgr 在用的切换门限（`netthr.loss_count`） */
+    int      probe_fail_n; /* iv_probe 判目标 DOWN 的门限（`probe.max_fail`） */
+    int      reboot_max;   /* iv_recovery 限次；0 = 禁用自愈 */
+    uint32_t cooldown_ms;  /* iv_recovery 冷却（毫秒；已归一化，永不为 0） */
+    /* 每通道剩余动作次数（下标＝`iv_recovery_port` 的通道号，0 基） */
+    uint8_t  credit[IV_RECOVERY_PORT_N];
+} iv_agent_netthr_view_t;
+
+/* a 或 out 为 NULL → IV_EINVAL；未 open → IV_ESTATE。 */
+int iv_agent_netthr_view(const iv_agent_t *a, iv_agent_netthr_view_t *out);
 
 /* M6 媒体出口：media＝iv_ctl_media_ops_t 绑定用（装配层经 iv_agent_media()
  * 拿实例指针）；recm＝app 层填/读录像 URL 表用（open 后直接改 recm.cfg 也行）。

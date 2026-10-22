@@ -45,8 +45,18 @@ src/modules/recovery  ——  故障沿断电重启：正常(1)→故障(2) 单�
   - **限次与冷却**：每通道独立状态机（相位 / 剩余次数 / 冷却截止）。动作后
     `netthr.reboot_interval_s`（默认 60 s，＝现网 `NETWAOK_RELOAD_TIME`）内不再
     动作；每通道最多 `netthr.reboot_max` 次；耗尽只告警不动作；**`reboot_max = 0`
-    ⇒ 禁用自愈**（对齐现网出厂 `net_reload = 0`）。⚠ 出厂默认值现为 **3**（＝自愈
-    默认开启），与现网出厂 0 不同 —— **登记为待用户决定项**。
+    ⇒ 禁用自愈**（对齐现网出厂 `net_reload = 0`）。出厂默认值自 **2026-10-14** 起
+    已改为 **0**（＝默认禁用），与现网一致。
+  - **热更新已接线（2026-10-22 11:49）**：网页/平台改 `netthr.reboot_max` /
+    `netthr.reboot_interval_s` 经 `on_cfg_committed(NETTHR)` →
+    `iv_agent_reload_netthr()` → `iv_recovery_set_limits()`，**不必重启主控**。
+    ⚠ `limits_apply()` 会把每通道 `credit` 重置回 `reboot_max`（这是本模块的规格：
+    热更新限次就该重新发次数），所以调用方**必须同值早返回** —— 否则用户只改一个
+    不相干的键（如 `netthr.timeout_ms`）也会把自愈次数偷偷补满，现场会看到一台该
+    停手的设备反复断电重启。该早返回由 `test_agent_netthr` n03 与
+    `tests/integration/netthr_e2e.py` C6 两处钉住。
+    运行期读数（`reboot_max` / `cooldown_ms` / 每通道 `credit`）走 ctl 的
+    `netthr.status`，读的是本模块内部值而非配置值。
   - **两处对参考实现有意不照抄（已登记）**：① 参考 `app_sys_net_relay_reload_num_times()`
     在冷却结束后会**自动重新武装**同通道（一次故障沿连做 N 轮，不管网络是否已恢复）
     ⇒ 本模块**只由新的故障沿驱动**；② 参考 `net_reload_num[]` **全程无复位点**

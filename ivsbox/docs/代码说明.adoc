@@ -4907,3 +4907,163 @@ camdet 是非阻塞状态机（RTSP 一次 `OPTIONS` 1 s 超时、端口扫描 7
 * `camera.test` 没有"等结果"模式，前端靠 `expect_ms` 定时回读。
 * `camtest_e2e.py` 会在真实数据根下按需建出 `camera.ch.0.*` 一槽 8 个键（结束时把 `.ip`
   置空、方式复位 —— 行为等同出厂，键本身留着）。要绝对干净就在临时目录里跑。
+
+== 2026-10-22 11:49 网络阈值（netthr.*）热生效 ＋ 切换门限归位
+
+`netthr.*` 是"改配置不生效"清单上的最后一块。它麻烦的地方在于**四个键状态各不相同**，
+不能一把梭：
+
+[cols="2,1,3,2"]
+|===
+| 键 | 默认 | 改之前的消费者 | 本轮处理
+
+| `netthr.reboot_max`
+| 0
+| `agent_setup()` 读一次 → `iv_agent_open()` 初始化 `iv_recovery`
+| 订阅热更
+| `netthr.reboot_interval_s`
+| 60
+| 同上（冷却秒数）
+| 订阅热更
+| `netthr.loss_count`
+| 3
+| **无**（切换门限由 `probe.max_fail` 喂）
+| **接管切换门限** ＋ 热更
+| `netthr.timeout_ms`
+| 2000
+| **无**
+| **保留键**，说明文字改成"改后不生效"
+|===
+
+=== 切换门限归位：一个键只管一件事
+
+架构 §10.2 写的是「切换门限由 `netthr.*` 承担」，代码里却是 `probe.max_fail` 同时在喂
+两处判定（`iv_probe` 判目标 DOWN、`iv_netmgr` 判 WAN 不可用）。于是界面上「连续失败
+次数上限」和「丢包次数上限」两个键**实际只有一个算数**，改另一个毫无反应 —— 现场
+没有任何办法判断哪个有效。
+
+改法（用户 2026-10-22 拍板）：`nm_fail_n` 的源换成 `netthr.loss_count`；
+`iv_agent_reload_probe()` 摘掉 `tmp.nm_fail_n = fail_n` 和末尾那次
+`iv_netmgr_set_fail_n()`。两者默认值都是 3 ⇒ **出厂行为不变**，变的只是"改哪个键"。
+
+[source,c]
+----
+agent_setup()                     on_cfg_committed()
+  probe.max_fail  ──────► ac.probe_fail_n     ┌ PROBE 分支 → iv_agent_reload_probe()
+                        （只喂探测）          │            → iv_probe.retune(fail_n)
+                                              │
+  netthr.loss_count ────► ac.nm_fail_n        └ NETTHR 分支 → iv_agent_reload_netthr()
+                        （只喂状态机）                       → iv_netmgr_set_fail_n()
+                                                           → iv_recovery_set_limits()
+----
+
+=== `netthr.timeout_ms` 为什么不接
+
+它没有诚实的消费者：ICMP 超时已经有 `probe.timeout_ms`，平台链路（`iv_report`）
+**根本没有可配超时**。硬塞一个（比如让它去喂探测超时）只会再造一组同类双源 ——
+正是上面刚拆掉的那种。
+
+所以它保留在默认值表里，但说明文字改成：
+
+[source,c]
+----
+"netthr.timeout_ms",
+"网络超时时间（毫秒）｜保留键：无消费方，改后不生效（探测超时见 probe.timeout_ms）",
+2000, 100, 60000
+----
+
+网页的配置卡片直接渲染这段说明文字（`config.class` 的 `label`），所以**界面不会继续
+骗人**。这比"删键"更稳：旧配置文件里已有的值照旧能读能存，只是明确告知不生效。
+
+=== 同值早返回是硬要求，不是优化
+
+`iv_recovery_set_limits()` 内部走 `limits_apply()`，按规格把每通道 `credit`
+重置成 `reboot_max`。而 `on_cfg_committed()` 是**对整类配置的批量回调** —— 用户只改
+`timeout_ms` 也会进来。
+
+少了早返回，"改个不相干的键"就等于把自愈次数偷偷补满：现场会看到一台本该停手的
+设备反复给摄像机断电重启，而且日志里只有一句"配置已保存"。所以
+`iv_agent_reload_netthr()` 的顺序是固定的：
+
+. 先算归一化后的有效值（`0` / 负数 = 这次不动）；
+. 与模块**当前生效值**逐项比对，全等 ⇒ 直接 `IV_OK`，一个模块都不碰；
+. 才真正写模块，成功后就地刷新 `a->cfg`（下次要比"旧值"）。
+
+`test_agent_netthr` 的 n03 就是这条的对照组：先把 `ch[0].credit` 手工改成 0、
+`ch[1]` 改成 1，再调一次**完全相同**的参数 ⇒ credit 保持 0/1；随后只把冷却改一下
+⇒ credit 按模块规格重新发满。两边都钉住，"早返回"才不是空话。
+
+=== 参数哨兵：`-1` 与 `0` 不是一回事
+
+[cols="1,1,3"]
+|===
+| 参数 | `-1` | `0`
+
+| `reboot_max`
+| **这次不动**
+| **禁用自愈**（合法值，对齐现网 `net_reload = 0`）
+| `cooldown_s` / `loss_count`
+| 同"不动"
+| 跳过（0 在 init 语境是"取默认/未配"）
+|===
+
+三项全被跳过 ⇒ 回 `IV_EINVAL`，不假装成功（那会让调用方以为热更发生了）。
+
+写失败也如实上抛：`iv_netmgr_set_fail_n()` 回 `IV_ESTATE`（未 open）时**不更新**
+`a->cfg.nm_fail_n`。更新了的话下次比对会以为"已经是新值了"，从此再也不重试 ——
+静默不生效是最难查的一类（`test_agent_netthr` n06 钉住）。
+
+=== 新接口 `netthr.status`（只读取证）
+
+[source,json]
+----
+{"ok":1,"d":{
+  "loss_count":3,          // iv_netmgr.cfg.fail_n —— 切换门限的**真值**
+  "probe_fail_n":3,        // iv_probe.cfg.fail_n —— 探测判 DOWN 的门限
+  "reboot_max":0,          // iv_recovery.cfg.reboot_max（0 = 禁用）
+  "reboot_interval_s":60,  // iv_recovery.cfg.cooldown_ms / 1000
+  "credit":[0,0,0,0,0,0,0,0]  // 每通道**剩余**自愈动作次数
+}}
+----
+
+读的是模块内部值，**不是配置值** —— 配置与模块长期不一致正是本轮修复对象，读配置
+等于把 bug 又盖回去（`test_agent_netthr` n05 就是故意把 `a->cfg` 留 0、只改模块，
+view 必须读出 9/5）。
+
+`credit` 能回答一个具体问题：「为什么这台不再断电重启了」。`reboot_max = 2` 而
+`credit` 全 0 ＝ 次数已耗尽，不是没配。注意它和 `reboot_max` 不是一回事：改配置会把
+credit 重置回满额。
+
+=== 验证
+
+`test` **41/41** ／ `analyze` 0 ／ `arm` 0 告警（`ivsboxd` md5
+`12e004d793279bc9c8643429aea55add`；`ivsbox-web` `0514246877ba3d8356b662146cbc9071`
+未变）／ `asan` 0 ／ `itest` 16 条 15 通过 1 SKIP（`test_tunnel_e2e` 无身份，同基线）。
+
+* `tests/unit/test_agent_netthr.c`（6 组）：NULL / 未 open / 三项全跳过；
+  `(2,30)` 落到 `iv_recovery` 且 credit 首次发满 2；**同值不被重置** ＋ "改冷却会重置"
+  的对照组；`reboot_max=0` 是禁用不是跳过；view 读模块不读配置；`IV_ESTATE` 上抛且
+  快照不被改写。
+* `tests/integration/netthr_e2e.py`（真 `ivsboxd`）**33 条**：出厂基线四值 ＋ credit 全 0；
+  `loss_count=7` 不重启即回读 7 且 `probe_fail_n` 仍 3；`probe.max_fail=9` 后
+  **`loss_count` 仍 7**（"两处不再同源"的对照）；`reboot_max=2` 后 credit 全 2；
+  `reboot_interval_s=25` 只动冷却；改同分类无关键 ⇒ **回调真发生了**但不出热更日志；
+  完全同值 apply ⇒ 配置层就判定无变化；收尾全恢复默认。
+* 反向证伪三条，都**编译干净**：①去掉 `IV_CFG_CLS_NETTHR` 掩码 ⇒ e2e **10 条红**
+  （配置照存、热更全线失效 —— "死分支"指纹）；②同值判断改成恒真 ⇒ 恰好 **1 条红**
+  （C6b）；③`iv_agent_reload_probe()` 末尾加回 `iv_netmgr_set_fail_n()` ⇒ 恰好
+  **1 条红**（C3d）。还原后 e2e 33 条复绿。
+
+⚠ 证伪中途踩了老坑：`tar` 还原源码后**没 `touch`** ⇒ `make` 认为 `.o` 更新、根本没
+重编，第二次证伪跑的还是上一份（被摘了掩码的）二进制，失败列表一模一样。补 `touch`
+后重做才拿到"恰好 1 条红"的正确指纹。
+
+=== 未做
+
+* `snmp.*` 热生效：`cfg_snmp_target()` 仍在启动读一次，改目标 IP 要重启。
+* `camera.ch.N` 除 `.ip` 外 7 个键：`cfg_rec_sources()` 同上。
+* `netthr.timeout_ms` 保持保留键。真要接，得先定它到底管哪条链路的超时，**别猜**。
+* `netthr.status` 目前只走 ctl；网页还没展示 `credit`（运维页是下一步的自然延伸）。
+* **口径变更提示**：旧板若曾用 `probe.max_fail` 调切换门限，升级后需改
+  `netthr.loss_count` 才有效果。
+

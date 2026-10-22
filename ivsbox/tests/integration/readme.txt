@@ -186,6 +186,15 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
   # 副作用：会按需建出 `camera.ch.0.*` 一槽 8 个键，结束时把 `.ip` 置空、方式复位。
   sudo python3 tests/integration/camtest_e2e.py
 
+  # netthr_e2e.py：同上口径，验 `netthr.*` 四个键的热生效与"两处不再同源"。
+  # 判据是 ctl 新方法 `netthr.status`（读模块真值，不是配置值）＋ 落盘日志：
+  #   loss_count 改完不重启即回读；改 probe.max_fail **不再**带动 loss_count；
+  #   reboot_max 改完 credit 全 2（限次真发下去了）；同分类无关键变化早返回、
+  #   不重置 credit（`iv_recovery_set_limits()` 会重置，这是硬要求）。
+  # 掩码漏 NETTHR 时单测全绿、运行期零反应，只有这一层抓得住（见
+  # docs/代码说明.adoc 2026-10-22 11:49）。
+  sudo python3 tests/integration/netthr_e2e.py
+
 【约定与注意事项】
   - 本目录**刻意不并入 make test**：目录里既有"需外部服务"的用例，并进去会让 CI 因
     "没起服务"而假红（见 Makefile `itest` 注释、架构 §16.1）。**需要按单用例粒度执行**

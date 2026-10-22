@@ -1425,10 +1425,12 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
     tmp.probe_target_be[1] = target2_be;
     tmp.probe_interval_ms  = interval_ms;
     tmp.probe_timeout_ms   = timeout_ms;
-    /* 同一个键 `probe.max_fail` 喂两处判定（探测判 DOWN / 状态机判 WAN 不可用），
-     * 必须一起改 —— 只热更一边会得出"探测说死了、状态机说还活着"。 */
+    /* ⚠ 只写 `probe_fail_n`。切换门限（`nm_fail_n`）自 2026-10-22 起由
+     * `netthr.loss_count` 提供（架构 §10.2「切换门限由 netthr.* 承担」），
+     * 见 `iv_agent_reload_netthr()`。原先这里两处同源，改 `probe.max_fail`
+     * 会连带把状态机的切换门限改掉 —— 界面上一共两个"次数"键、实际只有一个
+     * 起作用，现场无法判断哪个算数。 */
     tmp.probe_fail_n       = fail_n;
-    tmp.nm_fail_n          = fail_n;
     probe_cfg_of(&tmp, &pc);
 
     new_dst = agent_probe_dst(&tmp);
@@ -1479,11 +1481,9 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
      * 探测表被反复重建、统计反复清零。 */
     a->cfg = tmp;
 
-    /* 状态机的门限与探测同源。失败不致命（未 open 才失败，而上面已判过），
-     * 记一笔就够。 */
-    if (iv_netmgr_set_fail_n(&a->nm, pc.fail_n) != IV_OK) {
-        IV_LOG_W(AG_MOD, "netmgr fail_n not applied");
-    }
+    /* 这里**不再**调 `iv_netmgr_set_fail_n()`：切换门限的唯一来源已经是
+     * `netthr.loss_count`（`iv_agent_reload_netthr()` 管），PROBE 分类只负责
+     * 探测自身的判定门限。 */
 
     IV_LOG_I(AG_MOD, "probe reloaded: interval=%u timeout=%u fail_n=%u dst=%s",
              (unsigned)pc.interval_ms, (unsigned)pc.timeout_ms, (unsigned)pc.fail_n,
@@ -1654,6 +1654,108 @@ int iv_agent_camdet_probe(iv_agent_t *a, int ch, uint64_t now_ms)
     if (!a->opened)
         return IV_ESTATE;
     return iv_camdet_probe_now(&a->cd, ch, now_ms);
+}
+
+/* ---------------------------------------------------------------------------
+ * 网络阈值热生效（`netthr.*`）
+ * ---------------------------------------------------------------------------
+ * 三件事的顺序在这里很要紧：
+ *   ① 先算**归一化后的有效值**（0 / 负数 = "这次不动"），
+ *   ② 与模块**当前生效值**逐项比对，全等 ⇒ 直接 IV_OK、一个模块都不碰，
+ *   ③ 才真正写模块，并在成功后就地刷新 `a->cfg`（下次重载要比"旧值"）。
+ *
+ * 第②步不是省事：`iv_recovery_set_limits()` 会重置每通道 `credit`，
+ * 而 `on_cfg_committed()` 是整类回调 —— 改 `loss_count` 也会走到这里，
+ * 少了这条早返回就等于"改个不相干的键把自愈次数补满"。
+ *
+ * 为什么比的是 `a->cfg` 的归一化值而不是 `a->rec.cfg`：两者正常同步，但
+ * `rec` 可能没 open（`cfg.netthr_reboot_max==0` 时装配层照样 init 了，
+ * 只是 credit 恒 0），拿 `rec.cfg` 比会漏掉"cfg 已抬到 5、rec 还是 0"这种
+ * 半初始化状态。真正要不要写模块，由下面的 `>= 0 / > 0` 决定。 */
+int iv_agent_reload_netthr(iv_agent_t *a, int reboot_max, uint32_t cooldown_s,
+                           uint32_t loss_count)
+{
+    int rc = IV_OK;
+
+    if (a == NULL)
+        return IV_EINVAL;
+    if (!a->opened)
+        return IV_ESTATE;
+    if (reboot_max < 0 && cooldown_s == 0u && loss_count == 0u)
+        return IV_EINVAL; /* 三项全被跳过 ⇒ 调用方参数错了，别假装成功 */
+
+    /* ---- ① 切换门限（`netthr.loss_count`）---- */
+    if (loss_count != 0u) {
+        if (a->cfg.nm_fail_n != loss_count) {
+            int nrc = iv_netmgr_set_fail_n(&a->nm, loss_count);
+
+            if (nrc != IV_OK) {
+                IV_LOG_W(AG_MOD, "netthr.loss_count %u not applied (%d)",
+                         (unsigned)loss_count, nrc);
+                rc = nrc;
+            } else {
+                a->cfg.nm_fail_n = loss_count;
+                IV_LOG_I(AG_MOD, "netthr.loss_count -> %u (switch threshold)",
+                         (unsigned)loss_count);
+            }
+        }
+    }
+
+    /* ---- ② 自愈限次与冷却（`netthr.reboot_max` / `.reboot_interval_s`）---- */
+    {
+        int      new_max  = (reboot_max >= 0) ? reboot_max
+                                              : (int)a->cfg.netthr_reboot_max;
+        uint32_t new_cd_s = (cooldown_s != 0u) ? cooldown_s
+                                               : a->cfg.netthr_reboot_interval_s;
+        uint32_t new_cd_ms;
+
+        /* 只在用户真给了至少一项时才往下走；两项都没给 ⇒ 不动自愈。 */
+        if (reboot_max >= 0 || cooldown_s != 0u) {
+            /* 归一化口径与 `iv_agent_open()` 一致：0 秒 ⇒ 让 iv_recovery 取默认。
+             * 这里必须自己算，不能把 0 直接传进去后又不记 —— 那样 `a->cfg`
+             * 与模块会各存一个值，下次比对永远不相等、每次都重置 credit。 */
+            new_cd_ms = (new_cd_s != 0u) ? new_cd_s * 1000u
+                                         : (uint32_t)IV_RECOVERY_COOLDOWN_MS_DEFAULT;
+
+            if ((int)a->cfg.netthr_reboot_max != new_max ||
+                a->rec.cfg.cooldown_ms != new_cd_ms) {
+                int lrc = iv_recovery_set_limits(&a->rec, new_max,
+                                                 (new_cd_s != 0u) ? new_cd_ms : 0u);
+
+                if (lrc != IV_OK) {
+                    IV_LOG_W(AG_MOD, "netthr recovery limits not applied (%d)", lrc);
+                    if (rc == IV_OK)
+                        rc = lrc;
+                } else {
+                    a->cfg.netthr_reboot_max        = (uint32_t)new_max;
+                    a->cfg.netthr_reboot_interval_s = new_cd_s;
+                    IV_LOG_I(AG_MOD, "netthr recovery -> reboot_max=%d cooldown=%us",
+                             new_max, (unsigned)new_cd_s);
+                }
+            }
+        }
+    }
+
+    return rc;
+}
+
+int iv_agent_netthr_view(const iv_agent_t *a, iv_agent_netthr_view_t *out)
+{
+    int i;
+
+    if (a == NULL || out == NULL)
+        return IV_EINVAL;
+    if (!a->opened)
+        return IV_ESTATE;
+
+    /* 读模块，不读 config：两者长期不一致正是本组函数的修复对象。 */
+    out->nm_fail_n    = (int)a->nm.cfg.fail_n;
+    out->probe_fail_n = (int)a->pb.cfg.fail_n;
+    out->reboot_max   = a->rec.cfg.reboot_max;
+    out->cooldown_ms  = a->rec.cfg.cooldown_ms;
+    for (i = 0; i < (int)IV_RECOVERY_PORT_N; i++)
+        out->credit[i] = a->rec.ch[i].credit;
+    return IV_OK;
 }
 
 iv_media_t *iv_agent_media(iv_agent_t *a)

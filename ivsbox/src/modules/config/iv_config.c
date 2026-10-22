@@ -389,7 +389,9 @@ static const cfg_default_t s_defaults[] = {
     D_DBL(IV_CFG_CLS_ELEC, "elec.power", "功率阈值（W）", 0.0, 0.0, 1.0e5),
 
     /* ---- netthr. 网络阈值（架构 §10.2；丢包＝**次数**；承担原 wan.* 的切换门限） ---- */
-    D_INT(IV_CFG_CLS_NETTHR, "netthr.timeout_ms", "网络超时时间（毫秒）", 2000, 100, 60000),
+    D_INT(IV_CFG_CLS_NETTHR, "netthr.timeout_ms",
+          "网络超时时间（毫秒）｜保留键：无消费方，改后不生效（探测超时见 probe.timeout_ms）",
+          2000, 100, 60000),
     D_INT(IV_CFG_CLS_NETTHR, "netthr.loss_count", "丢包次数上限", 3, 1, 100),
     D_INT(IV_CFG_CLS_NETTHR, "netthr.reboot_max", "自愈重启次数上限（**0 = 禁用自愈**）",
           0, 0, 100), /* 2026-10-14 用户批准：出厂默认 3 → 0（对齐现网 net_reload=0） */

@@ -565,7 +565,9 @@ static int agent_sync_server_cfg(int force)
  *   - `sys` 分类里的 `sys.report.interval_s`：周期上报间隔 → 换节拍，**不断链**；
  *     `sys.sample.period_ms`：采集（0xE1 轮询）周期 → 只换轮询节拍，同样不断链；
  *     `sys.transport.mode`：传输模式 → 重跑一次状态机判定（活动口真变才重连）；
- *   - `probe` 分类：`probe.*` 五个键 → 探活参数热生效（目标变才重建探测表）。
+ *   - `probe` 分类：`probe.*` 五个键 → 探活参数热生效（目标变才重建探测表）；
+ *   - `netthr` 分类：切换门限（`loss_count`）与自愈限次/冷却 → 各改各的模块，
+ *     同值早返回（`iv_recovery_set_limits()` 会重置 credit，不能白调）。
  * 其余分类的热更新各有归属（隧道见 on_config_event）。 */
 static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, void *user)
 {
@@ -682,6 +684,31 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
                                      iv_clock_monotonic_ms());
         if (crc != IV_OK)
             IV_LOG_W(APP_MOD, "camera.* not applied (%d)", crc);
+    }
+    if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_NETTHR)) != 0u) {
+        /* `netthr.reboot_max` / `.reboot_interval_s` 原先只在 `agent_setup()` 里
+         * 读一次、交给 `iv_agent_open()` 初始化 `iv_recovery` ⇒ 网页改完必须重启；
+         * `netthr.loss_count` 更是**零消费方**的死键。
+         *
+         * `-1` / `0` 在这里表示"这一项这次没给"（0 是 `reboot_max` 的合法值＝禁用），
+         * 与 `iv_agent_reload_camdet()` 同口径；归一化与"同值早返回"都在 agent 侧
+         * 一处做 —— 那里早返回是硬要求，因为 `iv_recovery_set_limits()` 会重置
+         * 每通道 credit，改个 `loss_count` 不该把自愈次数补满。 */
+        int64_t nv       = 0;
+        int     reb_max  = -1;
+        uint32_t cd_s    = 0u;
+        uint32_t loss_n  = 0u;
+        int     nrc;
+
+        if (iv_config_get_int(g_cfg, "netthr.reboot_max", &nv) == IV_OK && nv >= 0)
+            reb_max = (int)nv;
+        if (iv_config_get_int(g_cfg, "netthr.reboot_interval_s", &nv) == IV_OK && nv > 0)
+            cd_s = (uint32_t)nv;
+        if (iv_config_get_int(g_cfg, "netthr.loss_count", &nv) == IV_OK && nv > 0)
+            loss_n = (uint32_t)nv;
+        nrc = iv_agent_reload_netthr(&g_agent, reb_max, cd_s, loss_n);
+        if (nrc != IV_OK)
+            IV_LOG_W(APP_MOD, "netthr.* not applied (%d)", nrc);
     }
 }
 
@@ -1423,10 +1450,12 @@ static int agent_setup(void)
         ac.probe_interval_ms = (uint32_t)v;
     if (iv_config_get_int(g_cfg, "probe.timeout_ms", &v) == IV_OK)
         ac.probe_timeout_ms = (uint32_t)v;
-    if (iv_config_get_int(g_cfg, "probe.max_fail", &v) == IV_OK) {
+    if (iv_config_get_int(g_cfg, "probe.max_fail", &v) == IV_OK)
         ac.probe_fail_n = (uint32_t)v;
-        ac.nm_fail_n    = (uint32_t)v;
-    }
+    /* ⚠ 这里**只有** `probe_fail_n`。切换门限（`nm_fail_n`）的来源是
+     * `netthr.loss_count`（架构 §10.2「切换门限由 netthr.* 承担」），见下方
+     * netthr 段。2026-10-22 之前两处同源 ⇒ 界面上「连续失败次数上限」和
+     * 「丢包次数上限」两个键实际只有一个算数，改另一个没反应。 */
 
     /* devid（TID）暂无配置键来源：待工厂身份分区（/dev/by-name/private）读取落地 */
     /* 摄像机网络状态检测（S4.1）：6 路 IP 与检测方式 */
@@ -1443,6 +1472,11 @@ static int agent_setup(void)
         ac.netthr_reboot_max = (uint32_t)v;
     if (iv_config_get_int(g_cfg, "netthr.reboot_interval_s", &v) == IV_OK && v > 0)
         ac.netthr_reboot_interval_s = (uint32_t)v;
+    /* 切换门限（`nm_fail_n`）的**唯一**来源：`netthr.loss_count`。
+     * 它此前是零消费方的死键（门限由 `probe.max_fail` 喂），而架构 §10.2 明写
+     * 「切换门限由 netthr.* 承担」⇒ 网页上「丢包次数上限」改多少次都不影响切换。 */
+    if (iv_config_get_int(g_cfg, "netthr.loss_count", &v) == IV_OK && v > 0)
+        ac.nm_fail_n = (uint32_t)v;
 
     /* 摄像机信息探测（S4.2）：开机一次自动搜索；SADP 走有线网口，报文字段取本机
      * 网口的 IPv4/MAC（取不到就留空，其余三路发现不受影响）。 */
@@ -1705,7 +1739,8 @@ static int app_init(void)
      * 没订等于**回调永远不触发**，编译、单测全绿、运行期毫无反应（"接线在装配层"
      * 这一类坑，单测抓不到，只有真拉进程的集成用例才看得见）。`elec`/`sensor`
      * （阈值下发）同理，一处都不能漏；`camera`（检测方式热生效）是同一条坑的第
-     * 三次 —— 见 `on_cfg_committed()` 里 CAMERA 分支。 */
+     * 三次 —— 见 `on_cfg_committed()` 里 CAMERA 分支；`netthr`（切换门限＋
+     * 自愈限次）是第四次。 */
     (void)agent_sync_server_cfg(0);
     if (iv_config_subscribe(g_cfg,
                             IV_CFG_CLASS_MASK(IV_CFG_CLS_NET) |
@@ -1713,12 +1748,13 @@ static int app_init(void)
                                 IV_CFG_CLASS_MASK(IV_CFG_CLS_PROBE) |
                                 IV_CFG_CLASS_MASK(IV_CFG_CLS_ELEC) |
                                 IV_CFG_CLASS_MASK(IV_CFG_CLS_SENSOR) |
-                                IV_CFG_CLASS_MASK(IV_CFG_CLS_CAMERA),
+                                IV_CFG_CLASS_MASK(IV_CFG_CLS_CAMERA) |
+                                IV_CFG_CLASS_MASK(IV_CFG_CLS_NETTHR),
                             on_cfg_committed, NULL) != IV_OK)
         IV_LOG_W(APP_MOD,
-                 "subscribe(net+sys+probe+elec+sensor+camera) failed -- server addr / "
-                 "report interval / probe params / thresholds / camera detect mode "
-                 "change needs a restart");
+                 "subscribe(net+sys+probe+elec+sensor+camera+netthr) failed -- server "
+                 "addr / report interval / probe params / thresholds / camera detect "
+                 "mode / net thresholds change needs a restart");
 
     /* 9d. M8-S8.3 受控远程通道装配（身份/令牌/服务端/落点/巡检定时器）。
      *    在 9b 之后：与 agent 装配同级，都在 reactor 建好之后。 */

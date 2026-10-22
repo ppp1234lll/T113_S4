@@ -66,6 +66,7 @@ static const char *const k_methods[] = {
     "snmp.run",
     "gps.status",
     "board.status",
+    "netthr.status",
     "relay.set",
     "device.identity.set",
     "camera.search",
@@ -1756,6 +1757,53 @@ static int m_board_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_t
     return rsp_data(d, out, cap, out_len);
 }
 
+/* ============================ netthr.status（2026-10-22） ============================
+ *
+ * `netthr.*` 四个键的**运行期真值**。存在的理由与 `board.status` 一类相同：
+ * 配置页能改能存，但"改完到底有没有生效"从界面上看不出 —— 本组键长期是
+ * 「网页改了等于没改」（只读一次的 + 零消费方的死键），现场只能靠重启赌一把。
+ * 这里直接读模块内部生效值，改完打这个接口就知道有没有落地。
+ *
+ * 为什么读模块不读 config：两者长期不一致正是本轮修复的对象（`nm_fail_n`
+ * 曾经由 `probe.max_fail` 喂，与 `netthr.loss_count` 毫无关系）。
+ *
+ * `credit` 是每通道**剩余**自愈动作次数 —— 现场排查"为什么这台不再断电重启了"
+ * 时，`reboot_max=2` 但 `credit` 全 0 就说明次数已耗尽，不是没配。
+ * ⚠ 它和 `reboot_max` 不是一回事：改配置会把 credit 重置回满额。 */
+static int m_netthr_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_t *out_len)
+{
+    iv_agent_netthr_view_t v;
+    json_object           *d;
+    json_object           *a;
+    int                    i;
+    int                    rc;
+
+    if (ctx->agent == NULL)
+        return rsp_err(IV_ESTATE, "agent unavailable", out, cap, out_len);
+    rc = iv_agent_netthr_view(ctx->agent, &v);
+    if (rc != IV_OK)
+        return rsp_err(rc, "netthr view unavailable", out, cap, out_len);
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    /* `loss_count` 是**切换门限**（`netthr.loss_count`）；`probe_fail_n` 是
+     * 探测判 DOWN 的门限（`probe.max_fail`）。两个键、两个消费者，别混。 */
+    json_object_object_add(d, "loss_count", json_object_new_int(v.nm_fail_n));
+    json_object_object_add(d, "probe_fail_n", json_object_new_int(v.probe_fail_n));
+    json_object_object_add(d, "reboot_max", json_object_new_int(v.reboot_max));
+    json_object_object_add(d, "reboot_interval_s",
+                           json_object_new_int((int)(v.cooldown_ms / 1000u)));
+
+    a = json_object_new_array();
+    if (a != NULL) {
+        for (i = 0; i < (int)IV_RECOVERY_PORT_N; i++)
+            json_object_array_add(a, json_object_new_int((int)v.credit[i]));
+        json_object_object_add(d, "credit", a);
+    }
+    return rsp_data(d, out, cap, out_len);
+}
+
 /* ============================ relay.set（S2.6 继电器人工控制） ============================ */
 
 /* 人点一下按钮就把某路继电器吸合/断开。
@@ -2772,6 +2820,8 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_cell_status(ctx, out, out_cap, out_len);
     else if (strcmp(method, "board.status") == 0)
         rc = m_board_status(ctx, out, out_cap, out_len);
+    else if (strcmp(method, "netthr.status") == 0)
+        rc = m_netthr_status(ctx, out, out_cap, out_len);
     else if (strcmp(method, "relay.set") == 0)
         rc = m_relay_set(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "device.identity.set") == 0)

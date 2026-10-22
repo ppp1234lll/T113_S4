@@ -1605,6 +1605,107 @@
     ops.appendChild(bar);
     root.appendChild(ops);
 
+    /* ---- 系统升级（`ota.status`，**只读**）----
+     * 参考 web 里的「升级有线/升级无线」是"设备自己去服务器下载"。本机没有下载器：
+     * 包由平台下发或随 U 盘落地，真正的安装由 monitor.sh 拉起 ivsbox-updater 完成
+     * （单写者原则，见 iv_upd.h）。所以这里**如实显示状态**，不摆一个按下去没反应
+     * 的"升级"按钮——那比没有按钮更糟。 */
+    var up = el('div', 'card');
+    up.appendChild(el('h3', null, '系统升级'));
+    var upHint = el('p', 'hint', '读取中…');
+    up.appendChild(upHint);
+    var upGrid = el('div', 'grid');
+    up.appendChild(upGrid);
+    var upBar = el('div', 'actions');
+    var bUpRefresh = el('button', 'ghost', '刷新升级状态');
+    bUpRefresh.type = 'button';
+    bUpRefresh.addEventListener('click', function () { loadOta(); });
+    upBar.appendChild(bUpRefresh);
+    up.appendChild(upBar);
+    root.appendChild(up);
+
+    function loadOta() {
+      upHint.textContent = '读取中…';
+      api('/api/ota').then(function (r) {
+        upGrid.textContent = '';
+        if (!r.ok) {
+          upHint.textContent = '升级状态不可用：' + (r.msg || r.e);
+          return;
+        }
+        var d = r.d || {};
+        upHint.textContent = d.pending
+          ? '有已落地的包，等待 ivsbox-updater 安装'
+          : '当前没有待安装的包';
+        upGrid.appendChild(kv('当前版本', fmtVer(d.version)));
+        upGrid.appendChild(kv('上一版本', fmtVer(d.previous)));
+        upGrid.appendChild(kv('运行分区', d.current || '—'));
+        upGrid.appendChild(kv('状态', d.state || '—'));
+        upGrid.appendChild(kv('待安装', d.pending ? '是' : '否', d.pending ? 'warn' : null));
+        upGrid.appendChild(kv('启动计数', (d.bootcount || 0) + ' / ' + (d.max_boot || 0),
+          (d.bootcount || 0) > 1 ? 'warn' : null));
+        upGrid.appendChild(kv('回滚次数', d.rollbacks || 0, d.rollbacks ? 'warn' : null));
+        upGrid.appendChild(kv('最近事件', d.last_event || '—'));
+        upGrid.appendChild(kv('最近原因', d.last_reason || '—'));
+      });
+    }
+    loadOta();
+
+    /* ---- 系统日志（对齐参考 web 的「打印日志」）----
+     * 列表与下载都由 ivsbox-web 直接读 `/mnt/UDISK/log/<日期>/<小时>.log`：
+     * 日志不是 ivsboxd 的内部状态，为一句话的目录列表单开一条协议不划算。 */
+    var lg = el('div', 'card');
+    lg.appendChild(el('h3', null, '系统日志'));
+    var lgHint = el('p', 'hint', '读取中…');
+    lg.appendChild(lgHint);
+    var lgList = el('div', 'grid');
+    lg.appendChild(lgList);
+    var lgBar = el('div', 'actions');
+    var bLgRefresh = el('button', 'ghost', '刷新日志列表');
+    bLgRefresh.type = 'button';
+    bLgRefresh.addEventListener('click', function () { loadLogs(); });
+    lgBar.appendChild(bLgRefresh);
+    lg.appendChild(lgBar);
+    root.appendChild(lg);
+
+    function fmtSize(n) {
+      n = Number(n) || 0;
+      if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+      if (n >= 1024) return Math.round(n / 1024) + ' KB';
+      return n + ' B';
+    }
+
+    function loadLogs() {
+      lgHint.textContent = '读取中…';
+      api('/api/logs?max=20').then(function (r) {
+        lgList.textContent = '';
+        if (!r.ok) {
+          lgHint.textContent = '日志列表不可用：' + (r.msg || r.e);
+          return;
+        }
+        var d = r.d || {};
+        var files = d.files || [];
+        if (!files.length) {
+          lgHint.textContent = '没有日志文件（目录 ' + (d.root || '?') + '）。';
+          return;
+        }
+        lgHint.textContent = (d.root || '') + ' —— 共 ' + (d.total || 0) +
+          ' 个文件，下面是最近 ' + files.length + ' 个。';
+        files.forEach(function (f) {
+          var row = el('div', 'kv');
+          row.appendChild(el('div', 'k', f.f));
+          var v = el('div', 'v');
+          v.appendChild(document.createTextNode(fmtSize(f.size) + ' · ' + fmtWall(f.mtime) + '　'));
+          var a = el('a', null, '下载');
+          a.href = '/api/logs/file?f=' + encodeURIComponent(f.f);
+          a.setAttribute('download', '');
+          v.appendChild(a);
+          row.appendChild(v);
+          lgList.appendChild(row);
+        });
+      });
+    }
+    loadLogs();
+
     root.appendChild(configCard('检测与自愈（probe.* / netthr.*）', ['probe', 'netthr'],
       '探活目标与节拍、故障重启次数与冷却。'));
     root.appendChild(configCard('电阈值与传感器（elec.* / sensor.*）', ['elec', 'sensor'],

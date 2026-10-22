@@ -25,6 +25,25 @@ ui_camera_slot.mjs
     断言 POST /api/config/apply 的 body（ver + 只发 1 个 camera.ch.N.ip 键）、
     空 IP 不发请求、建槽后下拉文案与 IP 回填。共 19 条断言。
 
+ui_device_name.mjs
+    总览页「设备名称」（`sys.device.name`）：断言输入框与「保存名称」按钮存在、
+    未命名时只读行显示「未命名」（"空"与"没读到"要分得开）、保存只发 1 个键且
+    版本号是**现取**的（本页没有 configCard 缓存 ver，拿旧值必撞 e=-3）。
+    共 15 条断言。
+
+ui_ops_log.mjs
+    运维页「系统升级」+「系统日志」两张卡：/api/ota 字段渲染、启动计数 >1 带
+    warn、日志列表文件名与下载链（`f` 做 URL 编码，日期里的 `/` 不编会被当路径段）、
+    空列表与后端 `ok:false` 各有明确文案。共 16 条断言。
+
+logs_e2e.py
+    **不是 jsdom**，是真的进程：起一个 `build/host/ivsbox-web`（`--log-root` 指到
+    /tmp 下造的假日志树），走真 HTTP 取证 `/api/logs` 与 `/api/logs/file`：
+    形状白名单（非日期目录/非 .log 都不列）、mtime 降序、max 截断、正文与磁盘
+    逐字节相同、Content-Disposition、`../` ⇒ 403、不存在 ⇒ 404、无 Cookie ⇒ 401、
+    POST ⇒ 405、`/api/logsXYZ` 不归本层、日志根不存在 ⇒ 空列表。共 21 条断言。
+    需要 python3（VM 上没有 node，所以这一半只能在 VM 上跑）。
+
 怎么跑
 ------
 jsdom **不是工程依赖**（不想把 node 生态塞进构建链），所以要单独准备：
@@ -38,6 +57,10 @@ jsdom **不是工程依赖**（不想把 node 生态塞进构建链），所以�
 
 找不到 jsdom 时**打印 SKIP 并退出 0**（与 test_web_http 缺二进制时的口径一致），
 不会把"没装环境"伪装成"跑过了且正常"。
+
+端到端那条（在 ivsbox/ 目录下、先 `make` 出 build/host/ivsbox-web）：
+
+    python3 tests/web/logs_e2e.py
 
 退出码：0 通过（或 SKIP），1 有断言失败，2 用例自身崩了。
 

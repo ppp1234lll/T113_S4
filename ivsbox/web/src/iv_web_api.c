@@ -47,7 +47,7 @@ static char s_ctl_req[IV_WEB_BODY_MAX + 256u];
 
 /* 从 `a=1&b=2` 里取 `key` 的值（不做 URL 解码：本工程用到的参数都是
  * 短标识符，没有需要转义的字符；真需要时在这里补 percent-decode）。 */
-static int query_get(const char *q, const char *key, char *out, size_t cap)
+int iv_web_query_get(const char *q, const char *key, char *out, size_t cap)
 {
     size_t      klen = strlen(key);
     const char *p = q;
@@ -305,13 +305,13 @@ static int api_config_get(iv_web_ctx_t *ctx, const iv_web_req_t *req,
     char cls[32];
     char p[64];
 
-    if (query_get(req->query, "all", cls, sizeof(cls))) {
+    if (iv_web_query_get(req->query, "all", cls, sizeof(cls))) {
         return api_simple_call(ctx, "config.all", out, cap, out_len, rsp);
     }
-    if (query_get(req->query, "defaults", cls, sizeof(cls))) {
+    if (iv_web_query_get(req->query, "defaults", cls, sizeof(cls))) {
         return api_simple_call(ctx, "config.defaults", out, cap, out_len, rsp);
     }
-    if (!query_get(req->query, "cls", cls, sizeof(cls)) || cls[0] == '\0') {
+    if (!iv_web_query_get(req->query, "cls", cls, sizeof(cls)) || cls[0] == '\0') {
         *out_len = api_err(out, cap, IV_EINVAL, "missing cls");
         return to_rsp(out, cap, out_len, rsp);
     }
@@ -343,7 +343,7 @@ static int api_snmp_get(iv_web_ctx_t *ctx, const iv_web_req_t *req,
     char which[16];
     char p[48];
 
-    if (!query_get(req->query, "which", which, sizeof(which)))
+    if (!iv_web_query_get(req->query, "which", which, sizeof(which)))
         (void)snprintf(which, sizeof(which), "cam");
     if (snprintf(p, sizeof(p), "{\"which\":\"%s\"}", which) >= (int)sizeof(p)) {
         *out_len = api_err(out, cap, IV_EINVAL, "bad which");
@@ -553,6 +553,17 @@ int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
         return api_p_call(ctx, "system.reboot",
                           (req->body != NULL) ? req->body : "{}",
                           out, cap, out_len, rsp);
+    /* 升级状态：**只读**（`ota.status` 不写盘）。真正的安装由 monitor.sh 拉起
+     * ivsbox-updater 执行，Web 侧只把状态显示出来——"谁改版本"永远只有一个写者。 */
+    if (strcmp(req->path, "/api/ota") == 0)
+        return api_simple_call(ctx, "ota.status", out, cap, out_len, rsp);
+
+    /* 日志浏览/下载（`iv_web_logs.c`）。**必须在兜底 404 之前**转出去：
+     * `/api/logs` 属于 `/api/` 前缀，本函数会先命中它；不在这里转交的话，
+     * 永远走不到 logs.c，表现是"路由写好了却恒 404"（2026-10-22 踩过一次）。 */
+    if (strncmp(req->path, "/api/logs", 9u) == 0 &&
+        (req->path[9] == '\0' || req->path[9] == '/'))
+        return iv_web_logs_handle(ctx, req, out, cap, out_len, rsp);
 
     *out_len = api_err(out, cap, IV_ENOENT, "no such api");
     rsp->status = 404;

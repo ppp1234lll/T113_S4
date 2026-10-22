@@ -696,16 +696,19 @@ static void usage(const char *argv0)
             "usage: %s [--port N] [--root DIR] [--chan PATH]\n"
             "          [--user NAME] [--pass PW] [--pass-file PATH]\n"
             "          [--media-root DIR] [--media-bps N]\n"
+            "          [--log-root DIR]\n"
             "          [--cam-port N] [--cam-upstream N]\n"
             "          [--heartbeat PATH] [--heartbeat-ms N] [--version]\n"
             "  defaults: port %d, root %s, chan %s\n"
             "            user %s, pass = factory default (must be changed on first login)\n"
             "            pass-file %s (empty = do not persist)\n"
             "            media-root %s, media-bps %u (0 = unlimited)\n"
+            "            log-root %s\n"
             "            cam-port %d (127.0.0.1 only, 0 = off), cam-upstream %u\n",
             argv0, WEB_PORT_DEF, WEB_ROOT_DEF, IV_CHAN_PATH_DEFAULT,
             WEB_USER_DEF, IV_WEB_PASS_FILE_DEF,
             IV_WEB_MEDIA_ROOT_DEFAULT, IV_WEB_MEDIA_BPS_DEFAULT,
+            IV_WEB_LOG_ROOT_DEFAULT,
             WEB_CAM_PORT_DEF, (unsigned)WEB_CAM_UPSTREAM_DEF);
 }
 
@@ -727,6 +730,7 @@ int main(int argc, char *argv[])
     (void)snprintf(g_ctx.media_root, sizeof(g_ctx.media_root), "%s",
                    IV_WEB_MEDIA_ROOT_DEFAULT);
     g_ctx.media_bps = IV_WEB_MEDIA_BPS_DEFAULT;
+    (void)snprintf(g_ctx.log_root, sizeof(g_ctx.log_root), "%s", IV_WEB_LOG_ROOT_DEFAULT);
     g_ctx.rng = (uint32_t)((uint64_t)time(NULL) ^ (uint64_t)getpid()) | 1u;
 
     for (i = 0; i < (int)IV_WEB_MAX_CONN; i++) {
@@ -760,6 +764,9 @@ int main(int argc, char *argv[])
                            (int)sizeof(g_ctx.media_root) - 1, argv[++i]);
         } else if (strcmp(argv[i], "--media-bps") == 0 && i + 1 < argc) {
             g_ctx.media_bps = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--log-root") == 0 && i + 1 < argc) {
+            (void)snprintf(g_ctx.log_root, sizeof(g_ctx.log_root), "%.*s",
+                           (int)sizeof(g_ctx.log_root) - 1, argv[++i]);
         } else if (strcmp(argv[i], "--cam-port") == 0 && i + 1 < argc) {
             cam_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--cam-upstream") == 0 && i + 1 < argc) {
@@ -803,6 +810,10 @@ int main(int argc, char *argv[])
         env = getenv("IVSBOX_WEB_MEDIA_BPS");
         if (env != NULL && env[0] != '\0')
             g_ctx.media_bps = (uint32_t)strtoul(env, NULL, 10);
+        env = getenv("IVSBOX_WEB_LOG_ROOT");
+        if (env != NULL && env[0] != '\0')
+            (void)snprintf(g_ctx.log_root, sizeof(g_ctx.log_root), "%.*s",
+                           (int)sizeof(g_ctx.log_root) - 1, env);
         /* 心跳路径/周期（S7.4）：monitor-web.sh 用同名变量，两边必须指同一个文件。 */
         env = getenv("IVSBOX_WEB_HEARTBEAT");
         if (env != NULL && env[0] != '\0')
@@ -861,6 +872,7 @@ int main(int argc, char *argv[])
     IV_LOG_I(WEB_MOD, "ivsbox-web listening on :%d, root=%s, chan=%s",
              port, g_ctx.static_root, g_ctx.chan_path);
     IV_LOG_I(WEB_MOD, "media root=%s bps=%u", g_ctx.media_root, g_ctx.media_bps);
+    IV_LOG_I(WEB_MOD, "log root=%s", g_ctx.log_root);
     IV_LOG_I(WEB_MOD, "cam proxy %s (upstream port %u)",
              (g_cam_fd >= 0) ? "enabled" : "off",
              (unsigned)g_ctx.cam_upstream);

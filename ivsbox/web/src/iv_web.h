@@ -99,6 +99,10 @@ extern "C" {
 /* S6.4：媒体根默认值（与 bird_media 的 PATH_RECORD_ROOT 同源，见 iv_storage.h） */
 #define IV_WEB_MEDIA_ROOT_DEFAULT "/mnt/sdcard"
 #define IV_WEB_MEDIA_ROOT_MAX     256u
+/* 系统日志根（对齐参考 web 的「打印日志」）：iv_log 按 `/<YYYY-MM-DD>/<HH>.log` 落盘，
+ * 默认值与 S65ivsboxd 的心跳/日志目录同源（`/mnt/UDISK/log`）。 */
+#define IV_WEB_LOG_ROOT_DEFAULT "/mnt/UDISK/log"
+#define IV_WEB_LOG_ROOT_MAX     256u
 /* 限速窗口（ms）与"配额用完先等这么久" */
 #define IV_WEB_RL_WIN_MS   1000u
 #define IV_WEB_RL_WAIT_MS  20u
@@ -206,6 +210,9 @@ typedef struct {
     char          media_root[IV_WEB_MEDIA_ROOT_MAX];
     uint32_t      media_bps;   /* 0 = 不限速 */
 
+    /* 系统日志浏览/下载（值语义，同上）。空串 = 用 IV_WEB_LOG_ROOT_DEFAULT。 */
+    char          log_root[IV_WEB_LOG_ROOT_MAX];
+
     /* S8.5 摄像机受控代理：cam_port 为**本机代理监听口**（只绑 127.0.0.1；0 = 未开），
      * 用作"目标是代理自己"的环回护栏；cam_upstream 是**摄像机侧的 Web 端口**（唯一
      * 允许被代理的端口，默认 80）。两者都来自命令行/环境变量 —— Web 不读配置。 */
@@ -247,6 +254,10 @@ typedef struct {
 uint64_t iv_web_now_ms(void);
 uint32_t iv_web_rand(iv_web_ctx_t *ctx);
 
+/* 从 `a=1&b=2` 里取 `key` 的值（不做 percent-decode：本工程的参数都是短标识符）。
+ * 实现在 api.c；logs.c 复用同一份 —— 两处各写一遍迟早只有一处支持新语法。 */
+int iv_web_query_get(const char *q, const char *key, char *out, size_t cap);
+
 /* --------------------------------------------------------------------------
  * pass.c —— 口令：哈希 / 复杂度 / 落盘（M10）
  *   - `iv_web_pass_hash()` 是登录比对与落盘**共用**的摘要函数（含域名前缀，见 .c 头）；
@@ -280,6 +291,16 @@ void iv_web_sess_new(iv_web_ctx_t *ctx, char *out_token, size_t cap);
  * -------------------------------------------------------------------------- */
 int iv_web_media_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
                         char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp);
+
+/* --------------------------------------------------------------------------
+ * logs.c —— 系统日志浏览/下载（对齐参考 web 的「打印日志」）
+ *   GET /api/logs?max=N       → {"ok":true,"d":{"root":..,"files":[{f,size,mtime}],..}}
+ *   GET /api/logs/file?f=..   → 文件体（走 rsp->file_path 流式，不经 wbuf）
+ * 与 api/media 同口径：IV_OK = 已填好响应；IV_ENOTSUP = 这个路径不归我。
+ * 未登录 ⇒ 401；出厂默认口令期 ⇒ 403；路径形状不合法/越界 ⇒ 403；不存在 ⇒ 404。
+ * -------------------------------------------------------------------------- */
+int iv_web_logs_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
+                       char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp);
 
 /* --------------------------------------------------------------------------
  * cam.c —— S8.5 摄像机受控代理（架构 §9.3）

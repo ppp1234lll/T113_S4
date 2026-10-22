@@ -423,6 +423,7 @@
     sys: '基础参数', net: '本机网络', probe: '检测探活', camera: '摄像机',
     switch: '交换机', elec: '电阈值', netthr: '网络阈值', sensor: '传感器阈值',
     'sys.tunnel': '远程运维通道',
+    'sys.device': '设备命名与型号',
     'net.server': '平台服务器', 'net.server.wired': '有线平台服务器',
     'net.server.wireless': '无线平台服务器', 'net.server.upgrade': '升级服务器',
     'net.server.log': '日志服务器',
@@ -620,6 +621,29 @@
     card.appendChild(hint);
     var grid = el('div', 'grid');
     card.appendChild(grid);
+
+    /* ---- 设备名称（`sys.device.name`，2026-10-22 用户要求可 Web 配）----
+     * 走配置事务（`config.apply`），**不是**身份分区：名称是"这一台叫什么"，
+     * 现场随时会改；身份分区存的是 devid/MAC 那种一改平台就认成另一台设备的东西。
+     * 版本号每次**现取**：本页没有 configCard 帮忙缓存，拿旧版本号提交必然撞 e=-3
+     * （「配置已被别处改动」）—— 那种失败最容易被误读成"没权限"。 */
+    var nameBar = el('div', 'actions');
+    var nameLab = el('label', 'field');
+    nameLab.appendChild(el('span', null, '设备名称'));
+    var inName = document.createElement('input');
+    inName.type = 'text';
+    inName.maxLength = 64;
+    inName.size = 30;
+    inName.placeholder = '如「3 号换热站」；留空＝未命名';
+    nameLab.appendChild(inName);
+    nameBar.appendChild(nameLab);
+    var nameSave = el('button', null, '保存名称');
+    nameSave.type = 'button';
+    nameBar.appendChild(nameSave);
+    card.appendChild(nameBar);
+    var nameMsg = el('p', 'msg', '');
+    card.appendChild(nameMsg);
+
     root.appendChild(card);
 
     /* ---- 设备身份写入（用户 2026-10-17 要求：设备 ID / MAC 可 Web 配置）----
@@ -671,6 +695,8 @@
         $('#verLabel').textContent = st.version;
         hint.textContent = '设备身份与版本。设备 SN 未做工厂写入时取默认值 1（橙色即为默认值）。'
           + '实时状态请看「网络」「摄像机」「控制板」各页。';
+        grid.appendChild(kv('设备名称', dv.name || '未命名',
+          dv.name ? null : 'warn'));
         grid.appendChild(kv('软件版本', fmtVer(dv.version || d.version)));
         grid.appendChild(kv('硬件型号', dv.model || '—'));
         grid.appendChild(kv('主控芯片', dv.soc || '—'));
@@ -689,11 +715,46 @@
         /* 输入框预填当前值。默认值（"1"）也一起填进去，否则用户得自己猜现在是什么。 */
         if (!inId.dataset.touched) inId.value = dv.sn || '';
         if (!inMac.dataset.touched) inMac.value = dv.id_mac || '';
+        if (!inName.dataset.touched) inName.value = dv.name || '';
       });
     }
 
     inId.addEventListener('input', function () { inId.dataset.touched = '1'; });
     inMac.addEventListener('input', function () { inMac.dataset.touched = '1'; });
+    inName.addEventListener('input', function () { inName.dataset.touched = '1'; });
+
+    nameSave.addEventListener('click', function () {
+      var v = (inName.value || '').replace(/^\s+|\s+$/g, '');
+      nameSave.disabled = true;
+      nameMsg.textContent = '保存中…';
+      api('/api/config?cls=sys').then(function (r) {
+        if (!r.ok) {
+          nameSave.disabled = false;
+          nameMsg.textContent = '读取配置失败：' + (r.msg || ('错误 ' + r.e));
+          return null;
+        }
+        var items = {};
+        items['sys.device.name'] = v;
+        return api('/api/config/apply',
+          { method: 'POST', body: { ver: r.d.version, items: items } });
+      }).then(function (r) {
+        if (!r) return;
+        nameSave.disabled = false;
+        if (r.ok) {
+          toast('设备名称已保存（版本 ' + r.d.version + '）', 'ok');
+          nameMsg.textContent = '';
+          inName.dataset.touched = '';   /* 交回回读：以设备里存的为准 */
+          loadInfo();
+        } else if (r.e === -3) {
+          nameMsg.textContent = '配置已被别处改动，请刷新后重试';
+        } else {
+          nameMsg.textContent = '保存失败：' + (r.msg || ('错误 ' + r.e));
+        }
+      }).catch(function () {
+        nameSave.disabled = false;
+        nameMsg.textContent = '无法连接服务';
+      });
+    });
 
     idSave.addEventListener('click', function () {
       var dev = inId.value.trim();

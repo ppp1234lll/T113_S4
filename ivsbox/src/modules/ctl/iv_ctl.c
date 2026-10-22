@@ -781,7 +781,7 @@ static void add_str_or_null(json_object *o, const char *k, const char *v)
         json_object_object_add(o, k, NULL);
 }
 
-static void add_device_info(json_object *d)
+static void add_device_info(json_object *d, const iv_config_t *cfg)
 {
     json_object          *dev = json_object_new_object();
     const dev_identity_t *id  = device_identity();
@@ -790,11 +790,20 @@ static void add_device_info(json_object *d)
     char                  soc[64]    = "";
     char                  ethmac[20] = "";
     char                  host[64]   = "";
+    const char           *name       = NULL;
 
     if (dev == NULL)
         return;
 
     json_object_object_add(dev, "version", json_object_new_string(iv_version_string()));
+
+    /* 设备名称来自配置 `sys.device.name`（不是身份分区）：它是**称呼**、不是唯一标识，
+     * 现场随时会改，写进工厂分区既没必要也不该动。空串＝没起名 ⇒ 给 null，
+     * 与"读到了但是空"的其他字段同口径（前端 null 显示"—"）。 */
+    if (cfg != NULL && iv_config_get_str(cfg, "sys.device.name", &name) == IV_OK)
+        add_str_or_null(dev, "name", name);
+    else
+        add_str_or_null(dev, "name", NULL);
 
     read_dt_string("/proc/device-tree/model", model, sizeof model);
     read_dt_string("/proc/device-tree/compatible", soc, sizeof soc);
@@ -936,7 +945,7 @@ static json_object *build_overview(const iv_ctl_ctx_t *ctx)
     json_object_object_add(d, "uptime_ms",
                            json_object_new_int64((int64_t)iv_clock_monotonic_ms()));
     /* 总览页要的那一块（身份/型号/内核/主机名）。其余块留给各自的页面。 */
-    add_device_info(d);
+    add_device_info(d, ctx->cfg);
 
     if (ctx->agent != NULL) {
         iv_netmgr_state_t st = iv_agent_netmgr_state(ctx->agent);

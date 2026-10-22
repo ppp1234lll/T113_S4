@@ -175,7 +175,7 @@ static iv_config_t *reopen_cfg(void)
 /* ===========================================================================
  * §S8.1 ① + F1/F4：文件根本不存在 ⇒ 用内置默认值照常启动
  * 新口径：单文件、八分类、128 容量上限。变长 camera.ch 不预建槽位，
- * 无相机时默认项共 13+11+5+18+20+5+4+5 = 81 项。
+ * 无相机时默认项共 14+11+5+18+20+5+4+5 = 82 项。
  * （sys 13 = debug.mode/reboot.hour/report.interval_s/transport.mode/sample.period_ms
  *   ＋ device.model（E3 应答的 mod，2026-10-20 加）
  *   共 6 ＋ M8-S8.3 的 sys.tunnel.* 7（server.host/port、ttl_s、web/media/cam 三端口、
@@ -206,9 +206,9 @@ static void case_defaults_startup(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c1: stat");
     chk(st.loaded == 0, "c1: loaded == 0 (started from built-in defaults)");
-    chk(st.items == 81u, "c1: 81 non-array defaults materialised");
+    chk(st.items == 82u, "c1: 82 non-array defaults materialised");
     chk(st.from_file == 0u, "c1: nothing came from the file");
-    chk(st.from_default == 81u, "c1: everything came from defaults");
+    chk(st.from_default == 82u, "c1: everything came from defaults");
     chk(st.invalid == 0u, "c1: a missing file is NOT an invalid value");
     chk(st.version == 0u, "c1: version is 0 when there is no file");
     chk(st.dirty == 0, "c1: not dirty right after open");
@@ -551,9 +551,9 @@ static void case_fill_and_origin(void)
         return;
 
     chk(iv_config_stat(c, &st) == IV_OK, "c5: stat");
-    chk(st.items == 81u, "c5: all non-array defaults are materialised");
+    chk(st.items == 82u, "c5: all non-array defaults are materialised");
     chk(st.from_file == 1u, "c5: exactly one key came from the file");
-    chk(st.from_default == 80u, "c5: eighty were filled from defaults");
+    chk(st.from_default == 81u, "c5: eighty-one were filled from defaults");
     chk(st.invalid == 0u, "c5: a MISSING key is not an INVALID key");
     chk(st.loaded == 1, "c5: the file itself loaded fine");
 
@@ -594,7 +594,7 @@ static void case_parent_scalar_rejected(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c6: stat");
     chk(st.invalid == 1u, "c6: the scalar that shadows a subtree is counted as invalid");
-    chk(st.items == 81u, "c6: the whole non-array default set is still there");
+    chk(st.items == 82u, "c6: the whole non-array default set is still there");
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && s[0] == '\0',
         "c6: net.* is usable again (defaulted empty)");
     chk(iv_config_get_int(c, "net", &iv) == IV_ENOENT, "c6: the offending key itself is gone");
@@ -976,8 +976,8 @@ static void case_array_support(void)
                     strcmp(s, "7") == 0,
                 "c10: the 8th element is reachable");
             chk(iv_config_stat(cx, &st8) == IV_OK, "c10: stat on the eight-camera config");
-            chk(st8.items == 81u + 64u,
-                "c10: 8 slots x 8 fields + 81 base == 145 items (fits ITEMS_MAX 192)");
+            chk(st8.items == 82u + 64u,
+                "c10: 8 slots x 8 fields + 82 base == 146 items (fits ITEMS_MAX 192)");
             iv_config_close(cx);
         }
     }
@@ -1043,7 +1043,7 @@ static void case_comment_roundtrip(void)
     chk(iv_config_stat(c, &st) == IV_OK, "c11: stat after round-trip");
     chk(st.loaded == 1, "c11: the rendered file parses back cleanly");
     chk(st.invalid == 0u, "c11: no value was rejected on the round-trip");
-    chk(st.items == 89u, "c11: 81 base keys plus one 8-field camera survived");
+    chk(st.items == 90u, "c11: 82 base keys plus one 8-field camera survived");
 
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "172.16.0.9") == 0,
         "c11: the string survived");

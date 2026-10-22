@@ -169,3 +169,35 @@ int iv_recctl_recording(const iv_recctl_t *r)
 {
     return (r != NULL) ? (int)r->recording : 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * 运行期换配置（2026-10-22：`camera.ch.N.url` / `.record` / `camera.rec.*` 热生效）
+ *
+ * 两种情形分开处理，**不能一律 re-init**：
+ *   - 没在录：直接把新配置装进去，状态清零即可（与 init 等价）；
+ *   - 正在录：先用**旧的** ops 把这一轮收口（stop_all），再按新表重开。
+ *     否则被改掉/删掉的那一路 recorder 会**漏在后台**继续往 SD 卡写，而状态机
+ *     已经忘了它 —— 这种泄漏在板上只能靠 `ps` 抓，日志里一片正常。
+ *
+ * 返回值：`IV_OK`；`IV_EINVAL` 入参非法（在录却没给 ops 也按非法处理，
+ * 因为"不知道该叫谁停"）。
+ * -------------------------------------------------------------------------- */
+int iv_recctl_set_cfg(iv_recctl_t *r, const iv_recctl_cfg_t *cfg,
+                      const iv_recctl_ops_t *ops)
+{
+    int was;
+
+    if (r == NULL || cfg == NULL)
+        return IV_EINVAL;
+    was = r->recording;
+    if (was && ops == NULL)
+        return IV_EINVAL;
+
+    if (was)
+        (void)iv_recctl_stop_all(r, ops);
+    if (iv_recctl_init(r, cfg) != IV_OK)
+        return IV_EINVAL;
+    if (was)
+        (void)start_all(r, ops); /* 新表重开；一路都没起来时 recording 保持 0 */
+    return IV_OK;
+}

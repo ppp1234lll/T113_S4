@@ -10,6 +10,9 @@
  *   c05 start 全被拒 ⇒ 不置位 recording、下拍重试（down_since 连续）
  *   c06 stop_all 手动收尾 + recording 读数
  *   c07 S6.5 容量闸门：关闸抑制开录、开闸即录、水位告急立即停录、step 兜底路径
+ *   c08 运行期换配置（`iv_recctl_set_cfg`，2026-10-22 `camera.ch.N.url` 热生效）：
+ *       没在录＝等价 init；正在录＝先用旧表收口再按新表重开；在录却没给 ops 回
+ *       `IV_EINVAL`；新表全空则停完不重开
  *
  * 反向证伪（本用例内建）：
  *   f1 若把"保持"判据去掉（到达 hold 前就开录），c02 的保持段会提前动作；
@@ -19,7 +22,10 @@
  *   f4 若去掉"闸门关时不核准开录"（step 里删掉 gate_block 判断），c07 会在关闸
  *      状态下开录；
  *   f5 若去掉"闸门要求停录即立即停"，c07 会一直录到恢复防抖（或根本不录）。
- * 三者都由对应的 chk 钉死：动作次数是精确断言，多一次/少一次都红。
+ *   f6 若把 `iv_recctl_set_cfg()` 里的"在录先 stop_all"去掉（只换 cfg），c08 的
+ *      `n_stop` 会变 0 —— 被删掉那一路的 recorder 会漏在后台继续写 SD 卡，
+ *      而状态机已经不认它了（板上只能靠 `ps` 抓到）。
+ * 以上都由对应的 chk 钉死：动作次数是精确断言，多一次/少一次都红。
  */
 #include <stdio.h>
 #include <string.h>
@@ -246,11 +252,82 @@ int main(void)
     r.gate_stop = 0;
     chk(iv_recctl_step(&r, 0, 0, 40000, &ops) == 0, "c07: clean state after safe-path stop");
 
+    /* ---------------- c08 运行期换配置（iv_recctl_set_cfg） ---------------- */
+    {
+        iv_recctl_cfg_t one;
+        iv_recctl_cfg_t none;
+
+        iv_recctl_cfg_default(&one);
+        one.n_url = 1;
+        snprintf(one.url[0], sizeof(one.url[0]), "rtsp://10.0.0.99/ch9");
+        iv_recctl_cfg_default(&none); /* n_url = 0：新表全空 */
+
+        /* 入参守卫 */
+        chk(iv_recctl_set_cfg(NULL, &one, &ops) == IV_EINVAL, "c08: NULL r -> EINVAL");
+        chk(iv_recctl_set_cfg(&r, NULL, &ops) == IV_EINVAL, "c08: NULL cfg -> EINVAL");
+
+        /* ① 没在录：等价 init —— 换表、状态清零、不触发任何动作 */
+        memset(&f, 0, sizeof(f));
+        chk(iv_recctl_init(&r, &cfg) == IV_OK, "c08: init with the 2-url table");
+        r.down_since_ms = 777; /* 哨兵：init 必须把它清掉 */
+        chk(iv_recctl_set_cfg(&r, &one, &ops) == IV_OK, "c08: set_cfg while idle -> OK");
+        chk(r.cfg.n_url == 1, "c08: idle swap takes the new table");
+        chk(strcmp(r.cfg.url[0], "rtsp://10.0.0.99/ch9") == 0, "c08: idle swap takes the url");
+        chk(r.down_since_ms == 0, "c08: idle swap zeroes the state (= init)");
+        chk(f.n_start == 0 && f.n_stop == 0, "c08: idle swap fires no action");
+
+        /* ② 在录：先用**旧**表收口（2 路各 stop），再按新表开（1 路）。
+         * 只换 cfg 而不 stop 会把被删掉那一路的 recorder 漏在后台（f6）。 */
+        chk(iv_recctl_init(&r, &cfg) == IV_OK, "c08: re-init with the 2-url table");
+        (void)iv_recctl_step(&r, 0, 0, 1000, &ops);  /* 起计时 */
+        (void)iv_recctl_step(&r, 0, 0, 11000, &ops); /* 到 hold：2 路开起来 */
+        chk(iv_recctl_recording(&r) == 1, "c08: old table recording");
+        memset(&f, 0, sizeof(f));
+        chk(iv_recctl_set_cfg(&r, &one, &ops) == IV_OK, "c08: set_cfg while recording -> OK");
+        chk(f.n_stop == 2, "c08: the OLD table is stopped first (2 ch, not 1) (f6)");
+        chk(f.stop_id[0] == 0 && f.stop_id[1] == 1, "c08: stop ids follow the old table");
+        chk(f.n_start == 1, "c08: the new table is started (1 ch)");
+        chk(strcmp(f.start_url[0], "rtsp://10.0.0.99/ch9") == 0,
+            "c08: the new url is used for the restart");
+        chk(r.cfg.n_url == 1, "c08: cfg swapped while recording");
+        chk(iv_recctl_recording(&r) == 1, "c08: still recording after the swap");
+
+        /* ③ 在录却没给 ops ⇒ 不知道该叫谁停，按非法处理且状态一字不动 */
+        memset(&f, 0, sizeof(f));
+        chk(iv_recctl_set_cfg(&r, &one, NULL) == IV_EINVAL,
+            "c08: recording but no ops -> EINVAL");
+        chk(iv_recctl_recording(&r) == 1, "c08: rejected swap leaves recording alone");
+        chk(r.cfg.n_url == 1, "c08: rejected swap leaves cfg alone");
+        chk(f.n_stop == 0 && f.n_start == 0, "c08: rejected swap fires nothing");
+
+        /* ④ 新表全空（所有路都被删/关掉）：停完不重开 */
+        memset(&f, 0, sizeof(f));
+        chk(iv_recctl_set_cfg(&r, &none, &ops) == IV_OK, "c08: swap to an empty table -> OK");
+        chk(f.n_stop == 1, "c08: the last channel is stopped");
+        chk(f.n_start == 0, "c08: nothing restarts with an empty table");
+        chk(iv_recctl_recording(&r) == 0, "c08: recording cleared by the empty table");
+
+        /* ⑤ 新表有地址但一路都起不来 ⇒ 不许把 recording 虚报回 1 */
+        chk(iv_recctl_init(&r, &cfg) == IV_OK, "c08: re-init for the reject case");
+        (void)iv_recctl_step(&r, 0, 0, 1000, &ops);
+        (void)iv_recctl_step(&r, 0, 0, 11000, &ops);
+        chk(iv_recctl_recording(&r) == 1, "c08: old channels recording (reject case)");
+        memset(&f, 0, sizeof(f));
+        f.start_fail = 1;
+        chk(iv_recctl_set_cfg(&r, &one, &ops) == IV_OK,
+            "c08: swap with a failing start -> OK (state machine still consistent)");
+        chk(f.n_stop == 2, "c08: old channels stopped anyway");
+        chk(f.n_start_att == 1, "c08: new channel start attempted once");
+        chk(iv_recctl_recording(&r) == 0,
+            "c08: recording NOT faked when the new table cannot start");
+        f.start_fail = 0;
+    }
+
     if (g_fail != 0) {
         fprintf(stderr, "test_recctl FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_recctl passed (hold/debounce edges, retry-on-reject, manual stop, "
-           "storage gate)\n");
+           "storage gate, runtime config swap)\n");
     return 0;
 }

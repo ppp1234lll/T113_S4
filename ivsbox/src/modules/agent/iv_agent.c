@@ -257,6 +257,79 @@ static void agent_probe_seed_links(iv_agent_t *a, uint64_t now_ms)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * S4.3 SNMP 采集作业装配（`a->cfg.snmp[t]` → `a->snmp_job[t]`）
+ *
+ * 抽成函数是为了**热生效**（2026-10-22 `camera.snmp.*` / `switch.snmp.*`）：
+ * open 和 reload 必须用同一段装配逻辑，否则"改完生效"和"开机生效"迟早漂移。
+ *
+ * ⚠ 作业在飞时**不能动 `jb`**：`snmp_task_fn` 在慢池里正读它（host/community/
+ * oid 表全在里面）。这种情况下只置 `snmp_stale[t]`，等这一轮落地后由
+ * `iv_agent_snmp_start()` 重装 —— 与 S4.4"保留队头、下一拍再试"同一套做法。
+ * ------------------------------------------------------------------------- */
+static void snmp_job_apply(iv_agent_t *a, int t)
+{
+    const iv_agent_snmp_cfg_t *sc = &a->cfg.snmp[t];
+    iv_agent_snmp_job_t       *jb = &a->snmp_job[t];
+    int                        k;
+
+    if (a->snmp_state[t] == IV_AGENT_SNMP_RUN) {
+        a->snmp_stale[t] = 1u; /* 在飞：等落地 */
+        return;
+    }
+
+    memset(jb, 0, sizeof(*jb));
+    iv_snmp_target_default(&jb->t);
+    jb->t.iops = iv_snmp_default_iops();
+    jb->owner  = a;
+    jb->which  = t;
+    if (sc->port != 0u)
+        jb->t.port = sc->port;
+    if (sc->timeout_ms != 0u)
+        jb->t.timeout_ms = sc->timeout_ms;
+    if (sc->retries != 0u)
+        jb->t.retries = sc->retries;
+    if (sc->max_rows != 0u)
+        jb->t.max_rows = sc->max_rows;
+    (void)snprintf(jb->t.community, sizeof(jb->t.community), "%s", sc->community);
+    if (sc->ip_be != 0u) {
+        struct in_addr in;
+
+        in.s_addr = sc->ip_be;
+        (void)inet_ntop(AF_INET, &in, jb->t.host, sizeof(jb->t.host));
+    }
+    jb->n_slot = (sc->n_oid > 0) ? sc->n_oid : 0;
+    if (jb->n_slot > (int)IV_AGENT_SNMP_SLOT_MAX)
+        jb->n_slot = (int)IV_AGENT_SNMP_SLOT_MAX;
+    for (k = 0; k < jb->n_slot; k++)
+        (void)snprintf(jb->slot[k].oid, sizeof(jb->slot[k].oid), "%s", sc->oid[k]);
+    a->snmp_reqid[t] = 1u + (uint32_t)t * 0x1000u;
+    a->snmp_state[t] = IV_AGENT_SNMP_IDLE;
+    a->snmp_stale[t] = 0u;
+}
+
+/* 归一化一份 SNMP 目标配置：把"0 表示取默认"的几项按模块默认值填实，
+ * 再逐字节比较 —— 热更判据必须是**解析后的目标**，否则 0 与 161 会被当成
+ * "变了"，改个不相干的键也要重建一次作业（还会把就绪结果丢掉）。 */
+static void snmp_cfg_norm(iv_agent_snmp_cfg_t *d, const iv_agent_snmp_cfg_t *s)
+{
+    int k;
+
+    memset(d, 0, sizeof(*d));
+    d->enable     = s->enable;
+    d->ip_be      = s->ip_be;
+    d->port       = (s->port != 0u) ? s->port : (uint16_t)IV_SNMP_PORT_DEFAULT;
+    d->timeout_ms = (s->timeout_ms != 0u) ? s->timeout_ms : IV_SNMP_TIMEOUT_MS_DEFAULT;
+    d->retries    = (s->retries != 0u) ? s->retries : IV_SNMP_RETRIES_DEFAULT;
+    d->max_rows   = (s->max_rows != 0u) ? s->max_rows : IV_SNMP_MAX_ROWS_DEFAULT;
+    (void)snprintf(d->community, sizeof(d->community), "%s", s->community);
+    d->n_oid = (s->n_oid > 0) ? s->n_oid : 0;
+    if (d->n_oid > (int)IV_AGENT_SNMP_SLOT_MAX)
+        d->n_oid = (int)IV_AGENT_SNMP_SLOT_MAX;
+    for (k = 0; k < d->n_oid; k++)
+        (void)snprintf(d->oid[k], sizeof(d->oid[k]), "%s", s->oid[k]);
+}
+
 int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
                   uint64_t now_ms)
 {
@@ -398,42 +471,11 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
         }
     }
 
-    /* ---- 4c. M4-S4.3 SNMP 采集作业（**收发在慢任务池**，这里是纯参数装配）---- */
-    for (t = 0; t < IV_AGENT_SNMP_TARGET_N; t++) {
-        const iv_agent_snmp_cfg_t *sc = &cfg->snmp[t];
-        iv_agent_snmp_job_t       *jb = &a->snmp_job[t];
-        int                        k;
-
-        memset(jb, 0, sizeof(*jb));
-        iv_snmp_target_default(&jb->t);
-        jb->t.iops = iv_snmp_default_iops();
-        jb->owner  = a;
-        jb->which  = t;
-        if (sc->port != 0u)
-            jb->t.port = sc->port;
-        if (sc->timeout_ms != 0u)
-            jb->t.timeout_ms = sc->timeout_ms;
-        if (sc->retries != 0u)
-            jb->t.retries = sc->retries;
-        if (sc->max_rows != 0u)
-            jb->t.max_rows = sc->max_rows;
-        (void)snprintf(jb->t.community, sizeof(jb->t.community), "%s",
-                       sc->community);
-        if (sc->ip_be != 0u) {
-            struct in_addr in;
-
-            in.s_addr = sc->ip_be;
-            (void)inet_ntop(AF_INET, &in, jb->t.host, sizeof(jb->t.host));
-        }
-        jb->n_slot = (sc->n_oid > 0) ? sc->n_oid : 0;
-        if (jb->n_slot > (int)IV_AGENT_SNMP_SLOT_MAX)
-            jb->n_slot = (int)IV_AGENT_SNMP_SLOT_MAX;
-        for (k = 0; k < jb->n_slot; k++)
-            (void)snprintf(jb->slot[k].oid, sizeof(jb->slot[k].oid), "%s",
-                           sc->oid[k]);
-        a->snmp_reqid[t] = 1u + (uint32_t)t * 0x1000u;
-        a->snmp_state[t] = IV_AGENT_SNMP_IDLE;
-    }
+    /* ---- 4c. M4-S4.3 SNMP 采集作业（**收发在慢任务池**，这里是纯参数装配）----
+     * 装配搬进 `snmp_job_apply()`：热更（`iv_agent_reload_snmp()`）走同一段，
+     * 不许出现"开机一套、改配置另一套"。 */
+    for (t = 0; t < IV_AGENT_SNMP_TARGET_N; t++)
+        snmp_job_apply(a, t);
     if (cfg->pool != NULL)
         IV_LOG_I(AG_MOD, "snmp: cam(enable=%d n=%d host=%s) sw(enable=%d n=%d host=%s)",
                  cfg->snmp[IV_AGENT_SNMP_CAM].enable, a->snmp_job[IV_AGENT_SNMP_CAM].n_slot,
@@ -1763,6 +1805,138 @@ int iv_agent_reload_netthr(iv_agent_t *a, int reboot_max, uint32_t cooldown_s,
     return rc;
 }
 
+/* ---------------------------------------------------------------------------
+ * 运行期热更新：断网录像源表（`camera.ch.N.url` / `.record` / `camera.rec.*`）
+ *
+ * 原先这四项只在 `agent_setup()`/`iv_agent_open()` 里读一次 ⇒ 网页上改了"这一路
+ * 要不要录 / 拉流地址 / 保持与防抖时间"必须重启主控。`camera.ch.N.ip` 早在
+ * 10-22 11:20 就热了，同一张表里相邻的两列却要重启，现场最容易踩。
+ *
+ * `hold_ms`/`debounce_ms` 传 `0` ＝ "这一项没给"（与 `iv_agent_reload_camdet()`
+ * 同口径），归一化成模块默认值后再比 —— 判据是**解析后的目标**，否则每次整类
+ * 提交都会被当成"变了"，白白把一轮录像拆了重开。
+ *
+ * 正在录时由 `iv_recctl_set_cfg()` 负责收口：先停这一轮再按新表重开，
+ * 不把旧 recorder 漏在后台。返回值：`IV_OK` / `IV_EINVAL` / `IV_ESTATE`。
+ * -------------------------------------------------------------------------- */
+int iv_agent_reload_rec(iv_agent_t *a, const char *const *urls, int n,
+                        uint32_t hold_ms, uint32_t debounce_ms)
+{
+    iv_recctl_cfg_t  rcfg;
+    iv_recctl_ops_t  ops;
+    uint32_t         nhold = (hold_ms != 0u) ? hold_ms : IV_RECCTL_HOLD_MS_DEFAULT;
+    uint32_t         ndbt  = (debounce_ms != 0u) ? debounce_ms
+                                                 : IV_RECCTL_DEBOUNCE_MS_DEFAULT;
+    int              i;
+    int              changed = 0;
+    int              n_eff   = 0;
+
+    if (a == NULL || urls == NULL)
+        return IV_EINVAL;
+    if (n < 0 || n > IV_RECCTL_CH_N)
+        return IV_EINVAL;
+    if (!a->opened)
+        return IV_ESTATE;
+    /* 桥接没起来就没有 recm 可改（与 `iv_agent_open()` 的装配条件同口径）：
+     * 这时配置已经存进文件了，下次 open 自然按新值建表。 */
+    if (!a->media.inited)
+        return IV_ESTATE;
+
+    if ((int)a->cfg.rec_n_url != n || a->cfg.rec_hold_ms != nhold ||
+        a->cfg.rec_debounce_ms != ndbt)
+        changed = 1;
+    for (i = 0; i < n; i++) {
+        const char *u = (urls[i] != NULL) ? urls[i] : "";
+
+        if (strcmp(a->cfg.rec_url[i], u) != 0)
+            changed = 1;
+    }
+    if (!changed)
+        return IV_OK; /* 整类提交的常态：改的是别的键，一个字都不动 */
+
+    /* ① 记到 `a->cfg`（与 open 的归一化口径一致，下次比对才不会永远不等） */
+    a->cfg.rec_n_url       = n;
+    a->cfg.rec_hold_ms    = nhold;
+    a->cfg.rec_debounce_ms = ndbt;
+    for (i = 0; i < IV_RECCTL_CH_N; i++)
+        a->cfg.rec_url[i][0] = '\0';
+    for (i = 0; i < n; i++)
+        (void)snprintf(a->cfg.rec_url[i], sizeof(a->cfg.rec_url[i]), "%s",
+                       (urls[i] != NULL) ? urls[i] : "");
+
+    /* ② 落到状态机 */
+    iv_recctl_cfg_default(&rcfg);
+    if (hold_ms != 0u)
+        rcfg.hold_ms = hold_ms;
+    if (debounce_ms != 0u)
+        rcfg.debounce_ms = debounce_ms;
+    rcfg.n_url = n;
+    for (i = 0; i < n; i++)
+        (void)snprintf(rcfg.url[i], sizeof(rcfg.url[i]), "%s",
+                       (urls[i] != NULL) ? urls[i] : "");
+    for (i = 0; i < n; i++)
+        if (rcfg.url[i][0] != '\0')
+            n_eff++;
+
+    ops.start = rec_media_start;
+    ops.stop  = rec_media_stop;
+    ops.arg   = a;
+    if (iv_recctl_set_cfg(&a->recm, &rcfg, &ops) != IV_OK) {
+        IV_LOG_W(AG_MOD, "rec sources not applied");
+        return IV_EFAIL;
+    }
+    IV_LOG_I(AG_MOD, "rec sources reloaded: urls=%d/%d hold=%ums debounce=%ums",
+             n_eff, n, (unsigned)rcfg.hold_ms, (unsigned)rcfg.debounce_ms);
+    return IV_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * 运行期热更新：SNMP 目标（`camera.snmp.*` / `switch.snmp.*`）
+ *
+ * 原先这两组键只在 `agent_setup()` 里读一次 ⇒ 网页上改 community/端口/OID 表
+ * 必须重启主控才生效（"改配置不生效"清单里的一条）。现场最典型的动作是
+ * 换交换机 community 或补一个 OID 槽位。
+ *
+ * 判据是**归一化后的目标**（`0` 与默认值等价）：整类配置提交都会进这个函数，
+ * 只改别的键时它是空转，必须早返回 —— 否则每存一次配置就把就绪的采集结果
+ * 清一次（`snmp_job_apply()` 会 memset 作业）。
+ *
+ * 作业在飞时不动 `jb`，只置 `snmp_stale[t]`，由 `iv_agent_snmp_start()` 落地。
+ * 返回值：`IV_OK`（可能什么都没变）/ `IV_EINVAL` / `IV_ESTATE`（未 open）。
+ * -------------------------------------------------------------------------- */
+int iv_agent_reload_snmp(iv_agent_t *a, const iv_agent_snmp_cfg_t *sc)
+{
+    int t;
+    int changed = 0;
+
+    if (a == NULL || sc == NULL)
+        return IV_EINVAL;
+    if (!a->opened)
+        return IV_ESTATE;
+
+    for (t = 0; t < IV_AGENT_SNMP_TARGET_N; t++) {
+        iv_agent_snmp_cfg_t oldn;
+        iv_agent_snmp_cfg_t newn;
+
+        snmp_cfg_norm(&oldn, &a->cfg.snmp[t]);
+        snmp_cfg_norm(&newn, &sc[t]);
+        if (memcmp(&oldn, &newn, sizeof(oldn)) == 0)
+            continue;
+        /* 先落 cfg：`snmp_job_apply()` 与 `iv_agent_snmp_start()` 都读 `a->cfg` */
+        a->cfg.snmp[t] = newn;
+        snmp_job_apply(a, t);
+        changed++;
+        IV_LOG_I(AG_MOD, "snmp target %d reloaded: enable=%d host=%s slots=%d%s",
+                 t, newn.enable, a->snmp_job[t].t.host, a->snmp_job[t].n_slot,
+                 (a->snmp_stale[t] != 0u) ? " (job in flight: applied on next poll)"
+                                          : "");
+    }
+    if (changed > 0)
+        IV_LOG_I(AG_MOD, "snmp.* hot reload: %d/%d target(s) changed", changed,
+                 (int)IV_AGENT_SNMP_TARGET_N);
+    return IV_OK;
+}
+
 int iv_agent_netthr_view(const iv_agent_t *a, iv_agent_netthr_view_t *out)
 {
     int i;
@@ -1855,6 +2029,14 @@ int iv_agent_snmp_start(iv_agent_t *a, int which, uint64_t now_ms)
 
     if (a == NULL || which < 0 || which >= IV_AGENT_SNMP_TARGET_N)
         return IV_EINVAL;
+    /* 上一轮在飞期间配置被改过（`iv_agent_reload_snmp()` 只置了 stale）：
+     * 现在状态机空闲了，把新目标装进 `jb` 再判能不能发。
+     * 顺序很关键，**两道守卫都必须排在这之后**：
+     *   - 先判 `n_slot` 会把"刚配上 OID 的目标"永久判成不可采；
+     *   - 先判 `pool == NULL` 会让 stale 永远挂着，而 `jb` 里还是旧目标 ——
+     *     落地是纯状态归一化，与本拍有没有池、开没开、有没有 OID 无关。 */
+    if (a->snmp_stale[which] != 0u)
+        snmp_job_apply(a, which);
     if (a->cfg.pool == NULL)
         return IV_ESTATE; /* 无慢任务池：阻塞式收发绝不上 Reactor 线程 */
     sc = &a->cfg.snmp[which];

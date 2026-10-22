@@ -419,6 +419,8 @@ typedef struct {
 
     uint8_t      mn_last[IV_RECOVERY_MASTER_N]; /* S4.4 主网每路上一次 MN 状态（1/2） */
     uint8_t      snmp_state[IV_AGENT_SNMP_TARGET_N]; /* 0 空闲 / 1 在飞 / 2 就绪 */
+    uint8_t      snmp_stale[IV_AGENT_SNMP_TARGET_N]; /* 1 = 配置换了但作业正在飞，
+                                                      * 等它落地后由 start 重装 */
     uint32_t     snmp_reqid[IV_AGENT_SNMP_TARGET_N]; /* request-id 递增种子 */
     uint64_t     snmp_runs;           /* 累计完成的采集轮数 */
     uint64_t     snmp_slot_noval;     /* 累计"该项无值"（无应答/异常值）槽位次数 */
@@ -695,6 +697,41 @@ int iv_agent_camdet_probe(iv_agent_t *a, int ch, uint64_t now_ms);
  * ------------------------------------------------------------------------- */
 int iv_agent_reload_netthr(iv_agent_t *a, int reboot_max, uint32_t cooldown_s,
                            uint32_t loss_count);
+
+/* ============================ 录像源表热生效 ============================
+ * 2026-10-22：`camera.ch.N.url` / `camera.ch.N.record` / `camera.rec.hold_ms` /
+ * `camera.rec.debounce_ms` 原先只在 `iv_agent_open()` 读一次 ⇒ 改了必须重启主控。
+ * 同一张 `camera.ch` 表里 `ip` 早在 11:20 就热了，相邻几列却要重启，现场最容易踩。
+ *
+ * ============================ 参数口径 ============================
+ * `urls`：`n` 个 C 串，**空串或 `NULL` ＝ 该路不进表**（与 `cfg_rec_sources()`
+ *   的"url 非空 且 record 为真"同义，判定在 app 层做完再传进来）。
+ * `n`：`0..IV_RECCTL_CH_N`（表长，允许中间留洞）。
+ * `hold_ms` / `debounce_ms`：`0` ⇒ **跳过**（`0` 在 recctl 语境是"取默认"，
+ *   不是有效时长）。归一化后的有效值与现值全等就 `IV_OK` 早返回、一个模块都不碰 ——
+ *   整类提交（改个别的不相干键）是常态，早返回是硬要求。
+ *
+ * **正在录时会先把这一轮收口再按新表重开**（见 `iv_recctl_set_cfg()`）：只改
+ * `cfg` 会让被删掉的那一路 recorder 漏在后台继续写 SD 卡。
+ *
+ * 返回 `IV_OK` / `IV_EINVAL` / `IV_ESTATE`（未 open，或 media 桥接没起来 ——
+ * 这种情形配置已落盘，下次 open 按新值建表）。
+ * ------------------------------------------------------------------------- */
+int iv_agent_reload_rec(iv_agent_t *a, const char *const *urls, int n,
+                        uint32_t hold_ms, uint32_t debounce_ms);
+
+/* ============================ SNMP 目标热生效 ============================
+ * 2026-10-22：`camera.snmp.*` / `switch.snmp.*` 原先只在 `agent_setup()` 读一次 ⇒
+ * 换交换机 community、补一个 OID 槽位都要重启主控。
+ *
+ * `sc`：`IV_AGENT_SNMP_TARGET_N` 项（cam/sw），**按数组顺序**对齐。
+ * 判据是**归一化后的目标**（`port/timeout/retries/max_rows` 的 `0` 折成模块默认；
+ * `n_oid` 截到槽位上限），归一化后逐字节相同就跳过该目标。
+ *
+ * **作业在飞时不改作业**（慢池里正读它），只置 `snmp_stale[t]`，由
+ * `iv_agent_snmp_start()` 在空闲时落地。返回 `IV_OK` / `IV_EINVAL` / `IV_ESTATE`。
+ * ------------------------------------------------------------------------- */
+int iv_agent_reload_snmp(iv_agent_t *a, const iv_agent_snmp_cfg_t *sc);
 
 /* `netthr.*` 的**运行期真值**（诊断/取证/Web 展示）。
  *

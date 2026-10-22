@@ -5475,3 +5475,86 @@ if (!slots.length) { box.appendChild(el('p', 'hint', '尚无采集结果')); ret
 
 
 
+
+== 2026-10-22 20:12 录像源表与 SNMP 目标热生效（`camera.ch.N.url` / `camera.snmp.*` / `switch.snmp.*`）
+
+=== 干了什么事
+
+把"改完必须重启主控"的最后两组键接上运行期热更：
+
+[cols="1,3,3"]
+|===
+| 层 | 新增 | 为什么在这一层
+
+| 状态机
+| `iv_recctl_set_cfg()`（`iv_recctl.h` / `iv_recctl.c`）
+| "在录时换表"必须由**持有 recorder 状态的那一层**收口：先按旧表 stop，再按新表 start。放装配层做，早晚会漏掉"旧表比新表长"的那几路
+
+| 模块
+| `iv_agent_reload_rec()` / `iv_agent_reload_snmp()` ＋ `snmp_stale[]`（`iv_agent.h` / `iv_agent.c`）
+| 归一化、同值早返回、在飞保护都是本层的内部约定（`cfg` 与模块值谁说了算），装配层不该重复一遍
+
+| 装配
+| `cfg_snmp_targets()` / `cfg_rec_url_table()` ＋ `on_cfg_committed()` 两个分支
+| 开机装配与热更**必须同源**：两处各写一遍，加一个新键时只会改一处，另一半悄悄回默认
+
+|===
+
+=== 六条"为什么这么做"
+
+* **在录时不能只换 cfg**：`recording` 下面挂着真实 recorder。只换配置，被删/改地址那一路
+  会**漏在后台继续写 SD 卡**，状态机已忘了它 —— 板上只能靠 `ps` 抓到，日志一片正常。
+  所以 `iv_recctl_set_cfg()` 先 `stop_all()`（用**旧**表），再 `init()` 新表、`start_all()`。
+* **新表一路都起不来 ⇒ 不虚报在录**：`start_all()` 返回 0 时 `recording` 保持 0，下拍由
+  状态机自己重试（与"start 被拒不置位"同一口径）。
+* **整类回调必须空转**：`on_cfg_committed()` 的粒度是一级分类子树，改
+  `camera.detect.rtt_ms` 也会进来。而 `snmp_job_apply()` 会 `memset` 作业、
+  `iv_recctl_set_cfg()` 会拆掉在录会话 ⇒ **同值早返回不是优化，是不把就绪结果和
+  在录会话白白拆掉**。
+* **判据是归一化后的目标**：`snmp_cfg_norm()` 把 `port 0` 折成 161、`hold_ms 0` 折成
+  10000 再逐字节比。否则 `0` 与默认值每次都被判成"变了"，改个不相干的键也重建作业。
+* **在飞只置 stale**：慢池里的 `snmp_task_fn` 正读 `jb`（host/community/OID 表），
+  这时 `memset` 它就是数据竞争。只置 `snmp_stale[t]`，由 `iv_agent_snmp_start()` 落地。
+  落地**排在"有没有池 / 开没开 / 有没有 OID"三道守卫之前** —— 先判 `pool == NULL`
+  会让 stale 永远挂着，等池子就绪第一次用的还是旧表。
+* **订阅掩码是独立的一步**：SWITCH 分支写好了、掩码漏了 `IV_CFG_CLS_SWITCH` ⇒ 回调根本
+  不被调用。更隐蔽的是 CAMERA 分支会"顺手把两个目标一起送"，新值拖到下一次 camera
+  提交才生效，日志上隔一整步，看着像慢半拍。这是"接线在装配层"的第 5 次，
+  **单测永远抓不到**（`on_cfg_committed` 在 app 层，不进静态库）—— 只有
+  `tests/integration/hotcfg_e2e.py` 真拉进程才看得见，H5 就是这么红的。
+
+=== 顺带修掉的一颗地雷：`iv_media` 的退出标志数据竞争
+
+`worker_main()` 里 `while (!m->stop)` **不在锁内**，而 `iv_media_fini()` 在锁内写它
+⇒ 裸读写就是数据竞争，`setarch -R make tsan` 老实报了一条
+（`Read … worker_main iv_media.c:230` 对 `Previous write … iv_media_fini iv_media.c:380`）。
+三处访问统一改成 relaxed 原子（**只把读改原子、写仍裸写照样被判竞争**，所以必须一起改），
+与 `iv_taskpool` 的进度号/cancel 标志同一套做法；armv7 上是单条 ldr/str，不引入 libatomic。
+这条不是本轮引入的（`iv_media.c` 一行没动），属长期潜伏、被这次全量重编的时序撞上。
+
+=== 验证
+
+* 门禁：`test` **44/44**（新增 `test_agent_hotcfg`）、`arm`/`analyze` 零告警、
+  `asan` 44/44 零报告、`setarch -R make tsan` 44/44 零报告、`fuzz` 3×10 s 零报告；
+  `itest` 仍 17 条（16 通过 ＋ 1 SKIP）。**tsan 第一次是红的**，修完复绿（见上节）。
+* 新增用例：`test_recctl` **c08**（`set_cfg`：空闲等价 init / 在录先停旧表再开新表 /
+  在录不给 ops 回 `EINVAL` / 新表全空只停不开 / 新表起不来不虚报在录）；`test_agent_hotcfg`
+  **h01~h07**（守卫、录像源同值早返回、真变更落地、SNMP 归一化早返回、真变更重建、
+  在飞只置 stale、stale 由 start 落地）。
+* **反向证伪 8 条**（撤掉修复 → 重编零告警且二进制 mtime 变新 → 断言变红 → 还原复绿）：
+  不先 `stop_all` → c08 红；不归一 port → h04 红；去掉在飞判断 → h06 红；stale 落地挪到
+  pool 守卫后 → h07 红；去掉 `reload_rec` 同值早返回 → h02 红；掩码去 SWITCH → H5b 红；
+  camera 分支不送 SNMP → H2b 红；不比对整包重建 → H3c 红。
+* 装配层 e2e `hotcfg_e2e.py` **25 条断言全过**（H1~H8，见脚本头）。
+* 板端（`ivsboxd` md5 `7473160c2c59eb8d4bdbf0c2a7ec8848`，与 VM `build/arm` 一致）：
+  改 `camera.snmp.timeout_ms` / `switch.snmp.timeout_ms` / `camera.rec.hold_ms` 各自出现
+  `snmp target N reloaded` / `rec sources reloaded`，**pid 全程不变**；改 CAMERA 类里
+  无消费者的 `camera.ch.0.stream` **零热更日志**；收尾三键复原、`ERR|CRIT` 0 条。
+
+=== 未做（登记）
+
+* 板端没演练"正在录时换地址"的真实停/开（会打断现场录像）—— 该路径由 c08 ＋ e2e H3/H4 覆盖。
+* `camera.ch.N` 的 `vendor`/`mac`/`user`/`pass`/`stream` **全工程没有消费者**（纯页面档案），
+  谈不上热生效；`pass` 还卡在 F8 密钥分离。
+* `camera.snmp.port` 与 `max_rows` 没有配置键（`cfg_snmp_target()` 不读），端口归一化实际
+  只对交换机目标生效。

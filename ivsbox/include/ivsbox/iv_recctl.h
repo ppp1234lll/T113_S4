@@ -116,6 +116,16 @@ int iv_recctl_stop_all(iv_recctl_t *r, const iv_recctl_ops_t *ops);
 /* 当前是否在录。 */
 int iv_recctl_recording(const iv_recctl_t *r);
 
+/* 运行期换配置（2026-10-22：`camera.ch.N.url` / `.record` / `camera.rec.*` 热生效）。
+ *
+ * **没在录** ＝ 等价于 init；**正在录** ＝ 先用 `ops` 把这一轮逐路 stop 收口，
+ * 再按新表重开 —— 不能只改 `cfg`：被删掉/改掉的那一路 recorder 会漏在后台
+ * 继续写 SD 卡，而状态机已经不认识它了。
+ * 因此"在录却没给 `ops`"按 `IV_EINVAL` 处理（不知道该叫谁停）。
+ * 返回 `IV_OK` / `IV_EINVAL`。 */
+int iv_recctl_set_cfg(iv_recctl_t *r, const iv_recctl_cfg_t *cfg,
+                      const iv_recctl_ops_t *ops);
+
 #ifdef __cplusplus
 }
 #endif

@@ -221,13 +221,36 @@ static void ka_one(iv_media_t *m, int id, uint64_t now)
     pthread_mutex_unlock(&m->lock);
 }
 
+/* ---------------------------------------------------------------------------
+ * 退出标志的跨线程访问
+ *
+ * `stop` 是**唯一的跨线程标志**：调用方在 `iv_media_fini()` 里写，worker 在读。
+ * 而 worker 那句 `while (!m->stop)` **不在锁内**（锁内那句 `!m->stop && q_count==0`
+ * 才是有序的）⇒ 裸读写就是数据竞争，`make tsan` 会如实报一条
+ * （2026-10-22 门禁上真的红过一次：`Read of size 1 … worker_main iv_media.c:230`
+ * 对 `Previous write … iv_media_fini iv_media.c:380`）。
+ *
+ * 三处一律走 relaxed 原子，**不许混着来**：只把读改成原子、写还是裸写，TSan 照样判
+ * 竞争（原子与非原子访问同一地址同样是竞争）。做法与 iv_taskpool 的进度号/cancel
+ * 标志完全一致；armv7 上 1/4 字节 relaxed 访问是单条 ldr/str，不会引入 libatomic。
+ * ------------------------------------------------------------------------- */
+static int media_stopped(iv_media_t *m)
+{
+    return (int)__atomic_load_n(&m->stop, __ATOMIC_RELAXED);
+}
+
+static void media_request_stop(iv_media_t *m)
+{
+    __atomic_store_n(&m->stop, 1u, __ATOMIC_RELAXED);
+}
+
 static void *worker_main(void *arg)
 {
     iv_media_t *m = arg;
     uint32_t    ka = (m->cfg.ka_period_ms != 0u) ? m->cfg.ka_period_ms : 60000u;
 
     m->last_ka_ms = mono_ms();
-    while (!m->stop) {
+    while (media_stopped(m) == 0) {
         char     path[IV_MEDIA_URL_MAX];
         int      have = 0;
         uint64_t now;
@@ -306,7 +329,7 @@ static void *worker_main(void *arg)
                 ts.tv_nsec -= 1000000000L;
             }
             pthread_mutex_lock(&m->lock);
-            if (!m->stop && m->q_count == 0)
+            if (media_stopped(m) == 0 && m->q_count == 0)
                 pthread_cond_timedwait(&m->cond, &m->lock, &ts);
             pthread_mutex_unlock(&m->lock);
         }
@@ -377,7 +400,7 @@ void iv_media_fini(iv_media_t *m)
 
     if (m->worker_up) {
         pthread_mutex_lock(&m->lock);
-        m->stop = 1;
+        media_request_stop(m);
         pthread_cond_broadcast(&m->cond);
         pthread_mutex_unlock(&m->lock);
         pthread_join(m->worker, NULL);

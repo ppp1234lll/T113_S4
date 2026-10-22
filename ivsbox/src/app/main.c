@@ -581,6 +581,11 @@ static int agent_sync_server_cfg(int force)
     return changed;
 }
 
+/* 配置 → 模块参数的只读装配（定义在下面，`on_cfg_committed()` 要用）：
+ * 开机装配与热更共用同一段，避免"开机一套、改配置另一套"。 */
+static void cfg_snmp_targets(iv_agent_snmp_cfg_t *sc);
+static int  cfg_rec_url_table(char (*buf)[IV_CFG_STR_MAX], int cap);
+
 /* 配置事务通知（F7）。这里只接"改完必须马上生效"的：
  *   - `net` 分类：平台地址/端口（与出口网卡成对刷新）→ 断开旧连接、连新平台；
  *   - `sys` 分类里的 `sys.report.interval_s`：周期上报间隔 → 换节拍，**不断链**；
@@ -705,6 +710,61 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
                                      iv_clock_monotonic_ms());
         if (crc != IV_OK)
             IV_LOG_W(APP_MOD, "camera.* not applied (%d)", crc);
+
+        /* 录像源表与时间参数（2026-10-22）：`camera.ch.N.url` / `.record` /
+         * `camera.rec.hold_ms` / `.debounce_ms` 原先只在 `iv_agent_open()` 读一次。
+         * 同一张 `camera.ch` 表里 `ip` 11:20 就热了、相邻几列却要重启，现场最容易踩。
+         * 判据与早返回都在 agent 侧（整类提交是常态，改别的键必须空转）。 */
+        {
+            char        ubuf[IV_RECCTL_CH_N][IV_CFG_STR_MAX];
+            const char *urls[IV_RECCTL_CH_N];
+            int64_t     rv = 0;
+            uint32_t    rh = 0u;
+            uint32_t    rd = 0u;
+            int         rn;
+            int         ri;
+            int         rrc;
+
+            rn = cfg_rec_url_table(ubuf, IV_RECCTL_CH_N);
+            for (ri = 0; ri < IV_RECCTL_CH_N; ri++)
+                urls[ri] = ubuf[ri];
+            if (iv_config_get_int(g_cfg, "camera.rec.hold_ms", &rv) == IV_OK && rv > 0)
+                rh = (uint32_t)rv;
+            if (iv_config_get_int(g_cfg, "camera.rec.debounce_ms", &rv) == IV_OK &&
+                rv > 0)
+                rd = (uint32_t)rv;
+            rrc = iv_agent_reload_rec(&g_agent, urls, rn, rh, rd);
+            /* `IV_ESTATE` ＝ media 桥接没起来（此时配置已落盘，下次 open 生效），
+             * 与 camdet 那半边同口径，不按告警刷屏。 */
+            if (rrc != IV_OK && rrc != IV_ESTATE)
+                IV_LOG_W(APP_MOD, "camera rec sources not applied (%d)", rrc);
+        }
+
+        /* SNMP 目标（`camera.snmp.*`）：与 `switch.snmp.*` 一起送，
+         * 由 agent 按目标逐项比对（没变的那个一个字节都不动）。 */
+        {
+            iv_agent_snmp_cfg_t traps[IV_AGENT_SNMP_TARGET_N];
+            int                 src;
+
+            memset(traps, 0, sizeof(traps));
+            cfg_snmp_targets(traps);
+            src = iv_agent_reload_snmp(&g_agent, traps);
+            if (src != IV_OK && src != IV_ESTATE)
+                IV_LOG_W(APP_MOD, "snmp.* not applied (%d)", src);
+        }
+    }
+    if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_SWITCH)) != 0u) {
+        /* `switch.ip` 与 `switch.snmp.*`：前一版全无消费者（交换机页只读结果），
+         * 改完只能重启。这里与 `camera.snmp.*` 走同一条热更（按目标逐项比对，
+         * 摄像机那一份没变就跳过）。 */
+        iv_agent_snmp_cfg_t traps[IV_AGENT_SNMP_TARGET_N];
+        int                 src;
+
+        memset(traps, 0, sizeof(traps));
+        cfg_snmp_targets(traps);
+        src = iv_agent_reload_snmp(&g_agent, traps);
+        if (src != IV_OK && src != IV_ESTATE)
+            IV_LOG_W(APP_MOD, "switch.snmp.* not applied (%d)", src);
     }
     if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_NETTHR)) != 0u) {
         /* `netthr.reboot_max` / `.reboot_interval_s` 原先只在 `agent_setup()` 里
@@ -1268,6 +1328,16 @@ static void cfg_snmp_target(iv_agent_snmp_cfg_t *sc, const char *pfx,
     }
 }
 
+/* 两个目标一次填好：`agent_setup()` 与"改完热更"（`on_cfg_committed`）共用同一段，
+ * 否则开机一套、改配置另一套，迟早漂移。 */
+static void cfg_snmp_targets(iv_agent_snmp_cfg_t *sc)
+{
+    cfg_snmp_target(&sc[IV_AGENT_SNMP_CAM], "camera.snmp", iv_snmp_cam_slots,
+                    (int)IV_SNMP_CAM_SLOT_N, cfg_ip_be("camera.ch.0.ip"));
+    cfg_snmp_target(&sc[IV_AGENT_SNMP_SW], "switch.snmp", iv_snmp_sw_slots,
+                    (int)IV_SNMP_SW_SLOT_N, cfg_ip_be("switch.ip"));
+}
+
 /* ---------------------------------------------------------------------------
  * S6.5 前置：**断网录像的接线**（键早在默认表里，本步只是把没人读的键接上）
  *
@@ -1282,29 +1352,50 @@ static void cfg_snmp_target(iv_agent_snmp_cfg_t *sc, const char *pfx,
  *   网络探测（平台上报帧 `CNS` 段固定 6 宽），第 7/8 路**只录不测**。
  * ⚠ 地址长度受 `IV_CFG_STR_MAX`（160 含 NUL）限制：超长的 URL 在 `set` 时就被拒。
  * ------------------------------------------------------------------------- */
-static void cfg_rec_sources(iv_agent_cfg_t *ac)
+/* 录像源表的**只读数**：把 `camera.ch.N.url`（含账密）与 `.record` 合成一张表，
+ * 未进表（没地址 / 开关没开）的路写空串。返回表长（最后一个进表的路 ＋ 1）。
+ * 抽出来给"开机装配"与"热更"共用 —— 两处各写一遍迟早不一致。 */
+static int cfg_rec_url_table(char (*buf)[IV_CFG_STR_MAX], int cap)
 {
     char    key[IV_CFG_KEY_MAX];
-    int64_t v = 0;
+    int     n = 0;
     int     i;
 
-    ac->rec_n_url = 0;
-    for (i = 0; i < IV_RECCTL_CH_N; i++) {
+    for (i = 0; i < cap; i++) {
         const char *url = NULL;
         int         rec = 0;
 
-        ac->rec_url[i][0] = '\0';
+        buf[i][0] = '\0';
         if (snprintf(key, sizeof(key), "camera.ch.%d.url", i) >= (int)sizeof(key))
             continue;
-        if (iv_config_get_str(g_cfg, key, &url) != IV_OK || url == NULL || url[0] == '\0')
+        if (iv_config_get_str(g_cfg, key, &url) != IV_OK || url == NULL ||
+            url[0] == '\0')
             continue; /* 未配地址 ⇒ 该路不录 */
         if (snprintf(key, sizeof(key), "camera.ch.%d.record", i) >= (int)sizeof(key))
             continue;
         if (iv_config_get_bool(g_cfg, key, &rec) != IV_OK || rec == 0)
             continue; /* 录像开关未开 */
-        (void)snprintf(ac->rec_url[i], sizeof(ac->rec_url[i]), "%s", url);
-        ac->rec_n_url = i + 1;
+        (void)snprintf(buf[i], IV_CFG_STR_MAX, "%s", url);
+        n = i + 1;
     }
+    return n;
+}
+
+static void cfg_rec_sources(iv_agent_cfg_t *ac)
+{
+    int64_t v = 0;
+    int     i;
+    char    ubuf[IV_RECCTL_CH_N][IV_CFG_STR_MAX];
+    int     un;
+
+    ac->rec_n_url = 0;
+    for (i = 0; i < IV_RECCTL_CH_N; i++)
+        ac->rec_url[i][0] = '\0';
+
+    un = cfg_rec_url_table(ubuf, IV_RECCTL_CH_N);
+    for (i = 0; i < IV_RECCTL_CH_N; i++)
+        (void)snprintf(ac->rec_url[i], sizeof(ac->rec_url[i]), "%s", ubuf[i]);
+    ac->rec_n_url = un;
 
     if (iv_config_get_int(g_cfg, "camera.rec.hold_ms", &v) == IV_OK && v > 0)
         ac->rec_hold_ms = (uint32_t)v;
@@ -1520,12 +1611,7 @@ static int agent_setup(void)
     ac.pool = g_pool;
     /* S9 延伸：档案/SNMP/网络历史落 control.db（store 在第 2b 步就绪）。 */
     ac.store = g_store;
-    cfg_snmp_target(&ac.snmp[IV_AGENT_SNMP_CAM], "camera.snmp",
-                    iv_snmp_cam_slots, (int)IV_SNMP_CAM_SLOT_N,
-                    cfg_ip_be("camera.ch.0.ip"));
-    cfg_snmp_target(&ac.snmp[IV_AGENT_SNMP_SW], "switch.snmp",
-                    iv_snmp_sw_slots, (int)IV_SNMP_SW_SLOT_N,
-                    cfg_ip_be("switch.ip"));
+    cfg_snmp_targets(ac.snmp);
 
     /* 断网录像（S6.3）的源表与时间参数（S6.5 前置）：`camera.ch.N.url`/`.record`
      * ＋ `camera.rec.hold_ms`/`.debounce_ms`。未配的路留空、状态机自然跳过。 */
@@ -1894,7 +1980,10 @@ static int app_init(void)
      * 这一类坑，单测抓不到，只有真拉进程的集成用例才看得见）。`elec`/`sensor`
      * （阈值下发）同理，一处都不能漏；`camera`（检测方式热生效）是同一条坑的第
      * 三次 —— 见 `on_cfg_committed()` 里 CAMERA 分支；`netthr`（切换门限＋
-     * 自愈限次）是第四次。 */
+     * 自愈限次）是第四次。**第五次就在这一轮，而且是集成用例 H5 抓出来的**：
+     * `switch.snmp.*` 的热更分支写好了、掩码里却没有 SWITCH ⇒ 改 community 一点
+     * 反应都没有，而"摄像机那半边顺手把两个目标一起送"会让它拖到下一次 camera
+     * 提交才生效（日志上正好隔一整步，看着像慢半拍、其实是漏订阅）。 */
     (void)agent_sync_server_cfg(0);
     if (iv_config_subscribe(g_cfg,
                             IV_CFG_CLASS_MASK(IV_CFG_CLS_NET) |
@@ -1903,12 +1992,13 @@ static int app_init(void)
                                 IV_CFG_CLASS_MASK(IV_CFG_CLS_ELEC) |
                                 IV_CFG_CLASS_MASK(IV_CFG_CLS_SENSOR) |
                                 IV_CFG_CLASS_MASK(IV_CFG_CLS_CAMERA) |
+                                IV_CFG_CLASS_MASK(IV_CFG_CLS_SWITCH) |
                                 IV_CFG_CLASS_MASK(IV_CFG_CLS_NETTHR),
                             on_cfg_committed, NULL) != IV_OK)
         IV_LOG_W(APP_MOD,
-                 "subscribe(net+sys+probe+elec+sensor+camera+netthr) failed -- server "
-                 "addr / report interval / probe params / thresholds / camera detect "
-                 "mode / net thresholds change needs a restart");
+                 "subscribe(net+sys+probe+elec+sensor+camera+switch+netthr) failed -- "
+                 "server addr / report interval / probe params / thresholds / camera "
+                 "detect mode / snmp targets / net thresholds change needs a restart");
 
     /* 9d. M8-S8.3 受控远程通道装配（身份/令牌/服务端/落点/巡检定时器）。
      *    在 9b 之后：与 agent 装配同级，都在 reactor 建好之后。 */

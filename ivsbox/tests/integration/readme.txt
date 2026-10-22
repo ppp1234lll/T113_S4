@@ -179,6 +179,13 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
   sudo mkdir -p /mnt/UDISK/ivsbox/ota
   sudo python3 tests/integration/ota_install_e2e.py
 
+  # camtest_e2e.py：同上口径（自己起/收 daemon），验的是"网页改完配置有没有真的
+  # 走到 camdet"——`camera.detect.mode` / `camera.detect.rtt_ms` / `camera.ch.N.ip`
+  # 的热生效，以及 camera.test 的路由与错误码。掩码漏 class 时单测全绿、运行期零
+  # 反应，只有这一层抓得住（见 docs/代码说明.adoc 2026-10-22 11:20）。
+  # 副作用：会按需建出 `camera.ch.0.*` 一槽 8 个键，结束时把 `.ip` 置空、方式复位。
+  sudo python3 tests/integration/camtest_e2e.py
+
 【约定与注意事项】
   - 本目录**刻意不并入 make test**：目录里既有"需外部服务"的用例，并进去会让 CI 因
     "没起服务"而假红（见 Makefile `itest` 注释、架构 §16.1）。**需要按单用例粒度执行**

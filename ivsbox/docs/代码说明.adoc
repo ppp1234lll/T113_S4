@@ -4751,3 +4751,159 @@ web 相关用例全过）。
 * 安装进度沿用 `ota.status` 轮询，没有服务端推送。
 
 
+
+== 2026-10-22 11:20 摄像机：检测方式热生效 ＋ 单路重测 ＋「查摄像机」
+
+参考 web 的「检测方式」是三选一下拉（PING方式 / 端口扫描 / **RTSP拉流测试**）且
+保存即生效；系统操作里还有「查摄像机1」。本机这一块原本是**三处假功能**。
+
+=== 三处假功能分别是什么
+
+[cols="1,3,3"]
+|===
+| 位置 | 表面现象 | 真实原因
+
+| 「检测方式」 | 网页上选完保存，状态栏里还是老方式 | 三档检测在 `iv_camdet` 里早就实现了，
+但 `camera.detect.mode` 只在 `iv_agent_open()` 读一次 ⇒ **必须重启主控**
+
+| 摄像机 IP | 改完 IP，CNS 还报旧地址的结论 | `camera.ch.N.ip` 同样只在启动时喂给 camdet
+（`iv_agent_set_channels()` 只在 open 里调）
+
+| 「查摄像机1」 | 后端有 `snmp.run`/`snmp.result`，页面上找不到入口 | 入口只挂在「交换机」页
+—— 摄像机的东西不在摄像机页
+|===
+
+第三处不是 bug 而是**放错地方**：`camera.snmp` 那套（S4.3）目标 IP 复用
+`camera.ch.0.ip`，本来就是"查摄像机1"的等价物，只是按钮叫「采集摄像机」且长在交换机页。
+
+=== 换成订阅＋分支，不新造探测能力
+
+五态编码、三档检测、RTSP `OPTIONS` 请求串（含 LibVLC UA 行）都是 M4-S4.1 已交付、
+12 组单测守着的代码。本次只补"配置改完怎么走到它"：
+
+[source,c]
+----
+on_cfg_committed()  CAMERA 分支
+    ├── camera.detect.mode      ─┐
+    ├── camera.detect.rtt_ms    ─┼──► iv_agent_reload_camdet(mode, rtt, ip_be[6])
+    └── camera.ch.{0..5}.ip     ─┘        ├── iv_camdet_set_mode()
+                                          ├── iv_camdet_set_rtt_thr()   ← 新增
+                                          └── iv_camdet_set_channels()
+----
+
+**0 一律跳过不翻译**：0 是 open 语境下"取默认"的哨兵。若在运行期把 0 翻成 PING，
+用户在网页上把该键清空就会被读成"他选了 PING"。
+
+=== 一个差点漏掉的日志判据
+
+通道表那一笔**不能**用 `iv_camdet_set_channels()` 的返回值决定要不要打日志：
+
+[source,c]
+----
+/* set_channels 返回的是"本次对外状态**变化**的通道数" */
+刚配上一路 IP → 该路 vd 还是 NO_IP（要等下一轮探测才有 1/2）
+               → 表变了，返回值却是 0
+               → 照返回值打日志 = "IP 热生效了但日志里看不见"
+----
+
+改成自己 `memcmp` 前后表。**这是 e2e 第一次跑就抓出来的**（C6b 红），单测和读代码
+都没发现 —— 因为模块单测断言的是"表生效了"，而这里要的是"有没有留下证据"。
+
+=== 立即重测一路：为什么分两种语义
+
+`iv_camdet` 是轮询式（PING 4 包/20 s；扫描与 RTSP 30 s 一轮）。现场装完机想马上知道
+"这一路通不通"，等一整轮太久。`iv_camdet_probe_now(d, ch, now)` 按方式分两条路：
+
+[cols="1,4"]
+|===
+| 方式 | 做法与理由
+
+| PING | 六路并行、**没有"轮起点"可挪** ⇒ 清该路取样环，之后到来的 4 个样本
+（≤20 s）重新结算。**采样基准必须同时对到引擎当前计数**：否则"清环前已发出去、
+还没回来的那个包"会被算成新样本，4 个里混进 1 个旧的，均值就被旧 RTT 带偏。
+
+| 端口扫描 / RTSP | 是"一轮串行走完 6 路"的状态机 ⇒ **必须打断在飞的那一轮**，
+否则它拿着别的通道序号继续走（用户点 3 号，实际在测 1 号）。随后 `next_round_ms=0`
+让下一 tick 立刻从该通道开新轮；走到表尾本轮结束，下一轮回到 0 号 ——
+手动重测最多让"序号比它小"的通道晚一轮（≤ `round_ms`）更新，**不会漏测**。
+|===
+
+为此句柄加 `int sc_from`：`round_begin()` 拿它作轮起点，**只生效一次**
+（`sc_from = 0` 紧跟在 `sc_ch = sc_from` 后面）。`set_channels()` / `set_mode()` 也把它
+复位 —— 表或方式都变了，"从某一路起"的意图已失效（序号可能重排）。
+
+=== `camera.test` 只"排上"，不等结果
+
+camdet 是非阻塞状态机（RTSP 一次 `OPTIONS` 1 s 超时、端口扫描 7 端口各 1 s、PING 要
+集满 4 个样本）。在 ctl 里同步等结果就把 Reactor 卡住了，与"ctl 路由绝不阻塞"
+（架构 §4.2）直接冲突。所以：
+
+[source,json]
+----
+// POST /api/camera/test  {"ch":3}
+{"ok":true,"d":{"queued":true,"ch":3,"mode":3,"mode_name":"rtsp","expect_ms":1500}}
+----
+
+`expect_ms` 是"结论大约多久后出现"，前端按它定时回读 `/api/overview` 的 `cameras.cns`。
+
+**`ch` 是 1 基（1..6）**：与 `relay.set` 的 1..3、页面「摄像机N」同序；内部下标
+`ch-1`（`camera.ch.N` 的 N 是 0 基）在这一处一次翻完。写错就是"点 3 号在测 4 号"，
+**界面一切正常、只有结论不对** —— 所以 `ui_camera_test.mjs` 的 v03c 专门钉这个基号。
+
+=== 错误码：ENOENT 是 -10，不是 -2
+
+[cols="1,1,3"]
+|===
+| 码 | 值 | 这里的含义
+
+| `IV_EINVAL` | **-2** | `ch` 越界（不在 1..6）、缺 `ch`
+| `IV_ENOENT` | **-10** | 这一路没配 IP —— 没有可测的对象
+|===
+
+前端第一版按 -2 判"没配 IP"，永远走不到那句提示（-2 是参数非法）。现在
+`ui_camera_test.mjs` 的 v04a 钉死码号。
+
+=== `snmpCard()` 抽成共用卡
+
+摄像机页 `which=cam`、交换机页 `which=sw`，两处一套话术一份表格代码。交换机页那个
+「采集摄像机」按钮随之撤掉 —— 摄像机的东西在摄像机页才找得到，而且那边正好挨着
+"这一路通不通"。
+
+=== 验证
+
+`test` 40/40 ／ `analyze` 0 ／ `arm` 0 告警（`ivsboxd` md5 `7ce16baa7e3c8caf38b28fe08f2c1cca`；
+`ivsbox-web` `0514246877ba3d8356b662146cbc9071`）／ `asan` 0 ／ `itest` 16 条 15 通过
+1 SKIP（`test_tunnel_e2e` 无身份，同基线）。
+
+* `tests/unit/test_camdet.c` c13（22 条）：守卫（NULL / 未 open / ch 越界 / 未配 IP /
+  `rtt=0`）、端口扫描 `probe_now(ch=1)` 后**只有 ch1 变正常、ch0 仍是故障**（钉住
+  "从该路起"而不是"从 0 号起"）、`sc_from` 用后归零、PING 清环后样本数归 0、
+  同一批 150 ms 样本在阈值 200 下判"正常"、降到 100 后判"延时"（热生效）。
+* `tests/integration/camtest_e2e.py`（真 `ivsboxd`）19 条：改 `camera.detect.mode=3/2`
+  后 `sys.overview` 的 `cameras.mode` **不重启**就变、日志出 `mode -> rtsp` / `mode -> port`；
+  `camera.test` 的 `ch=7` / 缺 `ch` ⇒ -2、未配 IP ⇒ -10；改 `camera.ch.0.ip` 后日志出
+  `channel table reloaded` 且该路可测；RTSP 方式下 `mode_name=rtsp`、`expect_ms=1500`；
+  清掉 IP 后又回到 -10。
+* `tests/web/ui_camera_test.mjs`（jsdom）22 条：三档文案与参考 web 逐字一致、默认值取
+  `overview.cameras.mode`（不是配置里的值）、`camera.detect.mode` 发**数字**不是字符串、
+  点第 3 个「测」发 `ch=3`、`expect_ms` 换算成"约 20 秒"、`-10` 走"还没配 IP"分支、
+  失败后按钮可再点、到期自动回读、SNMP 卡发 `which=cam`、交换机页不再有「采集摄像机」。
+
+前端 jsdom 四个用例合计 **102** 条全过（80 ＋ 新增 22）。
+
+反向证伪两条，都**编译干净**：①把 `IV_CFG_CLS_CAMERA` 从订阅掩码里去掉 ⇒ `camtest_e2e`
+**10 条红**（热生效与 `camera.test` 全线失效，而配置照存 —— 正是"死分支"指纹）；
+②`round_begin()` 里 `d->sc_ch = d->sc_from` 改回 `0` ⇒ `test_camdet` 恰好 1 条红
+（"ch0 was NOT re-probed"，精确命中预期）。还原后 `arm` 的 `ivsboxd` md5 与证伪前一致
+`7ce16baa7e3c8caf38b28fe08f2c1cca`，e2e 19 条复绿。
+
+=== 未做
+
+* `camera.ch.N` 其余 7 个键（`user`/`pass`/`url`/`record`/`stream`/`vendor`/`mac`）的
+  热生效**只做到 `.ip`** —— 录像源表（`cfg_rec_sources()`）与 SNMP 目标
+  （`cfg_snmp_target()`）仍在启动时读一次，改了要重启。
+* RTSP 方式的"拉流测试"仍只是 `OPTIONS`（对齐现网 `rtsp_task.c`，**不拉流、不解析 SDP**）；
+  真要解码看画面属 M6 媒体面。
+* `camera.test` 没有"等结果"模式，前端靠 `expect_ms` 定时回读。
+* `camtest_e2e.py` 会在真实数据根下按需建出 `camera.ch.0.*` 一槽 8 个键（结束时把 `.ip`
+  置空、方式复位 —— 行为等同出厂，键本身留着）。要绝对干净就在临时目录里跑。

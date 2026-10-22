@@ -1585,6 +1585,77 @@ const iv_camdet_t *iv_agent_camdet(const iv_agent_t *a)
     return (a != NULL) ? &a->cd : NULL;
 }
 
+/* ---------------------------------------------------------------------------
+ * 摄像机检测方式热生效 ＋ 立即重测一路（2026-10-22）
+ * ------------------------------------------------------------------------- */
+int iv_agent_reload_camdet(iv_agent_t *a, int mode, uint32_t rtt_ms,
+                          const uint32_t *ip_be, uint64_t now_ms)
+{
+    int rc = IV_OK;
+    int mrc;
+
+    if (a == NULL)
+        return IV_EINVAL;
+    if (!a->opened || !iv_camdet_is_open(&a->cd))
+        return IV_ESTATE;
+
+    /* mode：0/负数＝"用户没配"，跳过。**不在这里把 0 翻译成 PING**：
+     * 那会把"web 上清空了该键"读成"他选了 PING"，而 open 时同一份 0 是当默认用的。
+     * 越界（如 9）则如实拒绝 —— camdet 内部同样拒，两边口径一致。 */
+    if (mode > 0) {
+        mrc = iv_camdet_set_mode(&a->cd, mode, now_ms);
+        if (mrc != IV_OK) {
+            IV_LOG_W(AG_MOD, "camdet mode %d rejected (%d)", mode, mrc);
+            rc = mrc;
+        } else {
+            a->cfg.camera_detect_mode = (uint32_t)mode;
+        }
+    }
+    if (rtt_ms > 0u) {
+        mrc = iv_camdet_set_rtt_thr(&a->cd, rtt_ms);
+        if (mrc != IV_OK) {
+            IV_LOG_W(AG_MOD, "camdet rtt %u rejected (%d)", (unsigned)rtt_ms, mrc);
+            rc = mrc;
+        } else {
+            a->cfg.camera_detect_rtt_ms = rtt_ms;
+        }
+    }
+    /* 通道表：NULL ⇒ 不动。表没变时 `iv_camdet_set_channels()` 自己早返回，
+     * 所以 camera 分类里改个 SNMP OID 也会无脑走到这里，代价为零。
+     * **放在 mode 之后**：`set_mode()` 会用**当时的**通道表重建 PING 引擎并重置
+     * 扫描轮；表放在它后面改，最后落地的引擎/轮才是"新方式 ＋ 新地址"这一份。
+     * 反过来先改表再切方式，切方式那一步会拿新表再重建一次，也对，只是多跑一趟。 */
+    if (ip_be != NULL) {
+        /* 日志判据**不能**用 `iv_camdet_set_channels()` 的返回值：那里返回的是
+         * "本次对外状态**变化**的通道数"，而刚配上一路 IP 时它的结论还是 NO_IP
+         * （要等下一轮探测才有 1/2），于是表变了、返回值却是 0 —— 照返回值打日志
+         * 就成了"IP 热生效了但日志里看不见"（2026-10-22 的 e2e 抓到的就是这个）。
+         * 自己比一次前后表，才是"要不要记这一笔"的正确判据。 */
+        int changed = (memcmp(a->cfg.camera_ip_be, ip_be,
+                              sizeof(a->cfg.camera_ip_be)) != 0);
+
+        mrc = iv_camdet_set_channels(&a->cd, ip_be, now_ms);
+        if (mrc < 0) {
+            IV_LOG_W(AG_MOD, "camdet channel table rejected (%d)", mrc);
+            rc = mrc;
+        } else {
+            memcpy(a->cfg.camera_ip_be, ip_be, sizeof(a->cfg.camera_ip_be));
+            if (changed)
+                IV_LOG_I(AG_MOD, "camdet channel table reloaded");
+        }
+    }
+    return rc;
+}
+
+int iv_agent_camdet_probe(iv_agent_t *a, int ch, uint64_t now_ms)
+{
+    if (a == NULL)
+        return IV_EINVAL;
+    if (!a->opened)
+        return IV_ESTATE;
+    return iv_camdet_probe_now(&a->cd, ch, now_ms);
+}
+
 iv_media_t *iv_agent_media(iv_agent_t *a)
 {
     return (a != NULL) ? &a->media : NULL;

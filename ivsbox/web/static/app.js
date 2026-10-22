@@ -584,7 +584,8 @@
    *
    * 后端约定：取不到的值是 JSON null（**不是空串**）。null 显示"—"；
    * "空串"表示"读到了，但值是空的"，两者不能混。 */
-  var CD_MODE = { 1: 'PING', 2: '端口扫描', 3: 'RTSP OPTIONS' };
+  /* 检测方式的名字表挪到摄像机页（`CD_MODE_OPT`，带下拉选项）。原先是
+   * `CD_MODE` 常量只用于总览页那行只读文字，2026-10-22 摄像机页接管后已无引用。 */
 
   var NET_STATE = {
     WIRELESS_UP: '无线已连接',
@@ -1388,6 +1389,214 @@
     };
   }
 
+  /* ==================== 摄像机检测方式 / 单路重测 / 查摄像机（2026-10-22） ====================
+   * 补齐参考 web 的三件事（蓝本：index.shtml 的「检测方式」下拉 ＋ 系统操作里的
+   * 「查摄像机1」）：
+   *
+   *   ① **检测方式**：参考 web 是三选一（PING方式 / 端口扫描 / RTSP拉流测试），
+   *      保存即生效。这三档在 `iv_camdet` 里早就实现了，但配置键
+   *      `camera.detect.mode` 原先只在 ivsboxd **启动时**读一次 ⇒ 网页上改完必须
+   *      重启主控，等于摆设。2026-10-22 补了装配层热生效
+   *      （`on_cfg_committed()` 的 CAMERA 分支 → `iv_agent_reload_camdet()`），
+   *      这里才给它一个正经下拉框，而不是让人去配置表格里填 1/2/3。
+   *   ② **单路「测」**：camdet 是轮询式（PING 20 s 一轮、扫描/RTSP 30 s 一轮），
+   *      现场改完 IP 想马上知道这一路通不通只能干等一轮。按钮打
+   *      `camera.test{ch}`，后端立刻重开该路探测，并给出 `expect_ms` 让本页定时回读。
+   *   ③ **查摄像机（SNMP）**：参考 web 的「查摄像机1」就是读第 1 路摄像机的 SNMP
+   *      槽位。后端 `snmp.run`/`snmp.result` 早就通了，但入口原先只在「交换机」页
+   *      —— 摄像机的东西放摄像机页才找得到。
+   */
+  var CD_MODE_OPT = [[1, 'PING方式'], [2, '端口扫描'], [3, 'RTSP拉流测试']];
+
+  /* 检测方式卡：下拉 ＋「保存并立即生效」。写成独立卡片而不是塞进 configCard，
+   * 是因为 configCard 只会渲染成"键=输入框"，让人手填 1/2/3 在现场等于没做。 */
+  function cameraModeCard() {
+    var card = el('div', 'card');
+    card.appendChild(el('h3', null, '检测方式'));
+    card.appendChild(el('p', 'hint',
+      '三种方式互斥、保存即生效（不必重启主控）。' +
+      'PING＝每路 4 个回包／20 秒，能分辨「延时」「丢包」；' +
+      '端口扫描＝逐台试 7 个常见端口（80/554/8000/37777/5000/8080/8899），只分「正常／故障」；' +
+      'RTSP拉流测试＝向 rtsp://<ip>:554/ 发一个 OPTIONS，收到任何响应即「正常」（不拉流、不解析 SDP）。'));
+
+    var bar = el('div', 'actions');
+    var sel = document.createElement('select');
+    var i;
+    for (i = 0; i < CD_MODE_OPT.length; i++) {
+      var op = document.createElement('option');
+      op.value = String(CD_MODE_OPT[i][0]);
+      op.textContent = CD_MODE_OPT[i][1];
+      sel.appendChild(op);
+    }
+    var btn = el('button', null, '保存并立即生效');
+    btn.type = 'button';
+    bar.appendChild(sel);
+    bar.appendChild(btn);
+    card.appendChild(bar);
+
+    var onSaved = null;
+
+    btn.addEventListener('click', function () {
+      var items = {};
+      items['camera.detect.mode'] = Number(sel.value);
+      btn.disabled = true;
+      api('/api/config/apply', { method: 'POST', body: { ver: st.ver, items: items } })
+        .then(function (r) {
+          btn.disabled = false;
+          if (r.ok) {
+            st.ver = r.d.version;
+            toast('检测方式已切到「' + sel.options[sel.selectedIndex].text + '」', 'ok');
+            if (onSaved) onSaved();
+          } else if (r.e === -3) {
+            toast('配置已被别处改动，请刷新后重试', 'err');
+          } else {
+            toast('保存失败：' + (r.msg || r.e), 'err');
+          }
+        })
+        .catch(function () { btn.disabled = false; toast('请求失败', 'err'); });
+    });
+
+    return {
+      node: card,
+      /* 回填当前生效的方式（来自 /api/overview 的 cameras.mode = camdet 的真实状态，
+       * 不是配置里的值 —— 两者在"改了但没生效"时会不一致，而这里要的是后者）。 */
+      showMode: function (m) { if (m) sel.value = String(m); },
+      onSaved: function (fn) { onSaved = fn; }
+    };
+  }
+
+  /* 六路 CNS（只读实时）＋ 每路一个「测」按钮。
+   * 「测」是"已排上"而不是"已出结论"：camdet 是非阻塞状态机，ctl 同步等结果会
+   * 把 Reactor 卡住。所以后端返回 `expect_ms`（PING 20 s／扫描 8 s／RTSP 1.5 s），
+   * 本卡按它定时回读一次。 */
+  function cameraStatusCard() {
+    var card = el('div', 'card');
+    card.appendChild(el('h3', null, '摄像机状态（实时）'));
+    var hint = el('p', 'hint', '读取中…');
+    card.appendChild(hint);
+    var grid = el('div', 'grid');
+    card.appendChild(grid);
+
+    var rows = [];
+    var onMode = null;
+
+    function testOne(idx, btn) {
+      btn.disabled = true;
+      api('/api/camera/test', { method: 'POST', body: { ch: idx + 1 } })
+        .then(function (r) {
+          btn.disabled = false;
+          if (!r.ok) {
+            /* -10 = IV_ENOENT：这一路还没配 IP（**不是** -2，那是 IV_EINVAL＝参数非法）。
+             * 现场点「测」最常撞的就是它，报"probe rejected"等于让人去翻日志。 */
+            if (r.e === -10) toast('摄像机' + (idx + 1) + ' 还没配 IP，先在下方建立通道', 'err');
+            else toast('测失败：' + (r.msg || r.e), 'err');
+            return;
+          }
+          var wait = (r.d && r.d.expect_ms) ? r.d.expect_ms : 3000;
+          var mn = (r.d && r.d.mode_name) ? r.d.mode_name : '';
+          toast('已在测摄像机' + (idx + 1) + '（' + mn + '），约 ' +
+            Math.round(wait / 1000) + ' 秒后自动刷新', 'ok');
+          setTimeout(load, wait);
+        })
+        .catch(function () { btn.disabled = false; toast('请求失败', 'err'); });
+    }
+
+    function load() {
+      api('/api/overview').then(function (r) {
+        var cm = (r && r.ok && r.d) ? r.d.cameras : null;
+
+        if (!cm || !cm.cns || !cm.cns.length) {
+          hint.textContent = '未获取到摄像机状态（检测模块未装配或尚未开始检测）。';
+          return;
+        }
+        hint.textContent = '判定口径：0 无IP／1 正常／2 故障／4 延时／5 丢包。' +
+          '「测」＝立刻用当前检测方式重测这一路，不必等下一轮。';
+        for (var k = 0; k < cm.cns.length; k++) {
+          var v = CNS_NAME[cm.cns[k]] === undefined ? cm.cns[k] : CNS_NAME[cm.cns[k]];
+          var cls = cm.cns[k] === 1 ? 'ok' : (cm.cns[k] === 2 ? 'err' : 'warn');
+          if (!rows[k]) {
+            var box = el('div', 'kv');
+            box.appendChild(el('div', 'k', '摄像机' + (k + 1)));
+            var vn = el('div', 'v', v);
+            box.appendChild(vn);
+            var b = el('button', 'ghost', '测');
+            b.type = 'button';
+            (function (idx, bb) {
+              bb.addEventListener('click', function () { testOne(idx, bb); });
+            })(k, b);
+            box.appendChild(b);
+            grid.appendChild(box);
+            rows[k] = { btn: b, value: vn };
+          }
+          rows[k].value.textContent = v;
+          rows[k].value.className = 'v ' + cls;
+        }
+        if (onMode) onMode(cm.mode);
+      });
+    }
+
+    load();
+    return {
+      node: card,
+      reload: load,
+      onMode: function (fn) { onMode = fn; }
+    };
+  }
+
+  /* SNMP 采集结果卡（摄像机页与交换机页共用一份，避免两处两套话术）。
+   * `which`：cam / sw（口径见 iv_ctl 的 snmp_which()）。 */
+  function snmpCard(which, title, hintText) {
+    var card = el('div', 'card');
+    card.appendChild(el('h3', null, title));
+    if (hintText) card.appendChild(el('p', 'hint', hintText));
+
+    var bar = el('div', 'actions');
+    var btn = el('button', null, '发起采集');
+    btn.type = 'button';
+    bar.appendChild(btn);
+    card.appendChild(bar);
+
+    var box = el('div');
+    card.appendChild(box);
+
+    function show() {
+      box.innerHTML = '读取中…';
+      api('/api/snmp?which=' + which).then(function (r) {
+        box.innerHTML = '';
+        if (!r.ok) { box.appendChild(el('p', 'msg', r.msg || '读取失败')); return; }
+        box.appendChild(el('p', 'hint', '状态：' + (SNMP_STATE[r.d.state] || r.d.state)));
+        if (!r.d.slots.length) { box.appendChild(el('p', 'hint', '尚无采集结果')); return; }
+        var t = el('table');
+        var head = el('tr');
+        ['槽位', 'OID', '行数', '取值'].forEach(function (h) { head.appendChild(el('th', null, h)); });
+        t.appendChild(head);
+        r.d.slots.forEach(function (s) {
+          var tr = el('tr');
+          tr.appendChild(el('td', null, s.name));
+          tr.appendChild(el('td', null, s.oid));
+          tr.appendChild(el('td', null, s.n_rows));
+          var vals = (s.rows || []).map(function (row) {
+            if (row.str) return row.str;
+            return String(row.num);
+          }).join(' / ');
+          tr.appendChild(el('td', null, vals || '—'));
+          t.appendChild(tr);
+        });
+        box.appendChild(t);
+      });
+    }
+
+    btn.addEventListener('click', function () {
+      api('/api/snmp/run', { method: 'POST', body: { which: which } }).then(function (r) {
+        toast(r.ok ? '已发起采集' : ('失败：' + (r.msg || r.e)), r.ok ? 'ok' : 'err');
+        if (r.ok) setTimeout(show, 2500);
+      });
+    });
+
+    show();
+    return { node: card, reload: show };
+  }
+
   function pageCamera() {
     var root = document.createDocumentFragment();
     root.appendChild(el('h2', 'page-title', '摄像机'));
@@ -1395,32 +1604,21 @@
     /* 六路 CNS 与检测方式原先在总览页，现归本页：状态和"这一路配的是哪个 IP"
      * 放在一起才有用 —— 看到"3 号故障"紧接着就能核对它的 IP/账号。
      * CNS 口径：0 无IP / 1 正常 / 2 故障 / 4 延时 / 5 丢包（无 3）。 */
-    var card = el('div', 'card');
-    card.appendChild(el('h3', null, '摄像机状态（实时）'));
-    var hint = el('p', 'hint', '读取中…');
-    card.appendChild(hint);
-    var grid = el('div', 'grid');
-    card.appendChild(grid);
-    root.appendChild(card);
+    var status = cameraStatusCard();
+    root.appendChild(status.node);
 
-    api('/api/overview').then(function (r) {
-      var cm = (r && r.ok && r.d) ? r.d.cameras : null;
+    var modeCard = cameraModeCard();
+    status.onMode(function (m) { modeCard.showMode(m); });
+    modeCard.onSaved(function () { status.reload(); });
+    root.appendChild(modeCard.node);
 
-      if (!cm || !cm.cns || !cm.cns.length) {
-        hint.textContent = '未获取到摄像机状态（检测模块未装配或尚未开始检测）。';
-        return;
-      }
-      hint.textContent = '检测方式：' + (cm.mode ? (CD_MODE[cm.mode] || cm.mode) : '—') +
-        '　判定口径：0 无IP／1 正常／2 故障／4 延时／5 丢包。';
-      for (var i = 0; i < cm.cns.length; i++)
-        grid.appendChild(kv('摄像机' + (i + 1),
-          CNS_NAME[cm.cns[i]] === undefined ? cm.cns[i] : CNS_NAME[cm.cns[i]],
-          cm.cns[i] === 1 ? 'ok' : (cm.cns[i] === 2 ? 'err' : 'warn')));
-    });
+    root.appendChild(snmpCard('cam', '查摄像机（SNMP）',
+      '读第 1 路摄像机（camera.ch.0.ip）的 SNMP 槽位 —— 对应参考 web 系统操作里的' +
+      '「查摄像机1」。采集是阻塞式 UDP 事务，落在慢任务池里跑，点完约 2~3 秒回读结果。').node);
 
     var slot = cameraSlotCard();
     root.appendChild(configCard('摄像机参数与账号（camera.*）', ['camera'],
-      '检测方式、6 路 IP/账号/端口，以及 SNMP OID 槽位（按机型填值）。',
+      '6 路 IP/账号/端口，以及 SNMP OID 槽位（按机型填值）。检测方式见上方卡片。',
       function (items, reload) { slot.sync(items, reload); }));
     root.appendChild(slot.node);
     return root;
@@ -1475,53 +1673,10 @@
     root.appendChild(configCard('交换机参数与 OID（switch.*）', ['switch'],
       'OID 槽位键名即语义（厂家中立），值按实际机型填。'));
 
-    var card = el('div', 'card');
-    card.appendChild(el('h3', null, 'SNMP 采集结果'));
-    var bar = el('div', 'actions');
-    var bCam = el('button', null, '采集摄像机');
-    var bSw = el('button', null, '采集交换机');
-    bCam.type = 'button'; bSw.type = 'button';
-    bar.appendChild(bCam); bar.appendChild(bSw);
-    card.appendChild(bar);
-    var box = el('div');
-    card.appendChild(box);
-
-    function show(which) {
-      box.innerHTML = '读取中…';
-      api('/api/snmp?which=' + which).then(function (r) {
-        box.innerHTML = '';
-        if (!r.ok) { box.appendChild(el('p', 'msg', r.msg || '读取失败')); return; }
-        box.appendChild(el('p', 'hint', '状态：' + (SNMP_STATE[r.d.state] || r.d.state)));
-        if (!r.d.slots.length) { box.appendChild(el('p', 'hint', '尚无采集结果')); return; }
-        var t = el('table');
-        var head = el('tr');
-        ['槽位', 'OID', '行数', '取值'].forEach(function (h) { head.appendChild(el('th', null, h)); });
-        t.appendChild(head);
-        r.d.slots.forEach(function (s) {
-          var tr = el('tr');
-          tr.appendChild(el('td', null, s.name));
-          tr.appendChild(el('td', null, s.oid));
-          tr.appendChild(el('td', null, s.n_rows));
-          var vals = (s.rows || []).map(function (row) {
-            if (row.str) return row.str;
-            return String(row.num);
-          }).join(' / ');
-          tr.appendChild(el('td', null, vals || '—'));
-          t.appendChild(tr);
-        });
-        box.appendChild(t);
-      });
-    }
-    function run(which) {
-      api('/api/snmp/run', { method: 'POST', body: { which: which } }).then(function (r) {
-        toast(r.ok ? '已发起采集' : ('失败：' + (r.msg || r.e)), r.ok ? 'ok' : 'err');
-        if (r.ok) setTimeout(function () { show(which); }, 2500);
-      });
-    }
-    bCam.addEventListener('click', function () { run('cam'); });
-    bSw.addEventListener('click', function () { run('sw'); });
-    show('cam');
-    root.appendChild(card);
+    /* 「采集摄像机」原先也在这张卡上，2026-10-22 挪到摄像机页（`snmpCard('cam')`）：
+     * 摄像机的东西在摄像机页才找得到，而且那边正好挨着"这一路通不通"。 */
+    root.appendChild(snmpCard('sw', 'SNMP 采集结果',
+      '按 switch.* 里的 OID 槽位读交换机（标准 IF-MIB ＋ 厂商私有节点）。').node);
     return root;
   }
 

@@ -340,6 +340,7 @@ int iv_camdet_set_channels(iv_camdet_t *d, const uint32_t *ip_be, uint64_t now_m
         close_fd(d);
         d->sc_on         = 0;
         d->sc_ch         = 0;
+        d->sc_from       = 0; /* 通道表变了，"从某一路起"的意图已失效（序号可能重排） */
         d->sc_step       = 0;
         d->sc_port       = 0;
         d->sc_bits       = 0u;
@@ -365,6 +366,7 @@ int iv_camdet_set_mode(iv_camdet_t *d, int mode, uint64_t now_ms)
     d->now_ms        = now_ms;
     d->sc_on         = 0;
     d->sc_ch         = 0;
+    d->sc_from       = 0; /* 换方式后本轮已是新方式的轮，别再继承旧的起始通道 */
     d->sc_step       = 0;
     d->sc_port       = 0;
     d->sc_bits       = 0u;
@@ -605,7 +607,8 @@ static int round_begin(iv_camdet_t *d, uint64_t now_ms)
         if (d->next_round_ms != 0u && now_ms < d->next_round_ms)
             return 0;
         d->sc_on   = 1;
-        d->sc_ch   = 0;
+        d->sc_ch   = d->sc_from; /* 手动"测这一路"时非 0：本轮从该通道开跑 */
+        d->sc_from = 0;          /* 只生效一次，下一轮回 0 号 */
         d->sc_step = 0;
         d->sc_port = 0;
         d->sc_bits = 0u;
@@ -812,6 +815,71 @@ static void rtsp_tick(iv_camdet_t *d, uint64_t now_ms)
         d->sc_step = 0;
         return;
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * 运行期设置（续）：延时阈值热生效 ＋ 立即重测一路
+ * 放在这里而不是和 set_mode/set_link 挨着，是因为要用的 ring_clear()/close_fd()
+ * 定义在前面 —— 与其加前向声明，不如把"使用期"函数排在"定义期"之后。
+ * ------------------------------------------------------------------------- */
+int iv_camdet_set_rtt_thr(iv_camdet_t *d, uint32_t ms)
+{
+    if (d == NULL)
+        return IV_EINVAL;
+    if (!d->opened)
+        return IV_ESTATE;
+    if (ms == 0u)
+        return IV_EINVAL; /* 0 = 取默认只在 init 有意义，见头文件 */
+    if (d->cfg.rtt_thr_ms == ms)
+        return IV_OK;
+
+    d->cfg.rtt_thr_ms = ms;
+    /* 结论不在这里重算：ping_verdict() 在"一轮 4 包结算"时才跑，改了阈值立刻
+     * 回写结论等于用旧样本套新阈值，还不如等下一轮（≤20 s）干净。 */
+    IV_LOG_I(CD_MOD, "rtt threshold -> %u ms", (unsigned)ms);
+    return IV_OK;
+}
+
+int iv_camdet_probe_now(iv_camdet_t *d, int ch, uint64_t now_ms)
+{
+    if (d == NULL || ch < 0 || ch >= IV_CAMDET_CH_N)
+        return IV_EINVAL;
+    if (!d->opened)
+        return IV_ESTATE;
+    /* 没配 IP 就没有可测的对象。返回 ENOENT 而不是"排上了但不做事"——
+     * 后者会让前端显示"已开始测试"，现场等到超时也等不出结论。 */
+    if (d->ch_ip_be[ch] == 0u)
+        return IV_ENOENT;
+
+    d->now_ms = now_ms;
+
+    if (d->cfg.mode == IV_CAMDET_MODE_PING) {
+        iv_probe_stat_t s;
+
+        ring_clear(d, ch);
+        /* 采样基准必须同时对齐到引擎**当前**计数：否则"清环前已经发出去、还没
+         * 回来的那个包"会被当成新样本算进来，新旧混采（4 个样本里有 1 个是旧的，
+         * 均值就被旧 RTT 带偏）。 */
+        if (d->ch_idx[ch] >= 0 &&
+            iv_probe_stat_get(&d->pb, d->ch_idx[ch], &s) == IV_OK) {
+            d->pv_sent[ch] = s.sent;
+            d->pv_lost[ch] = s.lost;
+        }
+    } else {
+        /* 端口扫描 / RTSP：打断在飞的那一轮，下一 tick 从该通道开新轮。
+         * `next_round_ms = 0` 是 round_begin() 里"立即开一轮"的既有语义。 */
+        close_fd(d);
+        d->sc_on         = 0;
+        d->sc_step       = 0;
+        d->sc_port       = 0;
+        d->sc_bits       = 0u;
+        d->tx_len        = 0u;
+        d->tx_off        = 0u;
+        d->next_round_ms = 0u;
+        d->sc_from       = ch;
+    }
+    IV_LOG_I(CD_MOD, "probe now: ch%d (%s)", ch, iv_camdet_mode_name(d->cfg.mode));
+    return IV_OK;
 }
 
 /* ---------------------------------------------------------------------------

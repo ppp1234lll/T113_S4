@@ -659,6 +659,30 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
         if (trc != IV_OK && trc != IV_ESTATE)
             IV_LOG_W(APP_MOD, "thresh.* not applied (%d)", trc);
     }
+    if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_CAMERA)) != 0u) {
+        /* `camera.detect.mode` / `camera.detect.rtt_ms` / `camera.ch.N.ip` 原先只在
+         * `agent_setup()` 里读一次、交给 `iv_agent_open()` 定初始状态 —— 网页上改
+         * 「检测方式」或摄像机 IP 都必须重启主控才生效（参考 web 那个下拉是保存即
+         * 生效的，本机等于摆设）。现场最典型的动作就是"换个 IP 再测一下"。
+         * 0 一律跳过不翻译：0 是 open 语境下"取默认"的哨兵，运行期当"用户没配"。 */
+        uint32_t cips[IV_CAMDET_CH_N];
+        int64_t  cv = 0;
+        int      cmode = 0;
+        uint32_t crtt = 0u;
+        int      ci;
+        int      crc;
+
+        for (ci = 0; ci < IV_CAMDET_CH_N; ci++)
+            cips[ci] = cfg_ip_be(CAM_IP_KEY[ci]);
+        if (iv_config_get_int(g_cfg, "camera.detect.mode", &cv) == IV_OK && cv > 0)
+            cmode = (int)cv;
+        if (iv_config_get_int(g_cfg, "camera.detect.rtt_ms", &cv) == IV_OK && cv > 0)
+            crtt = (uint32_t)cv;
+        crc = iv_agent_reload_camdet(&g_agent, cmode, crtt, cips,
+                                     iv_clock_monotonic_ms());
+        if (crc != IV_OK)
+            IV_LOG_W(APP_MOD, "camera.* not applied (%d)", crc);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1680,18 +1704,21 @@ static int app_init(void)
      * ⚠ `probe` 分类必须一起订上：`on_cfg_committed()` 里的分支写好了、但掩码
      * 没订等于**回调永远不触发**，编译、单测全绿、运行期毫无反应（"接线在装配层"
      * 这一类坑，单测抓不到，只有真拉进程的集成用例才看得见）。`elec`/`sensor`
-     * （阈值下发）同理，一处都不能漏。 */
+     * （阈值下发）同理，一处都不能漏；`camera`（检测方式热生效）是同一条坑的第
+     * 三次 —— 见 `on_cfg_committed()` 里 CAMERA 分支。 */
     (void)agent_sync_server_cfg(0);
     if (iv_config_subscribe(g_cfg,
                             IV_CFG_CLASS_MASK(IV_CFG_CLS_NET) |
                                 IV_CFG_CLASS_MASK(IV_CFG_CLS_SYS) |
                                 IV_CFG_CLASS_MASK(IV_CFG_CLS_PROBE) |
                                 IV_CFG_CLASS_MASK(IV_CFG_CLS_ELEC) |
-                                IV_CFG_CLASS_MASK(IV_CFG_CLS_SENSOR),
+                                IV_CFG_CLASS_MASK(IV_CFG_CLS_SENSOR) |
+                                IV_CFG_CLASS_MASK(IV_CFG_CLS_CAMERA),
                             on_cfg_committed, NULL) != IV_OK)
         IV_LOG_W(APP_MOD,
-                 "subscribe(net+sys+probe+elec+sensor) failed -- server addr / report "
-                 "interval / probe params / thresholds change needs a restart");
+                 "subscribe(net+sys+probe+elec+sensor+camera) failed -- server addr / "
+                 "report interval / probe params / thresholds / camera detect mode "
+                 "change needs a restart");
 
     /* 9d. M8-S8.3 受控远程通道装配（身份/令牌/服务端/落点/巡检定时器）。
      *    在 9b 之后：与 agent 装配同级，都在 reactor 建好之后。 */

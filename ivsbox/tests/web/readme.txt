@@ -62,6 +62,23 @@ ota_e2e.py
     不需要 ivsboxd；**「装没装」那半条在
     `tests/integration/ota_install_e2e.py`**（要真 daemon 才验得到 monitor 请求文件）。
 
+ui_camera_test.mjs
+    摄像机页三件事（对应参考 web 的「检测方式」下拉与「查摄像机1」）：
+    ①检测方式下拉三档文案逐字对齐、默认值取 `/api/overview` 的 `cameras.mode`
+    （camdet 的真实状态，不是配置里的值）、保存发 `camera.detect.mode` 时值是
+    **数字**不是字符串（配置模块按 D_INT 收口）；
+    ②六路各一个「测」，点第 3 个发 `ch=3`（**1 基**，内部下标 2 —— 写错就是
+    "点 3 号在测 4 号"，界面一切正常只有结论不对）、提示按后端 `expect_ms`
+    换算成"约 N 秒"、`IV_ENOENT(-10)` 走"还没配 IP"分支（**-2 是 IV_EINVAL**）、
+    失败后按钮可再点、到期自动回读 overview；
+    ③「查摄像机（SNMP）」卡发 `snmp.run{which:'cam'}` 并渲染槽位表；交换机页
+    不再有重复的「采集摄像机」。共 22 条断言。
+
+camtest_e2e.py
+    **不是 jsdom**，要真 `ivsboxd`：验的是"**网页改完配置到底走没走到 camdet**"
+    —— 这一层单测抓不到（掩码漏 class ⇒ 分支永远不触发、编译全绿、运行期零反应）。
+    见 `tests/integration/readme.txt`。
+
 怎么跑
 ------
 jsdom **不是工程依赖**（不想把 node 生态塞进构建链），所以要单独准备：

@@ -228,6 +228,9 @@ typedef struct iv_camdet {
     size_t   tx_off;     /* RTSP：已发偏移 */
     char     tx[IV_CAMDET_RTSP_REQ_MAX];
     uint64_t next_round_ms; /* 扫描/RTSP：下一轮起点（0=立即开一轮） */
+    int      sc_from;    /* 扫描/RTSP：下一轮的**起始通道**（0=从 0 号起）。
+                          * 只有 `iv_camdet_probe_now()` 会置成非 0 —— 用户点了
+                          * "测 3 号"，没道理再从 0 号一路扫过来。轮一开就归 0。 */
 
     int      link_up;    /* 摄像机所在网口 carrier；1=up */
     int      opened;
@@ -272,6 +275,35 @@ int iv_camdet_set_mode(iv_camdet_t *d, int mode, uint64_t now_ms);
  * up=0 ⇒ 所有**已配 IP**的通道对外状态变为故障(2)（对齐现网
  * `com_report_get_camera_status()` 的"网线断开→2"）；up=1 恢复为探测结论。 */
 int iv_camdet_set_link(iv_camdet_t *d, int up, uint64_t now_ms);
+
+/* 改 PING 方式的延时判定阈值（热生效；对应配置键 `camera.detect.rtt_ms`）。
+ *   - **不改已有结论**：结论在"一轮 4 包结算"时算，新阈值从下一轮开始起作用
+ *     （≤ 20 s）。想立刻看到新阈值的结论，跟一次 `iv_camdet_probe_now()`。
+ *   - `ms == 0` 返回 IV_EINVAL：0 表示"取默认"只在 init 语境成立，运行期传 0
+ *     一律当调用方 bug（否则会把 `rtt_thr_ms` 清成 0，`ping_verdict()` 里
+ *     `rtt_thr_ms != 0` 的判据直接失效 ⇒ 永远不判延时）。
+ *   IV_OK / IV_EINVAL / IV_ESTATE；同值空操作返回 IV_OK。 */
+int iv_camdet_set_rtt_thr(iv_camdet_t *d, uint32_t ms);
+
+/* ---------------------------------------------------------------------------
+ * 立即重测一路（Web 摄像机页「测」按钮；现场装完机想马上知道通不通）
+ * ---------------------------------------------------------------------------
+ * 本模块是**轮询**式（PING 4 包/20 s；扫描与 RTSP 30 s 一轮），现场改完 IP 要等
+ * 一整轮才看到新结论 —— 这就是这个接口存在的理由。
+ *
+ * **它不阻塞、也不直接出结论**（拉一次 RTSP OPTIONS/PING 是非阻塞 I/O，等结果
+ * 必须靠 tick）。语义按方式分两种：
+ *   - PING：六路并行、没有"轮起点"可挪 ⇒ 清掉该路取样环，之后到来的 4 个样本
+ *     （包间隔 5 s，故 ≤ 20 s）重新结算一次结论。
+ *   - 端口扫描 / RTSP：**打断在飞的那一轮**（否则它拿着别的通道序号继续走，
+ *     用户点了 3 号却在测 1 号），下一 tick 立刻从该通道开新轮；走到表尾本轮即
+ *     结束，再下一轮回到 0 号 ⇒ 手动重测最多让"序号比它小"的通道晚一轮
+ *     （≤ round_ms）更新，**不会漏测**。
+ *
+ * 返回：IV_OK（已排上）/ IV_EINVAL（ch 越界）/ IV_ESTATE（未 open）/
+ *       IV_ENOENT（该路没配 IP —— 没有可测的对象，不是错误，前端提示"先配 IP"）。
+ */
+int iv_camdet_probe_now(iv_camdet_t *d, int ch, uint64_t now_ms);
 
 /* ---------------------------------------------------------------------------
  * 驱动

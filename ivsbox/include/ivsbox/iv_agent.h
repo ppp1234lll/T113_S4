@@ -596,6 +596,36 @@ uint64_t          iv_agent_door_events(const iv_agent_t *a); /* S4.5 门开事�
  * 返回内部句柄，调用方只读；a 为 NULL 返回 NULL。 */
 const iv_camdet_t *iv_agent_camdet(const iv_agent_t *a);
 
+/* ---------------------------------------------------------------------------
+ * 摄像机检测方式热生效 ＋ 立即重测一路（2026-10-22 补）
+ *
+ * ============================ 修的是什么 ============================
+ * ① `camera.detect.mode` / `camera.detect.rtt_ms` 只在 `iv_agent_open()` 里读一次，
+ *    网页「检测方式」改完**必须重启主控**才生效 —— 参考 web 那个下拉框是保存即生效
+ *    的，本机等于摆设。这是"改配置不生效"清单上的同一条。
+ * ② **`camera.ch.N.ip` 也一样**：改完摄像机 IP，camdet 还在测旧地址，直到重启。
+ *    现场最典型的动作就是"换个 IP 再测一下"，不热生效等于整条流程断掉。
+ * ③ `iv_camdet` 是轮询式（PING 20 s 一轮、扫描/RTSP 30 s 一轮），现场装完摄像机
+ *    想马上知道"这一路通不通"只能干等一整轮。Web 摄像机页的「测」按钮就是它。
+ *
+ * ============================ 参数口径 ============================
+ * `mode`：1/2/3（PING/端口扫描/RTSP）。**`0` 或负数一律跳过**，不当成"改回默认" ——
+ *   与 `iv_agent_open()` 的口径一致（那里 `cfg->camera_detect_mode != 0` 才用），
+ *   否则用户在 web 上把键清空会被读成"他选了 PING"。
+ * `rtt_ms`：同上，`0` 跳过（0 是 init 期的"取默认"哨兵，不是合法阈值）。
+ * `ip_be`：6 项网络序地址表（`0` = 该路未配置）；**NULL ⇒ 不动通道表**。
+ *   与 `iv_camdet_set_channels()` 同口径：表没变时它是空操作，所以本函数可以在
+ *   camera 分类任一键变化时无脑调用。
+ * `ch`：**0 基下标 0..5**，与 `camera.ch.N.ip` 的 N 同口径（CNS 显示时再 +1）。
+ *
+ * 返回：reload 给 `IV_OK`（已应用）／`IV_EINVAL`／`IV_ESTATE`（agent 或 camdet 未
+ * open）；probe 给 `IV_OK`／`IV_EINVAL`（ch 越界）／`IV_ESTATE`／`IV_ENOENT`
+ * （该路没配 IP，前端据此提示"先配 IP"）。
+ * ------------------------------------------------------------------------- */
+int iv_agent_reload_camdet(iv_agent_t *a, int mode, uint32_t rtt_ms,
+                          const uint32_t *ip_be, uint64_t now_ms);
+int iv_agent_camdet_probe(iv_agent_t *a, int ch, uint64_t now_ms);
+
 /* M6 媒体出口：media＝iv_ctl_media_ops_t 绑定用（装配层经 iv_agent_media()
  * 拿实例指针）；recm＝app 层填/读录像 URL 表用（open 后直接改 recm.cfg 也行）。
  * 未 open 时 media.inited=0，绑给 ctl 的方法会按 IV_ENOTSUP 应答。 */

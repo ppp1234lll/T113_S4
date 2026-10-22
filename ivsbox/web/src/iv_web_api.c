@@ -553,6 +553,12 @@ int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
     }
     if (strcmp(req->path, "/api/camera/search") == 0)
         return api_simple_call(ctx, "camera.search", out, cap, out_len, rsp);
+    /* 立即重测一路（摄像机页「测」按钮）。参数 `{ch:1..6}` 原样交 ctl，
+     * 越界/未配 IP 的错误话术由 `m_camera_test()` 给（一处口径，不在这里重写）。 */
+    if (strcmp(req->path, "/api/camera/test") == 0)
+        return api_p_call(ctx, "camera.test",
+                          (req->body != NULL) ? req->body : "{}",
+                          out, cap, out_len, rsp);
     if (strcmp(req->path, "/api/system/time") == 0)
         return api_p_call(ctx, "system.time",
                           (req->body != NULL) ? req->body : "{}",

@@ -685,6 +685,114 @@ static void c12_cns_segment(void)
         "c12: CNS carries the camdet five-state codes as-is");
 }
 
+/* ---------------------------------------------------------------------------
+ * c13 立即重测一路（iv_camdet_probe_now）＋ 延时阈值热生效（set_rtt_thr）
+ *
+ * 这两条是 2026-10-22 补的"假功能"收口：`iv_camdet` 是轮询式（PING 20 s 一轮、
+ * 扫描/RTSP 30 s 一轮），现场改完 IP / 换完检测方式都得等一整轮才看得到效果，
+ * 而 `camera.detect.rtt_ms` 更只在 open 时读一次。Web 摄像机页的「测」按钮与
+ * 「检测方式」下拉就靠这两个接口。
+ *
+ * 端口扫描那段是本用例的核心：它**证明本轮真的从被点的那一路开跑**，而不是
+ * 从 0 号一路扫过来（否则 sc_from 白加、"测 3 号"实际在测 1 号）。
+ * ------------------------------------------------------------------------- */
+static void c13_probe_now_and_rtt(void)
+{
+    fx_t     f;
+    uint32_t ips[6];
+    uint64_t t;
+    int      i;
+
+    /* ---- 守卫：未 open / NULL / ch 越界 / 未配 IP / rtt=0 ---- */
+    memset(&f, 0, sizeof(f));
+    iv_camdet_init(&f.d, NULL);
+    chk(iv_camdet_probe_now(NULL, 0, 1u) == IV_EINVAL, "c13: probe_now(NULL) -> EINVAL");
+    chk(iv_camdet_probe_now(&f.d, 0, 1u) == IV_ESTATE, "c13: probe_now before open -> ESTATE");
+    chk(iv_camdet_set_rtt_thr(&f.d, 100u) == IV_ESTATE, "c13: set_rtt before open -> ESTATE");
+
+    g_conn_ret   = -1;
+    g_conn_errno = EINPROGRESS;
+    g_so_err     = 0;
+    fx_open(&f, IV_CAMDET_MODE_PORT, 0u);
+    one_cam(ips);
+    (void)iv_camdet_set_channels(&f.d, ips, 1000u);
+
+    chk(iv_camdet_probe_now(&f.d, -1, 1000u) == IV_EINVAL, "c13: ch<0 -> EINVAL");
+    chk(iv_camdet_probe_now(&f.d, IV_CAMDET_CH_N, 1000u) == IV_EINVAL,
+        "c13: ch>=CH_N -> EINVAL");
+    chk(iv_camdet_probe_now(&f.d, 3, 1000u) == IV_ENOENT,
+        "c13: channel without IP -> ENOENT");
+    chk(iv_camdet_set_rtt_thr(&f.d, 0u) == IV_EINVAL, "c13: rtt=0 -> EINVAL");
+    chk(iv_camdet_set_rtt_thr(&f.d, 300u) == IV_OK, "c13: rtt set");
+    chk(f.d.cfg.rtt_thr_ms == 300u, "c13: rtt stored");
+    chk(iv_camdet_set_rtt_thr(&f.d, 300u) == IV_OK, "c13: same rtt -> OK");
+    chk(iv_camdet_set_rtt_thr(&f.d, 90u) == IV_OK && f.d.cfg.rtt_thr_ms == 90u,
+        "c13: rtt lowered in place");
+    iv_camdet_close(&f.d);
+
+    /* ---- 端口扫描：probe_now 必须**从该路起**，而不是从 0 号起 ---- */
+    g_conn_ret   = -1;
+    g_conn_errno = ECONNREFUSED; /* 7 个端口全不可连 → 故障 */
+    fx_open(&f, IV_CAMDET_MODE_PORT, 0u);
+    for (i = 0; i < IV_CAMDET_CH_N; i++)
+        ips[i] = 0u;
+    ips[0] = CAM0_BE;
+    ips[1] = CAM1_BE;
+    (void)iv_camdet_set_channels(&f.d, ips, 1000u);
+
+    t = 1000u;
+    for (i = 0; i < 30; i++) { /* 2 台 × 7 端口，每 tick 至少走一步 */
+        (void)iv_camdet_tick(&f.d, t);
+        t += 100u;
+    }
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_FAULT &&
+            iv_camdet_status(&f.d, 1) == IV_CAMDET_FAULT,
+        "c13: baseline both fault");
+    chk(f.d.next_round_ms > t, "c13: round finished, next one is in the future");
+
+    /* 手动重测 1 号（0 基下标 1），同时把 connect 改成立刻连通 */
+    g_conn_ret   = 0;
+    g_conn_errno = 0;
+    chk(iv_camdet_probe_now(&f.d, 1, t) == IV_OK, "c13: probe_now(ch1) queued");
+    chk(f.d.sc_from == 1, "c13: next round starts at ch1");
+    chk(f.d.next_round_ms == 0u, "c13: next round fires immediately");
+    (void)iv_camdet_tick(&f.d, t);
+    chk(f.d.sc_from == 0, "c13: sc_from consumed once (next round back to ch0)");
+    chk(iv_camdet_status(&f.d, 1) == IV_CAMDET_NORMAL,
+        "c13: ch1 re-probed -> normal");
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_FAULT,
+        "c13: ch0 was NOT re-probed (round started at ch1, not ch0)");
+    iv_camdet_close(&f.d);
+
+    /* ---- PING：probe_now 清掉该路取样环（之后 4 个新样本重新结算） ---- */
+    fx_open(&f, IV_CAMDET_MODE_PING, 0u);
+    one_cam(ips);
+    (void)iv_camdet_set_channels(&f.d, ips, 1000u);
+    t = 1000u;
+    for (i = 0; i < 2; i++)
+        ping_pkt(&f, &t, 1, 10);
+    chk(iv_camdet_samples(&f.d, 0) == 2, "c13: 2 samples in the ring");
+    chk(iv_camdet_probe_now(&f.d, 0, t) == IV_OK, "c13: ping probe_now ok");
+    chk(iv_camdet_samples(&f.d, 0) == 0, "c13: ping ring cleared by probe_now");
+    iv_camdet_close(&f.d);
+
+    /* ---- 延时阈值热生效：同一批 150 ms 样本，阈值 200 → 正常 / 100 → 延时 ---- */
+    fx_open(&f, IV_CAMDET_MODE_PING, 200u);
+    one_cam(ips);
+    (void)iv_camdet_set_channels(&f.d, ips, 1000u);
+    t = 1000u;
+    for (i = 0; i < 4; i++)
+        ping_pkt(&f, &t, 1, 150);
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL,
+        "c13: rtt 150 under thr 200 -> normal");
+    chk(iv_camdet_set_rtt_thr(&f.d, 100u) == IV_OK, "c13: lower thr to 100");
+    for (i = 0; i < 4; i++)
+        ping_pkt(&f, &t, 1, 150);
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_DELAY,
+        "c13: same rtt 150 now over thr 100 -> delay (hot effect)");
+    iv_camdet_close(&f.d);
+}
+
 int main(void)
 {
     c01_args_and_guards();
@@ -699,12 +807,13 @@ int main(void)
     c10_mode_switch();
     c11_cns();
     c12_cns_segment();
+    c13_probe_now_and_rtt();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_camdet FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_camdet passed (guards, ping normal/delay/loss/fault, link-down, "
-           "channel refresh, port scan, rtsp, mode switch, cns)\n");
+           "channel refresh, port scan, rtsp, mode switch, cns, probe-now/rtt)\n");
     return 0;
 }

@@ -69,6 +69,7 @@ static const char *const k_methods[] = {
     "relay.set",
     "device.identity.set",
     "camera.search",
+    "camera.test",
     "system.time",
     "system.reboot",
     "snapshot.take",
@@ -1531,6 +1532,61 @@ static int m_camera_search(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_
     return rsp_data(d, out, cap, out_len);
 }
 
+/* ---- camera.test：立即重测一路（2026-10-22 补，Web 摄像机页「测」按钮）----
+ *
+ * 为什么是"排上"而不是"返回结果"：`iv_camdet` 是非阻塞状态机（RTSP 一次
+ * OPTIONS 1 s 超时、端口扫描 7 个端口各 1 s、PING 要集满 4 个样本），在这里
+ * 同步等结果就会把 Reactor 卡住 —— 与"ctl 路由绝不阻塞"（架构 §4.2）直接冲突。
+ * 所以本接口只做"立刻重开该路的探测"，`expect_ms` 给出结论大约多久后出现，
+ * 前端据此决定多少毫秒后自动刷新 CNS。
+ *
+ * **`ch` 是 1 基（1..6）**：与 `relay.set` 的 1..3、页面上"摄像机1"同序。
+ * 内部下标是 `ch-1`（`camera.ch.N.*` 的 N 是 0 基），差一在这一处一次翻完，
+ * 前端只管按显示序号传。 */
+static int m_camera_test(const iv_ctl_ctx_t *ctx, json_object *p,
+                         char *out, size_t cap, size_t *out_len)
+{
+    const iv_camdet_t *cd;
+    json_object       *d;
+    int64_t            ch = 0;
+    int                mode;
+    int                rc;
+
+    if (ctx->agent == NULL)
+        return rsp_err(IV_ESTATE, "agent unavailable", out, cap, out_len);
+    if (param_i64(p, "ch", &ch) != IV_OK)
+        return rsp_err(IV_EINVAL, "missing ch", out, cap, out_len);
+    if (ch < 1 || ch > IV_CAMDET_CH_N)
+        return rsp_err(IV_EINVAL, "ch must be 1..6", out, cap, out_len);
+
+    rc = iv_agent_camdet_probe(ctx->agent, (int)ch - 1, iv_clock_monotonic_ms());
+    /* ENOENT 单独给话术：现场点「测」最常见的原因就是这一路还没配 IP，
+     * 报"probe rejected"等于让人去翻日志。 */
+    if (rc == IV_ENOENT)
+        return rsp_err(rc, "this channel has no IP configured", out, cap, out_len);
+    if (rc != IV_OK)
+        return rsp_err(rc, "probe rejected", out, cap, out_len);
+
+    cd   = iv_agent_camdet(ctx->agent);
+    mode = (cd != NULL) ? iv_camdet_mode(cd) : 0;
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "queued", json_object_new_boolean(1));
+    json_object_object_add(d, "ch", json_object_new_int((int)ch));
+    json_object_object_add(d, "mode", json_object_new_int(mode));
+    json_object_object_add(d, "mode_name",
+                           json_object_new_string(iv_camdet_mode_name(mode)));
+    /* 最坏时长 + 一拍余量：PING 4 样本 × 5 s；端口扫描 7 端口 × 1 s；
+     * RTSP 单次 OPTIONS 1 s。前端按这个值定时回读 CNS。 */
+    json_object_object_add(d, "expect_ms",
+                           json_object_new_int((mode == IV_CAMDET_MODE_PING) ? 20000
+                                                : (mode == IV_CAMDET_MODE_PORT) ? 8000
+                                                                               : 1500));
+    return rsp_data(d, out, cap, out_len);
+}
+
 /* ============================ board.status（S2.6 采集板镜像出口） ============================ */
 
 /* 镜像字段的"未知"处理：`iv_status` 用 **valid 位图**区分"未填"与"真零"
@@ -2722,6 +2778,8 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_device_identity_set(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "camera.search") == 0)
         rc = m_camera_search(ctx, out, out_cap, out_len);
+    else if (strcmp(method, "camera.test") == 0)
+        rc = m_camera_test(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "system.time") == 0)
         rc = m_system_time(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "system.reboot") == 0)

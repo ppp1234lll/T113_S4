@@ -195,6 +195,19 @@ tests/integration  ——  集成测试：验端到端装配（部分需外部�
   # docs/代码说明.adoc 2026-10-22 11:49）。
   sudo python3 tests/integration/netthr_e2e.py
 
+  # netsrv_e2e.py：同上口径，验平台「备份」地址（`net.server.<口>.host_bak`/`port_bak`）
+  # 的**装配层接线**与两条口径。判据是落盘日志里
+  # `server addr reloaded -> <host>:<port> (wan=<口>, …)` 这一行：
+  #   两口主空、备份给不同地址 ⇒ 取"活动口自己的备"（从同一行的 wan= 反查，自洽校验
+  #   ⇒ 本口备 > 另一口备）；给主地址 ⇒ 选主；**主在用只改备份 ⇒ 不 reload 也不重连**
+  #   （缓存比对的是解析结果，不是四个输入值）；主地址清空 ⇒ 备份立刻顶上。
+  # ⚠ 它会把地址指到连不通的 127.0.0.1:160xx，所以**开头先把 `netthr.reboot_max` 置 0**
+  #   —— 否则上一轮留下的自愈限次会在连不通时把机器重启掉。
+  # 单测（`test_agent_pick`）只钉"选谁"；把 `main.c` 里写 `srv_host_bak` 的两行删掉，
+  # 单测 42 条全绿、本用例红 2 条 —— 这就是为什么必须有这一层
+  # （见 docs/代码说明.adoc 2026-10-22 14:34）。
+  sudo python3 tests/integration/netsrv_e2e.py
+
 【约定与注意事项】
   - 本目录**刻意不并入 make test**：目录里既有"需外部服务"的用例，并进去会让 CI 因
     "没起服务"而假红（见 Makefile `itest` 注释、架构 §16.1）。**需要按单用例粒度执行**

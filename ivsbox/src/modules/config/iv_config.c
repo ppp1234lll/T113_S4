@@ -203,6 +203,27 @@ static const cfg_default_t s_defaults[] = {
     D_INT(IV_CFG_CLS_NET, "net.server.wired.port", "有线平台服务器端口", 6012, 0, 65535),
     D_STR(IV_CFG_CLS_NET, "net.server.wireless.host", "无线平台服务器地址", "47.104.250.225", NULL),
     D_INT(IV_CFG_CLS_NET, "net.server.wireless.port", "无线平台服务器端口", 6012, 0, 65535),
+    /* ---- 平台**备份**地址（2026-10-22）----
+     * 对齐单片机参考 web「平台配置」卡的 `内网1地址_备份/内网1端口_备份/
+     * 外网1地址_备份/外网1端口_备份` 四个字段（`index.shtml` 里的 `ae/af/ag/ah`）。
+     *
+     * 出厂**空地址**：备用是"主地址没配时才顶上"的第二选择，不是默认通道。
+     * 见 `iv_agent.c` 的 `iv_agent_pick_host()`：优先级链是
+     * 本口主 → 本口备 → 另一口主 → 另一口备。
+     * ⚠ **不做失败自动切换**（用户 2026-10-22 拍板「不切换，只作为备份」）：
+     * 主地址连不上时不会自动改走备地址。要真切换得先定"何时切、何时回、
+     * 门限多少"，属另一件事，登记在 docs。
+     *
+     * ⚠ **必须是 4 段键**：`IV_CFG_DEPTH_MAX = 4`，写成
+     * `net.server.wired.backup.host` 就是第 5 段，`key_ok()` 判非法 ⇒
+     * `items_check()` 不过 ⇒ **每一条 save 全被拒**（不是只有这个键被丢，
+     * 是整份配置写不出去，且报错行只在 detail 里）。
+     * 遂用「`_bak` 后缀」而不是「`.backup.` 中间段」—— 这也正好对上参考 web 的
+     * 「地址_备份 / 端口_备份」命名。同理换键名时**先数段数**。 */
+    D_STR(IV_CFG_CLS_NET, "net.server.wired.host_bak", "有线平台服务器地址（备份）", "", NULL),
+    D_INT(IV_CFG_CLS_NET, "net.server.wired.port_bak", "有线平台服务器端口（备份）", 6012, 0, 65535),
+    D_STR(IV_CFG_CLS_NET, "net.server.wireless.host_bak", "无线平台服务器地址（备份）", "", NULL),
+    D_INT(IV_CFG_CLS_NET, "net.server.wireless.port_bak", "无线平台服务器端口（备份）", 6012, 0, 65535),
     D_STR(IV_CFG_CLS_NET, "net.server.upgrade.host", "升级服务器地址", "47.104.98.214", NULL),
     D_INT(IV_CFG_CLS_NET, "net.server.upgrade.port", "升级服务器端口", 8989, 0, 65535),
     D_STR(IV_CFG_CLS_NET, "net.server.log.host", "日志上报服务器地址", "", NULL),

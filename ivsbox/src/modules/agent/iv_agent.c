@@ -78,27 +78,51 @@ static iv_wan_t agent_initial_wan(iv_netmgr_mode_t mode)
     return (mode == IV_NETMGR_MODE_WIRED_ONLY) ? IV_WAN_WIRED : IV_WAN_WIRELESS;
 }
 
-/* 按指定出口取平台地址：**本口没配则回退另一口**；两口都没配 → NULL（不启平台链路）。
- * port 出参同步置为选中那条的端口（未选中时置 0）。 */
-static const char *agent_pick_host(const iv_agent_cfg_t *cfg, int w, uint16_t *port)
+/* 按指定出口取平台地址。优先级链（2026-10-22 起四条）：
+ *
+ *     本口主 → 本口备 → 另一口主 → 另一口备
+ *
+ * 前两轮是"指定的那条链路"，后两轮是"另一条链路"。这样"本口只配了备份地址"
+ * 与"本口什么都没配、另一口有主地址"两种现场都能连上，且**本口备份优先于
+ * 另一口主地址** —— 同一张网卡上的备用服务器，比换一条物理链路更可能是对的目标。
+ *
+ * ⚠ 这是**静态选择**，不是失败切换：主地址连不上不会自动改走备份（用户
+ * 2026-10-22 拍板「不切换，只作为备份」）。所以本函数是纯函数 —— 同样的
+ * 配置永远给出同一个答案，没有隐藏状态，也就没有"卡在备地址回不来"这种事。
+ * 每次重连/换出口都会重跑一遍，天然响应配置变更。
+ *
+ * 某条地址"有效"的判据与既有口径一致：host 非 NULL/空串 **且** port != 0。
+ * 四条都无效 → NULL（不启平台链路），port 出参置 0。
+ * 导出（非 static）是为单测能直接钉住 4 条链 —— 详见头文件里的契约说明。 */
+const char *iv_agent_pick_host(const iv_agent_cfg_t *cfg, int wan, uint16_t *port)
 {
     int i;
 
-    for (i = 0; i < IV_WAN_N; i++) {
-        int         x = (i == 0)
-                            ? w
-                            : ((w == IV_WAN_WIRELESS) ? IV_WAN_WIRED : IV_WAN_WIRELESS);
-        const char *h = cfg->srv_host[x];
-
-        if (h != NULL && h[0] != '\0' && cfg->srv_port[x] != 0u) {
-            if (port != NULL)
-                *port = cfg->srv_port[x];
-            return h;
-        }
-    }
     if (port != NULL)
         *port = 0u;
-    return NULL;
+    if (cfg == NULL)
+        return NULL;
+    if (wan != IV_WAN_WIRELESS && wan != IV_WAN_WIRED)
+        return NULL; /* 出口编号非法：按"无地址"处理，别去索引数组 */
+
+    for (i = 0; i < IV_WAN_N; i++) {
+        int x = (i == 0)
+                    ? wan
+                    : ((wan == IV_WAN_WIRELESS) ? IV_WAN_WIRED : IV_WAN_WIRELESS);
+        int k;
+
+        for (k = 0; k < 2; k++) {
+            const char *h = (k == 0) ? cfg->srv_host[x] : cfg->srv_host_bak[x];
+            uint16_t    p = (k == 0) ? cfg->srv_port[x] : cfg->srv_port_bak[x];
+
+            if (h != NULL && h[0] != '\0' && p != 0u) {
+                if (port != NULL)
+                    *port = p;
+                return h;
+            }
+        }
+    }
+    return NULL; /* `*port` 在入口已置 0，这里不必重复 */
 }
 
 /* ---------------------------------------------------------------------------
@@ -265,7 +289,7 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     rc.serial_path  = (cfg->serial_path != NULL) ? cfg->serial_path : IV_REPORT_SERIAL_DEFAULT;
     /* 平台地址按**初始活动出口**取（本口没配则回退另一口；两口都空 ⇒ 不启平台链路） */
     w0 = agent_initial_wan(mode);
-    rc.server_host  = agent_pick_host(cfg, w0, &rc.server_port);
+    rc.server_host  = iv_agent_pick_host(cfg, w0, &rc.server_port);
     /* 出口网卡与地址成对设置：只选地址不绑出口时，双 WAN 下报文会顺着内核默认路由
      * 从另一条链路出去（实测：选中的是 4G，报文却从 eth0 发）。网卡不存在则不绑
      * （绑一个不存在的名字只会白白记一次 bind_fail）。 */
@@ -1282,7 +1306,7 @@ static int agent_reconnect(void *arg, int new_ifindex)
         }
     }
 
-    h = agent_pick_host(&a->cfg, w, &port);
+    h = iv_agent_pick_host(&a->cfg, w, &port);
     if (iv_report_set_server(&a->rp, h, port) != IV_OK)
         IV_LOG_W(AG_MOD, "server addr switch rejected, keep old (%s)",
                  a->cfg.wan_name[w]);
@@ -1366,7 +1390,7 @@ int iv_agent_reload_server(iv_agent_t *a)
     if ((int)w < 0 || (int)w >= IV_WAN_N)
         w = IV_WAN_WIRELESS;
 
-    h    = agent_pick_host(&a->cfg, (int)w, &port);
+    h    = iv_agent_pick_host(&a->cfg, (int)w, &port);
     bind = (a->wan_ifindex[w] != 0 && a->cfg.wan_name[w] != NULL)
                ? a->cfg.wan_name[w]
                : NULL;

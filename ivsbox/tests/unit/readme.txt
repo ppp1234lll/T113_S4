@@ -38,6 +38,12 @@ tests/unit  ——  单元测试：自包含、可脱离一切外部环境运行
                         view 读模块不读配置；`IV_ESTATE` 如实上抛且快照不被改写。
                         不需要 `iv_agent_open()`（恢复分支只依赖 `a->rec`）；切换门限那半边
                         由 `tests/integration/netthr_e2e.py` 真拉进程取证。
+    test_agent_pick.c   平台地址四条链（`iv_agent_pick_host()`，纯函数）：本口主 → 本口备
+                        → 另一口主 → 另一口备；主胜备、**本口备胜另一口主**、链尾另一口备、
+                        四条全空返 NULL 且 `*port` 归零、端口 0 跳过、**同输入连调两次一致**
+                        （「不切换，只作为备份」⇒ 没有隐藏状态）、两出口链序对称、三个入参守卫。
+                        **装配层接线**（改配置会不会走到这条链）由 `tests/integration/netsrv_e2e.py`
+                        取证 —— 把 `main.c` 里写 `srv_host_bak` 的两行删掉，本文件 9 组依然全绿。
   配置（modules，M1-S8）
     test_config.c       iv_config：单文件口径、单句柄约束、数组/double 类型、中文注释往返、按一级分类子树的热更新事务
  升级（modules，M7-S7.1）

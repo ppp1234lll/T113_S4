@@ -523,34 +523,55 @@ static uint16_t cfg_port(const char *key)
  * `net` 分类下还有 `net.ip` / `net.mask` / `net.gateway` 这些与平台**无关**的键。
  * 只要分类里有一个值变了通知就会来，不比对的话"改个静态 IP"也会把平台连接
  * 拆一次。所以这里存一份上次推送的值，只有地址或端口真的变了才重连。
+ *
+ * 2026-10-22 起缓存的是 **`iv_agent_pick_host()` 的解析结果**（每个出口一份），
+ * 不再是四个输入值本身。理由：加了备份地址之后，"输入变了"不等于"要用的地址
+ * 变了"—— 主地址在用、只改备份地址时解析结果一模一样，却会把在跑的 TCP 会话
+ * 白拆一次。两个出口各解析一次即可覆盖"当前活动口是哪一个"两种可能。
  * ------------------------------------------------------------------------- */
-static char     s_srv_host[IV_WAN_N][64];
-static uint16_t s_srv_port[IV_WAN_N];
+static char     s_pick_host[IV_WAN_N][64];
+static uint16_t s_pick_port[IV_WAN_N];
 
-/* 返回 1 = 地址/端口有变化。`force`=0 时只对齐缓存、不重连（启动时用：
- * 那时 agent 刚按同一份配置 open 过，再重连一次纯属多余）。 */
+/* 返回 1 = **会被用到的**地址/端口有变化。`force`=0 时只对齐缓存、不重连
+ * （启动时用：那时 agent 刚按同一份配置 open 过，再重连一次纯属多余）。 */
 static int agent_sync_server_cfg(int force)
 {
-    const char *host;
     const char *raw;
+    const char *bak;
     uint16_t    port;
+    uint16_t    bport;
     int         i;
     int         changed = 0;
 
+    /* 1) 先把四个值写进 agent 的配置快照（它是 `iv_agent_pick_host()` 的输入） */
     for (i = 0; i < IV_WAN_N; i++) {
-        raw  = (i == IV_WAN_WIRELESS) ? cfg_str("net.server.wireless.host")
-                                      : cfg_str("net.server.wired.host");
-        port = (i == IV_WAN_WIRELESS) ? cfg_port("net.server.wireless.port")
-                                      : cfg_port("net.server.wired.port");
-        host = (raw != NULL) ? raw : "";
-        if (strcmp(s_srv_host[i], host) != 0 || s_srv_port[i] != port)
-            changed = 1;
-        (void)snprintf(s_srv_host[i], sizeof(s_srv_host[i]), "%s", host);
-        s_srv_port[i] = port;
+        raw   = (i == IV_WAN_WIRELESS) ? cfg_str("net.server.wireless.host")
+                                       : cfg_str("net.server.wired.host");
+        port  = (i == IV_WAN_WIRELESS) ? cfg_port("net.server.wireless.port")
+                                       : cfg_port("net.server.wired.port");
+        bak   = (i == IV_WAN_WIRELESS) ? cfg_str("net.server.wireless.host_bak")
+                                       : cfg_str("net.server.wired.host_bak");
+        bport = (i == IV_WAN_WIRELESS) ? cfg_port("net.server.wireless.port_bak")
+                                       : cfg_port("net.server.wired.port_bak");
         /* host 直接沿用配置内部指针：配置的字符串存在定长缓冲里（`union{char s[]}`），
          * 原地改写、指针一直有效。**端口是值类型，必须重写**（agent 存的是拷贝）。 */
-        g_agent.cfg.srv_host[i] = raw;
-        g_agent.cfg.srv_port[i] = port;
+        g_agent.cfg.srv_host[i]     = raw;
+        g_agent.cfg.srv_port[i]     = port;
+        g_agent.cfg.srv_host_bak[i] = bak;
+        g_agent.cfg.srv_port_bak[i] = bport;
+    }
+
+    /* 2) 再比"解析出来到底连谁"。备份地址只在主地址没配时才顶上，所以
+     *    "只改了当前没在用的备份"⇒ 解析结果不变 ⇒ 不重连。 */
+    for (i = 0; i < IV_WAN_N; i++) {
+        uint16_t    p  = 0u;
+        const char *h  = iv_agent_pick_host(&g_agent.cfg, i, &p);
+        const char *hs = (h != NULL) ? h : "";
+
+        if (strcmp(s_pick_host[i], hs) != 0 || s_pick_port[i] != p)
+            changed = 1;
+        (void)snprintf(s_pick_host[i], sizeof(s_pick_host[i]), "%s", hs);
+        s_pick_port[i] = p;
     }
     if (changed && force != 0) {
         int rc = iv_agent_reload_server(&g_agent);
@@ -1427,13 +1448,21 @@ static int agent_setup(void)
 
     iv_agent_cfg_default(&ac);
 
-    /* 平台地址：**按活动出口取**（下标＝iv_wan_t）—— 两条分开配置，活动出口由
-     * sys.transport.mode ＋ netmgr 状态机决定；本口没配则回退另一口（iv_agent 内）。
-     * 两条都为空 ⇒ 不启平台链路（iv_report 内部 idle）。 */
+    /* 平台地址：**按活动出口取**（下标＝iv_wan_t）—— 每条链路主/备各一份，活动
+     * 出口由 sys.transport.mode ＋ netmgr 状态机决定。选地址的优先级链在
+     * `iv_agent.c` 的 `iv_agent_pick_host()`：
+     *     本口主 → 本口备 → 另一口主 → 另一口备
+     * 四条全空 ⇒ 不启平台链路（iv_report 内部 idle）。
+     * ⚠ 备份地址**不做失败切换**（用户 2026-10-22 拍板）：它只在主地址"没配"
+     *   时才顶上，与"主地址连不上就换一条"是两件不同的事。 */
     ac.srv_host[IV_WAN_WIRELESS] = cfg_str("net.server.wireless.host");
     ac.srv_port[IV_WAN_WIRELESS] = cfg_port("net.server.wireless.port");
     ac.srv_host[IV_WAN_WIRED]    = cfg_str("net.server.wired.host");
     ac.srv_port[IV_WAN_WIRED]    = cfg_port("net.server.wired.port");
+    ac.srv_host_bak[IV_WAN_WIRELESS] = cfg_str("net.server.wireless.host_bak");
+    ac.srv_port_bak[IV_WAN_WIRELESS] = cfg_port("net.server.wireless.port_bak");
+    ac.srv_host_bak[IV_WAN_WIRED]    = cfg_str("net.server.wired.host_bak");
+    ac.srv_port_bak[IV_WAN_WIRED]    = cfg_port("net.server.wired.port_bak");
 
     /* 定时上报间隔（配置单位秒 → 毫秒） */
     if (iv_config_get_int(g_cfg, "sys.report.interval_s", &v) == IV_OK && v > 0)

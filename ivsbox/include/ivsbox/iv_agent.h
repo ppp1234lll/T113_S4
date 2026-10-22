@@ -69,8 +69,10 @@
  *     开链时按**初始活动出口**取（只有 `WIRED_ONLY` 模式从有线起步，其余从无线起步，
  *     与 netmgr 初始态 `WIRELESS_UP` 一致）；换出口时在 `reconnect` 钩子里按
  *     **netmgr 传入的 new_ifindex** 反推目标出口再取址，并交给
- *     `iv_report_set_server()` 生效。**本口没配则回退另一口**；两口都空 ⇒
- *     不启平台链路（`iv_report_reconnect` 返回 `IV_ESTATE` 空转）。
+ *     `iv_report_set_server()` 生效。选址优先级链（2026-10-22 起四条）：
+ *     **本口主 → 本口备 → 另一口主 → 另一口备**（备地址来自
+ *     `net.server.<口>.host_bak` / `port_bak`，**只在主地址没配时顶上，不做失败切换**）；
+ *     四条都空 ⇒ 不启平台链路（`iv_report_reconnect` 返回 `IV_ESTATE` 空转）。
  *   - **箱门事件（S4.5）**：本层把 `on_door_open` 挂到 `iv_report_cfg_t::on_door`，
  *     `iv_status` 解到 `0xC1`（箱门开启）时同步回调。**M4 阶段＝空实现 ＋ 日志 ＋ 计数**，
  *     抓图本体属 M6-S6.2（到时把 `on_door_open` 换成本地通道 `snapshot.take` 派发即可）；
@@ -227,6 +229,18 @@ typedef struct {
      * 某口 NULL/"" 或 port=0 ⇒ 该口无地址（自动回退另一口）。 */
     const char *srv_host[IV_WAN_N];
     uint16_t    srv_port[IV_WAN_N];
+    /* 各口的**备份**平台地址（2026-10-22 新增；对应 `net.server.<口>.host_bak` / `port_bak`）。
+     * 选地址的完整优先级链在 `iv_agent_pick_host()`：
+     *     本口主 → 本口备 → 另一口主 → 另一口备
+     * ⚠ **不参与失败切换**：主地址连不上时不会自动改走备份（用户 2026-10-22
+     *   拍板「不切换，只作为备份」）。它只在主地址"没配"（NULL/"" 或 port=0）
+     *   时才顶上 —— 所以这条链是**静态选择**，每次重连/换出口重跑一遍即可，
+     *   不需要额外状态、也没有"卡在备地址回不来"的风险。
+     * 与主地址同口径：NULL/"" 或 port=0 ⇒ 该口无备份。
+     * ⚠ 指针语义同 `mod`（见 main.c 的 `g_mod[]` 注释）：装配层把配置内部的
+     *   定长缓冲指针直接放在这里，配置事件里原地改写内容、指针不变。 */
+    const char *srv_host_bak[IV_WAN_N];
+    uint16_t    srv_port_bak[IV_WAN_N];
     const char *mod;         /* 硬件型号串（E3 应答）；NULL → "" */
     const char *sv;          /* 软件版本串（E3 应答）；NULL → 由本层填 iv_version */
     const char *tsn;         /* 终端序列号（E3 应答）；NULL → "" */
@@ -437,6 +451,26 @@ typedef struct {
 /* 填默认配置：默认串口/队列路径、wan_name = usb0/eth0、mode = AUTO、
  * 探活默认、平台地址空（不启平台链路）。 */
 void iv_agent_cfg_default(iv_agent_cfg_t *cfg);
+
+/*
+ * 平台地址选择（**纯函数**，2026-10-22 起是 4 条链）。
+ * 入参 `wan` 是"当前活动出口"（`iv_wan_t`：IV_WAN_WIRELESS / IV_WAN_WIRED）。
+ * 优先级：**本口主 → 本口备 → 另一口主 → 另一口备**，第一条"地址有效"的胜出；
+ * 有效判据＝host 非 NULL / 非空串 **且** port != 0。
+ *   - 返回值为 `cfg` 内部的字符串指针（不拷贝、不返回静态缓冲），`*port` 同步改写；
+ *   - 四条都无效 ⇒ 返回 NULL 且 `*port = 0`（调用方据此不启平台链路）；
+ *   - `port == NULL` 时不回写端口；
+ *   - `cfg == NULL` ⇒ 返回 NULL。
+ *
+ * ⚠ **它不看任何运行期状态，也不做失败切换**（用户 2026-10-22 拍板
+ *   「不切换，只作为备份」）：主地址"有效但连不上"时会话层报错重连，
+ *   **不会**改走备地址 —— 备份只在主地址"没配"时顶上。这是刻意的：
+ *   要真切换得先定"何时切、何时回切、门限多少"，属另一件事（登记在 docs）。
+ *
+ * 之所以导出而不是留 static：这是本层最容易写错的一处分支（4 条链 × 两个口），
+ * 单测直接钉住比"起一整套 report 只为了看选中谁"便宜得多。
+ */
+const char *iv_agent_pick_host(const iv_agent_cfg_t *cfg, int wan, uint16_t *port);
 
 /* 清零句柄（不碰系统资源）。使用前必须先 init（或 `= {0}`）。 */
 void iv_agent_init(iv_agent_t *a);

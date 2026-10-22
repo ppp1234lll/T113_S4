@@ -206,9 +206,9 @@ static void case_defaults_startup(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c1: stat");
     chk(st.loaded == 0, "c1: loaded == 0 (started from built-in defaults)");
-    chk(st.items == 82u, "c1: 82 non-array defaults materialised");
+    chk(st.items == 86u, "c1: 86 non-array defaults materialised");
     chk(st.from_file == 0u, "c1: nothing came from the file");
-    chk(st.from_default == 82u, "c1: everything came from defaults");
+    chk(st.from_default == 86u, "c1: everything came from defaults");
     chk(st.invalid == 0u, "c1: a missing file is NOT an invalid value");
     chk(st.version == 0u, "c1: version is 0 when there is no file");
     chk(st.dirty == 0, "c1: not dirty right after open");
@@ -254,6 +254,29 @@ static void case_defaults_startup(void)
         "c1: net.server.wireless.host default 47.104.250.225");
     chk(iv_config_get_int(c, "net.server.wireless.port", &iv) == IV_OK && iv == 6012,
         "c1: net.server.wireless.port default 6012");
+    /* 平台**备份**地址（2026-10-22）：出厂**空**地址 —— 备份是"主地址没配时
+     * 才顶上"的第二选择，不是默认通道；端口给 6012（与主地址同值），这样现场
+     * 只填地址就能用，不会因为忘了改端口而"填了等于没填"。 */
+    chk(iv_config_get_str(c, "net.server.wired.host_bak", &s) == IV_OK &&
+            s != NULL && s[0] == '\0',
+        "c1: net.server.wired.host_bak default is empty");
+    chk(iv_config_get_int(c, "net.server.wired.port_bak", &iv) == IV_OK && iv == 6012,
+        "c1: net.server.wired.port_bak default 6012");
+    chk(iv_config_get_str(c, "net.server.wireless.host_bak", &s) == IV_OK &&
+            s != NULL && s[0] == '\0',
+        "c1: net.server.wireless.host_bak default is empty");
+    chk(iv_config_get_int(c, "net.server.wireless.port_bak", &iv) == IV_OK && iv == 6012,
+        "c1: net.server.wireless.port_bak default 6012");
+    /* 段数上限（`IV_CFG_DEPTH_MAX = 4`）**必须在这里钉住**：备份地址最初写成
+     * `net.server.wired.backup.host`（5 段），`key_ok()` 判非法 ⇒ 默认表里那条
+     * 条目让 `items_check()` 整表不过 ⇒ **每一条 save 全被拒**（现象是 test_config
+     * 里 c2/c4/c5/c7/c8/c9/c10/c11/c13/c17/c18 一片红，而报错只说 "invalid key"、
+     * 且只在 save 的 detail 里）。把 5 段键名改成 4 段后才会绿。 */
+    chk(iv_config_set_int(c, "net.server.wired.backup.port", 1) == IV_EINVAL,
+        "c1: a 5-segment key is rejected (IV_CFG_DEPTH_MAX == 4)");
+    chk(iv_config_default_get(IV_CFG_NAME, "net.server.wired.backup.host", NULL, NULL, 0u) ==
+            IV_ENOENT,
+        "c1: the 5-segment form is not in the default table either");
     chk(iv_config_get_str(c, "net.server.upgrade.host", &s) == IV_OK &&
             strcmp(s, "47.104.98.214") == 0,
         "c1: net.server.upgrade.host default 47.104.98.214");
@@ -551,9 +574,9 @@ static void case_fill_and_origin(void)
         return;
 
     chk(iv_config_stat(c, &st) == IV_OK, "c5: stat");
-    chk(st.items == 82u, "c5: all non-array defaults are materialised");
+    chk(st.items == 86u, "c5: all non-array defaults are materialised");
     chk(st.from_file == 1u, "c5: exactly one key came from the file");
-    chk(st.from_default == 81u, "c5: eighty-one were filled from defaults");
+    chk(st.from_default == 85u, "c5: eighty-five were filled from defaults");
     chk(st.invalid == 0u, "c5: a MISSING key is not an INVALID key");
     chk(st.loaded == 1, "c5: the file itself loaded fine");
 
@@ -574,7 +597,7 @@ static void case_fill_and_origin(void)
  * F4：文件把子树写成标量（`"net": 5`）必须判非法并剔除，不能让它把整棵
  *     net.* 默认子树挡在门外。
  * 反向证伪：去掉 item_check() 里的 is_default_parent 分支后，invalid 会退回 0，
- *           而 items 也不再是 80 —— 这正是 F6 静默清空运行中配置的那条路。
+ *           而 items 也不再是整份默认表的条数 —— 这正是 F6 静默清空运行中配置的那条路。
  * ========================================================================= */
 static void case_parent_scalar_rejected(void)
 {
@@ -594,7 +617,7 @@ static void case_parent_scalar_rejected(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c6: stat");
     chk(st.invalid == 1u, "c6: the scalar that shadows a subtree is counted as invalid");
-    chk(st.items == 82u, "c6: the whole non-array default set is still there");
+    chk(st.items == 86u, "c6: the whole non-array default set is still there");
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && s[0] == '\0',
         "c6: net.* is usable again (defaulted empty)");
     chk(iv_config_get_int(c, "net", &iv) == IV_ENOENT, "c6: the offending key itself is gone");
@@ -976,7 +999,7 @@ static void case_array_support(void)
                     strcmp(s, "7") == 0,
                 "c10: the 8th element is reachable");
             chk(iv_config_stat(cx, &st8) == IV_OK, "c10: stat on the eight-camera config");
-            chk(st8.items == 82u + 64u,
+            chk(st8.items == 86u + 64u,
                 "c10: 8 slots x 8 fields + 82 base == 146 items (fits ITEMS_MAX 192)");
             iv_config_close(cx);
         }
@@ -1043,7 +1066,7 @@ static void case_comment_roundtrip(void)
     chk(iv_config_stat(c, &st) == IV_OK, "c11: stat after round-trip");
     chk(st.loaded == 1, "c11: the rendered file parses back cleanly");
     chk(st.invalid == 0u, "c11: no value was rejected on the round-trip");
-    chk(st.items == 90u, "c11: 82 base keys plus one 8-field camera survived");
+    chk(st.items == 94u, "c11: 86 base keys plus one 8-field camera survived");
 
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "172.16.0.9") == 0,
         "c11: the string survived");

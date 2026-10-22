@@ -1813,6 +1813,20 @@ static int app_init(void)
     g_ctl_ctx.store       = g_store;
     g_ctl_ctx.do_reboot   = ctl_do_reboot;
     g_ctl_ctx.do_settime  = ctl_do_settime;
+    /* 恢复出厂（2026-10-22）：擦除目标的两个根。
+     *   数据根＝`/mnt/UDISK/ivsbox`（日志在它下面的 `log/`）；
+     *   媒体根走 `iv_storage_root_resolve("")`，与 SD 卡策略、抓拍目录**同源**
+     *   （`IVSBOX_SD_ROOT` 覆盖对它同样有效——单测/回放才设，产线不设）。
+     * 两个串都存进 static 缓冲：ctx 只借指针，函数返回后局部量就没了。 */
+    {
+        static char s_fac_data_root[96];
+        static char s_fac_media_root[96];
+
+        snprintf(s_fac_data_root, sizeof(s_fac_data_root), "%s", IV_UPD_DATA_ROOT_DEFAULT);
+        iv_storage_root_resolve("", s_fac_media_root, sizeof(s_fac_media_root));
+        g_ctl_ctx.factory_data_root  = s_fac_data_root;
+        g_ctl_ctx.factory_media_root = s_fac_media_root;
+    }
     /* g_ctl_ctx.agent 在 agent_setup() 之后回填（见第 9 步）。 */
 
     if (mkdir_for_channel() != 0)

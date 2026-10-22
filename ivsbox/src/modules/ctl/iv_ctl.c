@@ -43,6 +43,7 @@
 #include "ivsbox/iv_camdet.h"
 #include "ivsbox/iv_clock.h"
 #include "ivsbox/iv_ctl.h"
+#include "ivsbox/iv_factory.h"
 #include "ivsbox/iv_media.h"
 #include "ivsbox/iv_provision.h" /* 设备 SN／身份 MAC：只读工厂身份分区 */
 #include "ivsbox/iv_recovery.h" /* 0xD1 载荷的唯一权威构造：iv_recovery_build_payload() */
@@ -73,6 +74,7 @@ static const char *const k_methods[] = {
     "camera.test",
     "system.time",
     "system.reboot",
+    "sys.factory_reset",
     "snapshot.take",
     "record.start",
     "record.stop",
@@ -2387,6 +2389,117 @@ static int m_system_reboot(const iv_ctl_ctx_t *ctx, json_object *p,
     return rsp_data(d, out, cap, out_len);
 }
 
+/* ============================ 恢复出厂 / 擦除存储 ============================ */
+
+/* 解析 `erase`：可以是单个字符串 `"media"`、字符串数组 `["media","log"]`，
+ * 也可以不给（＝只恢复配置，不删任何数据）。未知名字直接 `IV_EINVAL` ——
+ * 拼错一个词就静默不清，比报错更坏。 */
+static int parse_erase(json_object *p, unsigned *mask)
+{
+    json_object *v = NULL;
+    int          i, n;
+
+    *mask = 0u;
+    if (p == NULL || !json_object_object_get_ex(p, "erase", &v) || v == NULL)
+        return IV_OK;
+
+    if (json_object_is_type(v, json_type_string)) {
+        unsigned bit = iv_factory_erase_bit(json_object_get_string(v));
+
+        if (bit == 0u)
+            return IV_EINVAL;
+        *mask = bit;
+        return IV_OK;
+    }
+    if (json_object_is_type(v, json_type_array)) {
+        n = (int)json_object_array_length(v);
+        if (n > 3)
+            return IV_EINVAL;
+        for (i = 0; i < n; i++) {
+            json_object *e    = json_object_array_get_idx(v, i);
+            unsigned     bit;
+
+            if (e == NULL || !json_object_is_type(e, json_type_string))
+                return IV_EINVAL;
+            bit = iv_factory_erase_bit(json_object_get_string(e));
+            if (bit == 0u)
+                return IV_EINVAL;
+            *mask |= bit;
+        }
+        return IV_OK;
+    }
+    return IV_EINVAL;
+}
+
+static int m_factory_reset(const iv_ctl_ctx_t *ctx, json_object *p,
+                           char *out, size_t cap, size_t *out_len)
+{
+    iv_factory_cfg_t    fc;
+    iv_factory_report_t rep;
+    json_object        *v       = NULL;
+    json_object        *d;
+    json_object        *arr;
+    unsigned            mask = 0u;
+    int                 confirm = 0;
+    int                 rc;
+    unsigned            bit;
+
+    /* 高风险操作：与 system.reboot 同一道 confirmed 门（不可撤销，必须显式确认） */
+    if (p != NULL && json_object_object_get_ex(p, "confirm", &v) && v != NULL)
+        confirm = json_object_get_boolean(v);
+    if (!confirm)
+        return rsp_err(IV_EPROTO, "confirm required", out, cap, out_len);
+
+    rc = parse_erase(p, &mask);
+    if (rc != IV_OK)
+        return rsp_err(IV_EINVAL, "bad erase (media|log|db)", out, cap, out_len);
+
+    memset(&fc, 0, sizeof(fc));
+    fc.data_root  = ctx->factory_data_root;
+    fc.media_root = ctx->factory_media_root;
+
+    rc = iv_factory_reset(ctx->cfg, ctx->store, &fc, mask, &rep);
+    if (rc == IV_ENOTSUP)
+        return rsp_err(IV_ENOTSUP, "erase target not wired", out, cap, out_len);
+    if (rc != IV_OK)
+        return rsp_err(rc, (rep.cfg_saved != 0) ? "reset partly done" : "reset failed",
+                       out, cap, out_len);
+
+    if (ctx->store != NULL) {
+        char ad[80];
+
+        (void)snprintf(ad, sizeof ad, "erase=0x%x cfg=%u entries=%lu db=%lld", mask,
+                       rep.cfg_changed, rep.entries_removed, (long long)rep.db_rows_removed);
+        (void)iv_store_audit_add(ctx->store, "sys.factory_reset", ad, 0,
+                                 (int64_t)time(NULL));
+    }
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "cfg_changed", json_object_new_int((int)rep.cfg_changed));
+    json_object_object_add(d, "version",
+                           json_object_new_int64((int64_t)rep.cfg_version));
+    json_object_object_add(d, "entries_removed",
+                           json_object_new_int64((int64_t)rep.entries_removed));
+    json_object_object_add(d, "db_rows_removed",
+                           json_object_new_int64(rep.db_rows_removed));
+    arr = json_object_new_array();
+    if (arr != NULL) {
+        for (bit = IV_FACTORY_ERASE_MEDIA; bit <= IV_FACTORY_ERASE_DB; bit <<= 1) {
+            if ((mask & bit) != 0u) {
+                const char *nm = iv_factory_erase_name(bit);
+
+                json_object_array_add(arr, json_object_new_string((nm != NULL) ? nm : "?"));
+            }
+        }
+        json_object_object_add(d, "erase", arr);
+    }
+    /* Web 用这个字段决定"要不要把口令重置 + 强制改密"：恢复出厂必然为真 */
+    json_object_object_add(d, "password_reset_required", json_object_new_boolean(1));
+    return rsp_data(d, out, cap, out_len);
+}
+
 /* ============================ 媒体（M6-S6.1） ============================ */
 
 /* 四个媒体方法共同的门口：未挂 ops 一律 IV_ENOTSUP（同 do_reboot 口径）。 */
@@ -2859,6 +2972,8 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_system_time(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "system.reboot") == 0)
         rc = m_system_reboot(ctx, params, out, out_cap, out_len);
+    else if (strcmp(method, "sys.factory_reset") == 0)
+        rc = m_factory_reset(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "snapshot.take") == 0)
         rc = m_media_capture(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "record.start") == 0)

@@ -1766,6 +1766,78 @@
     ops.appendChild(bar);
     root.appendChild(ops);
 
+    /* ---- 恢复出厂 / 擦除存储（2026-10-22 单片机 web 对齐第 ⑥ 项）----
+     * 三条口径（都拍过板，别在这里"顺手优化"）：
+     *   1. **擦除存储是独立勾选、默认不勾**。录像/快照、日志、数据库历史删了就
+     *      没了，不能跟"恢复出厂"绑着默认执行。不勾时请求体里**根本没有 `erase`
+     *      键**，服务端按"只恢复配置"处理（见 web/src/iv_web_api.c 的
+     *      api_factory_reset 与 iv_factory.h 的三条口径）。
+     *   2. **口令回出厂默认并强制改密**。这一步由 ivsbox-web 自己做 —— 它是
+     *      `<secure>/web.passwd` 的唯一写者，ivsboxd 不认识这个路径。成功后全部
+     *      会话作废，所以本页必须回登录页，不能让用户对着已经失效的界面点按钮。
+     *   3. **不自动重启**。配置已落盘、各模块已按新配置跑起来了，重启只会多断
+     *      一次现场业务；真要重启，上面那颗"重启设备"是独立按钮。 */
+    var fac = el('div', 'card');
+    fac.appendChild(el('h3', null, '恢复出厂'));
+    fac.appendChild(el('p', 'hint',
+      '把配置全部恢复为出厂默认值（工厂身份 devid / MAC 在独立分区，不受影响）。' +
+      '执行后登录口令回到出厂默认并强制改密，当前登录会被踢出。'));
+    var facChk = el('label', 'field chk');
+    var facErase = document.createElement('input');
+    facErase.type = 'checkbox';
+    facErase.id = 'fac-erase';
+    facChk.appendChild(facErase);
+    facChk.appendChild(el('span', null, '同时擦除存储（录像/快照、按小时日志、数据库历史记录）'));
+    fac.appendChild(facChk);
+    fac.appendChild(el('p', 'hint', '擦除不可撤销：不勾这一项就只恢复配置，录像与日志一条都不动。'));
+
+    var facAct = el('div', 'actions');
+    var bFac = el('button', 'danger', '恢复出厂设置');
+    bFac.type = 'button';
+    var facBusy = false;
+    bFac.addEventListener('click', function () {
+      if (facBusy) return; /* 防重入：连点两下会下发两次，第二次擦的是空气但配置会再存一遍 */
+      var erase = !!facErase.checked;
+      if (!window.confirm(erase
+        ? '确认恢复出厂，并擦除全部录像/快照、日志与数据库历史？'
+        : '确认恢复出厂？配置将全部回到出厂默认值。'))
+        return;
+      /* 勾了擦除再问一次：这一步删的是现场数据，"不可撤销"要用户亲手点第二遍 */
+      if (erase && !window.confirm('第二步确认：勾选的存储数据会被永久删除，无法恢复。仍要继续？'))
+        return;
+      var body = { confirm: true };
+      if (erase) body.erase = ['media', 'log', 'db'];
+      facBusy = true;
+      bFac.disabled = true;
+      api('/api/factory_reset', { method: 'POST', body: body }).then(function (r) {
+        facBusy = false;
+        bFac.disabled = false;
+        if (!r.ok) {
+          toast('恢复出厂失败：' + (r.msg || r.e), 'err');
+          return;
+        }
+        var d = r.d || {};
+        var m = '配置 ' + ((d.cfg_changed !== undefined) ? (d.cfg_changed + ' 项回默认') : '已恢复默认');
+        if (erase) {
+          m += '，删除 ' + (d.entries_removed || 0) + ' 个文件/目录、' +
+               (d.db_rows_removed || 0) + ' 行数据库记录';
+        }
+        /* 口令已回出厂 ⇒ 会话全废，回登录页（提示语里给出出厂口令，现场要能照着重登）。
+         * 注意 `password_reset` 在**顶层**（ivsbox-web 自己加的），不在 d 里 ——
+         * d 是 ctl 原样透传的那一份，别在 d 上找它。 */
+        lastPass = '';
+        showLogin('恢复出厂完成（' + m + '）。请用 ' +
+                  (r.password_reset ? '出厂口令重新登录并立即改密' : '原口令重新登录') + '。');
+      }).catch(function () {
+        facBusy = false;
+        bFac.disabled = false;
+        toast('恢复出厂失败：无法连接服务', 'err');
+      });
+    });
+    facAct.appendChild(bFac);
+    fac.appendChild(facAct);
+    root.appendChild(fac);
+
     /* ---- 系统升级（状态只读 ＋ 包上传 ＋ 安装请求）----
      * 参考 web 里的「升级有线/升级无线」是"设备自己去服务器下载"，本机没有下载器：
      * 包由浏览器（或平台/U 盘）送到设备上。分工写死在这里：

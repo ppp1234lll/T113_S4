@@ -84,12 +84,19 @@ extern "C" {
 #define IV_WEB_MAX_CONN   8u        /* 并发连接上限（超出的直接 503 并关闭） */
 #define IV_WEB_HEAD_MAX   4096u     /* 请求行 ＋ 头总长上限 */
 #define IV_WEB_BODY_MAX   32768u    /* 请求体上限（配置提交） */
-#define IV_WEB_RSP_MAX    (96u * 1024u) /* 响应缓冲上限（静态资源整体读入） */
+#define IV_WEB_RSP_MAX    (128u * 1024u) /* 响应缓冲上限（静态资源整体读入） */
 #define IV_WEB_PATH_MAX   256u
 #define IV_WEB_TOKEN_MAX  48u
 #define IV_WEB_SESS_N     8u
 #define IV_WEB_IDLE_MS    30000u    /* 连接空闲超时 */
 #define IV_WEB_STATIC_MAX (IV_WEB_RSP_MAX - 2048u) /* 单个静态文件上限 */
+/* ⚠ 这个上限是**硬顶**，撞上不是"少一个文件"，是 `/app.js` 直接回 413
+ *   （浏览器里表现为白屏，`test_web_http` w09a 变红）。
+ *   2026-10-22：恢复出厂那张卡把 app.js 从 95018 B 顶到 99207 B，超过当时的
+ *   96256 B ⇒ 只能抬上限。96 KiB → 128 KiB，留约 30 KiB 余量。
+ *   再顶到就**不要再抬**：改走 S6.4 的文件体分流（`build_response` 里
+ *   `rsp->file_path` 那条路 —— 头进 wbuf、正文 pread 分块发），静态资源就不受
+ *   wbuf 容量约束了。抬上限的代价是 `g_conn[]` 每连接多占 32 KiB（8 连接 ≈ +256 KiB BSS）。 */
 
 /* S6.4：媒体下载的块大小。**必须 ≤ rbuf 容量**（块缓冲复用 rbuf，见文件头）。 */
 #define IV_WEB_FILE_CHUNK  32768u

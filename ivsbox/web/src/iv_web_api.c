@@ -33,8 +33,12 @@
 
 #include <json-c/json.h>
 
+#include "ivsbox/iv_log.h"
 #include "ivsbox/iv_ret.h"
 #include "iv_web.h"
+
+/* 本文件自己打日志时用的模块名（web/src/main.c 的 WEB_MOD 是那个文件的局部宏） */
+#define API_MOD "web-api"
 
 #define IV_API_SESS_TTL_MS (8u * 3600u * 1000u)
 
@@ -497,6 +501,142 @@ static int api_passwd(iv_web_ctx_t *ctx, const iv_web_req_t *req,
 }
 
 /* --------------------------------------------------------------------------
+ * 恢复出厂 / 擦除存储（2026-10-22 单片机 web 对齐第 ⑥ 项）
+ *
+ * 分工（写在两处容易看不全，所以在这儿讲清楚）：
+ *   - **配置回默认 + 擦数据** 走本地通道 `sys.factory_reset`（`ivsboxd` 是唯一
+ *     能写配置的进程）。本层只负责转手，不自己动配置。
+ *   - **口令** 由本层自己重置 —— `<secure>/web.passwd` 的单写者就是 ivsbox-web，
+ *     `ivsboxd` 连这个路径都不该认识。恢复出厂后口令回到出厂默认并**强制改密**，
+ *     同时**踢掉所有会话**：把"回到出厂口令"的窗口压到最短。
+ *
+ * 请求体：`{"confirm":true,"erase":["media","log","db"],"reset_password":true}`
+ *   - `confirm` 必填（与 ctl 的二次确认门一致，前后端各判一次 —— 前端那道只是
+ *     "别让手滑点到"，后端这道才是闸门）；
+ *   - `erase` 可省略 ＝ 只恢复配置、**不删任何数据**（用户 2026-10-22 口径）；
+ *   - `reset_password` 缺省 true；显式给 false 时只恢复配置与数据、不动口令
+ *     （留一个口子给"只想清配置"的现场，且这条路径不会踢会话）。
+ * -------------------------------------------------------------------------- */
+static void sess_drop_all(iv_web_ctx_t *ctx)
+{
+    /* 全会话作废：恢复出厂之后不该还有任何一扇门开着 */
+    memset(ctx->sess, 0, sizeof(ctx->sess));
+}
+
+static int api_factory_reset(iv_web_ctx_t *ctx, const iv_web_req_t *req,
+                             char *out, size_t cap, size_t *out_len,
+                             iv_web_resp_t *rsp)
+{
+    json_object *o       = body_json(req);
+    json_object *v       = NULL;
+    json_object *d       = NULL;
+    const char  *erase_s = NULL;
+    char         pbuf[320];
+    char         hex[IV_WEB_PASS_HEX_MAX];
+    int          confirm       = 0;
+    int          reset_passwd  = 1;
+    int          pwd_done      = 0;
+    int          n;
+    int          rc;
+
+    if (o != NULL) {
+        if (json_object_object_get_ex(o, "confirm", &v) && v != NULL)
+            confirm = json_object_get_boolean(v);
+        v = NULL;
+        if (json_object_object_get_ex(o, "reset_password", &v) && v != NULL)
+            reset_passwd = json_object_get_boolean(v);
+        v = NULL;
+        /* erase 允许字符串或数组：原样序列化再拼进 ctl 请求，免得这里再写一份
+         * "哪些名字合法"的判断（那份判断属于 ctl/iv_factory）。 */
+        if (json_object_object_get_ex(o, "erase", &v) && v != NULL &&
+            (json_object_is_type(v, json_type_array) || json_object_is_type(v, json_type_string)))
+            erase_s = json_object_to_json_string(v);
+    }
+    if (!confirm) {
+        if (o != NULL)
+            json_object_put(o);
+        *out_len = api_err(out, cap, IV_EPROTO, "confirm required");
+        rsp->status = 400;
+        rsp->len = *out_len;
+        return IV_OK;
+    }
+
+    if (erase_s != NULL) {
+        n = snprintf(pbuf, sizeof(pbuf), "{\"confirm\":true,\"erase\":%s}", erase_s);
+    } else {
+        n = snprintf(pbuf, sizeof(pbuf), "{\"confirm\":true}");
+    }
+    if (n < 0 || (size_t)n >= sizeof(pbuf)) {
+        if (o != NULL)
+            json_object_put(o);
+        *out_len = api_err(out, cap, IV_ERANGE, "erase too long");
+        rsp->status = 400;
+        rsp->len = *out_len;
+        return IV_OK;
+    }
+    if (o != NULL)
+        json_object_put(o);
+
+    rc = iv_web_api_call(ctx, "sys.factory_reset", pbuf, out, cap, out_len, rsp);
+    if (rc != IV_OK)
+        return to_rsp(out, cap, out_len, rsp);
+    /* ctl 侧成功才是真的成功 */
+    {
+        json_object *resp = json_tokener_parse(out);
+
+        if (resp == NULL || !json_object_is_type(resp, json_type_object) ||
+            !json_object_object_get_ex(resp, "ok", &v) || v == NULL ||
+            !json_object_get_boolean(v)) {
+            if (resp != NULL)
+                json_object_put(resp);
+            return to_rsp(out, cap, out_len, rsp);
+        }
+        d = json_object_object_get(resp, "d");
+        /* d 属于 resp，后面要拼回 out，所以先留下它的文本 */
+        if (d != NULL && reset_passwd) {
+            /* 1) 落盘：写回**出厂默认**口令的哈希（只存哈希，见 iv_web_pass.c） */
+            iv_web_pass_hash(ctx->user, IV_WEB_PASS_DEF, hex);
+            rc = iv_web_pass_save(ctx, ctx->user, hex);
+            if (rc == IV_OK || rc == IV_ENOTSUP) {
+                (void)snprintf(ctx->pass_hash, sizeof(ctx->pass_hash), "%s", hex);
+                ctx->must_change = 1; /* 出厂口令期：强制改密（与 M10 同一道闸） */
+                pwd_done = 1;
+            } else {
+                IV_LOG_E(API_MOD, "factory reset: cannot save factory password (rc=%d)", rc);
+            }
+        }
+        /* 2) 拼响应：ctl 的字段照抄，另加本层做的两件事 */
+        {
+            char         tail[192];
+            int          tl;
+
+            tl = snprintf(tail, sizeof(tail),
+                          "\"password_reset\":%s,\"must_change\":%s}",
+                          (pwd_done != 0) ? "true" : "false",
+                          (ctx->must_change != 0) ? "true" : "false");
+            if (tl < 0 || (size_t)tl >= sizeof(tail)) {
+                json_object_put(resp);
+                *out_len = api_err(out, cap, IV_ERANGE, "response too long");
+                rsp->status = 500;
+                rsp->len = *out_len;
+                return IV_OK;
+            }
+            (void)snprintf(out, cap, "{\"ok\":true,\"d\":%s,%s",
+                           (d != NULL) ? json_object_to_json_string(d) : "{}", tail);
+            *out_len = strlen(out);
+        }
+        json_object_put(resp);
+    }
+
+    if (pwd_done != 0)
+        sess_drop_all(ctx); /* 口令回出厂 ⇒ 现存会话一律作废 */
+    rsp->status = 200;
+    (void)snprintf(rsp->ctype, sizeof(rsp->ctype), "application/json");
+    rsp->len = *out_len;
+    return IV_OK;
+}
+
+/* --------------------------------------------------------------------------
  * 入口
  * -------------------------------------------------------------------------- */
 int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
@@ -549,6 +689,15 @@ int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
     }
     if (strcmp(req->path, "/api/logout") == 0)
         return api_logout(ctx, req, out, cap, out_len, rsp);
+    if (strcmp(req->path, "/api/factory_reset") == 0) {
+        if (strcmp(req->method, "POST") != 0) {
+            *out_len = api_err(out, cap, IV_EINVAL, "POST required");
+            rsp->status = 405;
+            rsp->len = *out_len;
+            return IV_OK;
+        }
+        return api_factory_reset(ctx, req, out, cap, out_len, rsp);
+    }
     if (strcmp(req->path, "/api/overview") == 0)
         return api_simple_call(ctx, "sys.overview", out, cap, out_len, rsp);
     if (strcmp(req->path, "/api/devices") == 0)

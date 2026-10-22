@@ -48,6 +48,17 @@
  *   camera.search      —                   触发一轮设备发现（S4.2）
  *   system.time        {"ts":<秒>}         设系统墙钟（运维页"同步时间"）
  *   system.reboot      —                   请求重启（运维页"重启"）
+ *   sys.factory_reset  {"confirm":true,"erase":["media","log","db"]}
+ *                                          恢复出厂：配置全部回默认（工厂身份
+ *                                          分区在 `private` 裸分区里，天然不动）
+ *                                          ＋ 可选擦除。`erase` 可省略（＝只恢复
+ *                                          配置，**不删任何数据**，这是用户
+ *                                          2026-10-22 定的口径）；`confirm` 必填，
+ *                                          与 `system.reboot` 同一道二次确认门。
+ *                                          **口令不在本方法里**：响应带
+ *                                          `password_reset_required:true`，由
+ *                                          `ivsbox-web` 自己重置 `<secure>/web.passwd`
+ *                                          （单写者；模块层不碰鉴权）。
  *   snapshot.take      {"path":"..."}      抓拍（M6-S6.2，入队即回；path 省略
  *                                          则按媒体桥接默认目录自动命名）
  *   record.start       {"id":N,"url":"rtsp://..."}  开始录第 N 路（M6-S6.3）
@@ -159,6 +170,15 @@ typedef struct {
      * 进程（归 `scripts/frp.sh` + `monitor.sh`）、**不**读 secretKey（钥匙只落在
      * 0600 的 `frpc.toml` 里）、**不**把令牌回给调用方。 */
     iv_tunnel_t *tunnel;
+
+    /* 恢复出厂（2026-10-22）：擦除目标的两个根。空 ⇒ 对应的擦除位返回 IV_ENOTSUP
+     * （"能调但没接"，与 media / reboot 同一口径）。
+     *   factory_data_root  —— `<data_root>`（`/mnt/UDISK/ivsbox`），擦 `<它>/log`
+     *   factory_media_root —— 媒体根（`/mnt/sdcard` 或 `IVSBOX_SD_ROOT` 覆盖值）
+     * 口令**不在这里**：`<secure>/web.passwd` 由 `ivsbox-web` 自己写（单写者）。
+     * 本模块只多给响应里一个 `password_reset_required:true`，让 Web 知道该动手。 */
+    const char *factory_data_root;
+    const char *factory_media_root;
 } iv_ctl_ctx_t;
 
 /*

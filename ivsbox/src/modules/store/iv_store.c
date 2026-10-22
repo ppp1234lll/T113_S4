@@ -448,3 +448,30 @@ int iv_store_rows(iv_store_t *st, const char *table, int64_t *out)
     sqlite3_finalize(stmt);
     return (rc == SQLITE_ROW) ? IV_OK : IV_EIO;
 }
+
+int iv_store_purge_all(iv_store_t *st, int64_t *removed)
+{
+    /* 顺序无所谓（无外键），但写成固定顺序便于日志比对 */
+    static const char *const k_tables[] = {
+        "device", "snmp_latest", "audit", "net_event",
+    };
+    int64_t total = 0;
+    size_t  i;
+
+    if (st == NULL)
+        return IV_EINVAL;
+    for (i = 0; i < sizeof k_tables / sizeof k_tables[0]; i++) {
+        char sql[64];
+
+        (void)snprintf(sql, sizeof sql, "DELETE FROM %s;", k_tables[i]);
+        if (sqlite3_exec(st->db, sql, NULL, NULL, NULL) != SQLITE_OK) {
+            IV_LOG_E(ST_MOD, "purge %s failed: %s", k_tables[i], sqlite3_errmsg(st->db));
+            return IV_EIO;
+        }
+        total += (int64_t)sqlite3_changes(st->db);
+    }
+    IV_LOG_W(ST_MOD, "purged %lld row(s) from all tables", (long long)total);
+    if (removed != NULL)
+        *removed = total;
+    return IV_OK;
+}

@@ -95,6 +95,19 @@ int iv_store_snmp_value(iv_store_t *st, const char *target, const char *slot,
  * 其余 IV_EINVAL —— 绝不把外部字符串拼进 SQL）。 */
 int iv_store_rows(iv_store_t *st, const char *table, int64_t *out);
 
+/* ---------------------------------------------------------------------------
+ * 清空全部四张表的**数据行**（表结构与 schema 版本保留）—— 恢复出厂用
+ *
+ * 为什么不是"删 `control.db` 文件"：本进程正持有这个库的句柄（`iv_db` 打开着、
+ * WAL 也在），`unlink()` 只会把 inode 从目录里摘掉，正在跑的写入继续落到那个
+ * 已无名字的文件里，重启后**旧数据仍在**（换个文件名找不回来而已）。要"清干净"
+ * 只能从 SQL 层删，删完 `VACUUM` 交给下次整机重启，不在这里做（几 MB 的库，
+ * 现场不在意那点空间，而在意别把库锁住）。
+ *
+ * `*removed` 返回删掉的总行数（可为 NULL）。空库返回 `IV_OK` 且 0。
+ * ------------------------------------------------------------------------- */
+int iv_store_purge_all(iv_store_t *st, int64_t *removed);
+
 #ifdef __cplusplus
 }
 #endif

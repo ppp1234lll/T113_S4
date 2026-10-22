@@ -1772,6 +1772,105 @@ static void case_ip_keys(void)
     iv_config_close(c);
 }
 
+/* ===========================================================================
+ * 恢复出厂（`iv_config_reset_defaults`，2026-10-22 单片机 web 对齐第 ⑥ 项）
+ *
+ * 三件必须同时成立的事，缺一件就是"恢复出厂等于没恢复"：
+ *   ① 默认表里的键逐个回默认值；
+ *   ② `camera.ch` **整段删除**（出厂态＝一条通道都没有）。**只清值不行**：
+ *      重载时 `camera_count` 是按数组长度回填的，8 个空槽留在文件里就变回 8；
+ *   ③ 不在默认表里的扩展键**保留**（既有口径：文件里多出来的键不丢）。
+ * 反向证伪：把 ② 改成"只把 ip 清空、不删条目"，`c31f/c31g`（落盘重载后
+ * 数组长度仍为 2）立刻变红。
+ * ========================================================================= */
+static void case_reset_defaults(void)
+{
+    static const char SEED[] =
+        "{\"_meta\":{\"version\":7},"
+        "\"sys\":{\"device\":{\"name\":\"SITE-A\"}},"
+        "\"net\":{\"ip\":\"10.1.2.3\","
+        " \"server\":{\"wired\":{\"host\":\"47.104.250.225\",\"port\":6013}}},"
+        "\"switch\":{\"ip\":\"10.9.9.9\"},"
+        "\"camera\":{\"ch\":[{\"ip\":\"192.168.2.10\"},{\"ip\":\"192.168.2.11\"}]},"
+        "\"mine\":{\"note\":\"keep-me\"}}\n";
+    char         pf[200];
+    char         tmpf[200];
+    char         def[256];
+    iv_cfg_type_t dt;
+    iv_config_t *c;
+    const char  *s = NULL;
+    unsigned     changed = 0u;
+    unsigned     n       = 99u;
+    uint64_t     ver0;
+    uint64_t     ver1;
+
+    cfg_path(pf, sizeof(pf));
+    path_of(tmpf, sizeof(tmpf), "ivsbox.json.tmp");
+    chk(write_file(pf, SEED, 0644u) == 0, "c31: seed ivsbox.json");
+
+    c = reopen_cfg();
+    chk(c != NULL, "c31: open");
+    if (c == NULL)
+        return;
+
+    /* 布景：确实带着现场改过的值 */
+    chk(iv_config_get_str(c, "sys.device.name", &s) == IV_OK &&
+            strcmp(s, "SITE-A") == 0,
+        "c31a: device name seeded");
+    chk(iv_config_array_len(c, "camera.ch", &n) == IV_OK && n == 2u,
+        "c31b: two camera slots seeded");
+
+    ver0 = iv_config_version(c);
+    chk(iv_config_reset_defaults(c, &changed) == IV_OK, "c31c: reset returns ok");
+    chk(changed > 0u, "c31d: reset reports changed keys");
+    chk(iv_config_reset_defaults(c, NULL) == IV_OK, "c31e: reset again ok (idempotent)");
+
+    /* ① 逐键回默认：拿默认表比，不硬编码值（默认值改了用例不用跟着改） */
+    chk(iv_config_default_get("ivsbox", "sys.device.name", &dt, def, sizeof(def)) == IV_OK &&
+            iv_config_get_str(c, "sys.device.name", &s) == IV_OK && strcmp(s, def) == 0,
+        "c31f: device name back to default");
+    chk(iv_config_default_get("ivsbox", "net.server.wired.host", &dt, def, sizeof(def)) ==
+                IV_OK &&
+            iv_config_get_str(c, "net.server.wired.host", &s) == IV_OK &&
+            strcmp(s, def) == 0,
+        "c31g: platform host back to default (empty)");
+    chk(iv_config_default_get("ivsbox", "switch.ip", &dt, def, sizeof(def)) == IV_OK &&
+            iv_config_get_str(c, "switch.ip", &s) == IV_OK && strcmp(s, def) == 0,
+        "c31h: switch ip back to default");
+
+    /* ② camera.ch 整段没了 */
+    chk(iv_config_array_len(c, "camera.ch", &n) == IV_OK && n == 0u,
+        "c31i: camera.ch array is empty after reset");
+
+    /* ③ 扩展键保留 */
+    chk(iv_config_get_str(c, "mine.note", &s) == IV_OK && strcmp(s, "keep-me") == 0,
+        "c31j: unknown extension key survives reset");
+
+    chk(iv_config_save(c, NULL, 0u) == IV_OK, "c31k: save after reset");
+    ver1 = iv_config_version(c);
+    chk(ver1 == ver0 + 1u, "c31l: version bumped exactly once");
+    iv_config_close(c);
+
+    /* 落盘重载：这才是 ③ 的真正判据 —— 只改内存的话"空槽又回来了" */
+    c = reopen_cfg();
+    chk(c != NULL, "c31m: reopen");
+    if (c == NULL)
+        return;
+    chk(iv_config_array_len(c, "camera.ch", &n) == IV_OK && n == 0u,
+        "c31n: camera.ch stays empty across reload");
+    chk(iv_config_get_str(c, "sys.device.name", &s) == IV_OK && s[0] == '\0',
+        "c31o: device name stays default across reload");
+    chk(iv_config_get_str(c, "mine.note", &s) == IV_OK && strcmp(s, "keep-me") == 0,
+        "c31p: extension key survives save+reload");
+    changed = 99u;
+    chk(iv_config_reset_defaults(c, &changed) == IV_OK && changed == 0u,
+        "c31q: a fresh factory state needs no reset");
+    iv_config_close(c);
+
+    (void)unlink(pf);
+    (void)unlink(tmpf);
+}
+
 int main(void)
 {
     char   tmpl[] = "/tmp/ivcfg_XXXXXX";
@@ -1814,6 +1913,7 @@ int main(void)
     case_dir_recursive_create();
     case_snmp_oid_keys();
     case_ip_keys();
+    case_reset_defaults();
 
     cleanup();
 

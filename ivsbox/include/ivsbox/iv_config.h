@@ -286,6 +286,29 @@ int iv_config_array_len(const iv_config_t *c, const char *arr_key, unsigned *n);
 int iv_config_fill_defaults(iv_config_t *c, int *filled, char *detail, size_t detail_cap);
 
 /* ---------------------------------------------------------------------------
+ * 恢复出厂（配置侧，2026-10-22 单片机 web 对齐第 ⑥ 项）
+ *
+ * 把**默认表里所有已存在的键**逐个写回内置默认值，并**删掉 `camera.ch` 整段**
+ * （出厂态＝一条摄像机通道都没有：文件不存在时 `fill_missing_defaults()` 是按
+ * `camera_count = 0` 一条都不补的，"只清值"会把 8 个空槽留在文件里，重载后
+ * `camera_count` 又按数组长度回填成 8）。
+ *
+ * **不动的东西**（这些都是刻意的，别"顺手"改）：
+ *   - 工厂身份分区（devid / MAC / SN）：在 `private` 裸分区里，根本不在配置中；
+ *   - **不在默认表里的扩展键**：既有口径是"文件里多出来的键不丢"，恢复出厂也
+ *     不该拿它开刀；
+ *   - `_meta` 里的 schema / 版本号：版本号由随后的 `save()` 自增。
+ *
+ * 只改内存：**必须随后调 `iv_config_save()`** 才落盘，失败时调用方负责回滚
+ * （`config.apply` 已有同口径的两阶段写法，可照抄）。
+ * 通知不在这里发（逐键发会让装配层看到一串中间态），攒成分类掩码交给 `save()`。
+ *
+ * `*n_changed` 返回实际变化的键数（可为 NULL；`camera.ch` 的每条删除算一条，
+ * `camera_count` 归零也算一条）。参数非法返回 `IV_EINVAL`。
+ * ------------------------------------------------------------------------- */
+int iv_config_reset_defaults(iv_config_t *c, unsigned *n_changed);
+
+/* ---------------------------------------------------------------------------
  * F3 + F5 保存
  * 步骤：整体校验（类型/范围/跨字段）→ 写 `<path>.tmp` → fsync 文件 →
  * rename 覆盖 → fsync 目录（保证改名本身落盘，见计划 §S8 坑 3）。

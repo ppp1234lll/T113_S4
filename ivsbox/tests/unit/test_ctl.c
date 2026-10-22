@@ -96,6 +96,20 @@ static int jobool(json_object *j, const char *k, int dflt)
     return json_object_get_boolean(v);
 }
 
+/* 取整数字段。**不能用 jobool()**：`json_object_get_boolean()` 对任何非零整数
+ * 都返回 1，`cfg_changed > 0` / `version > v0` 这类断言会因此全部失去区分力
+ * （c25k 首版就是这么假绿的）。 */
+static int jint(json_object *j, const char *k, int dflt)
+{
+    json_object *v = NULL;
+
+    if (j == NULL)
+        return dflt;
+    if (!json_object_object_get_ex(j, k, &v) || v == NULL)
+        return dflt;
+    return (int)json_object_get_int(v);
+}
+
 static int joerr(json_object *j)
 {
     json_object *v = NULL;
@@ -771,6 +785,79 @@ int main(void)
     chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c24: closed again");
     if (j != NULL)
         json_object_put(j);
+
+    /* ---------------- c25 恢复出厂（sys.factory_reset，2026-10-22） ----------------
+     * 放在最后：它会把整份配置打回默认，前面那些"改过配置"的用例不能排在它后面。 */
+    {
+        int found = 0, i;
+
+        for (i = 0; i < iv_ctl_method_count(); i++) {
+            if (strcmp(iv_ctl_method_name(i), "sys.factory_reset") == 0)
+                found = 1;
+        }
+        chk(found == 1, "c25c: sys.factory_reset is registered");
+    }
+    /* 二次确认门：与 system.reboot 同一道 */
+    j = call(&ctx, "{\"m\":\"sys.factory_reset\"}", &rc, raw, sizeof(raw));
+    chk(rc == IV_OK && j != NULL && joerr(j) == IV_EPROTO,
+        "c25d: confirm required");
+    if (j != NULL)
+        json_object_put(j);
+    j = call(&ctx, "{\"m\":\"sys.factory_reset\",\"p\":{\"confirm\":true,\"erase\":[\"nope\"]}}",
+             &rc, raw, sizeof(raw));
+    chk(rc == IV_OK && j != NULL && joerr(j) == IV_EINVAL,
+        "c25e: unknown erase name rejected");
+    if (j != NULL)
+        json_object_put(j);
+    /* 没接根 ⇒ 擦除位一律"能调但没接" */
+    j = call(&ctx, "{\"m\":\"sys.factory_reset\",\"p\":{\"confirm\":true,\"erase\":\"media\"}}",
+             &rc, raw, sizeof(raw));
+    chk(rc == IV_OK && j != NULL && joerr(j) == IV_ENOTSUP,
+        "c25f: erase media without factory_media_root -> ENOTSUP");
+    if (j != NULL)
+        json_object_put(j);
+
+    /* 布景：先把配置改脏，再确认"恢复出厂真的动了东西、且落了盘" */
+    chk(iv_config_set_str(cfg, "sys.device.name", "SITE-X") == IV_OK, "c25g: dirty a key");
+    chk(iv_config_save(cfg, NULL, 0u) == IV_OK, "c25h: save dirty state");
+    {
+        uint64_t v0 = iv_config_version(cfg);
+
+        j = call(&ctx, "{\"m\":\"sys.factory_reset\",\"p\":{\"confirm\":true}}", &rc, raw,
+                 sizeof(raw));
+        chk(rc == IV_OK && j != NULL && jobool(j, "ok", 0) == 1, "c25i: reset ok");
+        if (j != NULL) {
+            json_object *d = jodata(j);
+
+            chk(d != NULL && jobool(d, "password_reset_required", 0) == 1,
+                "c25j: web is told to reset the password");
+            chk(d != NULL && jint(d, "cfg_changed", 0) > 0, "c25k: changed keys reported");
+            chk(d != NULL && (uint64_t)jint(d, "version", 0) > v0,
+                "c25l: config version advanced (saved)");
+            json_object_put(j);
+        } else {
+            chk(0, "c25i: no response object");
+        }
+        {
+            const char *s = NULL;
+            int64_t     audit1 = 0;
+
+            chk(iv_config_get_str(cfg, "sys.device.name", &s) == IV_OK && s[0] == '\0',
+                "c25m: device name back to default");
+            chk(iv_store_rows(tstore, "audit", &audit1) == IV_OK && audit1 > 0,
+                "c25n: the reset left an audit row");
+        }
+    }
+    /* 再来一次：已经出厂态 ⇒ 不报错、也不重复改 */
+    j = call(&ctx, "{\"m\":\"sys.factory_reset\",\"p\":{\"confirm\":true}}", &rc, raw,
+             sizeof(raw));
+    chk(rc == IV_OK && j != NULL && jobool(j, "ok", 0) == 1, "c25o: second reset ok");
+    if (j != NULL) {
+        json_object *d = jodata(j);
+
+        chk(d != NULL && jint(d, "cfg_changed", 9) == 0, "c25p: nothing left to change");
+        json_object_put(j);
+    }
 
     /* ---------------- 收尾（规则 6） ---------------- */
     iv_config_close(cfg);

@@ -2677,6 +2677,91 @@ int iv_config_fill_defaults(iv_config_t *c, int *filled, char *detail, size_t de
 }
 
 /* ---------------------------------------------------------------------------
+ * 公开 API：恢复出厂（配置侧）
+ * ------------------------------------------------------------------------- */
+
+/* 内存条目是否已经等于内置默认值（类型 + 值都比） */
+static int item_is_default(const cfg_item_t *it, const cfg_default_t *d)
+{
+    if (it->type != d->type)
+        return 0;
+    switch (d->type) {
+    case IV_CFG_T_STR:
+        return strcmp(it->v.s, d->sdef) == 0;
+    case IV_CFG_T_INT:
+        return it->v.i == d->idef;
+    case IV_CFG_T_DBL:
+        return it->v.d == d->ddef;
+    case IV_CFG_T_BOOL:
+        return (it->v.i != 0) == (strcmp(d->sdef, "true") == 0);
+    default:
+        return 0;
+    }
+}
+
+int iv_config_reset_defaults(iv_config_t *c, unsigned *n_changed)
+{
+    unsigned i;
+    unsigned changed = 0u;
+    uint32_t mask    = 0u;
+
+    if (c == NULL || !c->used)
+        return IV_EINVAL;
+
+    /* 1) `camera.ch` 整段删掉，而不是"把值清空"。
+     *
+     * 出厂态（配置文件不存在）时 `fill_missing_defaults()` 是按 `camera_count = 0`
+     * **一条都不补**的；只清值会把 8 个空槽留在文件里，重载后 `camera_count` 又按
+     * 数组长度回填成 8 —— 页面上就出现 8 个空槽，"恢复出厂"等于没恢复。
+     * 这也解释了为什么下面必须先删再谈 `camera_count = 0`。 */
+    for (i = 0u; i < c->n_items;) {
+        if (camera_slot_index(c->items[i].key, NULL)) {
+            char key[IV_CFG_KEY_MAX];
+
+            str_copy(key, sizeof(key), c->items[i].key);
+            item_drop(c, key);
+            changed++;
+            mask |= IV_CFG_CLASS_MASK((unsigned)IV_CFG_CLS_CAMERA);
+            continue; /* 删除后同一位置已是下一条，不能 i++ */
+        }
+        i++;
+    }
+    if (c->camera_count != 0u) {
+        c->camera_count = 0u;
+        changed++;
+        mask |= IV_CFG_CLASS_MASK((unsigned)IV_CFG_CLS_CAMERA);
+    }
+
+    /* 2) 默认表里的键逐个回默认值。**不在默认表里的扩展键保留**（既有口径：
+     *   文件里多出来的键不丢，恢复出厂也不该拿它开刀 —— 那是别人加的扩展）。 */
+    for (i = 0u; i < CFG_DEFAULT_N; i++) {
+        const cfg_default_t *d  = &s_defaults[i];
+        cfg_item_t          *it = item_find(c, d->key);
+        int                  cls;
+
+        if (it == NULL || item_is_default(it, d))
+            continue;
+        item_reset_to_default(c, d->key);
+        changed++;
+        cls = iv_config_class_of(d->key);
+        if (cls >= 0)
+            mask |= IV_CFG_CLASS_MASK((unsigned)cls);
+    }
+
+    if (changed > 0u) {
+        c->dirty = 1;
+        /* 通知粒度仍是"一级分类子树"（F7）：这里不逐键发，攒成一个掩码交给随后的
+         * save()。逐键发会让装配层看到一串中间态（例如地址先清、端口后清 ⇒
+         * 两次重连、两次日志）。只把**真正变过的**分类记进去，不做全类广播。 */
+        c->dirty_classes |= mask;
+    }
+    IV_LOG_I(CFG_MOD, "%s: reset to defaults, %u key(s) changed", c->name, changed);
+    if (n_changed != NULL)
+        *n_changed = changed;
+    return IV_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * 公开 API：F6 热更新
  * ------------------------------------------------------------------------- */
 

@@ -152,10 +152,17 @@ static void n05_view_reads_modules(void)
     /* 只改模块内部字段，不碰 `a->cfg`：view 若去读配置就会看到 0。 */
     a.nm.cfg.fail_n = 9u;
     a.pb.cfg.fail_n = 5u;
+    a.pb.cfg.degrade_rtt_ms = 1500u;
 
     chk(iv_agent_netthr_view(&a, &v) == IV_OK, "n05 view -> OK");
     chk(v.nm_fail_n == 9, "n05 view reads iv_netmgr (not config)");
     chk(v.probe_fail_n == 5, "n05 view reads iv_probe (not config)");
+    chk(v.probe_delay_ms == 1500,
+        "n05 view reads the live delay threshold (prove 0xFE really applied)");
+    /* 没有探测项（`make_agent` 里 `wan_probe_idx` 全 -1）⇒ -1，不是 0。
+     * 报 0 会让现场以为"0 ms，快得很"，把"没在测"伪装成"测得很好"。 */
+    chk(v.probe_rtt_ms[0] == -1 && v.probe_rtt_ms[1] == -1,
+        "n05 view reports -1 rtt when a WAN has no probe item");
     chk(v.reboot_max == 4, "n05 view reboot_max = 4");
     chk(v.cooldown_ms == 15000u, "n05 view cooldown = 15000 ms");
     chk(v.credit[0] == 4, "n05 view credit mirrors the recovery channels");

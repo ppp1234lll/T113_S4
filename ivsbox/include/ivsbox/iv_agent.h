@@ -176,6 +176,27 @@ extern "C" {
 
 /* 总线节拍：probe 驱动（发探/收结果/超时判定）与 netmgr 驱动（迟滞/回切）。 */
 #define IV_AGENT_PROBE_TICK_MS  200u
+/* **探测回包的排空节拍**（2026-10-26 加）。
+ *
+ * 为什么不能只靠上面那个 200 ms 的节拍：`iv_probe` 测的 RTT 是"发出时刻 → 读到
+ * 回包的时刻"。回包只在调用方喂 fd 的时候才被读走 —— 如果只每 200 ms 读一次，
+ * 那么**局域网里 0.5 ms 的往返也会被记成 200 ms**（回包躺在缓冲区里等到下一拍）。
+ * 于是 `probe.timeout_ms` 这个"延时门限"根本无法判 100 ms 量级，配 100 就会把
+ * 两条好链路全标成「延时」——正是 `iv_camdet` 在 R-02（2026-10-22）踩过的同一个坑
+ * （见 `iv_camdet.h` 的 `IV_CAMDET_RTT_THR_MS_DEFAULT` 注释）。
+ *
+ * 本板的口径是"每 ping 一次拿到平均时延，和门限比"（用户 2026-10-26），所以
+ * **测量分辨率必须明显细于门限下界 100 ms**：10 ms ⇒ 量化误差 ≤ 10%。
+ * 代价是每 10 ms 两个 `recv()`（无数据立刻 EAGAIN），单核 1 GHz 上可忽略。
+ *
+ * 注意：`iv_camdet` 有自己的实例与节拍，**不受这个值影响**（它的 200 ms 分辨率
+ * 已在 R-02 里按"严格大于"判据适配过）。 */
+#define IV_AGENT_PROBE_DRAIN_MS 10u
+/* 契约钉在编译期：采样分辨率必须明显细于门限下界（`probe.timeout_ms` 的下界是
+ * 100 ms）。有人把这个值改大、或者把门限下界改小到覆盖不了，这里立刻编译失败
+ * —— 否则"延时门限"会悄悄退化成"能不能在一个节拍内应答"的二值判断。 */
+_Static_assert(IV_AGENT_PROBE_DRAIN_MS * 5u <= 100u,
+               "RTT sampling must be well below the 100 ms threshold floor");
 #define IV_AGENT_NETMGR_TICK_MS 1000u
 
 /* 阈值下发（0xF1）待发 JSON 的缓冲。九项全发也就 `{"hv":12345,...}` 一百多字节，
@@ -274,7 +295,16 @@ typedef struct {
     char        wan_name[IV_WAN_N][IV_AGENT_WAN_NAME_MAX]; /* 下标＝iv_wan_t；空串跳过 */
     uint32_t    probe_target_be[IV_AGENT_TARGET_N]; /* target1/2（**网络序**）；0=未配 */
     uint32_t    probe_interval_ms;  /* 0 → iv_probe 默认 5000 */
-    uint32_t    probe_timeout_ms;   /* 0 → iv_probe 默认 1000 */
+    /* 有线网络**延时门限**（毫秒），来自配置键 `probe.timeout_ms`
+     * ＝平台 0xFE「有线网络超时时间(ms)」/ 0xE1 的 `pn`。落到
+     * `iv_probe_cfg_t::degrade_rtt_ms`：每轮 ping 的平均时延超过它 ⇒ 判
+     * "延时严重"（`IV_PROBE_DEGRADED` ⇒ 上报 `MN=4`），不超过 ⇒ 正常。
+     * 0 → `iv_probe` 默认 800。
+     *
+     * ⚠ 它**不是**单次探测的等回包超时（那一项由间隔推导，见
+     * `probe_io_timeout_of()`）。原先两件事共用一个名字，2026-10-26 用户明确
+     * 口径后拆开：配置里那个数只负责"延时算不算大"。 */
+    uint32_t    probe_delay_ms;
     uint32_t    probe_fail_n;       /* 0 → iv_probe 默认 3 */
 
     iv_netmgr_mode_t mode;          /* 0 → AUTO */
@@ -432,6 +462,9 @@ typedef struct {
     iv_reactor_t *r;          /* NULL = 由调用方按节拍调 iv_agent_step() */
     iv_event_t   *nl_ev;
     iv_timer_t   *pb_timer;
+    /* 回包排空定时器（`IV_AGENT_PROBE_DRAIN_MS`）：只管读回包，不发探、不判超时。
+     * 与 `pb_timer` 分开是为了让"测量分辨率"和"发送/超时节拍"互不牵制。 */
+    iv_timer_t   *pb_drain_timer;
     iv_timer_t   *nm_timer;
 
     int          wan_ifindex[IV_WAN_N];   /* 启动时按名字解析；0=未绑定 */
@@ -764,6 +797,15 @@ int iv_agent_reload_snmp(iv_agent_t *a, const iv_agent_snmp_cfg_t *sc);
 typedef struct {
     int      nm_fail_n;    /* iv_netmgr 在用的切换门限（`netthr.loss_count`） */
     int      probe_fail_n; /* iv_probe 判目标 DOWN 的门限（`probe.max_fail`） */
+    /* iv_probe 在用的**延时门限**（毫秒，`probe.timeout_ms` ⇒ `degrade_rtt_ms`）：
+     * ping 平均时延超过它 ⇒ DEGRADED ⇒ 上报 `MN=4`。
+     * 加这个字段是为了让"0xFE 落盘了、引擎有没有真换门限"能取证 —— 只看配置
+     * 只能证明存下来了（`0xFE` 那一课：回了 0x01 不等于生效）。 */
+    int      probe_delay_ms;
+    /* 每路 WAN 的**平均时延**（ms，下标＝`iv_wan_t`；-1 ＝该路没有探测项）。
+     * 这是"延时门限"那一侧的被比较量：现场问"为什么显示延时"时，要能直接看到
+     * 分子（实测平均）和分母（门限），否则只能靠猜。 */
+    int      probe_rtt_ms[IV_WAN_N];
     int      reboot_max;   /* iv_recovery 限次；0 = 禁用自愈 */
     uint32_t cooldown_ms;  /* iv_recovery 冷却（毫秒；已归一化，永不为 0） */
     /* 每通道剩余动作次数（下标＝`iv_recovery_port` 的通道号，0 基） */

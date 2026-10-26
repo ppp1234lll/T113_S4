@@ -170,10 +170,18 @@ const iv_probe_iops_t *iv_probe_default_iops(void);
  * ------------------------------------------------------------------------- */
 typedef struct {
     uint32_t interval_ms;           /* 默认探测间隔（ms），0 视为默认 */
-    uint32_t timeout_ms;            /* 单次探测超时（ms），0 视为默认 */
+    /* 单次探测"等回包"超时（ms），0 视为默认。
+     * ⚠ 本板**不开放配置**：装配层按"间隔的一半"推导（见 `iv_agent` 的
+     * `probe_io_timeout_of()`）。配置键 `probe.timeout_ms` 指的是下面那个
+     * **延时门限**，不是这一项 —— 两者都叫 timeout 是历史包袱，别混。 */
+    uint32_t timeout_ms;
     uint32_t fail_n;                /* 连续失败阈值 -> DOWN，0 视为默认 */
     uint32_t ok_n;                  /* 连续成功阈值 -> UP，0 视为默认 */
-    uint32_t degrade_rtt_ms;        /* avg RTT 超此值判 DEGRADED，0=不判 */
+    /* avg RTT 超此值判 DEGRADED（"延时严重"），0=不判。
+     * 本板的值来自配置键 `probe.timeout_ms`，也就是平台 0xFE
+     * 「有线网络超时时间(ms)」/ 0xE1 的 `pn` —— **用户口径（2026-10-26）**：
+     * 设备每轮 ping 拿到平均时延，与它比较；大于＝延时严重，小于＝正常。 */
+    uint32_t degrade_rtt_ms;
     uint32_t degrade_loss_permille; /* 丢包率超此值判 DEGRADED，0=不判 */
     const iv_probe_iops_t *iops;    /* NULL -> iv_probe_default_iops() */
 } iv_probe_cfg_t;
@@ -347,6 +355,17 @@ int iv_probe_set_link(iv_probe_t *p, int ifindex, int up, uint64_t now_ms);
  * 未 init 返回 `IV_ESTATE`。 */
 int iv_probe_retune(iv_probe_t *p, uint32_t interval_ms, uint32_t timeout_ms,
                     uint32_t fail_n, uint64_t now_ms);
+
+/* 运行期改两个劣化门限（`probe.timeout_ms` → `degrade_rtt_ms` 的热生效入口）。
+ *
+ * 本板用的是 RTT 那一维：设备每轮 ping 得到**平均时延**，与 `rtt_ms` 比较，
+ * 大于 ⇒ `IV_PROBE_DEGRADED`（上报 `MN=4`「延时」），小于 ⇒ 正常。`0` 表示
+ * 该维度不判（与 `iv_probe_cfg_default()` 的默认值无关，运行期 0 是合法值）。
+ *
+ * `loss_permille` 同批下发，本板传 0（丢包维度不参与判定：链路质量看延时，
+ * 丢包由 `fail_n` 那条线走"断开"）。同值早返回；写完按现有证据立刻重判一次。
+ * 未 init 返回 `IV_ESTATE`。 */
+int iv_probe_set_degrade(iv_probe_t *p, uint32_t rtt_ms, uint32_t loss_permille);
 
 /* ---------------------------------------------------------------------------
  * 查询

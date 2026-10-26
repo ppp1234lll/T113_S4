@@ -303,8 +303,11 @@ const main = async () => {
     }
 
     /* 三个非法值都必须在**发请求之前**挡住：区间 100~60000、
-     * 必须小于探测周期（桩里 interval=5000）、整数。 */
+     * 必须**严格小于半个探测周期**（桩里 interval=5000 ⇒ 上限 2499）、整数。
+     * 「半周期」这条是 2026-10-26 语义纠正带出来的：这个键是延时门限，
+     * 等回包超时＝半周期，门限摆到半周期及以上 ⇒ 时延永远够不到它。 */
     const bads = [['50', '低于下界 100'], ['5000', '不小于探测周期'],
+                  ['2500', '正好等于半周期（必须严格小于）'],
                   ['2.5', '不是整数'], ['', '留空']];
     for (const [v, tag] of bads) {
         applyCalls.length = 0;
@@ -314,6 +317,18 @@ const main = async () => {
         await sleep(40);
         chk(applyCalls.length === 0 && toastText().length > 0,
             'n09i: ' + tag + ' 被前端拦住（不发请求、有提示）');
+    }
+
+    /* 边界内侧必须能过：2499 < 2500（半周期），前端不许一味拦死 */
+    applyCalls.length = 0;
+    to.value = '2499';
+    to.dispatchEvent(new window.Event('input'));
+    byText(content, 'button', '配置有线超时').click();
+    await sleep(60);
+    chk(applyCalls.length === 1, 'n09j: 2499（半周期内侧）放行');
+    if (applyCalls.length === 1) {
+        chk(applyCalls[0].items['probe.timeout_ms'] === 2499,
+            'n09j: 发的仍是数字 2499');
     }
 
     if (fail === 0) {

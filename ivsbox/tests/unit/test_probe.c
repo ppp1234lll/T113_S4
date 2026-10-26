@@ -308,6 +308,9 @@ static void c04_degrade(void)
     c.degrade_loss_permille = 0; /* 只测 RTT 维度 */
     (void)iv_probe_init(&p, &c);
     (void)iv_probe_add_app(&p, 0, "app");
+    /* 运行期调参入口（`retune` / `set_degrade`）都要求引擎已 start —— 只有 APP 项，
+     * 不会去开 raw socket。 */
+    chk(iv_probe_start(&p, 0) == IV_OK, "c04 start");
 
     (void)iv_probe_note_result(&p, 0, 1, 50, 100);
     (void)iv_probe_note_result(&p, 0, 1, 50, 200);
@@ -319,6 +322,29 @@ static void c04_degrade(void)
     (void)iv_probe_stat_get(&p, 0, &st);
     chk(st.avg_rtt_ms > 100, "c04 avg risen");
     chk(st.state == IV_PROBE_DEGRADED, "c04 high rtt -> DEGRADED");
+
+    /* ---- 运行期改门限（`probe.timeout_ms` 的热生效入口）----
+     * 现场把它从 100 拉到 4000 ⇒ 同一条链路立刻**不再**算延时严重；拉回来又变回去。
+     * 判据必须是"按现有证据立刻重判"，等下一拍会让引擎口径与上报口径打架。 */
+    chk(iv_probe_set_degrade(&p, 4000, 0) == IV_OK, "c04 set_degrade -> OK");
+    chk(iv_probe_state(&p, 0) == IV_PROBE_UP,
+        "c04 raising the threshold clears DEGRADED at once");
+    chk(iv_probe_set_degrade(&p, 4000, 0) == IV_OK, "c04 same value -> OK");
+    chk(iv_probe_state(&p, 0) == IV_PROBE_UP, "c04 same value does not flap");
+    chk(iv_probe_set_degrade(&p, 0, 0) == IV_OK, "c04 0 = do not judge");
+    chk(iv_probe_state(&p, 0) == IV_PROBE_UP, "c04 threshold 0 never degrades");
+    chk(iv_probe_set_degrade(&p, 100, 0) == IV_OK, "c04 threshold back to 100");
+    chk(iv_probe_state(&p, 0) == IV_PROBE_DEGRADED,
+        "c04 lowering the threshold re-degrades at once");
+    {
+        /* 未 init（started=0）⇒ ESTATE，不许"改内存当生效" */
+        iv_probe_t fresh;
+
+        memset(&fresh, 0, sizeof(fresh));
+        chk(iv_probe_set_degrade(&fresh, 100, 0) == IV_ESTATE,
+            "c04 set_degrade before start -> ESTATE");
+        chk(iv_probe_set_degrade(NULL, 100, 0) == IV_EINVAL, "c04 set_degrade(NULL) -> EINVAL");
+    }
 }
 
 static void c05_link_event(void)

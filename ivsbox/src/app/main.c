@@ -649,18 +649,18 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
          * 与 `iv_agent_open()` 共用同一份 `probe_cfg_of()`，不在这里二次翻译。 */
         int64_t  pv   = 0;
         uint32_t i_ms = 0;
-        uint32_t t_ms = 0;
+        uint32_t d_ms = 0; /* 延时门限（`probe.timeout_ms`），毫秒 */
         uint32_t f_n  = 0;
         int      prc;
 
         if (iv_config_get_int(g_cfg, "probe.interval_ms", &pv) == IV_OK)
             i_ms = (uint32_t)pv;
         if (iv_config_get_int(g_cfg, "probe.timeout_ms", &pv) == IV_OK)
-            t_ms = (uint32_t)pv;
+            d_ms = (uint32_t)pv;
         if (iv_config_get_int(g_cfg, "probe.max_fail", &pv) == IV_OK)
             f_n = (uint32_t)pv;
         prc = iv_agent_reload_probe(&g_agent, cfg_ip_be("probe.target1"),
-                                    cfg_ip_be("probe.target2"), i_ms, t_ms, f_n,
+                                    cfg_ip_be("probe.target2"), i_ms, d_ms, f_n,
                                     iv_clock_monotonic_ms());
         if (prc != IV_OK)
             IV_LOG_W(APP_MOD, "probe.* not applied (%d)", prc);
@@ -1257,13 +1257,15 @@ static int query_cfg_json(char *out, size_t cap, void *arg)
     /* ping 每轮间隔 / 每个设备间隔 —— 两个字段**量纲不同**，别再一起 /1000：
      *   `pl`（每轮间隔）仍是**秒**：同一批"间隔"类字段里 `rt`（定时上报间隔）就是秒，
      *        继续 `v / 1000`；
-     *   `pn`（每设备超时）是**毫秒**，原样送。三条证据：
+     *   `pn`（有线网络延时门限）是**毫秒**，原样送。三条证据：
      *        ① 平台参数设置页那一项自己就标着「有线网络超时时间(ms)」；
      *        ② 10-26 15:51 板端实抓 `0xFE … 01 64`（界面填 100）⇒ 下发就是毫秒、
      *           不换算（见 `on_plat_net_timeout()`）；
      *        ③ 16:09 用户明确该单位是毫秒。
      * 读写量纲必须一致：写下去 100（ms）、读回来 0（秒）⇒ 平台设完再打开页面显示 0，
-     * 现场会以为"没保存上"，然后再点一次。 */
+     * 现场会以为"没保存上"，然后再点一次。
+     * 语义见 `on_plat_net_timeout()` 头部：这个数不是"等回包超时"，是"平均时延
+     * 超过它就算延时严重"的门限。 */
     if (iv_config_get_int(g_cfg, "probe.interval_ms", &v) != IV_OK)
         v = 0;
     cj_int(&j, "pl", (long long)(v / 1000));
@@ -1847,17 +1849,17 @@ static void on_plat_ping_target(const iv_proto_frame_t *f, void *arg)
     {
         int64_t  pv   = 0;
         uint32_t i_ms = 0;
-        uint32_t t_ms = 0;
+        uint32_t d_ms = 0; /* 延时门限（`probe.timeout_ms`），毫秒 */
         uint32_t f_n  = 0;
         int      prc;
 
         if (iv_config_get_int(g_cfg, "probe.interval_ms", &pv) == IV_OK)
             i_ms = (uint32_t)pv;
         if (iv_config_get_int(g_cfg, "probe.timeout_ms", &pv) == IV_OK)
-            t_ms = (uint32_t)pv;
+            d_ms = (uint32_t)pv;
         if (iv_config_get_int(g_cfg, "probe.max_fail", &pv) == IV_OK)
             f_n = (uint32_t)pv;
-        prc = iv_agent_reload_probe(&g_agent, tgt[0], tgt[1], i_ms, t_ms, f_n,
+        prc = iv_agent_reload_probe(&g_agent, tgt[0], tgt[1], i_ms, d_ms, f_n,
                                     iv_clock_monotonic_ms());
         if (prc != IV_OK) {
             /* 配置已落盘但没生效：如实回失败，别让平台以为成功（下次重启会生效，
@@ -1971,9 +1973,12 @@ static void on_plat_search_mode(const iv_proto_frame_t *f, void *arg)
  * 差一个 x1000，两种解释都能自圆其说 —— 所以一直标着"量纲未知**不猜**"。
  * 现在真帧到手，按**实测**取值：100 就是 100 ms，不做任何换算。
  *
- * 落到 `probe.timeout_ms`（单次探测超时，毫秒，区间 100..60000，且必须 < 探测周期）。
+ * 落到 `probe.timeout_ms`（毫秒，区间 100..60000，且必须小于探测周期的一半）。
+ * 这个键的**语义**是"有线网络延时门限"，不是"等回包超时"（2026-10-26 用户明确）：
+ * 设备每轮 ping 拿到平均时延，与之比较 —— 大于 ⇒ 延时严重（上报 `MN=4`），
+ * 小于 ⇒ 正常。它经 `probe_cfg_of()` 落到 `iv_probe_cfg_t::degrade_rtt_ms`。
  * 为什么不落 `netthr.timeout_ms`：那个键在默认值表里写着"保留键：**无消费方**，
- * 改后不生效（探测超时见 `probe.timeout_ms`）"，用户 10-22 已拍板不接。
+ * 改后不生效"，用户 10-22 已拍板不接。
  * 写进去就等于"回了 0x01 但什么都没变"——正是本轮在清的那类病。
  *
  * 顺序：**不碰平台链路**（只重建探测表），所以可以"落盘 → 生效 → ACK"，
@@ -2000,14 +2005,15 @@ static void on_plat_net_timeout(const iv_proto_frame_t *f, void *arg)
     }
     ms = (int)f->data[0];
     if (ms == 0) {
-        /* 参考实现同样把 0 当非法：0 ms 超时没有意义，别悄悄改成"取默认" */
-        IV_LOG_W(APP_MOD, "0xFE timeout=0ms rejected, ack 0x74");
+        /* 参考实现同样把 0 当非法：0 ms 延时门限没有意义（任何时延都"超"），
+         * 别悄悄改成"取默认" */
+        IV_LOG_W(APP_MOD, "0xFE delay=0ms rejected, ack 0x74");
         (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
         return;
     }
     if (iv_config_get_int(g_cfg, "probe.timeout_ms", &cur) == IV_OK &&
         cur == (int64_t)ms) {
-        IV_LOG_I(APP_MOD, "0xFE timeout=%dms unchanged, ack 0x01, probe untouched", ms);
+        IV_LOG_I(APP_MOD, "0xFE delay=%dms unchanged, ack 0x01, probe untouched", ms);
         (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
         return;
     }
@@ -2015,8 +2021,10 @@ static void on_plat_net_timeout(const iv_proto_frame_t *f, void *arg)
     rc = iv_config_set_int(g_cfg, "probe.timeout_ms", (int64_t)ms);
     if (rc != IV_OK) {
         /* 1 字节最大 255，区间下界是 100 ⇒ 只有 1..99 会被拒（如实回失败，
-         * 不 clamp —— 悄悄改成 100 会让平台以为它就是 100） */
-        IV_LOG_W(APP_MOD, "0xFE timeout=%dms out of range [100,60000] (%d), ack 0x74",
+         * 不 clamp —— 悄悄改成 100 会让平台以为它就是 100）。
+         * 上界那条（延时门限必须 < 探测周期的一半）也在这里被拒：这是诚实的行为，
+         * 门限高过等回包超时 ⇒ RTT 永远够不到它 ⇒ "延时严重"永远不触发。 */
+        IV_LOG_W(APP_MOD, "0xFE delay=%dms rejected by config (%d), ack 0x74",
                  ms, rc);
         (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
         return;
@@ -2031,7 +2039,8 @@ static void on_plat_net_timeout(const iv_proto_frame_t *f, void *arg)
     }
 
     /* 显式兜底生效（口径同 0xF8）：`iv_agent_reload_probe()` 内部对同值早返回，
-     * 周期/失败次数按配置现值传，别因为"这次只改超时"就把它们清成 0。 */
+     * 周期/失败次数按配置现值传，别因为"这次只改门限"就把它们清成 0。
+     * 第 5 个参数就是延时门限本体（毫秒原样，不换算）。 */
     if (iv_config_get_int(g_cfg, "probe.interval_ms", &pv) == IV_OK && pv > 0)
         i_ms = (uint32_t)pv;
     if (iv_config_get_int(g_cfg, "probe.max_fail", &pv) == IV_OK && pv > 0)
@@ -2045,7 +2054,8 @@ static void on_plat_net_timeout(const iv_proto_frame_t *f, void *arg)
         return;
     }
 
-    IV_LOG_I(APP_MOD, "platform set wired net timeout -> %d ms (saved + applied)", ms);
+    IV_LOG_I(APP_MOD, "platform set wired net delay threshold -> %d ms (saved + applied)",
+             ms);
     (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
 }
 
@@ -2190,8 +2200,11 @@ static int agent_setup(void)
     ac.probe_target_be[1] = cfg_ip_be("probe.target2");
     if (iv_config_get_int(g_cfg, "probe.interval_ms", &v) == IV_OK)
         ac.probe_interval_ms = (uint32_t)v;
+    /* 配置键 `probe.timeout_ms` ＝ **有线网络延时门限**（平台「有线网络超时时间(ms)」/
+     * 0xFE / 0xE1 的 `pn`），落到 `probe` 的 `degrade_rtt_ms`：ping 平均时延超过它
+     * 判"延时严重"（`MN=4`）。2026-10-26 用户明确口径后改的，原先当成"等回包超时"。 */
     if (iv_config_get_int(g_cfg, "probe.timeout_ms", &v) == IV_OK)
-        ac.probe_timeout_ms = (uint32_t)v;
+        ac.probe_delay_ms = (uint32_t)v;
     if (iv_config_get_int(g_cfg, "probe.max_fail", &v) == IV_OK)
         ac.probe_fail_n = (uint32_t)v;
     /* ⚠ 这里**只有** `probe_fail_n`。切换门限（`nm_fail_n`）的来源是

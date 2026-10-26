@@ -7006,3 +7006,130 @@ for (i = 0; i < n; i++)                      /* ← 然后才轮到读回包 */
   `probe item add failed` 归零、`link seed: eth0 up` 出现、
   `state` 由 `BOTH_DOWN` → **`WIRELESS_UP`**、`mn` 由 `[2,2]` → **`[1,1]`**、
   `switches=0`、`bound=usb0`（**平台链路没换口**）。
+
+== 2026-10-26 17:47 `probe.timeout_ms` 是**延时门限**，不是等回包超时
+
+=== 语义（用户口径，一句话）
+
+> 设备每 ping 一次网络，得到 ping 的**平均时间**；用这个平均时间和**超时时间**比较 ——
+> 如果大，表明当前网络**延时严重**；如果小，表明网络正常。
+
+所以这个数是**判定"延时算不算大"的门限**，和"等回包等多久"是两件不同的事。
+键名与平台叫法（「有线网络超时时间(ms)」/ `0xFE` / `0xE1` 的 `pn`）**都不改**：
+平台契约和已落盘的现场配置都认这个名字。
+
+=== 原状：这个键的两个消费者都对不上
+
+[cols="1,3", options="header"]
+|===
+| 位置 | 原来怎么用
+
+| `probe_cfg_of()`
+| 只读 `interval_ms` / `timeout_ms` / `fail_n`，**从不读** `degrade_rtt_ms`
+  ⇒ `iv_probe` 判"延时"的门限**一直是默认 800**，现场设 100 从来没生效
+
+| `iv_probe.cfg.timeout_ms`
+| 被这个键直接覆盖 ⇒ 探测自己的等回包时间成了 100 ms，而驱动节拍是 200 ms
+  （上一节 17:24 那个坑的根）
+|===
+
+也就是说：现场改这个键，唯一真实效果是**把探测搞坏**，平台想让它做的那件事一件没做。
+
+=== 现在
+
+[source,c]
+----
+static void probe_cfg_of(const iv_agent_cfg_t *cfg, iv_probe_cfg_t *pc)
+{
+    iv_probe_cfg_default(pc);
+    if (cfg->probe_interval_ms != 0u) pc->interval_ms  = cfg->probe_interval_ms;
+    if (cfg->probe_delay_ms    != 0u) pc->degrade_rtt_ms = cfg->probe_delay_ms; /* ← 语义落点 */
+    if (cfg->probe_fail_n      != 0u) pc->fail_n       = cfg->probe_fail_n;
+    pc->timeout_ms = probe_io_timeout_of(pc->interval_ms); /* 等回包超时＝周期的一半，不可配 */
+}
+----
+
+* **等回包超时改成推导**：`interval/2`，下限 250 ms（＝一个驱动节拍 200 ms 之上），
+  并保证 `< interval` 满足 `iv_probe_retune()` 的硬约束。副作用是好的：17:24 那个
+  "`timeout_ms` ≤ 节拍 ⇒ 稳定 100% 丢包"的坑从此**结构上不可能再踩到**（最小 250 ms），
+  即使 `probe_drive()` 的 drain/tick 顺序将来被谁改回去。
+* **字段改名**：`iv_agent_cfg_t::probe_timeout_ms` → `probe_delay_ms`。名字必须跟着语义走，
+  否则下一个人还会按名字把它喂给 `timeout_ms`。
+* **热生效补齐**（`iv_agent_reload_probe()`）：
+  * 同值早返回的比较里补 `degrade_rtt_ms` —— 漏掉就是"配置改了、引擎没变、日志不报"；
+  * retune 分支里补 `iv_probe_set_degrade(&a->pb, pc.degrade_rtt_ms, 0u)`
+    （新接口：同值早返回，写完按现有证据**立刻重判**一次 —— 门限一降下来，
+    此刻已经超门限的链路立刻变 DEGRADED，不用等下一拍）。
+* **配置跨字段收紧**：`timeout < interval` → **`2*timeout < interval`**。
+  等回包超时是半周期，时延超过它就成了"丢包"而不是"延时" ⇒ 门限摆在半周期及以上，
+  这个键就等于**配了永远不触发**。拒绝比接受诚实。
+* **取证出口**：`netthr.status` 增 `probe_delay_ms`（读 `a->pb.cfg.degrade_rtt_ms`）
+  与 `probe_rtt_ms`（每路 WAN 实测平均时延，`-1`＝没探测项）。
+  "落盘"和"生效"必须能分开看 —— `0xFE` 那一课就是回了 `0x01` 却什么都没变；
+  而现场问"为什么显示延时"时，**分子和分母都得看得见**。
+
+=== 第三个缺陷：RTT 的采样分辨率（板端实测才暴露）
+
+门限改成 100 之后，真机 `mn` 立刻变成 `[4,4]` —— 两条好链路全标「延时」。原因不在判定，
+在**测量**：`iv_probe` 的 RTT ＝ "发出时刻 → **读到回包的时刻**"，而回包原先只在 200 ms 的
+`probe_drive()` 节拍里被读走。局域网 0.5 ms 的往返于是被记成 **200 ms**。
+
+这与 `iv_camdet` 的 R-02（2026-10-22，「ping 明明是 0.5 ms，页面报延时(4)」）
+是**同一个坑**，只是这次落在 WAN 探测这一侧。
+
+[source,c]
+----
+/* 之前：唯一的读取点绑在 200 ms 节拍上 */
+probe_drive(now)  →  probe_drain()  →  iv_probe_on_readable(now)  /* 一拍一次 */
+
+/* 现在：另开一个只读的 10 ms 排空节拍 */
+on_probe_drain_timer()  →  probe_drain()  →  iv_probe_on_readable(now)  /* 10 ms 一次 */
+on_pb_timer(200 ms)     →  probe_drive()  →  probe_drain() ＋ iv_probe_tick()
+----
+
+* 发送与超时判定仍留在 200 ms 的 `probe_drive()`，**只把读取拆出来**：
+  "测量分辨率"与"发送节拍"本来是两件事，绑在一起就会互相牵制。
+* 契约钉在编译期：`_Static_assert(IV_AGENT_PROBE_DRAIN_MS * 5 <= 100)` ——
+  采样必须明显细于门限下界（100 ms），否则"延时门限"退化成
+  "一个节拍内有没有应答"的二值判断。
+* `iv_camdet` 有**自己的实例与节拍**，不受这个值影响（它已按 200 ms 分辨率适配判据）。
+* 真机结果：`probe_rtt_ms=[7,9]`（两路 7 / 9 ms）、门限 100、`mn=[1,1]`
+  —— 换版前同一配置是 `[4,4]`。
+
+=== `MN=` 补 3/4：网线断开与延时
+
+`iv_report_env_t::mn` 的取值表一直是五个值，但生产者只填了 0/1/2。
+`env_feed()` 抽出 `mn_state_of()`，顺序即优先级：
+
+[cols="1,1,3", options="header"]
+|===
+| 顺序 | 返回 | 判据（命中即返回）
+
+| ① | 0 | `wan_ifindex[w] == 0` —— 这一路没绑接口，平台看就是"未指定 IP"
+| ② | 3 | **有线**且 carrier down —— 拔网线是物理事实，比"探测不通"更硬；
+      无线没有网线这回事，4G 掉载波仍报 2
+| ③ | 4 | 探测结论 `IV_PROBE_DEGRADED` —— 平均时延超 `probe.timeout_ms` 门限
+| ④ | 1 / 2 | 状态机说可用 ⇒ 1，否则 2
+|===
+
+③ 必须排在 ④ 前：`netmgr` 把 DEGRADED 当"可用"（劣化不切链路），而平台要的恰恰是
+"能用但慢"这个独立状态。同一个事实、两个消费者、两种口径，别合成一个。
+
+顺带补了一个坑：`wan_link_up[]` 原先**只有 netlink 事件写**，而 netlink 只报变化
+⇒ "开机就是 UP、之后没抖过"的板子上它永远是 0，拿它判"网线断开"会一直误报 3。
+现在 `agent_probe_seed_links()` 里一起 seed（那一刻才是权威事实）。
+
+**故障沿**由 `1→2` 放宽成 `(1|4) → (2|3)`：拔网线该断继电器（真的上不了网），
+**延时严重不该**（只是慢，链路还在，重启一次现场代价更大）。
+
+=== 验证
+
+* 单测：新增 `test_agent_mn`（0/1/2/3/4 五档 ＋ 优先级 ＋ 故障沿）；
+  `test_agent_hotcfg h08`（门限落 `degrade_rtt_ms`、io 超时＝`interval/2`、
+  只改门限也真落地）；`test_probe c04` 加 `set_degrade` 的立即重判 / `0`=不判 / 未 start 守卫；
+  `test_config c8` 加"正好等于半周期也必须拒"；`test_agent_netthr n05` 加 `probe_delay_ms`。
+* **反向证伪 5 项全红**：去掉 carrier 那条 ⇒ m04；去掉 DEGRADED 那条 ⇒ m05/m06/m07；
+  故障沿改回 `1→2` ⇒ m07；`probe_cfg_of()` 不喂门限 ⇒ h08 四条；io 超时换常量 ⇒ h08 两条。
+* `platcmd_e2e.py` **C8d**：`0xFE` 设 100 ⇒ `netthr.status.probe_delay_ms == 100`
+  （证明的是"引擎真的换了门限"，不是"配置里存了个 100"）。
+

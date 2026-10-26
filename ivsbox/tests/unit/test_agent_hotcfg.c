@@ -17,6 +17,8 @@
  *   h06 作业在飞：**不动 `jb`**，只置 `snmp_stale`，`a->cfg` 立即更新
  *   h07 stale 由 `iv_agent_snmp_start()` 落地，且必须在"有没有池"这类守卫**之前**
  *       （否则池缺/开关关期间 stale 一直挂着，等就绪了第一次仍按旧表采）
+ *   h08 `probe.timeout_ms` 是**延时门限**（落 `degrade_rtt_ms`），等回包超时由
+ *       周期推导（`interval/2`）；只改门限也必须真的落地（2026-10-26）
  *
  * 为什么这一层能测：两个 reload 只依赖 `a->cfg` / `a->recm` / `a->snmp_job`，
  * 不需要 `iv_agent_open()` 的串口/netlink。**"改配置会不会走到它们"** 取决于
@@ -238,17 +240,61 @@ static void h04_snmp_targets(void)
         "h07 the OID table came back with the rebuild");
 }
 
+/* h08 `probe.timeout_ms` 是**延时门限**（2026-10-26 用户口径），不是"等回包超时"。
+ *
+ * 修之前 `probe_cfg_of()` 只读 interval/timeout/fail_n，**从不读** `degrade_rtt_ms`
+ * ⇒ 现场把这个键设成 100，平台说的"平均时延超过 100 ms 就算延时严重"从来没生效，
+ * 反倒把探测自己的等回包时间压到 100 ms（一轮 200 ms 的节拍下几乎必然判丢包）。
+ * 现在：门限 → `degrade_rtt_ms`；等回包超时由周期推导（`interval/2`）。
+ *
+ * 反向证伪：把 `probe_cfg_of()` 里那一行 `pc->degrade_rtt_ms = cfg->probe_delay_ms`
+ * 去掉 ⇒ h08 的 degrade 三条全红；把 `probe_io_timeout_of()` 换成常量 1000 ⇒
+ * 周期 500 那条（io 250）全红、且 retune 会因 timeout >= interval 直接回 EINVAL。 */
+static void h08_probe_delay_threshold(void)
+{
+    iv_agent_t     a;
+    iv_probe_cfg_t pc;
+
+    make_agent(&a);
+    /* 目标都不配（0/0 ⇒ 前后相同）⇒ 走"目标没变"的 retune 分支，它要求引擎已 start */
+    iv_probe_cfg_default(&pc);
+    (void)iv_probe_init(&a.pb, &pc);
+    chk(iv_probe_start(&a.pb, 0u) == IV_OK, "h08 probe started");
+
+    chk(iv_agent_reload_probe(&a, 0u, 0u, 5000u, 300u, 3u, 1000u) == IV_OK,
+        "h08 reload -> OK");
+    chk(a.pb.cfg.degrade_rtt_ms == 300u,
+        "h08 delay threshold lands in iv_probe.degrade_rtt_ms");
+    chk(a.cfg.probe_delay_ms == 300u, "h08 snapshot probe_delay_ms = 300");
+    chk(a.pb.cfg.timeout_ms == 2500u, "h08 io timeout = interval/2 (5000/2)");
+    chk(a.pb.cfg.timeout_ms < a.pb.cfg.interval_ms,
+        "h08 io timeout < interval (retune 的硬约束)");
+
+    /* 周期下界 500 ⇒ 半周期 250，仍必须严格小于周期，否则 retune 会拒 */
+    chk(iv_agent_reload_probe(&a, 0u, 0u, 500u, 200u, 3u, 1000u) == IV_OK,
+        "h08 reload at the minimum interval -> OK");
+    chk(a.pb.cfg.timeout_ms == 250u, "h08 io timeout 250 at interval 500");
+    chk(a.pb.cfg.timeout_ms < a.pb.cfg.interval_ms, "h08 io timeout still < interval");
+
+    /* 只改门限（同目标、同周期、同次数）：早返回的比对里若漏掉 degrade，
+     * 这次调用会静默什么都不做 —— 正是 0xFE"回了 0x01 却没效果"的样子。 */
+    chk(iv_agent_reload_probe(&a, 0u, 0u, 500u, 120u, 3u, 2000u) == IV_OK,
+        "h08 delay-only reload -> OK");
+    chk(a.pb.cfg.degrade_rtt_ms == 120u, "h08 delay-only change really landed");
+}
+
 int main(void)
 {
     h01_guards();
     h02_rec_sources();
     h04_snmp_targets();
+    h08_probe_delay_threshold();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_agent_hotcfg FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_agent_hotcfg passed (guards, same-value early return, rec table "
-           "apply, snmp normalise, in-flight stale, late apply)\n");
+           "apply, snmp normalise, in-flight stale, late apply, probe delay threshold)\n");
     return 0;
 }

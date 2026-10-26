@@ -41,6 +41,7 @@ static void cell_drive(iv_agent_t *a, uint64_t now_ms);
 static void cell_redial_tick(iv_agent_t *a, uint64_t now_ms);
 static int  cell_spawn_dial(iv_agent_t *a);
 static void on_pb_timer(void *arg);
+static void on_probe_drain_timer(void *arg);
 static void on_nm_timer(void *arg);
 static int  agent_reconnect(void *arg, int new_ifindex);
 
@@ -175,15 +176,46 @@ void iv_agent_init(iv_agent_t *a)
  * iv_report.h）。探测表同理：如果 reload 自己再写一遍 `iv_probe_cfg_default()` +
  * 三个 if，将来加了新键只改 open，重载后就会"参数悄悄回到默认"。
  * ------------------------------------------------------------------------- */
+/* 单次探测"等回包"超时：取探测周期的一半（下限 250 ms = 一个驱动节拍 200 ms
+ * 之上，避免"这一拍刚发出去、下一拍就判超时"）。
+ *
+ * 为什么不再从配置取：配置键 `probe.timeout_ms` 已经按用户口径改成**延时门限**
+ * （见 `probe_cfg_of()`），而"等回包等多久"本来就不该由现场调 —— 它只由节拍
+ * 决定：等超过半个周期，下一拍就该发新的了，继续等只会把节拍拖乱。
+ *
+ * 上限不设：周期最大 600 s ⇒ 等回包最长 300 s，这段时间里该项 `inflight=1`
+ * 不会重复发，不会积压。 */
+static uint32_t probe_io_timeout_of(uint32_t interval_ms)
+{
+    uint32_t t = interval_ms / 2u;
+
+    if (t < 250u)
+        t = 250u;
+    /* `iv_probe_retune()` 的硬约束是 timeout < interval。周期最小值 500 ⇒
+     * 上一步得到 250，天然满足；这里仍留一道，防止将来改小周期下界时踩空。 */
+    if (t >= interval_ms)
+        t = (interval_ms > 1u) ? (interval_ms - 1u) : 1u;
+    return t;
+}
+
 static void probe_cfg_of(const iv_agent_cfg_t *cfg, iv_probe_cfg_t *pc)
 {
     iv_probe_cfg_default(pc);
     if (cfg->probe_interval_ms != 0u)
         pc->interval_ms = cfg->probe_interval_ms;
-    if (cfg->probe_timeout_ms != 0u)
-        pc->timeout_ms = cfg->probe_timeout_ms;
+    /* ⚠ 这一行是本轮语义纠正的落点（2026-10-26 用户）：
+     *   配置里的 `probe.timeout_ms`（平台「有线网络超时时间(ms)」）
+     *   ＝ **延时门限** ⇒ 喂 `degrade_rtt_ms`，**不**喂 `timeout_ms`。
+     * 之前一直喂 `timeout_ms`（"等回包多久判丢包"），结果是：现场把它设成 100，
+     * 平台说的"延时超过 100 ms 就算严重"从来没生效，而探测自己的等回包时间被
+     * 压到 100 ms ⇒ 一轮 200 ms 的节拍下几乎必然判丢包（10-26 那次"网络状态
+     * 显示断开"的另一半原因）。 */
+    if (cfg->probe_delay_ms != 0u)
+        pc->degrade_rtt_ms = cfg->probe_delay_ms;
     if (cfg->probe_fail_n != 0u)
         pc->fail_n = cfg->probe_fail_n;
+    /* 等回包超时由节拍推导，不是配置项。放在最后，覆盖上面可能的默认值。 */
+    pc->timeout_ms = probe_io_timeout_of(pc->interval_ms);
 }
 
 /* 目标 IP：优先 target1，没配则退 target2；都没有 ⇒ 0（只做被动 LINK 探测）。 */
@@ -253,6 +285,10 @@ static void agent_probe_seed_links(iv_agent_t *a, uint64_t now_ms)
             continue;
         }
         (void)iv_probe_set_link(&a->pb, a->wan_ifindex[w], up, now_ms);
+        /* 顺手把 carrier 现状记进快照：`wan_link_up[]` 原先只有 netlink 事件写，
+         * 而 netlink **只报变化** ⇒ "开机就是 UP、之后一直没抖"的板子上它永远是
+         * 0，拿它判"网线断开"会一直误报（`MN=3`）。seed 这一刻才是权威事实。 */
+        a->wan_link_up[w] = (uint8_t)up;
         IV_LOG_I(AG_MOD, "link seed: %s %s", a->cfg.wan_name[w], up ? "up" : "down");
     }
 }
@@ -709,9 +745,12 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     /* ---- 6. 本层定时器（仅 Reactor 模式；r == NULL 时由调用方按节拍推进）---- */
     if (r != NULL) {
         a->pb_timer   = iv_timer_add(r, IV_AGENT_PROBE_TICK_MS, on_pb_timer, a);
+        a->pb_drain_timer =
+            iv_timer_add(r, IV_AGENT_PROBE_DRAIN_MS, on_probe_drain_timer, a);
         a->nm_timer   = iv_timer_add(r, IV_AGENT_NETMGR_TICK_MS, on_nm_timer, a);
         a->cell_timer = iv_timer_add(r, IV_AGENT_CELL_TICK_MS, on_cell_timer, a);
-        if (a->pb_timer == NULL || a->nm_timer == NULL || a->cell_timer == NULL)
+        if (a->pb_timer == NULL || a->pb_drain_timer == NULL ||
+            a->nm_timer == NULL || a->cell_timer == NULL)
             IV_LOG_W(AG_MOD, "agent timer add failed");
     }
 
@@ -773,6 +812,10 @@ void iv_agent_close(iv_agent_t *a)
         if (a->pb_timer != NULL) {
             (void)iv_timer_cancel(a->r, a->pb_timer);
             a->pb_timer = NULL;
+        }
+        if (a->pb_drain_timer != NULL) {
+            (void)iv_timer_cancel(a->r, a->pb_drain_timer);
+            a->pb_drain_timer = NULL;
         }
         if (a->cell_timer != NULL) {
             (void)iv_timer_cancel(a->r, a->cell_timer);
@@ -925,6 +968,34 @@ static void storage_drive(iv_agent_t *a, uint64_t now)
                          iv_storage_stop_rec(&a->stg), &ops);
 }
 
+/* 主网状态（上报帧 `MN=` 的两个数，取值表见 `iv_report_env_t::mn`）：
+ *   0 未指定IP / 1 正常 / 2 断开 / 3 网线断开 / 4 延时
+ *
+ * 判定顺序＝"从物理事实往推断排"，越靠前越不可辩驳：
+ *   ① 这一路没绑到接口 ⇒ 0（平台看就是"未指定 IP"）；
+ *   ② **有线**且载波 down ⇒ 3。拔网线是物理事实，比"探测不通"更准、也更该
+ *      让现场一眼看懂。无线没有网线这回事，4G 掉载波仍报 2；
+ *   ③ 探测结论 `IV_PROBE_DEGRADED` ⇒ 4（延时：ping 平均时延超
+ *      `probe.timeout_ms` 门限 —— 用户口径，见 `probe_cfg_of()`）；
+ *   ④ 状态机说可用 ⇒ 1，否则 2。
+ *
+ * ③ 必须排在 ④ 前：`iv_netmgr` 把 DEGRADED 当"可用"（劣化不等于断开，不切链路，
+ * 见 `netmgr_feed()`），而平台要的恰恰是"链路能用、但延时严重"这个独立状态。
+ * 同一个事件，两个消费者两种口径，别试图合成一个。 */
+static int mn_state_of(const iv_agent_t *a, int w)
+{
+    int idx;
+
+    if (a->wan_ifindex[w] == 0)
+        return 0;
+    if (w == (int)IV_WAN_WIRED && a->wan_link_up[w] == 0u)
+        return 3;
+    idx = a->wan_probe_idx[w];
+    if (idx >= 0 && iv_probe_state(&a->pb, idx) == IV_PROBE_DEGRADED)
+        return 4;
+    return iv_netmgr_wan_is_up(&a->nm, (iv_wan_t)w) ? 1 : 2;
+}
+
 /* 把本层掌握的"非采集板事实"注入上报层：CNS（六路摄像机网络状态）＋ MN（主网两路）。
  * 只改这两个字段，其余外部事实（CSQ/定位/故障码）原样保留。
  *
@@ -958,16 +1029,17 @@ static void env_feed(iv_agent_t *a, uint64_t now_ms)
                                                                 : -1;
 
     for (i = 0; i < (int)IV_RECOVERY_MASTER_N && i < (int)IV_WAN_N; i++) {
-        int st;
+        int st = mn_state_of(a, i);
 
-        if (a->wan_ifindex[i] == 0) {
-            st = 0; /* 未绑定接口 ⇒ 未指定 IP */
-        } else {
-            st = iv_netmgr_wan_is_up(&a->nm, (iv_wan_t)i) ? 1 : 2;
-        }
         env.mn[i] = st;
-        if (a->mn_last[i] == 1u && st == 2)
-            iv_recovery_on_master_change(&a->rec, i, 1, 2, now_ms);
+        /* 故障沿：只有"原来能上网 → 现在不能"才算故障。
+         *   3（网线断开）**算** —— 那是真的上不了网，该断继电器重启现场设备；
+         *   4（延时严重）**不算** —— 延时只是慢，链路还在，重启只会把现场
+         *     多断一次（用户口径："延时严重"不等于"断开"）。
+         * 原先只认 `1 → 2`，于是"网线被拔"永远触发不了自愈（这一路一直报 3）。 */
+        if ((a->mn_last[i] == 1u || a->mn_last[i] == 4u) && (st == 2 || st == 3))
+            iv_recovery_on_master_change(&a->rec, i, IV_RECOVERY_NORMAL,
+                                         IV_RECOVERY_FAULT, now_ms);
         a->mn_last[i] = (uint8_t)st;
     }
 
@@ -1179,11 +1251,46 @@ static void thresh_drive(iv_agent_t *a, uint64_t now_ms)
         IV_LOG_W(AG_MOD, "thresh not sent yet (rc=%d, tries=%u)", rc, (unsigned)a->th_tries);
 }
 
-static void probe_drive(iv_agent_t *a, uint64_t now_ms)
+/* 读一遍所有在飞的探测 fd（ICMP 回包 ＋ TCP 连接完成）。**只读，不发探、不判超时。**
+ *
+ * 两个调用者：`probe_drive()`（200 ms 节拍，顺带判超时）与 `on_probe_drain_timer()`
+ * （10 ms 节拍，只为精度）。抽成一处是因为这里决定了 RTT 的**测量分辨率** ——
+ * `iv_probe` 的 RTT ＝ "发出时刻 → 读到回包的时刻"，读得晚就等于测得慢：
+ * 只按 200 ms 读，局域网 0.5 ms 的往返会被记成 **200 ms**，于是"延时门限 100 ms"
+ * 恒判延时（`iv_camdet` R-02 踩过同一个坑）。详见 `IV_AGENT_PROBE_DRAIN_MS` 的注释。 */
+static void probe_drain(iv_agent_t *a, uint64_t now_ms)
 {
-    int n;
+    int n = iv_probe_fd_count(&a->pb);
     int i;
 
+    for (i = 0; i < n; i++) {
+        int fd = iv_probe_fd_at(&a->pb, i);
+
+        if (fd < 0)
+            continue;
+        (void)iv_probe_on_readable(&a->pb, fd, now_ms);
+        (void)iv_probe_on_writable(&a->pb, fd, now_ms);
+    }
+}
+
+/* 回包排空节拍（`IV_AGENT_PROBE_DRAIN_MS`）。只做 `probe_drain()`，别的什么都不碰：
+ * 发送与超时判定仍留在 `probe_drive()`，两者的周期互不牵制。
+ * `r == NULL` 模式没有定时器，只能靠 `iv_agent_step()` 的 200 ms 节拍 ——
+ * 那条路不判 RTT 精度（单测与无 Reactor 的装配都不是现场路径）。 */
+static void on_probe_drain_timer(void *arg)
+{
+    iv_agent_t *a = arg;
+
+    if (a == NULL)
+        return;
+    probe_drain(a, iv_clock_monotonic_ms());
+    if (a->r != NULL)
+        a->pb_drain_timer =
+            iv_timer_add(a->r, IV_AGENT_PROBE_DRAIN_MS, on_probe_drain_timer, a);
+}
+
+static void probe_drive(iv_agent_t *a, uint64_t now_ms)
+{
     /* ⚠ **顺序不能反：先读回包，再判超时**（2026-10-26 修）。
      *
      * 本函数由 `on_pb_timer` 每 `IV_AGENT_PROBE_TICK_MS`(=200 ms) 驱动一次，
@@ -1198,15 +1305,7 @@ static void probe_drive(iv_agent_t *a, uint64_t now_ms)
      * 表象是「双链路断开 / 主网1 断开」，实际平台 TCP 正常、上报正常。
      *
      * 先 drain 的语义也是对的：**先看有没有已到达的回包，再判"该来的没来"**。 */
-    n = iv_probe_fd_count(&a->pb);
-    for (i = 0; i < n; i++) {
-        int fd = iv_probe_fd_at(&a->pb, i);
-        if (fd < 0)
-            continue;
-        (void)iv_probe_on_readable(&a->pb, fd, now_ms);
-        (void)iv_probe_on_writable(&a->pb, fd, now_ms);
-    }
-
+    probe_drain(a, now_ms);
     (void)iv_probe_tick(&a->pb, now_ms);
 }
 
@@ -1463,7 +1562,7 @@ int iv_agent_reload_server(iv_agent_t *a)
  * open 和 reload 都走它。否则将来给 probe 加一个配置键，只改了 open，
  * 重载一次参数就"悄悄回到默认"，编译不报、日志也不报。 */
 int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_be,
-                          uint32_t interval_ms, uint32_t timeout_ms, uint32_t fail_n,
+                          uint32_t interval_ms, uint32_t delay_ms, uint32_t fail_n,
                           uint64_t now_ms)
 {
     iv_agent_cfg_t tmp;
@@ -1488,7 +1587,7 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
     tmp.probe_target_be[0] = target1_be;
     tmp.probe_target_be[1] = target2_be;
     tmp.probe_interval_ms  = interval_ms;
-    tmp.probe_timeout_ms   = timeout_ms;
+    tmp.probe_delay_ms     = delay_ms;
     /* ⚠ 只写 `probe_fail_n`。切换门限（`nm_fail_n`）自 2026-10-22 起由
      * `netthr.loss_count` 提供（架构 §10.2「切换门限由 netthr.* 承担」），
      * 见 `iv_agent_reload_netthr()`。原先这里两处同源，改 `probe.max_fail`
@@ -1509,7 +1608,10 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
         probe_cfg_of(&a->cfg, &oldpc);
         if (oldpc.interval_ms == pc.interval_ms &&
             oldpc.timeout_ms == pc.timeout_ms && oldpc.fail_n == pc.fail_n &&
-            old_dst == new_dst) {
+            /* 延时门限必须参与比较：它是 `probe.timeout_ms` 唯一的消费者，
+             * 漏掉就等于"平台 0xFE 改完落盘了、探测引擎还是旧门限"—— 而且
+             * 会静默走下面 retune 分支并被 retune 的同值早返回吞掉。 */
+            oldpc.degrade_rtt_ms == pc.degrade_rtt_ms && old_dst == new_dst) {
             return IV_OK;
         }
     }
@@ -1534,9 +1636,18 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
         if (rc != IV_OK) {
             /* 参数非法（如 timeout >= interval）：如实回报，不动快照、
              * 也不动 netmgr 阈值 —— 半套生效比不生效更难查。 */
-            IV_LOG_W(AG_MOD, "probe retune rejected (%d): interval=%u timeout=%u fail_n=%u",
+            IV_LOG_W(AG_MOD, "probe retune rejected (%d): interval=%u io_timeout=%u fail_n=%u",
                      rc, (unsigned)pc.interval_ms, (unsigned)pc.timeout_ms,
                      (unsigned)pc.fail_n);
+            return rc;
+        }
+        /* 延时门限单独一个入口（`retune` 只管节奏与判死阈值）。它自己会按现有
+         * 证据重判一次 ⇒ 门限一降下来，"此刻已经在超门限"的链路立刻变 DEGRADED，
+         * 不用等下一拍。丢包维度本板不判（传 0）。 */
+        rc = iv_probe_set_degrade(&a->pb, pc.degrade_rtt_ms, 0u);
+        if (rc != IV_OK) {
+            IV_LOG_W(AG_MOD, "probe degrade threshold rejected (%d): rtt_ms=%u",
+                     rc, (unsigned)pc.degrade_rtt_ms);
             return rc;
         }
     }
@@ -1549,9 +1660,9 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
      * `netthr.loss_count`（`iv_agent_reload_netthr()` 管），PROBE 分类只负责
      * 探测自身的判定门限。 */
 
-    IV_LOG_I(AG_MOD, "probe reloaded: interval=%u timeout=%u fail_n=%u dst=%s",
+    IV_LOG_I(AG_MOD, "probe reloaded: interval=%u io_timeout=%u fail_n=%u delay=%u dst=%s",
              (unsigned)pc.interval_ms, (unsigned)pc.timeout_ms, (unsigned)pc.fail_n,
-             ipv4_dotted(new_dst, nb, sizeof(nb)));
+             (unsigned)pc.degrade_rtt_ms, ipv4_dotted(new_dst, nb, sizeof(nb)));
     return IV_OK;
 }
 
@@ -1947,6 +2058,21 @@ int iv_agent_netthr_view(const iv_agent_t *a, iv_agent_netthr_view_t *out)
     /* 读模块，不读 config：两者长期不一致正是本组函数的修复对象。 */
     out->nm_fail_n    = (int)a->nm.cfg.fail_n;
     out->probe_fail_n = (int)a->pb.cfg.fail_n;
+    /* 延时门限也读模块真值：配置里那个键能被 0xFE / 网页改，而"引擎到底换了没有"
+     * 只有这里看得见（`probe_cfg_of()` 漏读过一次，现场表现为"设了 100 没反应"）。 */
+    out->probe_delay_ms = (int)a->pb.cfg.degrade_rtt_ms;
+    /* 每路 WAN 的实测平均时延：门限的另一半。没建项（ifindex 解析不到 / 目标未配
+     * 且退回 LINK 项）就是 -1，别报 0 冒充"0 ms 很快"。 */
+    for (i = 0; i < (int)IV_WAN_N; i++) {
+        iv_probe_stat_t st;
+
+        if (a->wan_probe_idx[i] < 0 ||
+            iv_probe_stat_get(&a->pb, a->wan_probe_idx[i], &st) != IV_OK) {
+            out->probe_rtt_ms[i] = -1;
+            continue;
+        }
+        out->probe_rtt_ms[i] = (int)st.avg_rtt_ms;
+    }
     out->reboot_max   = a->rec.cfg.reboot_max;
     out->cooldown_ms  = a->rec.cfg.cooldown_ms;
     for (i = 0; i < (int)IV_RECOVERY_PORT_N; i++)

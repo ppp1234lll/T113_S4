@@ -83,7 +83,10 @@
   }
 
   var CNS_NAME = { 0: '无IP', 1: '正常', 2: '故障', 4: '延时', 5: '丢包' };
-  var MN_NAME = { 0: '未判定', 1: '正常', 2: '断开' };
+  /* 主网状态（上报帧 `MN=` 每路一个数）：码值与后端/平台一致，别自己加名字。
+   * 3/4 是 2026-10-26 补上的：网线被拔报 3、平均时延超门限报 4（「延时」），
+   * 原来只有 0/1/2 ⇒ 这两种情况界面上显示「—」，现场看不出是拔线还是慢。 */
+  var MN_NAME = { 0: '未判定', 1: '正常', 2: '断开', 3: '网线断开', 4: '延时' };
   var SNMP_STATE = { 0: '空闲', 1: '采集中', 2: '就绪' };
   /* 设备类型（上报帧头 `DEVTYPE=` 的码值）→ 可读名。
    * 码值由后端 `sys.overview.device.devtype` 给：**出厂定死、没有配置入口**
@@ -873,7 +876,9 @@
     var hint = el('p', 'hint',
       '「配置 IP 和网关」会立刻改本机地址：保存后约 1 秒网口切换，本页连接会断，' +
       '请按新地址重新打开。三项留空＝不在此处指定（沿用系统网络配置）。' +
-      '「配置有线超时」只改探测超时，不断链、不重启。');
+      '「配置有线超时」改的是**延时门限**：设备每轮 ping 测一次平均时延，超过这个数' +
+      '就在「网络状态」里把对应主网标成「延时」（链路照用、不切换、不重启），' +
+      '没超过就是「正常」。它不断链、不重启。');
     card.appendChild(hint);
 
     var grid = el('div', 'grid');
@@ -923,7 +928,9 @@
         /* 平台「参数设置」页把这一项摆在"配置IP和网关 / 主网检测IP"同一组里，
          * 名字是「有线网络超时时间(ms)」。我们原来只在「检测与自愈」页用配置键的
          * 中文描述「单次探测超时」显示 —— 名字对不上、又换了一页，现场照着平台
-         * 找必然找不到（2026-10-26 用户第二次报同一类问题）。这里标成平台的叫法。 */
+         * 找必然找不到（2026-10-26 用户第二次报同一类问题）。这里标成平台的叫法。
+         * ⚠ 它的语义是**延时门限**（平均时延超过它就标「延时」），不是等回包超时；
+         * 平台那个名字沿用不改（契约），卡片顶部 hint 里写清了用途。 */
         grid.appendChild(fieldFor('probe.timeout_ms', it['probe.timeout_ms'],
                                   '有线网络超时时间(ms)'));
         cur = it;
@@ -996,7 +1003,9 @@
       submit(['probe.target1', 'probe.target2'], '已保存并生效（探测目标不重启、不断链）');
     });
     /* 有线网络超时（`0xFE` 落的就是这个键）：整数毫秒，区间与配置默认值表一致
-     * `100..60000`，且必须**小于探测周期** —— 后端的跨键校验就是这么判的。
+     * `100..60000`，且必须**小于探测周期的一半** —— 后端的跨键校验就是这么判的。
+     * 为什么是"一半"：等回包超时由周期推导（`interval/2`），时延超过它就不是
+     * "延时"而是"丢包"了；门限摆在半周期及以上 ⇒ 这个键配了也永远不触发。
      * 三样都在发请求前挡住：后端拒绝只会变成一句"保存失败：…"，而现场更常见的
      * 理解是"我明明点了保存"（与上面 n07/n08 同一类假成功）。 */
     btnTimeout.addEventListener('click', function () {
@@ -1007,16 +1016,17 @@
       var items = {};
 
       if (raw === '' || !/^\d+$/.test(raw)) {
-        why = '有线网络超时时间必须是整数毫秒';
+        why = '有线网络超时时间（延时门限）必须是整数毫秒';
       } else if (n < 100 || n > 60000) {
-        why = '有线网络超时时间必须在 100~60000 毫秒之间';
-      } else if (isFinite(itv) && itv > 0 && n >= itv) {
-        why = '超时时间必须小于探测周期（当前 ' + itv + ' ms）';
+        why = '有线网络超时时间（延时门限）必须在 100~60000 毫秒之间';
+      } else if (isFinite(itv) && itv > 0 && n * 2 >= itv) {
+        why = '延时门限必须小于探测周期的一半（当前周期 ' + itv +
+              ' ms，等回包超时就是 ' + Math.floor(itv / 2) + ' ms）';
       }
       if (why) { toast(why, 'err'); return; }
 
       items['probe.timeout_ms'] = n;
-      applyItems(items, '已保存并生效（探测超时即时生效，不断链）');
+      applyItems(items, '已保存并生效（延时门限即时生效，不断链）');
     });
     btnReload.addEventListener('click', load);
 
@@ -1077,10 +1087,15 @@
             : (nt.state === 'WIRED_UP' || nt.state === 'WIRELESS_UP' ? 'ok' : 'warn')));
         /* 活动出口挪到下面「平台通信」块（那边带网口名，比 wired/wireless 更有用） */
         if (nt.mn && nt.mn.length) {
-          lGrid.appendChild(kv('主网1', MN_NAME[nt.mn[0]] || '—',
-            nt.mn[0] === 2 ? 'err' : (nt.mn[0] === 1 ? 'ok' : 'warn')));
-          lGrid.appendChild(kv('主网2', MN_NAME[nt.mn[1]] || '—',
-            nt.mn[1] === 2 ? 'err' : (nt.mn[1] === 1 ? 'ok' : 'warn')));
+          /* 3（网线断开）按"坏"着色；4（延时）是"可用但慢" ⇒ 只到 warn 一档，
+           * 与后端口径一致：延时严重不切链路、不触发自愈重启。 */
+          var mnCls = function (s) {
+            if (s === 2 || s === 3) return 'err';
+            if (s === 1) return 'ok';
+            return 'warn';
+          };
+          lGrid.appendChild(kv('主网1', MN_NAME[nt.mn[0]] || '—', mnCls(nt.mn[0])));
+          lGrid.appendChild(kv('主网2', MN_NAME[nt.mn[1]] || '—', mnCls(nt.mn[1])));
         }
       }
 
@@ -2340,8 +2355,8 @@
     loadLogs();
 
     root.appendChild(configCard('检测与自愈（probe.* / netthr.*）', ['probe', 'netthr'],
-      '探活节拍与超时、故障重启次数与冷却。主网检测 IP 1/2 与有线网络超时时间'
-      + '（`probe.timeout_ms`）已收进「网络配置」页的「本机网络与主网检测」卡片'
+      '探活节拍、连续失败次数、故障重启次数与冷却。主网检测 IP 1/2 与有线网络超时时间'
+      + '（`probe.timeout_ms`，即**延时门限**）已收进「网络配置」页的「本机网络与主网检测」卡片'
       + '（与平台摆在一起），这里不再重复。',
       null, ['probe.target1', 'probe.target2', 'probe.timeout_ms']));
     root.appendChild(configCard('电阈值与传感器（elec.* / sensor.*）', ['elec', 'sensor'],

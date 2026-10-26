@@ -738,16 +738,25 @@ static void case_reject_writes_nothing(void)
     chk(contains(detail, "camera.search"), "c8: detail names the enum key");
     chk(iv_config_set_str(c, "camera.search", "onvif") == IV_OK, "c8: restore the enum");
 
-    /* ---- 跨字段：探活超时 >= 间隔 ---- */
+    /* ---- 跨字段：延时门限必须**严格小于半个探测周期** ----
+     * `probe.timeout_ms` 是延时门限（不是等回包超时）：等回包超时由周期推导、
+     * 取 `interval/2`，时延超过它就变成"丢包" ⇒ 门限摆在半周期及以上就永远
+     * 不触发（"配了不生效"那一类）。2026-10-26 用户明确语义后收紧。 */
     chk(iv_config_set_int(c, "probe.interval_ms", 1000) == IV_OK, "c8: set interval=1000");
-    chk(iv_config_set_int(c, "probe.timeout_ms", 1000) == IV_OK, "c8: set timeout=1000");
+    chk(iv_config_set_int(c, "probe.timeout_ms", 1000) == IV_OK, "c8: set delay=1000");
     detail[0] = '\0';
     chk(iv_config_save(c, detail, sizeof(detail)) == IV_EINVAL,
-        "c8: save refuses timeout_ms >= interval_ms");
+        "c8: save refuses delay >= interval_ms");
     chk(contains(detail, "probe.timeout_ms"), "c8: detail names the cross-field key");
 
+    /* 边界：正好等于半周期也不行（这一档的时延根本观察不到，只能是丢包） */
+    chk(iv_config_set_int(c, "probe.timeout_ms", 500) == IV_OK, "c8: set delay=500 (= half)");
+    detail[0] = '\0';
+    chk(iv_config_save(c, detail, sizeof(detail)) == IV_EINVAL,
+        "c8: save refuses delay == interval_ms/2 (strictly less required)");
+
     /* ---- 修好就能存（证明拒绝是"这条不变量"，不是"保存坏了"） ---- */
-    chk(iv_config_set_int(c, "probe.timeout_ms", 500) == IV_OK, "c8: fix timeout");
+    chk(iv_config_set_int(c, "probe.timeout_ms", 400) == IV_OK, "c8: fix delay");
     chk(iv_config_save(c, detail, sizeof(detail)) == IV_OK, "c8: save succeeds after the fix");
 
     /* ---- 跨字段：阈值上下限倒置（§S8.1 新增的 double 不变量） ---- */
@@ -787,7 +796,7 @@ static void case_reject_writes_nothing(void)
     chk(iv_config_set_int(c, "netthr.reboot_max", 3) == IV_OK,
         "c8: restore reboot_max");
 
-    chk(iv_config_get_int(c, "probe.timeout_ms", &iv) == IV_OK && iv == 500,
+    chk(iv_config_get_int(c, "probe.timeout_ms", &iv) == IV_OK && iv == 400,
         "c8: the accepted values are live");
 
     iv_config_close(c);

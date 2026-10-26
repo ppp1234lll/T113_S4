@@ -1958,6 +1958,20 @@ static int m_netthr_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_
      * 探测判 DOWN 的门限（`probe.max_fail`）。两个键、两个消费者，别混。 */
     json_object_object_add(d, "loss_count", json_object_new_int(v.nm_fail_n));
     json_object_object_add(d, "probe_fail_n", json_object_new_int(v.probe_fail_n));
+    /* 有线网络延时门限（`probe.timeout_ms` 在引擎里的真值）。平台 `0xFE` /
+     * 网页改完，这里跟着变才算"真的生效了"；只变配置不变这里＝只落盘。 */
+    json_object_object_add(d, "probe_delay_ms", json_object_new_int(v.probe_delay_ms));
+    /* 实测平均时延（每路 WAN）：与 `probe_delay_ms` 一起看才解释得了"为什么显示延时"。 */
+    {
+        json_object *rtt = json_object_new_array();
+        int          w;
+
+        if (rtt != NULL) {
+            for (w = 0; w < (int)IV_WAN_N; w++)
+                json_object_array_add(rtt, json_object_new_int(v.probe_rtt_ms[w]));
+            json_object_object_add(d, "probe_rtt_ms", rtt);
+        }
+    }
     json_object_object_add(d, "reboot_max", json_object_new_int(v.reboot_max));
     json_object_object_add(d, "reboot_interval_s",
                            json_object_new_int((int)(v.cooldown_ms / 1000u)));

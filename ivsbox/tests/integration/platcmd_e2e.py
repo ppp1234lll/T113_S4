@@ -581,7 +581,7 @@ def main():
                 'C7 0x%02X ⇒ ack 0x%02X（期望 0x74）'
                 % (cmd, f['code'] if f is not None else -1))
 
-        print('C8 0xFE 有线网络超时时间(ms) ⇒ ack 0x01 ＋ probe.timeout_ms 落盘')
+        print('C8 0xFE 有线网络超时时间(ms) ⇒ ack 0x01 ＋ probe.timeout_ms 落盘＋生效')
         plat.clear()
         start = len(logtext())
         plat.send(build_downlink(0xFE, b'\x64'))   # 100 ms（板端实抓过的真值）
@@ -589,8 +589,14 @@ def main():
         chk(f is not None and f['code'] == 0x01, 'C8a 0xFE 100ms ⇒ ack=0x01')
         chk(cls_items('probe').get('probe.timeout_ms') == 100,
             'C8b probe.timeout_ms == 100（落盘，不是只回话）')
-        chk(wait_log(r'wired net timeout -> 100 ms', start=start) is not None,
-            'C8c 日志有 "wired net timeout -> 100 ms"')
+        chk(wait_log(r'wired net delay threshold -> 100 ms', start=start) is not None,
+            'C8c 日志有 "wired net delay threshold -> 100 ms"')
+        # 落盘 ≠ 生效。这个键的消费者是 `iv_probe_cfg_t::degrade_rtt_ms`（延时门限），
+        # 而它**曾经根本没被读过**（`probe_cfg_of()` 漏读）⇒ 现场设 100 从来没反应。
+        # 只有 `netthr.status` 的 `probe_delay_ms`（模块真值）能证明真的换上了。
+        st = ctl('netthr.status')
+        chk(st.get('ok') is True and (st.get('d') or {}).get('probe_delay_ms') == 100,
+            'C8d 探测引擎的延时门限真的变成 100（netthr.status.probe_delay_ms）')
 
         print('C9 0xFE 非法值 ⇒ 0x74，且不改坏配置')
         plat.clear()
@@ -610,7 +616,7 @@ def main():
         plat.send(build_downlink(0xFE, b'\x64'))
         f = plat.wait(0xFE, kind='bin')
         chk(f is not None and f['code'] == 0x01, 'C10a 0xFE 同值 ack=0x01')
-        chk(wait_log(r'0xFE timeout=100ms unchanged', start=start) is not None,
+        chk(wait_log(r'0xFE delay=100ms unchanged', start=start) is not None,
             'C10b 走的是 unchanged 分支（没白重建探测表）')
 
         # ---- 收尾：把动过的键按**原值**还原 ----

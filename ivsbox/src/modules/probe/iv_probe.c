@@ -877,6 +877,38 @@ int iv_probe_set_link(iv_probe_t *p, int ifindex, int up, uint64_t now_ms)
     return changed;
 }
 
+/* 运行期改"延时/丢包"两个劣化门限（`probe.timeout_ms` 的热生效入口）。
+ *
+ * 为什么另开一个入口而不是塞进 `iv_probe_retune()`：`retune` 的三项都在"节奏与
+ * 判死阈值"这一档，而 `degrade_*` 是**判定质量**那一档 —— 它不影响探谁、多久探
+ * 一次，只决定"成功样本算不算好"。塞进 retune 会让那个函数的语义从"调参"变成
+ * "调参 + 改判据"，而调用方（装配层）手里这两组值来源本来就不同：节奏来自
+ * `probe.interval_ms`，门限来自 `probe.timeout_ms`。
+ *
+ * 语义与 `iv_probe_retune()` 对齐：
+ *   - 0 是**合法值**（＝该维度不判），不同于 init 里的"取默认"；
+ *   - 同值早返回，反复下发同一配置不该抖；
+ *   - 写完立刻按现有证据重判一次：门限从 800 降到 100，此刻窗口里 avg RTT
+ *     已经是 300 ⇒ 结论就该是 DEGRADED，不该等下一拍。 */
+int iv_probe_set_degrade(iv_probe_t *p, uint32_t rtt_ms, uint32_t loss_permille)
+{
+    int i;
+
+    if (p == NULL)
+        return IV_EINVAL;
+    if (!p->started)
+        return IV_ESTATE;
+    if (p->cfg.degrade_rtt_ms == rtt_ms &&
+        p->cfg.degrade_loss_permille == loss_permille)
+        return IV_OK;
+
+    p->cfg.degrade_rtt_ms        = rtt_ms;
+    p->cfg.degrade_loss_permille = loss_permille;
+    for (i = 0; i < p->n_items; i++)
+        recompute(p, &p->item[i]);
+    return IV_OK;
+}
+
 int iv_probe_retune(iv_probe_t *p, uint32_t interval_ms, uint32_t timeout_ms,
                     uint32_t fail_n, uint64_t now_ms)
 {

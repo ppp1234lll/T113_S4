@@ -235,7 +235,12 @@ static const cfg_default_t s_defaults[] = {
     D_STR(IV_CFG_CLS_PROBE, "probe.target1", "主网检测 IP 1", "", NULL),
     D_STR(IV_CFG_CLS_PROBE, "probe.target2", "主网检测 IP 2", "", NULL),
     D_INT(IV_CFG_CLS_PROBE, "probe.interval_ms", "探测周期（毫秒）", 5000, 500, 600000),
-    D_INT(IV_CFG_CLS_PROBE, "probe.timeout_ms", "单次探测超时（毫秒，必须 < 探测周期）", 2000, 100, 60000),
+    /* ⚠ 键名带 timeout，但语义是**延时门限**（2026-10-26 用户口径，平台
+     * 「有线网络超时时间(ms)」/ 0xFE / 0xE1 的 `pn`）：ping 平均时延超过它判
+     * "延时严重"（上报 `MN=4`）。键名不改 —— 平台契约与已落盘的现场配置都认这个名字。
+     * 上界由跨字段校验压到"小于探测周期的一半"（等回包超时就是半个周期）。 */
+    D_INT(IV_CFG_CLS_PROBE, "probe.timeout_ms", "有线网络延时门限（毫秒，平均时延超过它判延时严重）",
+          2000, 100, 60000),
     D_INT(IV_CFG_CLS_PROBE, "probe.max_fail", "连续失败次数上限", 3, 1, 100),
 
     /* ---- camera. 摄像机配置（架构 §10.2；ch[] 是真数组，元素＝1 条目） ---- */
@@ -413,7 +418,8 @@ static const cfg_default_t s_defaults[] = {
 
     /* ---- netthr. 网络阈值（架构 §10.2；丢包＝**次数**；承担原 wan.* 的切换门限） ---- */
     D_INT(IV_CFG_CLS_NETTHR, "netthr.timeout_ms",
-          "网络超时时间（毫秒）｜保留键：无消费方，改后不生效（探测超时见 probe.timeout_ms）",
+          "网络超时时间（毫秒）｜保留键：无消费方，改后不生效（有线延时门限见 probe.timeout_ms；"
+          "等回包超时由探测周期推导，不可配）",
           2000, 100, 60000),
     D_INT(IV_CFG_CLS_NETTHR, "netthr.loss_count", "丢包次数上限", 3, 1, 100),
     D_INT(IV_CFG_CLS_NETTHR, "netthr.reboot_max", "自愈重启次数上限（**0 = 禁用自愈**）",
@@ -1069,11 +1075,16 @@ static int cross_check(const iv_config_t *c, const char **k1, const char **k2, c
 
     ival = item_find(c, "probe.interval_ms");
     tval = item_find(c, "probe.timeout_ms");
+    /* `probe.timeout_ms` 是**延时门限**（不是等回包超时）：要判"平均时延超过门限"，
+     * 前提是门限本身够得到 —— 等回包超时由周期推导、取 `interval/2`（见
+     * `iv_agent` 的 `probe_io_timeout_of()`），时延一旦超过它就成了"丢包"而不是
+     * "延时"。所以门限必须**严格小于**半个周期，否则这个键配了也永远不触发
+     * （正是本项目反复栽的"配了不生效、编译不报、日志不报"那一类）。 */
     if (ival != NULL && tval != NULL && ival->type == IV_CFG_T_INT && tval->type == IV_CFG_T_INT &&
-        tval->v.i >= ival->v.i) {
+        tval->v.i * 2 >= ival->v.i) {
         *k1  = "probe.timeout_ms";
         *k2  = "probe.interval_ms";
-        *why = "probe timeout_ms must be < interval_ms";
+        *why = "probe delay threshold must be < interval_ms/2";
         return 0;
     }
 

@@ -1254,13 +1254,22 @@ static int query_cfg_json(char *out, size_t cap, void *arg)
     (void)snprintf(pair, sizeof(pair), "%lld,0,0", (long long)v);
     cj_str(&j, "rt", pair);
 
-    /* ping 每轮间隔 / 每个设备间隔：对应我们的探测周期与单次超时（毫秒 → 秒） */
+    /* ping 每轮间隔 / 每个设备间隔 —— 两个字段**量纲不同**，别再一起 /1000：
+     *   `pl`（每轮间隔）仍是**秒**：同一批"间隔"类字段里 `rt`（定时上报间隔）就是秒，
+     *        继续 `v / 1000`；
+     *   `pn`（每设备超时）是**毫秒**，原样送。三条证据：
+     *        ① 平台参数设置页那一项自己就标着「有线网络超时时间(ms)」；
+     *        ② 10-26 15:51 板端实抓 `0xFE … 01 64`（界面填 100）⇒ 下发就是毫秒、
+     *           不换算（见 `on_plat_net_timeout()`）；
+     *        ③ 16:09 用户明确该单位是毫秒。
+     * 读写量纲必须一致：写下去 100（ms）、读回来 0（秒）⇒ 平台设完再打开页面显示 0，
+     * 现场会以为"没保存上"，然后再点一次。 */
     if (iv_config_get_int(g_cfg, "probe.interval_ms", &v) != IV_OK)
         v = 0;
     cj_int(&j, "pl", (long long)(v / 1000));
     if (iv_config_get_int(g_cfg, "probe.timeout_ms", &v) != IV_OK)
         v = 0;
-    cj_int(&j, "pn", (long long)(v / 1000));
+    cj_int(&j, "pn", (long long)v);
 
     /* 风扇温湿度 / 网络延时：本板无风扇、无该配置项 ⇒ 0，不编 */
     cj_str(&j, "ft", "0,0");

@@ -368,6 +368,16 @@ def prefix_to_mask(n):
     return (0xFFFFFFFF << (32 - n)) & 0xFFFFFFFF
 
 
+def as_int(x):
+    """`0xE1` 应答里所有数值都是**带引号的字符串**（`cj_int` 走 `cj_str`，
+    照抄参考实现 `"pn":"2000"`）⇒ 断言前必须转一次，否则 `'2000' == 2000`
+    恒假，报出来的消息却是"配置 2000，应答 2000"，看着像设备错了。"""
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
 def chk(cond, what):
     if cond:
         print('  PASS ' + what)
@@ -437,13 +447,28 @@ def main():
             chk(b'2874540201432778632' in d,
                 'B1c qn 原样回显请求里的 QN（qn1qn2 十进制拼接）')
 
-        print('B2 0xE1 查询参数 ⇒ 回 JSON')
+        print('B2 0xE1 查询参数 ⇒ 回 JSON，且 pn 的量纲必须与 0xFE 写下去的一致')
         plat.clear()
         plat.send(build_downlink(0xE1))
         f = plat.wait(0xE1, kind='json')
         chk(f is not None, 'B2a 0xE1 回了 JSON 帧')
         if f is not None:
             chk(b'{' in f['data'], 'B2b 应答体里是配置 JSON')
+            # 平台参数设置页那一项写的是「有线网络超时时间(ms)」，`0xFE` 也是 1 字节
+            # 毫秒原样写进 `probe.timeout_ms` ⇒ 读回来的 `pn` 必须同量纲。
+            # 以前这里是 `v / 1000`（秒）：设 100 ms、读回 0，平台再打开页面显示 0，
+            # 现场只会以为"没保存上"，然后再点一次。
+            pr = cls_items('probe')
+            want_pn = int(pr.get('probe.timeout_ms', 0))
+            want_pl = int(pr.get('probe.interval_ms', 0)) // 1000
+            try:
+                bd = (json.loads(f['data'].decode('utf-8', 'replace')) or {}).get('data') or {}
+            except Exception:
+                bd = {}
+            chk(as_int(bd.get('pn')) == want_pn,
+                'B2c pn 送毫秒（配置 %d，应答 %s）' % (want_pn, bd.get('pn')))
+            chk(as_int(bd.get('pl')) == want_pl,
+                'B2d pl 仍送秒（配置 %d ms，应答 %s）' % (want_pl * 1000, bd.get('pl')))
 
         print('B3 0xE2 立即上报 ⇒ 回 ACK 0x01')
         plat.clear()
@@ -525,12 +550,18 @@ def main():
 
         print('C6 0xF4 同值本机地址 ⇒ ack 0x01 且**不动网口**（真改地址会掐掉 SSH）')
         mask = prefix_to_mask(plen)
-        # 先确认配置里的 net.ip 与本机一致，否则同值分支走不到、真去 flush 网口
+        mask_s = socket.inet_ntoa(struct.pack('>I', mask))
+        # "同值"的判据是**三个键都比**（`on_plat_local_net()` 里就是这么写的），
+        # 所以前置条件也得把三个键都摆成"与将要下发的完全一致"。原来只摆 ip/mask：
+        # `net.gateway` 出厂默认是**空串**，于是 `strcmp("", "0.0.0.0")` 不等 ⇒
+        # 走的其实是真改分支（真 flush 了一次 eth0），用例却还叫"同值"。
+        # 这是**用例自己的前置条件不全**，与"设备没走 unchanged"长得一模一样。
         it = cls_items('net')
-        same = (it.get('net.ip') == ip)
+        same = (it.get('net.ip') == ip and it.get('net.mask') == mask_s and
+                it.get('net.gateway') == '0.0.0.0')
         if not same:
-            apply_cls('net', {'net.ip': ip, 'net.mask': socket.inet_ntoa(
-                struct.pack('>I', mask))})
+            apply_cls('net', {'net.ip': ip, 'net.mask': mask_s,
+                              'net.gateway': '0.0.0.0'})
         plat.clear()
         start = len(logtext())
         plat.send(build_downlink(0xF4, socket.inet_aton(ip) +
@@ -584,7 +615,8 @@ def main():
 
         # ---- 收尾：把动过的键按**原值**还原 ----
         print('Z 收尾：还原现场配置')
-        keep = ('net.server.wired.host', 'net.server.wired.port',
+        keep = ('net.ip', 'net.mask', 'net.gateway',
+                'net.server.wired.host', 'net.server.wired.port',
                 'net.server.wired.host_bak', 'net.server.wired.port_bak',
                 'net.server.wireless.host', 'net.server.wireless.port',
                 'net.server.wireless.host_bak', 'net.server.wireless.port_bak')
@@ -604,6 +636,15 @@ def main():
             'Z1 平台地址已还原')
         chk(cls_items('camera').get('camera.detect.mode') ==
             orig['camera'].get('camera.detect.mode'), 'Z2 检测方式已还原')
+        # `net.ip`/`mask`/`gateway` 原来**根本没进还原清单** —— C6 把它们改成
+        # "本机地址 + 0.0.0.0"，于是每跑一次就固化一次，下次 C6 又读到"已污染的原值"。
+        # 现场设备跑这条用例会把本机地址写进配置：必须还原。
+        chk(it.get('net.ip') == orig['net'].get('net.ip'),
+            'Z3 net.ip 已还原（本机 %r ← 原值 %r）'
+            % (it.get('net.ip'), orig['net'].get('net.ip')))
+        chk(it.get('net.gateway') == orig['net'].get('net.gateway'),
+            'Z4 net.gateway 已还原（本机 %r ← 原值 %r）'
+            % (it.get('net.gateway'), orig['net'].get('net.gateway')))
     finally:
         print('DIAG: accept=%d bytes_read=%d parsed=%d live=%d err=%s'
               % (plat.nacc, plat.nread, plat.nparsed, len(plat.frames),

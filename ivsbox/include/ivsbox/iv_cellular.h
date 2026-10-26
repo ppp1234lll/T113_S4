@@ -169,6 +169,17 @@ typedef struct {
     char           resp[IV_CELL_RESP_MAX];
     size_t         resp_len;
     uint32_t       resp_trunc;      /* 响应被截断的次数（诊断用） */
+
+    /* ---- 链路质量诊断（不进度快照，只给装配层判"要不要换口"） ----
+     * `no_reply_rounds`：**整轮一条命令都没回**（12 条全超时）的连续轮数。
+     *   为什么不能拿 "csq 无效" 代替：卡没插 / 没信号时 `+CSQ: 99,99` 也是
+     *   "CSQ 无效"，但 AT 明明是通的。两者混在一起会把"串口接错"误诊成
+     *   "SIM 卡问题"（2026-10-23 现场就是这个误诊）。
+     * 装配层据此在连续若干轮无响应后**重新探口** —— 见 `iv_agent.c` 的
+     * `cell_redial_tick()`。 */
+    uint32_t       no_reply_rounds;
+    uint32_t       timeouts0;       /* 本轮开始时的 cmd_timeouts（算本轮超时数用） */
+    uint32_t       fail_streak;     /* 连续失败轮数（恢复时打一条日志并清零） */
 } iv_cell_t;
 
 /* 初始化 / 复位。

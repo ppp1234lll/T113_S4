@@ -132,8 +132,15 @@ extern "C" {
 /* 4G 模组 AT 口（只读状态查询，见 iv_cellular.h）。
  * **与出厂镜像的拨号脚本共用同一个口**：本层只发查询命令，不发任何会改模块
  * 状态或断网的命令。实测 EC200G 的 AT 口是 `/dev/ttyUSB0`（ttyUSB1=NMEA，
- * ttyUSB2 不回话，ttyUSB3 是数据口）。 */
+ * ttyUSB2 不回话，ttyUSB3 是数据口）。
+ *
+ * ⚠ 这个常量只是**首选**，不是"事实"：模组 `AT+CFUN=1,1` 会让 USB 重枚举，
+ * ttyUSB 的编号会变（2026-10-23 板端踩过）。真正的口由 `iv_cellport` 探出来，
+ * 结果记在 `iv_agent_t::cell_dev`。本常量仅用作"第一个要探的候选"。 */
 #define IV_AGENT_CELL_PATH_DEFAULT "/dev/ttyUSB0"
+
+/* 实际在用的 AT 口路径缓冲。`/dev/ttyUSB12` 共 14 字节，32 有 2 倍余量。 */
+#define IV_AGENT_CELL_DEV_N 32
 /* 自动重拨用的**拨号动作**：一段由 `/bin/sh -c` 执行的短序列，`$0` = AT 口路径、
  * `$1` = 无线网卡名。默认值就是本板手工验证过的那三步（见下），**不调出厂
  * `usb-EC200G-inserted.sh`** —— 那个脚本在本板会卡在 `timeout 1 cat /dev/ttyUSB0`
@@ -156,6 +163,13 @@ extern "C" {
 /* AT 轮询驱动节拍。必须远小于 `IV_CELL_CMD_TIMEOUT_MS`（800 ms），
  * 否则节拍本身会把"发一条、等一条"的节奏拖成龟速。 */
 #define IV_AGENT_CELL_TICK_MS 100u
+
+/* 判定"AT 口静默失效"的连续无回应轮数，以及两次重探之间的最小间隔。
+ * 一轮 30 s，3 轮 = 90 s：短于这个数可能只是被拨号脚本抢了口（它要在同一个
+ * 口上读写几秒），长于这个数现场就白等。重探本身要扫 6 个口（最坏 1.2 s），
+ * 30 s 的间隔保证即使一直探不到也不会拖慢主循环。 */
+#define IV_AGENT_CELL_NOREPLY_RESCAN 3u
+#define IV_AGENT_CELL_RESCAN_GAP_MS  ((uint64_t)30000u)
 /* 表列 GETNEXT 结果**留存行数**上限（装配层只留前 N 行，避免结果表过大；
  * 完整遍历上限由 iv_snmp_target_t::max_rows 管） */
 #define IV_AGENT_SNMP_ROWS_MAX 4
@@ -402,6 +416,14 @@ typedef struct {
     uint64_t     cell_dial_ms;      /* 本次拨号开始的时刻（判硬超时用） */
     uint32_t     cell_dials;        /* 累计发起次数（给日志/诊断） */
     uint64_t     cell_reopen_ms;    /* 上次尝试重开 AT 口的时刻；防每拍 open() */
+    /* **实际在用的** AT 口（探口结果），不是配置值。
+     * 为什么要单独记：`cfg.cell_path` 是"用户说要哪个"，而 ttyUSB 编号会随
+     * 模组重新枚举漂移（`AT+CFUN=1,1` 就会），写死的路径可能指向 diag 口。
+     * 探口一旦命中就记在这里，之后重开先探它（一次往返 ~20 ms），探不到才全扫。
+     * 空串 = 还没探到过。`cell_spawn_dial()` 也用它当 `$0` —— 否则拨号脚本会
+     * 去读那个错的路径，把好不容易探对的口又扔了。 */
+    char         cell_dev[IV_AGENT_CELL_DEV_N];
+    uint64_t     cell_rescan_ms;    /* 上次因"整轮无响应"而重探的时刻；防风暴 */
 
     /* netmgr 的事务执行点：switch_route 复用默认（netlink 改路由），reconnect
      * 接本层 → iv_report_reconnect。ops.arg 指向本结构，故不能是静态常量。 */
@@ -821,7 +843,9 @@ const iv_cell_t *iv_agent_cell(const iv_agent_t *a);
 
 /* 链路状态（给页面与诊断用）：`*path` 出参指向实际设备节点（永不为 NULL），
  * `*fd` 为 AT 口 fd（-1 = 没开），`*rx_bytes` 为累计收字节，
- * 返回最近一次开 AT 口的结果（0 = 已打开；负 = 错误码；IV_ENOTSUP = 配置为空串）。 */
+ * 返回最近一次开 AT 口的结果（0 = 已打开；负 = 错误码；IV_ENOTSUP = 配置为空串）。
+ * **`*path` 是探口探出来的那个口，不是配置里写的那个**：两者不一致时以实际为准，
+ * 否则页面上的 `link.path` 会指向一个根本没在用的设备（现场照它排查必错方向）。 */
 int iv_agent_cell_link(const iv_agent_t *a, const char **path, int *fd,
                        uint64_t *rx_bytes);
 

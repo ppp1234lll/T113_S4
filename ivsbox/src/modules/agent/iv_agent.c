@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "ivsbox/iv_agent.h"
+#include "ivsbox/iv_cellport.h"
 #include "ivsbox/iv_proto.h"
 #include "ivsbox/iv_clock.h"
 #include "ivsbox/iv_log.h"
@@ -695,6 +696,8 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
         a->cell_dial_pid  = -1;
         a->cell_dial_ms   = 0;
         a->cell_dials     = 0;
+        a->cell_dev[0]    = '\0';   /* 还没探过：首次 open 会扫一遍 */
+        a->cell_rescan_ms = 0;
 
         /* 装配期与"重拨后重开"走同一个入口，避免两处开串口逻辑分叉。 */
         (void)cell_link_open(a);
@@ -748,8 +751,8 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
     rec_drive(a, now_ms); /* M6-S6.3：断网录像状态机（每拍喂判据） */
     thresh_drive(a, now_ms); /* 阈值下发重试（0xF1）：与 on_pb_timer 同装同驱动 */
     (void)iv_report_step(&a->rp, now_ms);
-    if (a->cell_fd >= 0)
-        cell_drive(a, now_ms);   /* 4G 查询状态机：与定时器同一入口，重复驱动无害 */
+    cell_drive(a, now_ms);       /* 4G 查询状态机：与定时器**同一条入口**，重复驱动无害。
+                                  * 口没开时怎么办（含状态机复位）在 cell_drive 内部统一处理。 */
     cell_redial_tick(a, now_ms); /* 4G 自愈：掉线且"只差地址"时跑一次出厂拨号脚本 */
     return IV_OK;
 }
@@ -2219,15 +2222,47 @@ uint64_t iv_agent_gps_last_parse_ms(const iv_agent_t *a)
 
 /* 摘读事件 + 关串口 + 复位状态机。**幂等**：重复调用无副作用。
  * 注意复位的是状态机，**快照保留** —— 串口抖一下不该让页面上的信号值瞬间归零。 */
+/* 定长路径拷贝。
+ * 不用 `snprintf("%s")`：源与目标同为 32 字节缓冲时，GCC 会报
+ * `-Werror=format-truncation`（它无法证明长度不超）。也不用 `strncpy`：
+ * 源恰好等长时它不补 NUL，是个老坑。 */
+static void cell_dev_set(char *dst, size_t cap, const char *src)
+{
+    size_t n;
+
+    if (dst == NULL || cap == 0u)
+        return;
+    n = (src != NULL) ? strlen(src) : 0u;
+    if (n >= cap)
+        n = cap - 1u;
+    if (n > 0u)
+        memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 /* 打开 AT 口并挂 reactor。
  * 装配期与"重拨脚本跑完之后"共用这一个入口 —— 两处各写一遍必然分叉
  * （一处改了波特率、另一处忘了改，症状是"重拨后模块再也不回话"）。
+ *
+ * **不再是"打开配置里那个路径"**，而是"探出一个会回 `AT` 的口"：
+ *   ① 上次探到的口（`cell_dev`）—— 稳态路径，一次 AT 往返（~20 ms）；
+ *   ② 配置/环境指定的口（`cfg.cell_path`）—— 探不通**不致命**，继续 ③；
+ *   ③ 逐个扫 `/dev/ttyUSB0..5`。
+ *
+ * 为什么必须探：ttyUSB 的编号会随模组重新枚举漂移（`AT+CFUN=1,1` 就会，
+ * 而自动重拨发的正是它），而**打开成功不等于 AT 通** —— diag 口能打开、能读、
+ * `rx_bytes` 一路涨到五千多万，就是一个 `OK` 都不回。2026-10-23 现场主控拿着
+ * 一个指向已消失设备的旧 fd 空转了 15 h（`fail_rounds=1795`），一条日志都没有。
+ *
+ * ② 里"探不通继续扫"还顺带纠正了另一种现场故障：`IVSBOX_CELL_DEV` 被设成了
+ * 错的口（实测 `/dev/ttyUSB1`）。代码自愈，不必让人去改 init 脚本的环境。
+ *
  * 返回 0 = 已打开；负值 = 错误码；IV_ENOTSUP = 配置为不开。 */
 static int cell_link_open(iv_agent_t *a)
 {
-    const char     *cpath;
-    iv_serial_cfg_t scfg;
-    int             cfd;
+    const char *cpath;
+    char        used[IV_AGENT_CELL_DEV_N];
+    int         cfd = -1;
 
     if (a == NULL)
         return IV_EINVAL;
@@ -2246,14 +2281,38 @@ static int cell_link_open(iv_agent_t *a)
     if (a->cell_fd >= 0)   /* 已经开着：幂等 */
         return 0;
 
-    iv_serial_cfg_default(&scfg);
-    scfg.baud = IV_CELL_AT_BAUD;   /* 显式写：默认值将来若变，这里不能跟着变 */
-    cfd = iv_serial_open(cpath, &scfg);
+    used[0] = '\0';
+
+    /* ① 上次探到的口优先 */
+    if (a->cell_dev[0] != '\0') {
+        cfd = iv_cellport_probe(a->cell_dev, IV_CELLPORT_BAUD_DEFAULT, 0u);
+        if (cfd >= 0)
+            cell_dev_set(used, sizeof used, a->cell_dev);
+        else
+            IV_LOG_W(AG_MOD, "cell: previous AT port %s silent (%d), rescanning",
+                     a->cell_dev, cfd);
+    }
+
+    /* ② 配置/环境指定的口 */
+    if (cfd < 0 && strcmp(cpath, a->cell_dev) != 0) {
+        cfd = iv_cellport_probe(cpath, IV_CELLPORT_BAUD_DEFAULT, 0u);
+        if (cfd >= 0)
+            cell_dev_set(used, sizeof used, cpath);
+        else
+            IV_LOG_W(AG_MOD, "cell: configured AT port %s silent (%d), scanning",
+                     cpath, cfd);
+    }
+
+    /* ③ 扫描 */
+    if (cfd < 0)
+        cfd = iv_cellport_scan(used, sizeof used, 0u, 0u);
+
     if (cfd < 0) {
         a->cell_open_rc = cfd;
-        IV_LOG_W(AG_MOD, "cell: AT open failed (%d): %s", cfd, cpath);
+        IV_LOG_W(AG_MOD, "cell: no AT port available (%d), will retry", cfd);
         return cfd;
     }
+
     a->cell_fd = cfd;
     a->cell_ev = iv_reactor_add(a->r, cfd, IV_EV_READ, on_cell_fd, a);
     if (a->cell_ev == NULL) {
@@ -2263,9 +2322,14 @@ static int cell_link_open(iv_agent_t *a)
         a->cell_open_rc = IV_ESTATE;
         return IV_ESTATE;
     }
-    a->cell_open_rc = 0;
+    if (strcmp(a->cell_dev, used) != 0) {
+        IV_LOG_I(AG_MOD, "cell: AT port is %s (was %s)", used,
+                 (a->cell_dev[0] != '\0') ? a->cell_dev : "none");
+        cell_dev_set(a->cell_dev, sizeof a->cell_dev, used);
+    }
+    a->cell_open_rc   = 0;
     IV_LOG_I(AG_MOD, "cell: %s up, %u 8N1 (read-only AT)",
-             cpath, (unsigned)IV_CELL_AT_BAUD);
+             used, (unsigned)IV_CELL_AT_BAUD);
     return 0;
 }
 
@@ -2288,7 +2352,14 @@ static int cell_spawn_dial(iv_agent_t *a)
         cmd = IV_AGENT_CELL_DIAL_DEFAULT;
     if (cmd[0] == '\0')
         return IV_ENOTSUP;   /* 配置为关闭 */
-    tty    = (a->cfg.cell_path != NULL) ? a->cfg.cell_path : IV_AGENT_CELL_PATH_DEFAULT;
+    /* `$0` 必须是**实际在用的**那个口，不是配置里写的那个。
+     * 探口已经把编号漂移的事处理掉了（见 `cell_link_open`）；如果这里还按配置
+     * 拼的话，拨号脚本会去读写一个不存在的/diag 口，既拨不上号，也会把探对的
+     * 结果作废 —— 下一次重开又得全扫一遍。 */
+    if (a->cell_dev[0] != '\0')
+        tty = a->cell_dev;
+    else
+        tty = (a->cfg.cell_path != NULL) ? a->cfg.cell_path : IV_AGENT_CELL_PATH_DEFAULT;
     ifname = a->cfg.wan_name[IV_WAN_WIRELESS];
 
     cell_link_drop(a);   /* 让出 AT 口（顺带 iv_cell_reset 丢掉半条命令） */
@@ -2395,11 +2466,30 @@ static void cell_redial_tick(iv_agent_t *a, uint64_t now_ms)
     }
 
     /* AT 口没打开时先试图重开（模块重新枚举后设备节点可能变，也可能只是短暂失败）。
-     * 5 s 一次，避免每 100 ms 一次 open()。 */
+     * 5 s 一次，避免每 100 ms 一次 open()。
+     * 重开走探口（`cell_link_open` 会扫 `/dev/ttyUSB*`），不是"再打开同一个路径"。 */
     if (a->cell_fd < 0) {
         if (a->cell_reopen_ms == 0 || now_ms >= a->cell_reopen_ms + 5000u) {
             a->cell_reopen_ms = now_ms;
             (void)cell_link_open(a);
+        }
+    } else if (a->cell.no_reply_rounds >= IV_AGENT_CELL_NOREPLY_RESCAN) {
+        /* ② **静默失效**：口是开的、字节也在读，但整轮一条 AT 都不回。
+         *    这比"读失败"隐蔽得多 —— diag 口能打开、能读、`rx_bytes` 一路涨到
+         *    5800 万，状态机却永远等不到 `OK`（2026-10-23 现场）。
+         *    只看 `cell_fd >= 0` 永远发现不了，只能看"连续几轮无回应"。
+         *    阈值 3 轮（90 s）：一两轮可能只是被拨号脚本抢了口，不该急着换。 */
+        if (a->cell_rescan_ms == 0 ||
+            now_ms >= a->cell_rescan_ms + IV_AGENT_CELL_RESCAN_GAP_MS) {
+            a->cell_rescan_ms = now_ms;
+            IV_LOG_W(AG_MOD,
+                     "cell: %u rounds with no AT reply on %s, rescanning ports",
+                     a->cell.no_reply_rounds,
+                     (a->cell_dev[0] != '\0') ? a->cell_dev : "(none)");
+            cell_link_drop(a);      /* 内部 iv_cell_reset：清 no_reply_rounds */
+            a->cell_reopen_ms = 0;
+            (void)cell_link_open(a);
+            return;                 /* 本拍不再做重拨判定：口刚换，快照还是旧的 */
         }
     }
 
@@ -2443,9 +2533,21 @@ static void cell_drive(iv_agent_t *a, uint64_t now_ms)
 
     if (a == NULL)
         return;
-    iv_cell_tick(&a->cell, now_ms);
-    if (a->cell_fd < 0)
+
+    if (a->cell_fd < 0) {
+        /* 口没开：**不要**推状态机。`iv_cell_tick()` 起轮不看 fd，起完轮
+         * 就没机会调 `iv_cell_next_cmd()`（下面直接 return 了），于是状态机
+         * 停在 `running=1, in_cmd=0` —— 这个状态既不进也不退：
+         * 超时判定要求 `in_cmd`，`finish_round` 也就永远不会跑。
+         * （原实现把 `cell_drive` 包在 `if (cell_fd >= 0)` 里躲过了这一条，
+         * 但 `on_cell_timer` 是无条件调用的，Reactor 模式下其实一直有这个洞。）
+         * 这里显式 reset：重开后从干净状态起轮，且**快照保留**。 */
+        if (a->cell.running)
+            iv_cell_reset(&a->cell);
         return;
+    }
+
+    iv_cell_tick(&a->cell, now_ms);
 
     n = iv_cell_next_cmd(&a->cell, cmd, sizeof(cmd), now_ms);
     if (n <= 0)
@@ -2470,9 +2572,16 @@ static void on_cell_fd(int fd, uint32_t events, void *arg)
 
     if (a == NULL)
         return;
+    /* 无论哪种失败，都**立刻允许重开**（`cell_reopen_ms = 0`）。
+     * 早先这里是"drop 之后等 5 s 那套节流"，而节流本身没问题，问题在于
+     * `open()` 拿的还是那个已消失的设备：USB 重枚举后 `/dev/ttyUSB1` 的 inode
+     * 从 3557 变成 1157610，进程手里的旧 fd 读出来恒定 `EIO(-5)`，
+     * 而重开（只认路径、不验 AT）会"成功"，于是永远转不出来。
+     * 现在重开走 `cell_link_open()` 的探口路径，换 inode / 换口都能纠正。 */
     if ((events & (IV_EV_ERR | IV_EV_HUP | IV_EV_RDHUP)) != 0u) {
-        IV_LOG_W(AG_MOD, "cell: AT port error/hup, link dropped");
+        IV_LOG_W(AG_MOD, "cell: AT port error/hup (events 0x%x), reopening", events);
         cell_link_drop(a);
+        a->cell_reopen_ms = 0;
         return;
     }
     for (;;) {
@@ -2482,8 +2591,11 @@ static void on_cell_fd(int fd, uint32_t events, void *arg)
         if (rc == IV_EAGAIN)
             return;
         if (rc != IV_OK) {
-            IV_LOG_W(AG_MOD, "cell: AT read failed (%d), link dropped", rc);
+            /* `IV_EIO` 且 errno=EIO 的典型成因是"fd 指向已注销的 tty"，
+             * `IV_ECONN` 是 USB 转串口被拔。两者都只能靠重开解决。 */
+            IV_LOG_W(AG_MOD, "cell: AT read failed (%d), reopening", rc);
             cell_link_drop(a);
+            a->cell_reopen_ms = 0;
             return;
         }
         a->cell_rx_bytes += got;
@@ -2522,10 +2634,20 @@ const iv_cell_t *iv_agent_cell(const iv_agent_t *a)
 int iv_agent_cell_link(const iv_agent_t *a, const char **path, int *fd,
                        uint64_t *rx_bytes)
 {
-    if (path != NULL)
-        *path = (a != NULL && a->cfg.cell_path != NULL)
-                    ? a->cfg.cell_path
-                    : IV_AGENT_CELL_PATH_DEFAULT;
+    if (path != NULL) {
+        /* 出参契约是"**实际在用的**那个设备节点"（见 iv_agent.h）。
+         * 早先这里直接回 `cfg.cell_path`，而 `cell_link_open()` 的探口会把配置
+         * 纠正掉（`IVSBOX_CELL_DEV` 指错时也一样） ⇒ 页面显示 `/dev/ttyUSB1`、
+         * 真实数据却来自 `/dev/ttyUSB0`。现场照这个字段排查**必然走错方向**
+         * —— 2026-10-26 实测踩到：探口日志说 `AT port is /dev/ttyUSB0`，
+         * `cellular.status` 的 `link.path` 还是 `ttyUSB1`。 */
+        if (a != NULL && a->cell_dev[0] != '\0')
+            *path = a->cell_dev;
+        else if (a != NULL && a->cfg.cell_path != NULL)
+            *path = a->cfg.cell_path;
+        else
+            *path = IV_AGENT_CELL_PATH_DEFAULT;
+    }
     if (fd != NULL)
         *fd = (a != NULL) ? a->cell_fd : -1;
     if (rx_bytes != NULL)

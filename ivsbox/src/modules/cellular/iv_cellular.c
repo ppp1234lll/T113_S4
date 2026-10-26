@@ -18,11 +18,20 @@
  */
 #include "ivsbox/iv_cellular.h"
 
+#include "ivsbox/iv_log.h"
 #include "ivsbox/iv_ret.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define CELL_MOD "cell"
+
+/* 失败轮日志的打印间隔（轮数）。一轮默认 30 s，10 轮 ≈ 5 min：
+ * 掉线 15 h 也不过 180 条，既能看出"一直在失败"，又不会把日志刷爆。
+ * **改这里之前先想清楚**：本模块原先零日志，1795 轮失败一条记录都没有，
+ * 现场只能靠页面上的计数倒推原因（2026-10-23）。 */
+#define IV_CELL_LOG_EVERY 10u
 
 /* --------------------------------------------------------------------------
  * 小工具
@@ -578,6 +587,18 @@ static void compute_usable(iv_cell_snap_t *s)
     s->usable     = 0;
     s->reason[0]  = '\0';
 
+    /* AT 层不通就别往下猜。
+     * 早先这里直接落到 `sim_present < 0` 分支报 "SIM 卡状态未知" —— 而当时的
+     * 真实情况是串口接在 diag 口上、一条 AT 都没回（`fail_rounds=1795`、
+     * `cmd_timeouts=21540`）。把"串口/模块不回话"说成"卡状态不明"，现场会照着
+     * SIM 卡去查，白费工夫。
+     * 判据：本轮有 AT 层错误（超时/IO）**且** CSQ 无效（`csq` 有效说明 AT 是通的，
+     * 此时 `99` 只是"信号未知"，属于模组正常答复）。 */
+    if (s->at_err != 0 && (s->csq < 0 || s->csq > 31)) {
+        (void)snprintf(s->reason, sizeof s->reason, "AT 无响应");
+        return;
+    }
+
     sim_ok = (s->sim_present == 1) &&
              (strncmp(s->sim_state, "READY", 5) == 0);
     reg_ok = (s->cereg_stat == 1 || s->cereg_stat == 5);
@@ -690,24 +711,56 @@ void iv_cell_reset(iv_cell_t *c)
     c->resp[0]   = '\0';
     c->deadline_ms   = 0;
     c->next_round_ms = 0;
+    /* 链路诊断计数跟着状态机一起重置：换了个口就重新开始数。
+     * **`snap.fail_rounds` / `snap.ok_rounds` 不清** —— 它们是累计量，
+     * 是"这块板到底坏过多久"的证据，重开串口不该把它抹掉。 */
+    c->no_reply_rounds = 0;
+    c->timeouts0       = c->snap.cmd_timeouts;
+    c->fail_streak     = 0;
 }
 
 static void finish_round(iv_cell_t *c, uint64_t now_ms)
 {
+    uint32_t round_timeouts;
+    int      ok;
+
     c->running = 0;
     c->in_cmd  = 0;
     c->cur     = IV_CELL_CMD_IDLE;
     c->next_round_ms = now_ms + c->period_ms;
 
+    /* "本轮一条都没回"的判据：本轮 12 条命令**全部**超时。
+     * 这个数才是"串口接错了/模块不回话"的可靠证据 —— 见 iv_cellular.h 里
+     * `no_reply_rounds` 的说明。 */
+    round_timeouts = c->snap.cmd_timeouts - c->timeouts0;
+    if (round_timeouts >= (uint32_t)((int)IV_CELL_CMD_LAST - 1))
+        c->no_reply_rounds++;
+    else
+        c->no_reply_rounds = 0;
+
     /* "本轮算成功"的判据：CSQ 读到了有效值。它是每轮必发的动态命令，
      * 能读到说明 AT 通道是通的；其它命令偶发失败不影响这一轮的结论。 */
-    if (c->snap.csq >= 0 && c->snap.csq <= 31) {
+    ok = (c->snap.csq >= 0 && c->snap.csq <= 31);
+    if (ok) {
         c->snap.ok_rounds++;
         c->snap.last_ok_ms = now_ms;
         c->snap.valid      = 1;
         c->snap.at_err     = 0;
+        if (c->fail_streak > 0u && c->snap.fail_rounds > 0u)
+            IV_LOG_I(CELL_MOD, "AT polling recovered after %u failed rounds",
+                     c->fail_streak);
+        c->fail_streak = 0;
     } else {
         c->snap.fail_rounds++;
+        c->fail_streak++;
+        /* 按间隔打印，且**第一轮必打**：刚坏的时候最需要现场信息。 */
+        if (c->fail_streak == 1u || (c->snap.fail_rounds % IV_CELL_LOG_EVERY) == 0u) {
+            IV_LOG_W(CELL_MOD,
+                     "round failed: streak=%u total=%u csq=%d at_err=%d "
+                     "timeouts=%u no_reply=%u",
+                     c->fail_streak, c->snap.fail_rounds, c->snap.csq,
+                     c->snap.at_err, c->snap.cmd_timeouts, c->no_reply_rounds);
+        }
     }
     compute_usable(&c->snap);
 }
@@ -829,6 +882,7 @@ void iv_cell_tick(iv_cell_t *c, uint64_t now_ms)
         c->resp[0]         = '\0';
         c->line[0]         = '\0';
         c->snap.last_try_ms = now_ms;
+        c->timeouts0        = c->snap.cmd_timeouts;   /* 本轮超时数的基准 */
         reset_dynamic(&c->snap);
     }
 

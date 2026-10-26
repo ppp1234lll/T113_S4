@@ -1950,6 +1950,96 @@ static void on_plat_search_mode(const iv_proto_frame_t *f, void *arg)
     (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
 }
 
+/* ---------------------------------------------------------------------------
+ * 平台下行 0xFE「有线网络超时时间(ms)」
+ *
+ * 板端实抓真帧（2026-10-26 15:51:18，界面填 100）：
+ *   `f0f0110a000b2cc1 fe ffffffffffffffff 01 64 e2 ffff`
+ *     head ver devtype devid  cmd  qn1       qn2  len data crc tail
+ * ⇒ **载荷 1 字节、量纲＝毫秒**（`0x64` = 100，与界面上的 (ms) 一致）。
+ *
+ * 这一条拖了很久，原因是参考实现的注释写的是"1 字节**秒**"，而界面标的是 (ms)，
+ * 差一个 x1000，两种解释都能自圆其说 —— 所以一直标着"量纲未知**不猜**"。
+ * 现在真帧到手，按**实测**取值：100 就是 100 ms，不做任何换算。
+ *
+ * 落到 `probe.timeout_ms`（单次探测超时，毫秒，区间 100..60000，且必须 < 探测周期）。
+ * 为什么不落 `netthr.timeout_ms`：那个键在默认值表里写着"保留键：**无消费方**，
+ * 改后不生效（探测超时见 `probe.timeout_ms`）"，用户 10-22 已拍板不接。
+ * 写进去就等于"回了 0x01 但什么都没变"——正是本轮在清的那类病。
+ *
+ * 顺序：**不碰平台链路**（只重建探测表），所以可以"落盘 → 生效 → ACK"，
+ * 与 `0xF8` 同构；真实失败（超范围/热更失败）如实回 `0x74`。
+ * ------------------------------------------------------------------------- */
+static void on_plat_net_timeout(const iv_proto_frame_t *f, void *arg)
+{
+    int64_t  cur = -1;
+    int64_t  pv  = 0;
+    int      ms;
+    int      rc;
+    int      prc;
+    uint32_t i_ms = 0u;
+    uint32_t f_n  = 0u;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+
+    if (f->data == NULL || f->len < 1u) {
+        IV_LOG_W(APP_MOD, "0xFE payload empty (0 bytes), ack 0x74");
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    ms = (int)f->data[0];
+    if (ms == 0) {
+        /* 参考实现同样把 0 当非法：0 ms 超时没有意义，别悄悄改成"取默认" */
+        IV_LOG_W(APP_MOD, "0xFE timeout=0ms rejected, ack 0x74");
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    if (iv_config_get_int(g_cfg, "probe.timeout_ms", &cur) == IV_OK &&
+        cur == (int64_t)ms) {
+        IV_LOG_I(APP_MOD, "0xFE timeout=%dms unchanged, ack 0x01, probe untouched", ms);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+
+    rc = iv_config_set_int(g_cfg, "probe.timeout_ms", (int64_t)ms);
+    if (rc != IV_OK) {
+        /* 1 字节最大 255，区间下界是 100 ⇒ 只有 1..99 会被拒（如实回失败，
+         * 不 clamp —— 悄悄改成 100 会让平台以为它就是 100） */
+        IV_LOG_W(APP_MOD, "0xFE timeout=%dms out of range [100,60000] (%d), ack 0x74",
+                 ms, rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    rc = iv_config_save(g_cfg, NULL, 0);
+    if (rc != IV_OK) {
+        if (cur >= 0)
+            (void)iv_config_set_int(g_cfg, "probe.timeout_ms", cur);
+        IV_LOG_W(APP_MOD, "0xFE save failed (%d), rolled back, ack 0x74", rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    /* 显式兜底生效（口径同 0xF8）：`iv_agent_reload_probe()` 内部对同值早返回，
+     * 周期/失败次数按配置现值传，别因为"这次只改超时"就把它们清成 0。 */
+    if (iv_config_get_int(g_cfg, "probe.interval_ms", &pv) == IV_OK && pv > 0)
+        i_ms = (uint32_t)pv;
+    if (iv_config_get_int(g_cfg, "probe.max_fail", &pv) == IV_OK && pv > 0)
+        f_n = (uint32_t)pv;
+    prc = iv_agent_reload_probe(&g_agent, cfg_ip_be("probe.target1"),
+                                cfg_ip_be("probe.target2"), i_ms, (uint32_t)ms, f_n,
+                                iv_clock_monotonic_ms());
+    if (prc != IV_OK) {
+        IV_LOG_E(APP_MOD, "0xFE saved but probe reload failed (%d), ack 0x74", prc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    IV_LOG_I(APP_MOD, "platform set wired net timeout -> %d ms (saved + applied)", ms);
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
 /* 把配置里存的静态地址（`net.ip`/`net.mask`/`net.gateway`）真正应用到网口。
  *
  * 两个调用点**共用同一段判定**（这是刻意的，不另写一份）：
@@ -2256,6 +2346,11 @@ static int agent_setup(void)
      * 写配置的下行命令只有装配层能接。 */
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_SEARCH,
                          on_plat_search_mode, NULL);
+    /* 平台下行 0xFE「有线网络超时时间(ms)」：1 字节毫秒（板端 10-26 15:51 实抓
+     * `fe … 01 64 …` ⇒ 界面填 100 就发 100），落 `probe.timeout_ms`。
+     * 此前落"未注册 ⇒ 0x74"，平台点「配置」一直失败。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_NET_DELAY,
+                         on_plat_net_timeout, NULL);
     return 0;
 }
 

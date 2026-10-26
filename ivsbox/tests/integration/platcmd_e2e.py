@@ -542,13 +542,45 @@ def main():
         chk(plat.online(), 'C6c 平台连接还在（证明真的没动网口）')
 
         print('C7 未实现命令必须回 0x74（回 0x01 就是骗平台）')
-        for cmd in (0xE5, 0xF2, 0xA3, 0xA4, 0xFE):
+        for cmd in (0xE5, 0xF2, 0xA3, 0xA4):
             plat.clear()
             plat.send(build_downlink(cmd, b'\x00\x00\x00\x00'))
             f = plat.wait(cmd, kind='bin')
             chk(f is not None and f['code'] == 0x74,
                 'C7 0x%02X ⇒ ack 0x%02X（期望 0x74）'
                 % (cmd, f['code'] if f is not None else -1))
+
+        print('C8 0xFE 有线网络超时时间(ms) ⇒ ack 0x01 ＋ probe.timeout_ms 落盘')
+        plat.clear()
+        start = len(logtext())
+        plat.send(build_downlink(0xFE, b'\x64'))   # 100 ms（板端实抓过的真值）
+        f = plat.wait(0xFE, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'C8a 0xFE 100ms ⇒ ack=0x01')
+        chk(cls_items('probe').get('probe.timeout_ms') == 100,
+            'C8b probe.timeout_ms == 100（落盘，不是只回话）')
+        chk(wait_log(r'wired net timeout -> 100 ms', start=start) is not None,
+            'C8c 日志有 "wired net timeout -> 100 ms"')
+
+        print('C9 0xFE 非法值 ⇒ 0x74，且不改坏配置')
+        plat.clear()
+        plat.send(build_downlink(0xFE, b'\x00'))   # 0 ms 无意义
+        f = plat.wait(0xFE, kind='bin')
+        chk(f is not None and f['code'] == 0x74, 'C9a 0xFE 0ms ⇒ ack=0x74')
+        plat.clear()
+        plat.send(build_downlink(0xFE, b'\x32'))   # 50 ms，低于区间下界 100
+        f = plat.wait(0xFE, kind='bin')
+        chk(f is not None and f['code'] == 0x74, 'C9b 0xFE 50ms 低于下界 ⇒ ack=0x74')
+        chk(cls_items('probe').get('probe.timeout_ms') == 100,
+            'C9c 非法值没有把配置改坏（仍是 100）')
+
+        print('C10 0xFE 同值重发 ⇒ ack 0x01 且不动探测（unchanged 早返回）')
+        plat.clear()
+        start = len(logtext())
+        plat.send(build_downlink(0xFE, b'\x64'))
+        f = plat.wait(0xFE, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'C10a 0xFE 同值 ack=0x01')
+        chk(wait_log(r'0xFE timeout=100ms unchanged', start=start) is not None,
+            'C10b 走的是 unchanged 分支（没白重建探测表）')
 
         # ---- 收尾：把动过的键按**原值**还原 ----
         print('Z 收尾：还原现场配置')
@@ -562,7 +594,9 @@ def main():
         apply_cls('probe', {'probe.target1': orig['probe'].get('probe.target1',
                                                               '192.168.2.1'),
                             'probe.target2': orig['probe'].get('probe.target2',
-                                                              '192.168.2.2')})
+                                                              '192.168.2.2'),
+                            'probe.timeout_ms': orig['probe'].get('probe.timeout_ms',
+                                                                  2000)})
         apply_cls('camera', {'camera.detect.mode':
                              orig['camera'].get('camera.detect.mode', 1)})
         it = cls_items('net')

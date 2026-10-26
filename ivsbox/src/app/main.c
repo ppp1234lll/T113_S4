@@ -2059,6 +2059,155 @@ static void on_plat_net_timeout(const iv_proto_frame_t *f, void *arg)
     (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
 }
 
+/* ---------------------------------------------------------------------------
+ * 平台下行 0xF7「配置摄像机 IP 及连接位」
+ *
+ * 载荷 **5 字节**：`num(1 基，1..6)` ＋ `ip(4 B 大端)`。三个来源互相印证：
+ *   - 参考实现 `com_deal_camera_config()`（`.../APP/User/src/com.c:1478`）：
+ *     `num = buff[0]-1; ip = buff[1..4]`；
+ *   - 本机桩帧 `tests/tools/fake_plat.py:161`：`01 c0 a8 02 64`
+ *     （第 1 路 ＋ 192.168.2.100）；
+ *   - 界面「配置摄像机 IP」正是 6 路输入框 ＋ 一个「配置」按钮，一次一路。
+ *
+ * ============================ 修的是什么 ============================
+ * 这条此前**根本没有 handler**：`IV_PROTO_CMD_CFG_CAMERA` 只在 `iv_proto.h:118`
+ * 有宏定义，`src/` 里 0 引用 ⇒ 落 `iv_proto.c` 的"未注册命令"默认分支回 `0x74`。
+ * 现场表现就是"平台点「配置」永远失败，改了 IP 也不生效"（2026-10-26 报障）。
+ *
+ * 数据侧其实早就齐了：`camera.ch.0..5.ip` 六个键在 `iv_config.c` 里，
+ * `on_cfg_committed()` 的 CAMERA 分支也已接好 `iv_agent_reload_camdet()` 热更 ——
+ * 缺的只是"把平台这 5 字节翻译成那个键"这一层。属于"该补"，不是"该回 0x74"。
+ *
+ * 三条语义按参考实现取，**不自己发明**：
+ *   ① `ip` 全 0 ⇒ **清除**该路（写空串），不是"配成 0.0.0.0"；
+ *   ② 该 IP 已被别的通道占用 ⇒ 回 `0x74`。参考实现靠 `app_match_local_camera_ip()`
+ *      返回非 0 判"IP 已存在"。这里**不悄悄覆盖**别人那一路 —— 否则平台会以为
+ *      两路都配好了，而探测/录像/SNMP 三个模块会对着同一台摄像机各算一遍；
+ *   ③ 本路已经是这个值 ⇒ 早返回。`iv_agent_reload_camdet()` 会重建通道表并重置
+ *      扫描轮，重复点同一个值不该白拆一轮正在跑的探测。
+ *
+ * 下标：`num` 是 **1 基**（与 ctl 的 `ch` 同口径），`camera.ch.N` 是 **0 基** ——
+ * 这个 `-1` 只在这一处翻，别处再也别翻（本项目栽过"同一个数两套基号"）。
+ *
+ * 顺序：**不碰链路**（只改通道表），所以"落盘 → 生效 → ACK"，与 `0xF8` 同构。
+ * ------------------------------------------------------------------------- */
+static void on_plat_camera_ip(const iv_proto_frame_t *f, void *arg)
+{
+    char        val[INET_ADDRSTRLEN];
+    char        oldv[INET_ADDRSTRLEN];
+    const char *cur = NULL;
+    uint32_t    cips[IV_CAMDET_CH_N];
+    uint32_t    ip_be;
+    int64_t     cv = 0;
+    int         cmode = 0;
+    int         num;
+    int         ch;
+    int         ci;
+    int         rc;
+    uint32_t    crtt = 0u;
+    int         crc;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+
+    if (f->data == NULL || f->len < 5u) {
+        IV_LOG_W(APP_MOD, "0xF7 payload short (%u bytes, need 5), ack 0x74",
+                 (unsigned)f->len);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    num = (int)f->data[0];
+    if (num < 1 || num > (int)IV_CAMDET_CH_N) {
+        /* 参考实现对越界同样的"不采纳"；不猜"你是不是想配第 1 路" */
+        IV_LOG_W(APP_MOD, "0xF7 channel=%d out of range (1..%d), ack 0x74",
+                 num, (int)IV_CAMDET_CH_N);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    ch = num - 1;
+
+    /* 4 字节大端**原样**拷进 `s_addr`：`inet_ntop` 按内存字节读，
+     * 与 `cfg_ip_be()` 返回的语义完全一致，不要在这里做 ntohl。 */
+    ip_be = 0u;
+    (void)memcpy(&ip_be, f->data + 1, 4u);
+    if (ip_be == 0u) {
+        val[0] = '\0'; /* 全 0 ＝清除该路 */
+    } else if (inet_ntop(AF_INET, &ip_be, val, sizeof val) == NULL) {
+        IV_LOG_W(APP_MOD, "0xF7 ip format failed, ack 0x74");
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    /* ② 重复 IP：清除（全 0）不计入重复 */
+    for (ci = 0; ci < (int)IV_CAMDET_CH_N; ci++) {
+        if (ci == ch || ip_be == 0u)
+            continue;
+        if (cfg_ip_be(CAM_IP_KEY[ci]) == ip_be) {
+            IV_LOG_W(APP_MOD, "0xF7 ch%d ip %s already used by ch%d, ack 0x74",
+                     num, val, ci + 1);
+            (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+            return;
+        }
+    }
+
+    /* ③ 同值早返回。`cur` 指向配置模块内部缓冲，写回前必须先快照成 `oldv`。 */
+    oldv[0] = '\0';
+    rc = iv_config_get_str(g_cfg, CAM_IP_KEY[ch], &cur);
+    if (rc == IV_OK && cur != NULL) {
+        if (strcmp(cur, val) == 0) {
+            IV_LOG_I(APP_MOD, "0xF7 ch%d unchanged (%s), ack 0x01, detect untouched",
+                     num, (val[0] != '\0') ? val : "none");
+            (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+            return;
+        }
+        (void)snprintf(oldv, sizeof oldv, "%s", cur);
+    }
+
+    /* ---- 落盘 ---- */
+    rc = iv_config_set_str(g_cfg, CAM_IP_KEY[ch], val);
+    if (rc != IV_OK) {
+        IV_LOG_W(APP_MOD, "0xF7 ch%d set %s rejected by config (%d), ack 0x74",
+                 num, CAM_IP_KEY[ch], rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    rc = iv_config_save(g_cfg, NULL, 0);
+    if (rc != IV_OK) {
+        /* 退回旧值：不留"内存新、盘上旧"的中间态（重启后自己变回去最难查） */
+        (void)iv_config_set_str(g_cfg, CAM_IP_KEY[ch], oldv);
+        IV_LOG_W(APP_MOD, "0xF7 save failed (%d), rolled back, ack 0x74", rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    /* ---- 生效：与 `on_cfg_committed()` 的 CAMERA 分支**同一个入口**。
+     * `iv_config_save()` 已派发过一次 reload 事件，这里仍显式再调一次，口径同
+     * `0xF8`/`0xA5`：应答必须真的对应"已经生效"，不能把生效挂在"订阅有没有订上"
+     * 这种装配层细节上。通道表整表传过去，其余 5 路按配置现值，别只传这一路
+     * （那会把别的通道清空）。 */
+    for (ci = 0; ci < (int)IV_CAMDET_CH_N; ci++)
+        cips[ci] = cfg_ip_be(CAM_IP_KEY[ci]);
+    if (iv_config_get_int(g_cfg, "camera.detect.mode", &cv) == IV_OK && cv > 0)
+        cmode = (int)cv;
+    if (iv_config_get_int(g_cfg, "camera.detect.rtt_ms", &cv) == IV_OK && cv > 0)
+        crtt = (uint32_t)cv;
+    crc = iv_agent_reload_camdet(&g_agent, cmode, crtt, cips,
+                                 iv_clock_monotonic_ms());
+    if (crc != IV_OK) {
+        /* 已落盘但没生效（如 camdet 未 open）：如实回失败，下次启动按新值建表。
+         * 这条日志是现场唯一能看出"存了没生效"的地方。 */
+        IV_LOG_E(APP_MOD, "0xF7 ch%d saved but detect hot apply failed (%d), ack 0x74",
+                 num, crc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    IV_LOG_I(APP_MOD, "platform set camera ch%d ip -> %s (saved + applied)",
+             num, (val[0] != '\0') ? val : "none (cleared)");
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
 /* 把配置里存的静态地址（`net.ip`/`net.mask`/`net.gateway`）真正应用到网口。
  *
  * 两个调用点**共用同一段判定**（这是刻意的，不另写一份）：
@@ -2373,6 +2522,13 @@ static int agent_setup(void)
      * 此前落"未注册 ⇒ 0x74"，平台点「配置」一直失败。 */
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_NET_DELAY,
                          on_plat_net_timeout, NULL);
+    /* 平台下行 0xF7「配置摄像机 IP 及连接位」：5 B（路号 1 基 ＋ IP 4 B 大端）
+     * → `camera.ch.(num-1).ip` ＋ 立刻热更通道表。此前 `src/` 里根本没有这条命令的
+     * handler（只有 `iv_proto.h` 的宏定义），落默认分支回 0x74 ⇒ 平台点「配置」
+     * 一直失败（2026-10-26 补）。规矩同 0xF3/0xF4/0xF5/0xF8/0xA5/0xFE：
+     * 写配置的下行命令只有装配层能接。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_CAMERA,
+                         on_plat_camera_ip, NULL);
     return 0;
 }
 

@@ -619,6 +619,81 @@ def main():
         chk(wait_log(r'0xFE delay=100ms unchanged', start=start) is not None,
             'C10b 走的是 unchanged 分支（没白重建探测表）')
 
+        # ---- C11~C15 0xF7「配置摄像机 IP 及连接位」----
+        # 载荷 5 B：路号(**1 基**) ＋ IP 4 B 大端。参考实现 `com_deal_camera_config()`
+        # 与 `tests/tools/fake_plat.py` 的桩帧 `01 c0 a8 02 64` 都是这个形状。
+        # 这条命令 2026-10-26 之前**根本没有 handler**（`src/` 里 0 引用）⇒ 落默认
+        # 分支回 0x74，平台点「配置」永远失败。所以这里既要用例覆盖正常路径，
+        # 也要钉住"越界/重复必须回 0x74"这两条不许被写成"悄悄采纳"。
+        cam0 = cls_items('camera')
+        used = set((cam0.get('camera.ch.%d.ip' % i) or '') for i in range(6))
+        tgt = None
+        for cand in ('192.168.2.211', '192.168.2.212', '192.168.2.213',
+                     '192.168.2.214'):
+            if cand not in used:
+                tgt = cand
+                break
+        chk(tgt is not None, 'C11a 找到未被占用的测试 IP（现场 6 路没占 211~214）')
+
+        if tgt is not None:
+            print('C11 0xF7 配置第 2 路 IP=%s ⇒ ack 0x01 ＋ camera.ch.1.ip 落盘 ＋ 生效'
+                  % tgt)
+            plat.clear()
+            start = len(logtext())
+            plat.send(build_downlink(0xF7, b'\x02' + socket.inet_aton(tgt)))
+            f = plat.wait(0xF7, kind='bin')
+            chk(f is not None and f['code'] == 0x01,
+                'C11b 0xF7 ch2 ⇒ ack 0x01（**这是本次修的**：原来必回 0x74）')
+            chk(cls_items('camera').get('camera.ch.1.ip') == tgt,
+                'C11c camera.ch.1.ip == %s（路号 1 基 → 键 0 基必须翻对）' % tgt)
+            chk(wait_log(r'camera ch2 ip -> %s \(saved \+ applied\)'
+                         % re.escape(tgt), start=start) is not None,
+                'C11d 日志有 "camera ch2 ip -> ... (saved + applied)"')
+
+            print('C12 0xF7 同值重发 ⇒ ack 0x01 且不动探测（unchanged 早返回）')
+            plat.clear()
+            start = len(logtext())
+            plat.send(build_downlink(0xF7, b'\x02' + socket.inet_aton(tgt)))
+            f = plat.wait(0xF7, kind='bin')
+            chk(f is not None and f['code'] == 0x01, 'C12a 同值 ack=0x01')
+            chk(wait_log(r'0xF7 ch2 unchanged \(%s\)' % re.escape(tgt),
+                         start=start) is not None,
+                'C12b 走的是 unchanged 分支（没白重建通道表）')
+
+            print('C13 0xF7 把第 3 路配成第 2 路已用的 IP ⇒ 必须 0x74，不覆盖别人')
+            pre3 = cls_items('camera').get('camera.ch.2.ip') or ''
+            plat.clear()
+            start = len(logtext())
+            plat.send(build_downlink(0xF7, b'\x03' + socket.inet_aton(tgt)))
+            f = plat.wait(0xF7, kind='bin')
+            chk(f is not None and f['code'] == 0x74,
+                'C13a 重复 IP ⇒ ack=0x74（参考实现 app_match_local_camera_ip 同口径）')
+            chk((cls_items('camera').get('camera.ch.2.ip') or '') == pre3,
+                'C13b 第 3 路没被这条重复指令改掉（原值 %r）' % pre3)
+
+        print('C14 0xF7 路号越界（0 和 7）⇒ 必须 0x74，不猜"你想配第 1 路"')
+        for bad in (0x00, 0x07):
+            plat.clear()
+            plat.send(build_downlink(0xF7, bytes([bad, 192, 168, 2, 215])))
+            f = plat.wait(0xF7, kind='bin')
+            chk(f is not None and f['code'] == 0x74,
+                'C14 ch=%d ⇒ ack=0x%02X（期望 0x74）'
+                % (bad, f['code'] if f is not None else -1))
+        chk('192.168.2.215' not in
+            set((cls_items('camera').get('camera.ch.%d.ip' % i) or ''
+                 for i in range(6))),
+            'C14c 越界载荷一个字都没写进配置')
+
+        if tgt is not None:
+            print('C15 0xF7 IP 全 0 ⇒ 清除该路（写空串），不是"配成 0.0.0.0"')
+            plat.clear()
+            start = len(logtext())
+            plat.send(build_downlink(0xF7, b'\x02\x00\x00\x00\x00'))
+            f = plat.wait(0xF7, kind='bin')
+            chk(f is not None and f['code'] == 0x01, 'C15a 清除 ⇒ ack=0x01')
+            chk((cls_items('camera').get('camera.ch.1.ip') or '') == '',
+                'C15b camera.ch.1.ip 已清空（全 0 ＝清除，与参考实现一致）')
+
         # ---- 收尾：把动过的键按**原值**还原 ----
         print('Z 收尾：还原现场配置')
         keep = ('net.ip', 'net.mask', 'net.gateway',
@@ -635,8 +710,14 @@ def main():
                                                               '192.168.2.2'),
                             'probe.timeout_ms': orig['probe'].get('probe.timeout_ms',
                                                                   2000)})
-        apply_cls('camera', {'camera.detect.mode':
-                             orig['camera'].get('camera.detect.mode', 1)})
+        # `camera.ch.N.ip` 同理：C11/C15 会改第 2 路（再清空），不还原就是
+        # "跑一次用例把现场某一路摄像机 IP 抹掉"。
+        cam_restore = {'camera.detect.mode': orig['camera'].get('camera.detect.mode', 1)}
+        for i in range(6):
+            k = 'camera.ch.%d.ip' % i
+            if k in orig['camera']:
+                cam_restore[k] = orig['camera'][k]
+        apply_cls('camera', cam_restore)
         it = cls_items('net')
         chk(it.get('net.server.wired.host') == orig['net'].get('net.server.wired.host'),
             'Z1 平台地址已还原')
@@ -651,6 +732,11 @@ def main():
         chk(it.get('net.gateway') == orig['net'].get('net.gateway'),
             'Z4 net.gateway 已还原（本机 %r ← 原值 %r）'
             % (it.get('net.gateway'), orig['net'].get('net.gateway')))
+        camn = cls_items('camera')
+        bad = [k for k in cam_restore if k.startswith('camera.ch.') and
+               (camn.get(k) or '') != (orig['camera'].get(k) or '')]
+        chk(not bad, 'Z5 六路摄像机 IP 已还原（不一致的键：%s）'
+            % (', '.join(bad) if bad else '无'))
     finally:
         print('DIAG: accept=%d bytes_read=%d parsed=%d live=%d err=%s'
               % (plat.nacc, plat.nread, plat.nparsed, len(plat.frames),

@@ -48,7 +48,6 @@ static void probe_drive(iv_agent_t *a, uint64_t now_ms);
 static void netmgr_feed(iv_agent_t *a, uint64_t now_ms);
 static void thresh_drive(iv_agent_t *a, uint64_t now_ms);
 static void env_feed(iv_agent_t *a, uint64_t now_ms);
-static void on_cfg_search_mode(const iv_proto_frame_t *f, void *arg);
 static void on_query_ipc(const iv_proto_frame_t *f, void *arg);
 static void on_query_snmp(const iv_proto_frame_t *f, void *arg);
 static int  agent_send_power(const void *data, uint16_t len, void *arg);
@@ -548,9 +547,13 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
                      (unsigned)cfg->netthr_reboot_interval_s);
         }
 
-        /* 平台命令 0xA5（CONFIGURE_SEARCH_MODE）切换检测方式 */
-        (void)iv_proto_route(&a->rp.pf, IV_PROTO_CMD_CFG_SEARCH,
-                             on_cfg_search_mode, a);
+        /* 平台命令 0xA5（CONFIGURE_SEARCH_MODE）**不在这里注册**（2026-10-26 移走）：
+         * 它要写配置键 `camera.detect.mode` 并落盘，而本层没有配置句柄
+         * （`iv_agent_cfg_t` 只放值不放指针）。原实现在这里只调
+         * `iv_camdet_set_mode()` —— 改了运行期、**从不落盘** ⇒ 平台点了成功、
+         * 设备重启又回原方式，与 `0xF3`/`0xF4`/`0xF5` 同一条规矩：
+         * 凡是要写配置的下行命令，一律在装配层 `main.c` 注册。
+         * 路由见 `main.c:on_plat_search_mode()`。 */
     }
 
     /* ---- 5b. M6 媒体桥接＋断网录像状态机（**不依赖 Reactor**，两种模式同装）----
@@ -969,26 +972,6 @@ static void env_feed(iv_agent_t *a, uint64_t now_ms)
     }
 
     iv_report_set_env(&a->rp, &env);
-}
-
-/* 平台 0xA5（配置搜索方式）：DATA[0] = 1/2/3，非法回 0x74。
- * 与现网 com_set_carema_search_mode_function() 同口径（那儿也是取 buff[0]）。 */
-static void on_cfg_search_mode(const iv_proto_frame_t *f, void *arg)
-{
-    iv_agent_t *a = (iv_agent_t *)arg;
-    int         rc;
-
-    if (f == NULL || a == NULL)
-        return;
-    if (f->data == NULL || f->len < 1u) {
-        (void)iv_proto_ack(&a->rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
-        return;
-    }
-    rc = iv_camdet_set_mode(&a->cd, (int)f->data[0], a->now_ms);
-    (void)iv_proto_ack(&a->rp.pf, f->cmd,
-                       (rc >= 0) ? IV_PROTO_ACK_OK : IV_PROTO_ERR_EXEC);
-    IV_LOG_I(AG_MOD, "platform set detect mode %u -> rc=%d",
-             (unsigned)f->data[0], rc);
 }
 
 /* 平台 0xE4（搜索摄像机信息）：重开一轮多品牌发现，与现网"摄像机搜索"按钮等价。

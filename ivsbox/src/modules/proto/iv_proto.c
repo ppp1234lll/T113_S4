@@ -365,11 +365,29 @@ int iv_proto_send(iv_proto_t *pf, uint8_t cmd, uint32_t qn1, uint32_t qn2,
     return IV_OK;
 }
 
+/* 应答发送 —— **失败必须留下日志**（2026-10-26 收口）。
+ *
+ * 全部调用点原来都写成 `(void)iv_proto_ack(...)`，返回码被就地吞掉。而
+ * `iv_transport_send()` 在链路非 UP 时直接回 `IV_ESTATE`（刻意不积压过期 ACK），
+ * `iv_transport_open()` / `iv_transport_close()` 还会把暂存里没刷出去的帧清零
+ * （`iv_transport_send()` 只是 memcpy 进 `tbuf`，真 `write()` 要等 200 ms 节拍）
+ * ⇒ "链路上刚好在重连"这一瞬间的应答会**永久消失**，而日志里一个字都没有。
+ * `0xF3`（传输模式）栽的就是这个：设备每一步都对，平台界面只显示超时；
+ * 同类还有 `0xF4`（`ip addr flush` 拆链路）。
+ *
+ * 判定收在**这一处**（不是 30 多个 `(void)` 各修一遍）：谁调用都自动记一笔，
+ * 需要按返回码分支的调用点仍可拿到原值。 */
 int iv_proto_ack(iv_proto_t *pf, uint8_t cmd, uint8_t code)
 {
+    int rc;
+
     if (pf == NULL)
         return IV_EINVAL;
-    return iv_proto_send(pf, cmd, pf->last_qn1, pf->last_qn2, &code, 1);
+    rc = iv_proto_send(pf, cmd, pf->last_qn1, pf->last_qn2, &code, 1);
+    if (rc != IV_OK)
+        IV_LOG_W(PROTO_MOD, "ack 0x%02X/0x%02X could not be sent (rc=%d): the "
+                 "platform will report a timeout", (unsigned)cmd, (unsigned)code, rc);
+    return rc;
 }
 
 int iv_proto_heartbeat(iv_proto_t *pf)

@@ -1612,11 +1612,10 @@ static void on_plat_mode(const iv_proto_frame_t *f, void *arg)
     }
 
     /* ACK 先走。返回码**不能丢** —— 丢了就等于"平台收不到 0x01 而我们不知道"，
-     * 正是这次要修的那种情形。 */
-    rc = iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
-    if (rc != IV_OK)
-        IV_LOG_W(APP_MOD, "0xF3 ack=0x01 could not be queued (%d): platform will "
-                 "report a timeout", rc);
+     * 正是这次要修的那种情形。现在丢不了：`iv_proto_ack()` 内部对发送失败统一
+     * 记一条 `ack 0xXX/0xXX could not be sent`（见 `iv_proto.c`，判定收在一处，
+     * 不靠 30 多个调用点各自记得判）。 */
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
 
     schedule_transport_mode_apply();
 }
@@ -1856,6 +1855,92 @@ static void on_plat_ping_target(const iv_proto_frame_t *f, void *arg)
 
     IV_LOG_I(APP_MOD, "platform set ping targets -> %s / %s (saved + applied)",
              val[0], val[1]);
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台下行 0xA5「配置搜索方式」
+ *
+ * 载荷 1 字节：1=PING 2=端口扫描 3=RTSP OPTIONS。与参考实现
+ * `com_set_carema_search_mode_function()`（取 `buff[0]`）同口径，也与本机配置键
+ * `camera.detect.mode`（1..3，见 `iv_config.c` 默认值表）**就是同一个东西**。
+ *
+ * ============================ 修的是什么 ============================
+ * 原实现挂在 `iv_agent` 层（`on_cfg_search_mode`），只调 `iv_camdet_set_mode()`：
+ * 改了**运行期**、从不落盘。后果两条：
+ *   ① 平台收到 `0x01`（设置成功），设备一重启又回配置里的旧方式；
+ *   ② 配置键一直是旧值 ⇒ 平台接着点「查询设备配置」(0xE1) 看到的是旧值，
+ *      两边对"当前是哪种搜索方式"的认知从此不一致。
+ * 这不是"少打了一行日志"，是**回了 OK 只干了一半活** —— 与 `0xF3` 之前那一批
+ * "回了 0x01 没干活"的指令同一类。规矩就是本项目反复栽出来的那条：
+ * **凡是要写配置的下行命令，一律在装配层注册**（本层才有 `g_cfg`），
+ * 库层不许自行"改内存当生效"。
+ *
+ * 顺序：**不碰链路**，所以可以"先落盘、再生效、最后 ACK"（与 `0xF8` 同构）。
+ * `iv_config_save()` 会派发 `on_cfg_committed(CAMERA)` → `iv_agent_reload_camdet()`
+ * 顺带把运行期切过去；下面仍显式再调一次兜底，口径同 `0xF8`：应答必须真的对应
+ * "已经生效"，不能把生效挂在"订阅有没有订上"这种装配层细节上。
+ * ------------------------------------------------------------------------- */
+static void on_plat_search_mode(const iv_proto_frame_t *f, void *arg)
+{
+    int64_t cur = -1;
+    int     mode;
+    int     rc;
+    int     arc;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+
+    if (f->data == NULL || f->len < 1u) {
+        IV_LOG_W(APP_MOD, "0xA5 payload empty (0 bytes), ack 0x74");
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    mode = (int)f->data[0];
+    if (mode < (int)IV_CAMDET_MODE_PING || mode > (int)IV_CAMDET_MODE_RTSP) {
+        /* 参考实现对非法值同样是"不采纳"；这里如实回 0x74，不猜"你是不是想设 PING" */
+        IV_LOG_W(APP_MOD, "0xA5 mode=%d out of range (1..3), ack 0x74", mode);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    /* 同值早返回：`iv_camdet_set_mode()` 会关掉在途探测 fd、清扫描轮、重建 PING
+     * 引擎 —— 平台重复点同一个值不该白拆一轮（那段"空窗"里这一路会暂时没有状态）。 */
+    if (iv_config_get_int(g_cfg, "camera.detect.mode", &cur) == IV_OK &&
+        cur == (int64_t)mode) {
+        IV_LOG_I(APP_MOD, "0xA5 unchanged (mode=%d %s), ack 0x01, detect untouched",
+                 mode, iv_camdet_mode_name(mode));
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+    rc = iv_config_set_int(g_cfg, "camera.detect.mode", (int64_t)mode);
+    if (rc != IV_OK) {
+        IV_LOG_W(APP_MOD, "0xA5 mode=%d rejected by config layer (%d), ack 0x74",
+                 mode, rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    rc = iv_config_save(g_cfg, NULL, 0);
+    if (rc != IV_OK) {
+        /* 退回旧值：不留"内存新、盘上旧"的中间态（重启后自己变回去最难查） */
+        if (cur >= 1)
+            (void)iv_config_set_int(g_cfg, "camera.detect.mode", cur);
+        IV_LOG_W(APP_MOD, "0xA5 save failed (%d), rolled back, ack 0x74", rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    arc = iv_agent_reload_camdet(&g_agent, mode, 0u, NULL, iv_clock_monotonic_ms());
+    if (arc != IV_OK) {
+        /* 已落盘但没生效：如实回失败（下次重启会生效，这条日志是现场唯一能看出
+         * "存了没生效"的地方）。 */
+        IV_LOG_E(APP_MOD, "0xA5 mode=%d saved but hot apply failed (%d), ack 0x74",
+                 mode, arc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    IV_LOG_I(APP_MOD, "platform set detect mode -> %d (%s) (saved + applied)",
+             mode, iv_camdet_mode_name(mode));
     (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
 }
 
@@ -2159,6 +2244,12 @@ static int agent_setup(void)
      * （2026-10-26 补；此前落默认分支回 0x74，平台点「配置主网检测IP」一直失败）。 */
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_MAIN_NET,
                          on_plat_ping_target, NULL);
+    /* 平台下行 0xA5「配置搜索方式」：`camera.detect.mode` 的另一个写入口。
+     * 2026-10-26 从 `iv_agent` 层搬到这里 —— 那边没有配置句柄，只能改运行期、
+     * 落不了盘（平台点了成功、设备重启回旧值）。规矩同 0xF3/0xF4/0xF5/0xF8：
+     * 写配置的下行命令只有装配层能接。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_SEARCH,
+                         on_plat_search_mode, NULL);
     return 0;
 }
 

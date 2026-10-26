@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""平台**下行指令**全量回归：每一条已注册的命令真发一帧、看应答、看副作用
+
+为什么必须有这一层：`main.c` / `iv_agent.c` / `iv_report.c` 里的 handler 都是
+`static`，单测与 `test_e2e_report.c` 都够不到它们（后者只测 `iv_report` 自己的
+路由，装配层注册的那几条根本不在场）。而 2026-10-26 一天之内连续在三条**配置**
+指令上翻车（0xF4 改完网口 ack 被自己 flush 掉、0xF3 切网把 ack 清零、0xA5 只改
+运行期不落盘）——共同点就是"**回了 0x01，平台看起来成功，实际没干全**"，
+而这类问题在静态阅读里全都看不出来：代码每一步都"对"，错的是顺序与落点。
+
+所以本脚本只做一件事：冒充平台，逐条下发，然后把三件事对账：
+  ① 应答码（0x01 / 0x74）——平台界面上那个"成功/失败"就是它；
+  ② **副作用**（配置键真的变了 / 日志真打了 applied）—— 光有 0x01 不算数；
+  ③ 未实现的命令必须回 0x74（绝不能回 0x01 说谎）。
+
+⚠ 安全约束（都是踩出来的）：
+  - 开头先把 `netthr.reboot_max` 置 0（自愈禁用）：本脚本把平台地址指到本机，
+    若上一轮留下 reboot_max>0，平台连不通时自愈会真把 VM 重启掉；
+  - 平台地址用 **本机 eth0 的地址**而不是 127.0.0.1：`bind_ifname` +
+    `SO_BINDTODEVICE` 下连 127.0.0.1 会因 oif 不匹配而永远 `EINPROGRESS`（D-01）；
+  - **不发会改本机地址的 0xF4**（那会把 SSH 掐掉）：只发"同值"一份，走
+    unchanged 早返回分支，仍然覆盖了解析＋应答＋早返回判据；
+  - 收尾把动过的键全部还原（平台地址、上报间隔、检测目标、检测方式）。
+
+用法（必须先 `make host`）：
+    cd <repo>/ivsbox
+    sudo python3 tests/integration/platcmd_e2e.py
+前置：`/mnt/UDISK/log` 可写；当前**没有**别的 ivsboxd 在跑（本脚本自己拉起，
+结束时收掉）。退出码：0 = 全部通过；1 = 有失败。
+"""
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+CTL = '/var/run/ivsbox/ctl'
+LOGROOT = '/mnt/UDISK/log'
+BIN = os.path.abspath('build/host/ivsboxd')
+MAGIC = 0x42535649
+HDR = struct.Struct('<IHHIIQII')
+
+PLAT_PORT = 16099
+DEFAULT_HOST = '47.104.250.225'
+DEFAULT_PORT = 6012
+
+fails = []
+rid = 0
+BASE = 0
+
+# 下行帧布局（与 src/modules/proto/iv_proto.c 的 OFF_* 一致）
+OFF_VER, OFF_TYPE, OFF_ID = 2, 3, 5
+OFF_CMD, OFF_QN1, OFF_QN2, OFF_LEN, OFF_DATA = 8, 9, 13, 17, 18
+VER = 0x11
+DEVTYPE = 0x0A00
+
+
+# ---------------------------------------------------------------------------
+# CRC8（poly 0x07 / seed 0，覆盖 [ver, data 末]）—— 与 iv_crc8 同参
+# ---------------------------------------------------------------------------
+def crc8(buf):
+    crc = 0
+    for b in buf:
+        crc ^= b
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x07) & 0xFF if (crc & 0x80) else (crc << 1) & 0xFF
+    return crc
+
+
+def build_downlink(cmd, data=b'', qn1=0x11223344, qn2=0x55667788, devid=0x0B2CC1):
+    n = len(data)
+    out = bytearray(21 + n)
+    out[0] = 0xF0
+    out[1] = 0xF0
+    out[OFF_VER] = VER
+    out[OFF_TYPE] = (DEVTYPE >> 8) & 0xFF
+    out[OFF_TYPE + 1] = DEVTYPE & 0xFF
+    out[OFF_ID] = (devid >> 16) & 0xFF
+    out[OFF_ID + 1] = (devid >> 8) & 0xFF
+    out[OFF_ID + 2] = devid & 0xFF
+    out[OFF_CMD] = cmd
+    struct.pack_into('>I', out, OFF_QN1, qn1)
+    struct.pack_into('>I', out, OFF_QN2, qn2)
+    out[OFF_LEN] = n & 0xFF
+    out[OFF_DATA:OFF_DATA + n] = data
+    out[OFF_DATA + n] = crc8(out[OFF_VER:OFF_DATA + n])
+    out[OFF_DATA + n + 1] = 0xFF
+    out[OFF_DATA + n + 2] = 0xFF
+    return bytes(out)
+
+
+def parse_bin(buf):
+    """二进制帧：F0F0 … LEN@17 … DATA@18 … CRC … FFFF。返回记录 dict 或 None。"""
+    if len(buf) < 21:
+        return None
+    n = buf[OFF_LEN]
+    if len(buf) < 21 + n:
+        return None
+    data = bytes(buf[OFF_DATA:OFF_DATA + n])
+    return {'kind': 'bin', 'cmd': buf[OFF_CMD],
+            'code': (data[0] if n >= 1 else None), 'data': data}
+
+
+def parse_json(blob, start):
+    """JSON/文本帧：`##` + json + `##`（`iv_proto_json_frame()`，总长 4 + len）。
+
+    从 start 开始找尾部的 `##`；返回 (记录, 消耗字节数) 或 (None, 0)。
+    这类帧的"命令码"只在 JSON 里（`"cmd":"E3"`），没有二进制头。"""
+    i = blob.find(b'##', start + 2)
+    if i < 0:
+        return None, 0
+    body = blob[start + 2:i]
+    cmd = None
+    try:
+        j = json.loads(body.decode('utf-8', 'replace'))
+        d = j.get('data') if isinstance(j, dict) else None
+        if isinstance(d, dict) and isinstance(d.get('cmd'), str):
+            cmd = int(d['cmd'][:2], 16)
+    except Exception:
+        pass
+    return {'kind': 'json', 'cmd': cmd, 'code': None, 'data': bytes(body)}, (i + 2 - start)
+
+
+# ---------------------------------------------------------------------------
+# 冒充平台的 TCP 服务（设备连进来，我们收发）
+# ---------------------------------------------------------------------------
+class Plat(object):
+    def __init__(self, port):
+        self.lock = threading.Lock()
+        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(('0.0.0.0', port))
+        self.srv.listen(8)
+        self.srv.settimeout(0.5)
+        self.conns = []
+        self.frames = []
+        self.buf = {}
+        self.stop = False
+        self.nacc = 0      # 累计 accept 次数
+        self.nread = 0     # 累计读到的字节数
+        self.nparsed = 0   # 累计切出的帧数（clear() 不清）
+        self.first = None  # 第一段原始字节（切不出帧时用它定位）
+        self.err = None    # 读线程的异常（不给出来就永远是"没应答"）
+        self.t = threading.Thread(target=self._run)
+        self.t.daemon = True
+        self.t.start()
+
+    def _run(self):
+        try:
+            self._loop()
+        except Exception as e:      # noqa: BLE001 —— 线程里任何异常都必须显式暴露
+            import traceback
+            self.err = traceback.format_exc()
+            sys.stderr.write('PLAT READER DIED: %r\n' % (e,))
+
+    def _loop(self):
+        while not self.stop:
+            try:
+                c, _ = self.srv.accept()
+                c.setblocking(False)
+                with self.lock:
+                    self.conns.append(c)
+                    self.buf[id(c)] = b''
+                    self.nacc += 1
+            except socket.timeout:
+                pass
+            except OSError:
+                break
+            with self.lock:
+                conns = list(self.conns)
+            for c in conns:
+                try:
+                    d = c.recv(65535)
+                except (BlockingIOError, InterruptedError):
+                    continue
+                except OSError:
+                    d = b''
+                if not d:
+                    with self.lock:
+                        if c in self.conns:
+                            self.conns.remove(c)
+                        self.buf.pop(id(c), None)
+                    try:
+                        c.close()
+                    except OSError:
+                        pass
+                    continue
+                with self.lock:
+                    self.buf[id(c)] = self.buf.get(id(c), b'') + d
+                    self.nread += len(d)
+                    if self.first is None:
+                        self.first = bytes(d[:48])
+                    blob = self.buf[id(c)]
+                    # 两种帧混在一条流里：二进制（F0F0…）与 JSON/文本（##…##）。
+                    # 只认其中一种 ⇒ 另一种会被当噪声、把后面的帧一起带偏
+                    # （第一版就是这么 false-FAIL 掉全部应答的）。
+                    while True:
+                        if len(blob) >= 2 and blob[0] == 0x23 and blob[1] == 0x23:
+                            rec, used = parse_json(blob, 0)
+                            if rec is None:
+                                break
+                            blob = blob[used:]
+                        elif len(blob) >= 2 and blob[0] == 0x0F and blob[1] == 0x0F:
+                            # **设备→平台的二进制帧头是 0x0F0F**（`IV_PROTO_HEAD_UP`），
+                            # 不是下行那个 0xF0F0（`IV_PROTO_HEAD_DOWN`）。第一版照
+                            # 下行头去认，结果把所有 ACK/心跳都当噪声丢了 —— 症状是
+                            # "每条指令都没应答"，而设备侧日志显示 ack 全部发出去了。
+                            rec = parse_bin(blob)
+                            if rec is None:
+                                break
+                            blob = blob[21 + blob[OFF_LEN]:]
+                        elif len(blob) >= 2:
+                            blob = blob[1:]
+                            continue
+                        else:
+                            break
+                        self.frames.append((time.time(), rec))
+                        self.nparsed += 1
+                    self.buf[id(c)] = blob
+
+    def online(self):
+        with self.lock:
+            return len(self.conns) > 0
+
+    def send(self, raw):
+        with self.lock:
+            conns = list(self.conns)
+        for c in conns:
+            try:
+                c.sendall(raw)
+                return True
+            except OSError:
+                pass
+        return False
+
+    def clear(self):
+        with self.lock:
+            self.frames = []
+
+    def wait(self, cmd, timeout=6.0, after=0.0, kind=None):
+        """等一个 cmd 匹配的上行帧，返回记录 dict 或 None。"""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self.lock:
+                for ts, rec in self.frames:
+                    if ts >= after and rec['cmd'] == cmd and (kind is None or
+                                                              rec['kind'] == kind):
+                        return rec
+            time.sleep(0.05)
+        return None
+
+    def close(self):
+        self.stop = True
+        with self.lock:
+            for c in self.conns:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+            self.conns = []
+        try:
+            self.srv.close()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# ctl（本地通道，AF_UNIX + SEQPACKET，32 B 小端头）
+# ---------------------------------------------------------------------------
+def ctl(method, params=None):
+    global rid
+    rid += 1
+    payload = json.dumps({'m': method, 'p': params or {}}).encode()
+    hdr = HDR.pack(MAGIC, 1, 1, 0, 0, rid, len(payload), 0)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    s.settimeout(10)
+    s.connect(CTL)
+    s.sendall(hdr + payload)
+    buf = s.recv(70000)
+    s.close()
+    _m, _ver, _typ, _fl, _pad, _rqid, plen, _rsv = HDR.unpack(buf[:32])
+    return json.loads(buf[32:32 + plen].decode())
+
+
+def wait_ctl(deadline=20.0):
+    t0 = time.time()
+    while time.time() - t0 < deadline:
+        if os.path.exists(CTL):
+            try:
+                ctl('system.snapshot')
+                return True
+            except Exception:
+                pass
+        time.sleep(0.2)
+    return False
+
+
+def logfile():
+    best = None
+    for day in sorted(os.listdir(LOGROOT)):
+        d = os.path.join(LOGROOT, day)
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            p = os.path.join(d, f)
+            if best is None or os.path.getmtime(p) > os.path.getmtime(best):
+                best = p
+    return best
+
+
+def logtext():
+    p = logfile()
+    if p is None:
+        return ''
+    with open(p, 'rb') as fh:
+        return fh.read().decode('utf-8', 'replace')
+
+
+def wait_log(pattern, deadline=8.0, start=None):
+    t0 = time.time()
+    off = BASE if start is None else start
+    last = None
+    while time.time() - t0 < deadline:
+        for line in logtext()[off:].splitlines():
+            if re.search(pattern, line):
+                last = line
+        if last is not None:
+            return last
+        time.sleep(0.2)
+    return last
+
+
+def cls_items(cls):
+    return (ctl('config.class', {'cls': cls}).get('d') or {}).get('items') or {}
+
+
+def cls_ver(cls):
+    return (ctl('config.class', {'cls': cls}).get('d') or {}).get('version')
+
+
+def apply_cls(cls, items):
+    return ctl('config.apply', {'ver': cls_ver(cls), 'items': items})
+
+
+def local_addr():
+    """本机"出口网卡"的 IPv4：平台地址必须指到**它自己网卡上的地址**（见 D-01）。
+
+    VM 上的网卡名是 `ens33`/`enp0s3`，板端才是 `eth0` ⇒ 不写死名字，
+    取第一条非 lo 的全局地址（也就是默认路由出口那一块）。"""
+    try:
+        out = subprocess.check_output(['ip', '-4', '-o', 'addr'],
+                                      stderr=subprocess.DEVNULL).decode()
+        for line in out.splitlines():
+            m = re.search(r'^\d+:\s+(\S+)\s+inet (\d+\.\d+\.\d+\.\d+)/(\d+)', line)
+            if m and m.group(1) != 'lo':
+                return m.group(1), m.group(2), int(m.group(3))
+    except Exception:
+        pass
+    return None, None, None
+
+
+def prefix_to_mask(n):
+    return (0xFFFFFFFF << (32 - n)) & 0xFFFFFFFF
+
+
+def chk(cond, what):
+    if cond:
+        print('  PASS ' + what)
+    else:
+        print('  FAIL ' + what)
+        fails.append(what)
+
+
+def main():
+    global BASE
+
+    if wait_ctl(0.1):
+        print('FAIL: 已经有 ivsboxd 在跑，换个环境再测')
+        return 1
+
+    ifn, ip, plen = local_addr()
+    if ip is None:
+        print('FAIL: 取不到本机出口网卡的地址')
+        return 1
+    print('平台冒充地址 = %s:%d（本机 %s = %s/%d）' % (ip, PLAT_PORT, ifn, ip, plen))
+
+    plat = Plat(PLAT_PORT)
+    p = subprocess.Popen([BIN], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    try:
+        if not wait_ctl():
+            print('FAIL: ivsboxd 没起来')
+            return 1
+        BASE = len(logtext())
+
+        # 动过的键先记原值，收尾按原值还原（不是按"出厂值猜"）
+        orig = {}
+        for cls in ('net', 'sys', 'probe', 'camera'):
+            orig[cls] = cls_items(cls)
+
+        # ---- A0 安全前置：自愈置 0，平台地址指到本机 ----
+        print('A0 前置：关自愈 ＋ 平台地址指到本机冒牌服务')
+        ver = (ctl('config.class', {'cls': 'netthr'}).get('d') or {}).get('version')
+        r = ctl('config.apply', {'ver': ver, 'items': {'netthr.reboot_max': 0}})
+        chk(r.get('ok') is True, 'A0a netthr.reboot_max=0（平台连不通也不会真重启）')
+
+        r = apply_cls('net', {
+            'net.server.wired.host': ip, 'net.server.wired.port': PLAT_PORT,
+            'net.server.wired.host_bak': ip, 'net.server.wired.port_bak': PLAT_PORT,
+            'net.server.wireless.host': ip, 'net.server.wireless.port': PLAT_PORT,
+            'net.server.wireless.host_bak': ip, 'net.server.wireless.port_bak': PLAT_PORT,
+        })
+        chk(r.get('ok') is True, 'A0b 平台地址指向本机冒牌服务')
+
+        t0 = time.time()
+        while time.time() - t0 < 25.0 and not plat.online():
+            time.sleep(0.2)
+        chk(plat.online(), 'A0c 设备真的连进来了（否则后面每条都会"没应答"）')
+        if not plat.online():
+            return 1
+        time.sleep(1.0)  # 让心跳/首帧先过去，别把它的 cmd 当我们的应答
+
+        # ---- B 查询类 ----
+        print('B1 0xE3 查询版本 ⇒ 回 ##{...}## JSON，不是 ACK')
+        plat.clear()
+        plat.send(build_downlink(0xE3))
+        f = plat.wait(0xE3, kind='json')
+        chk(f is not None, 'B1a 收到 0xE3 的 JSON 应答帧')
+        if f is not None:
+            d = f['data']
+            chk(b'QN=' in d or b'"qn":' in d, 'B1b 应答体是 JSON（带 qn）')
+            chk(b'2874540201432778632' in d,
+                'B1c qn 原样回显请求里的 QN（qn1qn2 十进制拼接）')
+
+        print('B2 0xE1 查询参数 ⇒ 回 JSON')
+        plat.clear()
+        plat.send(build_downlink(0xE1))
+        f = plat.wait(0xE1, kind='json')
+        chk(f is not None, 'B2a 0xE1 回了 JSON 帧')
+        if f is not None:
+            chk(b'{' in f['data'], 'B2b 应答体里是配置 JSON')
+
+        print('B3 0xE2 立即上报 ⇒ 回 ACK 0x01')
+        plat.clear()
+        plat.send(build_downlink(0xE2))
+        f = plat.wait(0xE2, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'B3a 0xE2 ack=0x01')
+
+        print('B4 0xE4 搜索摄像机 ⇒ 回 ACK 0x01（发现是异步的）')
+        plat.clear()
+        plat.send(build_downlink(0xE4))
+        f = plat.wait(0xE4, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'B4a 0xE4 ack=0x01')
+
+        print('B5 0xE7 查询 SNMP ⇒ 应答码必须与实际执行结果一致（不许谎报成功）')
+        plat.clear()
+        start = len(logtext())
+        plat.send(build_downlink(0xE7, b'\x00'))
+        f = plat.wait(0xE7, kind='bin')
+        chk(f is not None, 'B5a 0xE7 有应答')
+        # 判据不是"必须 0x01"：没配 SNMP 目标时 `iv_agent_snmp_start()` 回
+        # `IV_ESTATE`，那时**该**回 0x74。撒谎（rc<0 却回 0x01）才是缺陷
+        # —— 这正是 2026-10-20 那一批"二十多条没实现的指令全回 OK"的病根。
+        ln = wait_log(r'0xE7 snmp query .*-> rc=(-?\d+)', start=start)
+        rc = int(re.search(r'rc=(-?\d+)', ln).group(1)) if ln else None
+        chk(ln is not None, 'B5b 日志记了查询结果（现场唯一的观测窗口）')
+        chk(f is not None and rc is not None and
+            f['code'] == (0x01 if rc == 0 else 0x74),
+            'B5c 应答码与执行结果一致（rc=%s ⇒ 0x%02X）'
+            % (rc, f['code'] if f is not None else -1))
+
+        # ---- C 配置类：应答 + 副作用都要对 ----
+        print('C1 0xF5 配置上报间隔 37 s ⇒ ack 0x01 ＋ 配置键真的变了')
+        plat.clear()
+        start = len(logtext())
+        plat.send(build_downlink(0xF5, b'\x01\x00\x25'))  # sel=1, 37 s
+        f = plat.wait(0xF5, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'C1a 0xF5 ack=0x01')
+        chk(cls_items('sys').get('sys.report.interval_s') == 37,
+            'C1b sys.report.interval_s == 37（落了盘，不是只回话）')
+
+        print('C2 0xF8 配置主网检测 IP ⇒ ack 0x01 ＋ probe.target1/2 真的变了')
+        plat.clear()
+        start = len(logtext())
+        plat.send(build_downlink(0xF8,
+                                 bytes([192, 168, 2, 201, 192, 168, 2, 202])))
+        f = plat.wait(0xF8, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'C2a 0xF8 ack=0x01')
+        it = cls_items('probe')
+        chk(it.get('probe.target1') == '192.168.2.201' and
+            it.get('probe.target2') == '192.168.2.202', 'C2b probe.target1/2 已落盘')
+
+        print('C3 0xA5 配置搜索方式=2 端口扫描 ⇒ ack 0x01 ＋ camera.detect.mode 落盘')
+        plat.clear()
+        start = len(logtext())
+        plat.send(build_downlink(0xA5, b'\x02'))
+        f = plat.wait(0xA5, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'C3a 0xA5 ack=0x01')
+        chk(cls_items('camera').get('camera.detect.mode') == 2,
+            'C3b camera.detect.mode == 2（**这是本次修的**：原来只改运行期不落盘）')
+        chk(wait_log(r'detect mode -> 2 \(port\)', start=start) is not None,
+            'C3c 日志有 "detect mode -> 2 (port)"（证明真的生效，不只是存了）')
+
+        print('C4 0xA5 非法值 9 ⇒ 必须 0x74，且不采纳')
+        plat.clear()
+        plat.send(build_downlink(0xA5, b'\x09'))
+        f = plat.wait(0xA5, kind='bin')
+        chk(f is not None and f['code'] == 0x74, 'C4a 0xA5 mode=9 ⇒ ack=0x74')
+        chk(cls_items('camera').get('camera.detect.mode') == 2,
+            'C4b 非法值没有把配置改坏（仍是 2）')
+
+        print('C5 0xA5 同值重发 ⇒ ack 0x01 且不动探测（unchanged 早返回）')
+        plat.clear()
+        start = len(logtext())
+        plat.send(build_downlink(0xA5, b'\x02'))
+        f = plat.wait(0xA5, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'C5a 0xA5 同值 ack=0x01')
+        chk(wait_log(r'0xA5 unchanged', start=start) is not None,
+            'C5b 走的是 unchanged 分支（没白拆一轮探测）')
+
+        print('C6 0xF4 同值本机地址 ⇒ ack 0x01 且**不动网口**（真改地址会掐掉 SSH）')
+        mask = prefix_to_mask(plen)
+        # 先确认配置里的 net.ip 与本机一致，否则同值分支走不到、真去 flush 网口
+        it = cls_items('net')
+        same = (it.get('net.ip') == ip)
+        if not same:
+            apply_cls('net', {'net.ip': ip, 'net.mask': socket.inet_ntoa(
+                struct.pack('>I', mask))})
+        plat.clear()
+        start = len(logtext())
+        plat.send(build_downlink(0xF4, socket.inet_aton(ip) +
+                                 struct.pack('>I', mask) + socket.inet_aton('0.0.0.0')))
+        f = plat.wait(0xF4, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'C6a 0xF4 同值 ack=0x01')
+        chk(wait_log(r'0xF4 unchanged', start=start) is not None,
+            'C6b 走 unchanged 分支（链路没被拆）')
+        chk(plat.online(), 'C6c 平台连接还在（证明真的没动网口）')
+
+        print('C7 未实现命令必须回 0x74（回 0x01 就是骗平台）')
+        for cmd in (0xE5, 0xF2, 0xA3, 0xA4, 0xFE):
+            plat.clear()
+            plat.send(build_downlink(cmd, b'\x00\x00\x00\x00'))
+            f = plat.wait(cmd, kind='bin')
+            chk(f is not None and f['code'] == 0x74,
+                'C7 0x%02X ⇒ ack 0x%02X（期望 0x74）'
+                % (cmd, f['code'] if f is not None else -1))
+
+        # ---- 收尾：把动过的键按**原值**还原 ----
+        print('Z 收尾：还原现场配置')
+        keep = ('net.server.wired.host', 'net.server.wired.port',
+                'net.server.wired.host_bak', 'net.server.wired.port_bak',
+                'net.server.wireless.host', 'net.server.wireless.port',
+                'net.server.wireless.host_bak', 'net.server.wireless.port_bak')
+        apply_cls('net', {k: orig['net'][k] for k in keep if k in orig['net']})
+        apply_cls('sys', {'sys.report.interval_s':
+                          orig['sys'].get('sys.report.interval_s', 60)})
+        apply_cls('probe', {'probe.target1': orig['probe'].get('probe.target1',
+                                                              '192.168.2.1'),
+                            'probe.target2': orig['probe'].get('probe.target2',
+                                                              '192.168.2.2')})
+        apply_cls('camera', {'camera.detect.mode':
+                             orig['camera'].get('camera.detect.mode', 1)})
+        it = cls_items('net')
+        chk(it.get('net.server.wired.host') == orig['net'].get('net.server.wired.host'),
+            'Z1 平台地址已还原')
+        chk(cls_items('camera').get('camera.detect.mode') ==
+            orig['camera'].get('camera.detect.mode'), 'Z2 检测方式已还原')
+    finally:
+        print('DIAG: accept=%d bytes_read=%d parsed=%d live=%d err=%s'
+              % (plat.nacc, plat.nread, plat.nparsed, len(plat.frames),
+                 'none' if plat.err is None else 'YES'))
+        print('DIAG first bytes: %s' % (plat.first.hex() if plat.first else 'none'))
+        if plat.err is not None:
+            print(plat.err)
+        plat.close()
+        try:
+            p.terminate()
+            p.wait(timeout=8)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    print('')
+    if fails:
+        print('%d 项失败：' % len(fails))
+        for f in fails:
+            print('  - ' + f)
+        return 1
+    print('全部通过')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

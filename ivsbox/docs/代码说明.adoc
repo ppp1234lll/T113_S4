@@ -6615,3 +6615,115 @@ schedule_transport_mode_apply();
 * 已把**所有**平台下行命令过了一遍：能"动链路"的只有 `0xF4`（已修）与 `0xF3`（本次）。
   `0xF8` 只重建探测表、不碰平台 TCP；`0xF5` 只改上报周期；`0xF7`（配置事务）只走 web 侧 ctl，
   平台发不到。**以后新增任何会重连/改网口的命令，第一件事都是"ACK 在它前面"。**
+
+== 2026-10-26 15:18 平台下行指令成体系过一遍：`0xA5` 不落盘 ＋ ACK 失败零日志
+
+上一节（14:47）修的是 `0xF3` 一条。当天连续三条配置指令在平台侧失败之后，改法从"逐条补"
+换成"**按类排查**"——只找一种病：**回了 `0x01`，但活只干了一半**。查出四处，三处是代码、一处是判定
+分散。
+
+=== 一是 `0xA5` 只改运行期、从不落盘（真缺陷）
+
+原实现挂在 `iv_agent.c`：
+
+[source,c]
+----
+rc = iv_camdet_set_mode(&a->cd, (int)f->data[0], a->now_ms);
+(void)iv_proto_ack(&a->rp.pf, f->cmd, (rc >= 0) ? IV_PROTO_ACK_OK : IV_PROTO_ERR_EXEC);
+----
+
+`iv_camdet_set_mode()` 只写 `d->cfg.mode`，**没有一个字节进配置层**。后果两条：
+
+. 平台收到 `0x01`，设备重启回旧方式；
+. 配置键 `camera.detect.mode` 一直是旧值 ⇒ 平台再点「查询设备配置」(`0xE1`)，看到的是**旧的**，
+  两边对"现在是哪种搜索方式"的认知从此不一致。
+
+根因不是"忘了写日志"，是**放错了层**：`iv_agent_cfg_t` 只放值不放指针，库层根本没有配置句柄，
+自然写不了盘。所以修法不是"在库里补一句 save"，而是**搬到装配层**：
+
+* 路由改在 `main.c` 注册（`on_plat_search_mode()`），与 `0xF3`/`0xF4`/`0xF5`/`0xF8` 同一批；
+* 顺序：校验 1..3 → **同值早返回** → `iv_config_set_int()` → `iv_config_save()`
+  （失败**退回旧值**再回 `0x74`，不留"内存新、盘上旧"的中间态）→ `iv_agent_reload_camdet()`
+  显式兜底 → 回 `0x01`；
+* 这条**不碰链路**，所以不需要 `0xF3`/`0xF4` 那套"ACK 提前"，
+  可以"先落盘、再生效、最后应答"，把真实失败如实回给平台。
+
+由此定下一条通用规矩（写进本节，后续照办）：
+
+> **凡是要写配置的下行命令，一律在装配层 `main.c` 注册。** 库层不许"改内存当生效"。
+
+=== 二是 `(void)iv_proto_ack()` 把发送失败吞掉（跨全部命令）
+
+`iv_proto_ack()` 的返回码在 30 多个调用点被 `(void)` 就地丢弃。而应答**真的会丢**：
+
+* `iv_transport_send()` 在非 `UP` 时直接回 `IV_ESTATE`（刻意不积压过期 ACK）；
+* `iv_transport_open()` / `close()` 会把 `tx_len` 清零，而 `iv_transport_send()` 只是
+  memcpy 进 `tbuf` —— 真 `write()` 要等 reactor 200 ms 节拍。
+
+于是"链路恰好在重连/切网的那一瞬间"发出的应答**永久消失**，日志一个字都没有。
+`0xF3`（切网重连）与 `0xF4`（`ip addr flush`）就是这条的两种变体。
+
+修法**不逐个调用点改**，而是把判定收进 `iv_proto_ack()` 自己：
+
+[source,c]
+----
+rc = iv_proto_send(pf, cmd, pf->last_qn1, pf->last_qn2, &code, 1);
+if (rc != IV_OK)
+    IV_LOG_W(PROTO_MOD, "ack 0x%02X/0x%02X could not be sent (rc=%d): the "
+             "platform will report a timeout", (unsigned)cmd, (unsigned)code, rc);
+return rc;
+----
+
+理由与 `iv_netcfg_if_addr_equals()` 同：**判断抽到一处复用**，"靠每个调用点记得判"必然再漏一次。
+
+=== 三是 `0xE1`/`0xE3` 的发送失败分支**根本不存在**
+
+[source,c]
+----
+if (iv_proto_send_json(&rp->pf, json, (size_t)n) == IV_OK) {
+    rp->query_resp++;
+    IV_LOG_I(REP_MOD, "E3 reply: %s", json);
+}
+----
+
+没有 `else`。"JSON 组好了、一个字没发出去"这种情形**既无日志也无应答**，
+现场看到的是平台超时 ＋ 板端一片安静 —— 最难查的一类。两处都补上 `else`：记日志 ＋ 回 `0x74`。
+
+=== 四是新增 `tests/integration/platcmd_e2e.py`：把"排查其余指令"变成可复现的答案
+
+前面的排查都靠读码。`static` handler ＋ 装配层注册，单测和 `test_e2e_report.c` 都够不到，
+读码看不出"顺序与落点"的错。所以这一轮补了一个**真冒充平台**的用例：
+
+* 在 VM 上真监听 TCP，把 `net.server.*` 指到**本机出口网卡的地址**（不是 `127.0.0.1`：
+  `bind_ifname` ＋ `SO_BINDTODEVICE` 下连回环会永远 `EINPROGRESS`，D-01 那条）；
+* 开头先 `netthr.reboot_max=0` 关自愈（平台连不通时自愈会真重启机器）；
+* 逐条下发，三件事对账：**应答码** / **副作用**（配置键真变了、日志真打了 applied）/
+  **未实现命令必须 `0x74`**；
+* `0xF4` **只发同值**（真改地址会把 VM 的 SSH 掐掉），仍覆盖解析＋应答＋早返回判据。
+
+=== 本轮最值得记的一条：用例自己写错，症状和"设备不回"一模一样
+
+e2e 第一版把**全部 17 项应答**判成 FAIL，而设备侧日志显示 ack 全都发出去了。原因：
+
+> **设备→平台的二进制帧头是 `0x0F0F`（`IV_PROTO_HEAD_UP`），不是下行那个 `0xF0F0`
+> （`IV_PROTO_HEAD_DOWN`）。**
+
+用例照下行头去认，把所有 ACK/心跳当噪声丢了。这一条与"响应包是不是写错了先自查"是同一课：
+**先拿设备侧日志 ＋ 原始字节两头对账，再断言是谁的问题。** 与设备无关的失败，比设备故障更费时间。
+
+=== 验证
+
+* `platcmd_e2e.py`：**34 项断言全过**。覆盖 `0xE1/E2/E3/E4/E7`、`0xF3`(同值)/`F4`(同值)/`F5`/`F8`/`A5`、
+  未实现的 `0xE5/F2/A3/A4/FE`（各回 `0x74`）。
+* `0xE7` 的判据刻意不是"必须 `0x01`"，而是"**应答码必须与执行结果一致**"：没配 SNMP 目标时
+  `iv_agent_snmp_start()` 回 `IV_ESTATE`，那时**该**回 `0x74`（VM 上实测 `rc=-7 ⇒ 0x74`）。
+  撒谎才是缺陷 —— 那正是 2026-10-20 那批"二十多条没实现的指令全回 OK"的病根。
+* 门禁（VM）：`make host` 0 告警、`make test` 46/46、`make arm` 0 告警
+  （`build/arm/ivsboxd` = `5be5a84c640573fdf659094cfc88d699`）。
+
+=== 仍未做
+
+* `0xF3` **真改**传输模式的那条路径没进自动化（会让假平台掉线、得重连后继续，
+  且真值来自 `sys.transport.mode`，重连期间的 ACK 顺序才是被修的东西）。**靠 `test_transport` c12
+  钉机制 ＋ 板端复测。**
+* `0xF4` **真改**地址同理（VM 上会断 SSH），只有板端 `192.168.2.120 → .121 → .120` 两次实测。

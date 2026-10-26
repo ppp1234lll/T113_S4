@@ -451,6 +451,14 @@ static void h_query_version(const iv_proto_frame_t *f, void *arg)
          * 回的内容对不对（字段名写错也照样计数）。E3 是人工点击触发、频率极低，
          * 一条日志换"不用抓包就能对账"。 */
         IV_LOG_I(REP_MOD, "E3 reply: %s", json);
+    } else {
+        /* 发送失败（链路不在 UP，`iv_proto_send_json()` 回 `IV_ESTATE`）必须留痕：
+         * 原来这里是**没有 else 的**，于是"JSON 组好了、一个字没发出去"这种情形
+         * 既没有日志也没有应答，现场看到的就是平台超时 ＋ 板端一片安静。
+         * 补一条失败应答，至少让平台立刻拿到明确的 0x74 而不是干等。 */
+        IV_LOG_W(REP_MOD, "E3 reply send failed, fallback ack 0x%02X",
+                 (unsigned)IV_PROTO_ERR_EXEC);
+        (void)iv_proto_ack(&rp->pf, f->cmd, IV_PROTO_ERR_EXEC);
     }
 }
 
@@ -487,6 +495,12 @@ static void h_query_cfg(const iv_proto_frame_t *f, void *arg)
         rp->query_resp++;
         /* 同 E3：把整条应答打进日志，"回了"和"回对了"是两件事。 */
         IV_LOG_I(REP_MOD, "E1 reply: %s", json);
+    } else {
+        /* 同 E3：没有 else 的话，"JSON 组好了但一个字没发出去"既无日志也无应答，
+         * 现场看到的是平台超时 ＋ 板端一片安静（最难查的那一类）。 */
+        IV_LOG_W(REP_MOD, "E1 reply send failed, fallback ack 0x%02X",
+                 (unsigned)IV_PROTO_ERR_EXEC);
+        (void)iv_proto_ack(&rp->pf, f->cmd, IV_PROTO_ERR_EXEC);
     }
 }
 

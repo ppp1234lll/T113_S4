@@ -34,6 +34,7 @@
 #include "ivsbox/iv_db.h"
 #include "ivsbox/iv_health.h"
 #include "ivsbox/iv_log.h"
+#include "ivsbox/iv_netcfg.h"
 #include "ivsbox/iv_provision.h"
 #include "ivsbox/iv_reactor.h"
 #include "ivsbox/iv_taskpool.h"
@@ -1531,6 +1532,186 @@ static void on_plat_mode(const iv_proto_frame_t *f, void *arg)
                        (rc == IV_OK) ? IV_PROTO_ACK_OK : IV_PROTO_ERR_EXEC);
 }
 
+/* ---------------------------------------------------------------------------
+ * 平台下行 0xF4「配置设备 IP、网关」
+ *
+ * 载荷 12 字节：4 B IP ＋ 4 B 掩码 ＋ 4 B 网关（**全部大端/网络序**），与参考实现
+ * `com.c:com_set_local_net()` 一致。板端实测抓到过真帧：
+ *   `f0f0110a000b2cc1 f4 ffffffffffffffff 0c c0a80279 ffffff00 c0a80201 a3 ff...`
+ *                                    ↑len      ↑.121      ↑/24       ↑.1
+ *
+ * ============================ 顺序是这条命令的全部难点 ============================
+ * 改本机地址会**立刻断开**平台上那条 TCP。所以顺序只能是：
+ *   ① 校验并解析 ⇒ ② 落盘（失败还能如实回 0x74）⇒ ③ **先把 0x01 发出去**
+ *   ⇒ ④ 等一个往返的工夫 ⇒ ⑤ 才真正 flush/加地址。
+ * 把 ⑤ 提到 ③ 前面，平台永远收不到应答 —— 界面上照样显示"执行失败"，
+ * 而我们连原因都换掉了，比现在更难查。
+ * ④ 那 100 ms 不是随手 sleep：`send()` 只是把字节交给内核，紧跟其后的 `addr flush`
+ * 会把这条连接 RST 掉，缓冲里没来得及发的字节一起丢。
+ * ------------------------------------------------------------------------- */
+static void app_sleep_ms(unsigned ms)
+{
+    struct timespec ts;
+
+    ts.tv_sec  = (time_t)(ms / 1000u);
+    ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
+    (void)nanosleep(&ts, NULL);
+}
+
+static void on_plat_local_net(const iv_proto_frame_t *f, void *arg)
+{
+    static const char *const keys[3] = {"net.ip", "net.mask", "net.gateway"};
+    iv_netcfg_t c;
+    char        ipbuf[INET_ADDRSTRLEN]   = "";
+    char        maskbuf[INET_ADDRSTRLEN] = "";
+    char        gwbuf[INET_ADDRSTRLEN]   = "";
+    char        oldv[3][INET_ADDRSTRLEN];
+    const char *cur = NULL;
+    int         rc;
+    int         i;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+
+    rc = iv_netcfg_parse(f->data, f->len, &c);
+    if (rc != IV_OK) {
+        IV_LOG_W(APP_MOD, "0xF4 payload rejected (rc=%d, %u bytes), ack 0x74",
+                 rc, (unsigned)f->len);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    if (inet_ntop(AF_INET, &c.ip, ipbuf, sizeof ipbuf) == NULL ||
+        inet_ntop(AF_INET, &c.mask, maskbuf, sizeof maskbuf) == NULL ||
+        inet_ntop(AF_INET, &c.gw, gwbuf, sizeof gwbuf) == NULL) {
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    /* 同值早返回：每应用一次就要拆一次链路，不能为"什么都没变"付这个代价。
+     * 三个键都比，不能只比 IP —— 只改网关也是合法的下发。 */
+    if (iv_config_get_str(g_cfg, keys[0], &cur) == IV_OK && cur != NULL &&
+        strcmp(cur, ipbuf) == 0) {
+        if (iv_config_get_str(g_cfg, keys[1], &cur) == IV_OK && cur != NULL &&
+            strcmp(cur, maskbuf) == 0) {
+            if (iv_config_get_str(g_cfg, keys[2], &cur) == IV_OK && cur != NULL &&
+                strcmp(cur, gwbuf) == 0) {
+                IV_LOG_I(APP_MOD, "0xF4 unchanged (%s/%s gw %s), ack 0x01, link untouched",
+                         ipbuf, maskbuf, gwbuf);
+                (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+                return;
+            }
+        }
+    }
+
+    /* ---- 落盘：写不进去就如实回 0x74，**不动网络** ----
+     * 反过来（先改网络再落盘）会留下"地址改了但存不住"的状态：重启又回旧地址，
+     * 现场看到的是"改过、自己变回去了"，比直接失败难查十倍。 */
+    (void)memset(oldv, 0, sizeof oldv);
+    for (i = 0; i < 3; i++) {
+        const char *o = NULL;
+        int         j;
+
+        if (iv_config_get_str(g_cfg, keys[i], &o) == IV_OK && o != NULL)
+            (void)snprintf(oldv[i], sizeof oldv[i], "%s", o);
+        if (iv_config_set_str(g_cfg, keys[i], (i == 0) ? ipbuf
+                                : (i == 1) ? maskbuf : gwbuf) == IV_OK)
+            continue;
+        for (j = 0; j < i; j++) /* 已写进去的逐个退回旧值，不留半新半旧 */
+            (void)iv_config_set_str(g_cfg, keys[j], oldv[j]);
+        IV_LOG_W(APP_MOD, "0xF4 set %s failed, rolled back, ack 0x74", keys[i]);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    {
+        int save_rc = iv_config_save(g_cfg, NULL, 0);
+
+        if (save_rc != IV_OK) {
+            for (i = 0; i < 3; i++)
+                (void)iv_config_set_str(g_cfg, keys[i], oldv[i]);
+            IV_LOG_W(APP_MOD, "0xF4 save failed (%d), rolled back, ack 0x74", save_rc);
+            (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+            return;
+        }
+    }
+
+    IV_LOG_I(APP_MOD, "platform set local net -> %s/%s gw %s (acked first, applying next)",
+             ipbuf, maskbuf, gwbuf);
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+
+    /* 先把应答送出去，再动网口 —— 见本节开头的 ④。 */
+    app_sleep_ms(100u);
+    rc = iv_netcfg_apply(&c, NULL);
+    if (rc != IV_OK)
+        IV_LOG_E(APP_MOD, "0xF4 apply failed (%d): config saved but %s NOT changed",
+                 rc, IV_NETCFG_IFNAME_DEFAULT);
+    else
+        IV_LOG_I(APP_MOD, "0xF4 applied: this host is now %s/%s gw %s",
+                 ipbuf, maskbuf, gwbuf);
+}
+
+/* 开机时把配置里存的静态地址（`net.ip`）真正应用到网口。
+ *
+ * ============================ 为什么必须有这一段 ============================
+ * "落盘"的全部意义就是**重启后还在**。没有这一步，0xF4 改完地址、一重启又回到
+ * 出厂那套，平台会看到设备"自己变回去"，比改动不生效更难查。
+ *
+ * 出厂默认 `net.ip` 是空串（"由 DHCP 分配"）⇒ **什么都不做**，绝不覆盖现场
+ * 由 rootfs/DHCP 配出来的地址。这一条是安全底线：写错了也不能让设备一开机就没网。
+ *
+ * IP 已经等于目标时直接跳过：否则每次开机都要 flush 一遍地址，平台那条 TCP
+ * 刚建好就被自己踹掉，日志上表现为"开机后平台反复重连"。
+ */
+static void apply_saved_local_net(void)
+{
+    iv_netcfg_t c;
+    const char *ip = NULL;
+    const char *mask = NULL;
+    const char *gw = NULL;
+    char        addrbuf[INET_ADDRSTRLEN + 8];
+
+    if (g_cfg == NULL)
+        return;
+    if (iv_config_get_str(g_cfg, "net.ip", &ip) != IV_OK || ip == NULL || ip[0] == '\0')
+        return;
+    if (iv_config_get_str(g_cfg, "net.mask", &mask) != IV_OK || mask == NULL)
+        return;
+    if (iv_config_get_str(g_cfg, "net.gateway", &gw) != IV_OK || gw == NULL)
+        return;
+
+    (void)memset(&c, 0, sizeof c);
+    if (inet_pton(AF_INET, ip, &c.ip) != 1 ||
+        inet_pton(AF_INET, mask, &c.mask) != 1 ||
+        inet_pton(AF_INET, gw, &c.gw) != 1) {
+        IV_LOG_W(APP_MOD, "saved net.ip/mask/gateway not parseable (%s/%s/%s), skipped",
+                 ip, mask, gw);
+        return;
+    }
+    /* 与下发路径共用同一套校验：配置是人手改文件也能写进去的，不能假定它合法。 */
+    {
+        uint8_t raw[IV_NETCFG_PAYLOAD_LEN];
+
+        (void)memcpy(raw, &c.ip, 4u);
+        (void)memcpy(raw + 4, &c.mask, 4u);
+        (void)memcpy(raw + 8, &c.gw, 4u);
+        if (iv_netcfg_parse(raw, sizeof raw, &c) != IV_OK) {
+            IV_LOG_W(APP_MOD, "saved local net rejected by the same guards, skipped");
+            return;
+        }
+    }
+
+    (void)snprintf(addrbuf, sizeof addrbuf, "%s/%d", ip, iv_netcfg_prefix(c.mask));
+    if (iv_netcfg_if_ip_equals(NULL, c.ip) == 1) {
+        IV_LOG_I(APP_MOD, "saved local net %s already in place, not touching the link",
+                 addrbuf);
+        return;
+    }
+    if (iv_netcfg_apply(&c, NULL) == IV_OK)
+        IV_LOG_I(APP_MOD, "saved local net applied at boot: %s gw %s", addrbuf, gw);
+    else
+        IV_LOG_E(APP_MOD, "saved local net %s could NOT be applied at boot", addrbuf);
+}
+
 static int agent_setup(void)
 {
     iv_agent_cfg_t ac;
@@ -1717,6 +1898,11 @@ static int agent_setup(void)
     /* 平台下行 0xF3「配置传输模式」：同样要写配置 ＋ 立刻生效，
      * 只有装配层够得着 g_cfg 与 agent 句柄（2026-10-21 补）。 */
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_MODE, on_plat_mode, NULL);
+    /* 平台下行 0xF4「配置设备 IP、网关」：本条**会改本机网口地址**，只有装配层
+     * 够得着 g_cfg，且 `iv_netcfg_apply()` 属于"改系统"的动作，不该由协议层代劳
+     * （2026-10-26 补；此前落默认分支回 0x74，平台点「配置IP和网关」一直失败）。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_LOCAL_NET,
+                         on_plat_local_net, NULL);
     return 0;
 }
 
@@ -1855,6 +2041,18 @@ static int app_init(void)
         IV_LOG_E(APP_MOD, "config open failed");
         return -1;
     }
+
+    /* 1b. 把配置里存的静态地址（`net.ip`/`net.mask`/`net.gateway`）应用到网口。
+     *     放在这里而不是后面，有两个原因：
+     *     ① 越早越好 —— 后面每一步（DB、taskpool、reactor、agent）都可能自己
+     *        用网络；地址晚一步就位，早起的那些连接全走旧地址，日志上看起来
+     *        像"偶尔连不上"，其实是自己把网口换掉了。
+     *     ② 此刻还是单线程（taskpool/reactor 都没建），`iv_netcfg_apply()` 里
+     *        的 fork 是教科书意义上安全的；等到多线程再 fork，子进程只允许调
+     *        async-signal-safe 函数，而 execv 之前的每一步都得反复证明。
+     *     出厂默认 `net.ip` 是空串 ⇒ 直接返回，不动现场由 rootfs/DHCP 配出来的
+     *     地址（这条是安全底线，见函数注释）。 */
+    apply_saved_local_net();
 
     /* 2. SQLite */
     if (iv_db_open(NULL, &g_db) != IV_OK) {

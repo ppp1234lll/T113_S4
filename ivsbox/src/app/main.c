@@ -1495,7 +1495,83 @@ static void on_plat_report_intv(const iv_proto_frame_t *f, void *arg)
  * 生效会**拆一次现有平台连接**（活动出口换了就得按新出口重连，见
  * iv_agent_set_transport_mode 的说明），所以同值下发直接回 0x01、不重复落盘、
  * 不重复重连。
+ *
+ * ==================== ACK 必须在切链路**之前**发出去 ====================
+ * 板端实测（2026-10-26 14:38:30）：平台下发 `f3 … 01 45 ffff`（改成有线），设备侧
+ * 一路都对 —— `transport mode -> 1 (active wan 0 -> 1)`、`bind=eth0`、落盘 version=90、
+ * 重连后 `transport state -> 2`（链路恢复、心跳照收）—— 但平台界面"点了没反应"。
+ * 原因是**应答被自己掐掉了**：
+ *
+ *   ① `iv_agent_set_transport_mode()` → `iv_agent_reload_server()` → 重连；
+ *   ② 重连走 `iv_transport_open()`，那里把 `t->tx_len` **清零**；
+ *   ③ 而 `iv_transport_send()` 只是把帧 memcpy 进 `tbuf`，真正的 `write()` 在
+ *      `iv_transport_step()` 里按 reactor 节拍（200 ms）才刷；
+ *   ④ 于是"先切网、后 ACK" ⇒ ACK 进来时 `state` 已不是 `UP`，`iv_transport_send()`
+ *      直接回 `IV_ESTATE`（它**刻意不积压**："宁可让调用方丢弃，也不积压过期 ACK"）；
+ *      就算抢在切网前进了 `tbuf`，也会被 ② 清掉。
+ *      **两条路都是帧永久消失**，而 `(void)` 把返回码吞了，日志里一个字都没有。
+ *
+ * 这与 `0xF4` 是同一个坑的两个变体（那边是 `ip addr flush` 拆链路）。区别是那边
+ * 还能用 `nanosleep(100 ms)` 等 `send()` 的字节出内核 —— **这里不行**：帧根本还没
+ * `write()`，睡多久都躺在用户态暂存里。所以只能**把切网本身延后**到下一轮 reactor
+ * （600 ms ≈ 3 个节拍），让 ACK 先被正常刷出去。
+ *
+ * 代价：落盘被挪进延后段，它失败时就只能记日志、没法再回 `0x74`（平台已经收到
+ * `0x01`）。这是"应答要真实"与"链路已经不在了"之间躲不开的取舍，与 `0xF4` 的
+ * `flush` 失败同理 —— 好在 `iv_config_save()` 只会在整表校验不过时失败，而我们
+ * 刚写进去的只是一个 `1..4` 的枚举。
  * ------------------------------------------------------------------------- */
+
+/* 1＝"落盘＋切网"已排队一次。重发的同一条 0xF3 会走上面的同值早返回，进不到这里。 */
+static int g_tmode_apply_queued;
+
+/* `0xF3` 的"落盘 ＋ 切网"延后到这里执行，理由见 `on_plat_mode()` 上方。
+ *
+ * 延后段读**配置当前值**而不是把 mode 存进全局：期间若又来一条不同的 0xF3，
+ * 配置里的值已经是新的，直接按最新值生效即可（幂等，不需要"最后一次谁赢"的判定）。 */
+static void on_transport_mode_apply_timer(void *arg)
+{
+    int64_t v = 0;
+    int     mode;
+    int     arc;
+    int     src;
+
+    (void)arg;
+    g_tmode_apply_queued = 0;
+    if (g_cfg == NULL)
+        return;
+    if (iv_config_get_int(g_cfg, "sys.transport.mode", &v) != IV_OK)
+        return;
+    mode = (int)v;
+
+    /* 先落盘：它成功时会通过 `on_cfg_committed(SYS)` 顺带把模式切过去。 */
+    src = iv_config_save(g_cfg, NULL, 0);
+    if (src != IV_OK)
+        IV_LOG_E(APP_MOD, "0xF3 mode=%d applied but NOT saved (rc=%d): it will "
+                 "revert on the next boot", mode, src);
+
+    /* 再显式调一次兜底：`save` 的通知若因故障没派发（或掩码里没有 SYS），
+     * 这里是唯一的生效入口。同值早返回，重复调用无害。 */
+    arc = iv_agent_set_transport_mode(&g_agent, (iv_netmgr_mode_t)mode,
+                                      iv_clock_monotonic_ms());
+    IV_LOG_I(APP_MOD, "platform set transport mode -> %d applied (apply rc=%d, save rc=%d)",
+             mode, arc, src);
+}
+
+static void schedule_transport_mode_apply(void)
+{
+    if (g_reactor == NULL)
+        return;
+    if (g_tmode_apply_queued)
+        return; /* 已排一次队；定时器按配置当前值生效，再排只会多存一次盘 */
+    if (iv_timer_add(g_reactor, 600u, on_transport_mode_apply_timer, NULL) == NULL) {
+        IV_LOG_E(APP_MOD, "transport mode timer full -- 0xF3 was acked but will NOT "
+                 "be applied until the next boot");
+        return;
+    }
+    g_tmode_apply_queued = 1;
+}
+
 static void on_plat_mode(const iv_proto_frame_t *f, void *arg)
 {
     int64_t cur = 0;
@@ -1524,6 +1600,9 @@ static void on_plat_mode(const iv_proto_frame_t *f, void *arg)
         return;
     }
 
+    /* 只改内存里的值，**不动链路、不落盘** —— `iv_config_set_int()` 不派发提交
+     * 通知，所以这一步是安全的。写进去之后重发的同一条 0xF3 会走上面的同值早返回，
+     * 不会重复挂定时器。 */
     rc = iv_config_set_int(g_cfg, "sys.transport.mode", (int64_t)mode);
     if (rc != IV_OK) {
         IV_LOG_W(APP_MOD, "0xF3 mode=%d rejected by config layer (%d), ack 0x74",
@@ -1531,18 +1610,15 @@ static void on_plat_mode(const iv_proto_frame_t *f, void *arg)
         (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
         return;
     }
-    /* 先让新模式在运行期生效，再落盘（落盘失败只影响下次启动）。
-     * 配置层保存后还会通知 on_cfg_committed(SYS) 再调一次 —— 同值早返回，不会抖。 */
-    rc = iv_agent_set_transport_mode(&g_agent, (iv_netmgr_mode_t)mode,
-                                     iv_clock_monotonic_ms());
-    {
-        int save_rc = iv_config_save(g_cfg, NULL, 0);
 
-        IV_LOG_I(APP_MOD, "platform set transport mode -> %d (apply rc=%d, save rc=%d)",
-                 mode, rc, save_rc);
-    }
-    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd,
-                       (rc == IV_OK) ? IV_PROTO_ACK_OK : IV_PROTO_ERR_EXEC);
+    /* ACK 先走。返回码**不能丢** —— 丢了就等于"平台收不到 0x01 而我们不知道"，
+     * 正是这次要修的那种情形。 */
+    rc = iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+    if (rc != IV_OK)
+        IV_LOG_W(APP_MOD, "0xF3 ack=0x01 could not be queued (%d): platform will "
+                 "report a timeout", rc);
+
+    schedule_transport_mode_apply();
 }
 
 /* ---------------------------------------------------------------------------

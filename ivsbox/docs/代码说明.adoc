@@ -6511,3 +6511,107 @@ if (iv_netcfg_if_addr_equals(NULL, c.ip, c.mask) == 1) { ... return; }
   `config.apply` 才观测得到，只做了代码走查，留待板端实测（改一次 IP 看日志里
   `saved local net ... applied` 是否在 `config.apply` 之后约 1 秒出现）。
 * 网关单独变化（IP 与掩码都不变）仍不会被同值判定发现，见上文取舍。
+== 2026-10-26 14:47 平台 `0xF3`「传输模式」：ACK 被自己掐掉的那一类坑
+
+=== 用户的问题
+
+「传输模式修改后，没有反应。」
+
+=== 设备侧其实全对
+
+板端 14:38:30 抓到真帧 `f0f0110a000b2cc1 f3 ffffffffffffffff 01 01 45 ffff`（cmd `0xF3`、
+len 1、mode `0x01`＝有线），紧接着这一串：
+
+[source,text]
+----
+14:38:30 INFO [agent]  transport mode -> 1 (active wan 0 -> 1)
+14:38:30 INFO [agent]  server addr reloaded -> 47.104.250.225:6013 (wan=eth0, bind=eth0)
+14:38:30 INFO [report] transport reconnect on route switch
+14:38:30 INFO [cfg]    ivsbox: saved 150 keys, version=90
+14:38:30 INFO [app]    platform set transport mode -> 1 (apply rc=0, save rc=0)
+14:38:30 INFO [report] transport state -> 3
+14:38:31 INFO [report] transport state -> 1
+14:38:31 INFO [report] transport state -> 2      ← 又连上了，之后心跳照收
+----
+
+配置存了、模式切了、链路也重连回来 —— **坏在应答上**：`0x01` 被自己掐掉了。
+
+=== 根因链（读代码能完整复原）
+
+[cols="1,4", options="header"]
+|===
+| 步
+| 发生了什么
+
+| ①
+| `iv_agent_set_transport_mode()` → `iv_agent_reload_server()` → 要按新出口重连
+
+| ②
+| 重连走 `iv_transport_open()`，那里把 `t->tx_len` **清零**
+
+| ③
+| 而 `iv_transport_send()` 只是把帧 `memcpy` 进 `tbuf`；真正的 `write()` 在
+  `iv_transport_step()` 里按 reactor 节拍（200 ms）才发生
+
+| ④
+| 于是"先切网、后 ACK"必然丢两条路：ACK 进来时 `state` 已非 `UP` ⇒ `iv_transport_send()`
+  直接回 `IV_ESTATE`（**刻意不积压**："宁可让调用方丢弃，也不积压过期 ACK/心跳"）；
+  就算抢在切网前进了 `tbuf`，也会被 ② 清掉
+
+| ⑤
+| 旧代码 `(void)iv_proto_ack(...)` 把返回码吞了 ⇒ **日志里一个字都没有**，
+  现场只能看到"设备全对、平台没反应"
+|===
+
+=== 与 `0xF4` 的关系：同一个坑的两个变体
+
+`0xF4`（改本机 IP）当初就是栽在这上面 —— `ip addr flush` 把平台那条 TCP 拆掉，ACK 若在其后
+就永远发不出去。修法是「先 ack、再 `nanosleep(100 ms)`、最后 flush」。
+
+**这里不能照抄那个 sleep**：`0xF4` 那边睡是等 `send()` 的字节出内核；而 `0xF3` 这条路上帧
+**根本还没 `write()`**，睡多久都躺在用户态暂存里。所以只能**把切网本身延后**：
+
+[source,c]
+----
+/* 只改内存：iv_config_set_int() 不派发提交通知，不动链路 */
+iv_config_set_int(g_cfg, "sys.transport.mode", mode);
+
+/* ACK 先走，返回码不丢 */
+rc = iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+if (rc != IV_OK) IV_LOG_W(..., "platform will report a timeout", rc);
+
+/* 落盘＋切网延后 600 ms（≈3 个 reactor 节拍），让 ACK 先被正常刷出去 */
+schedule_transport_mode_apply();
+----
+
+延后段里读**配置当前值**而不是把 mode 存进全局：期间若又来一条不同的 `0xF3`，配置里的值
+已经是新的，直接按最新值生效即可（幂等，不需要"最后一次谁赢"的判定）。
+
+=== 代价（写在这里，别以为没有）
+
+落盘被挪进延后段，它失败时就只能记 ERROR、没法再回 `0x74`（平台已经收到 `0x01`）。
+这是"应答要真实"与"链路已经不在了"之间躲不开的取舍，与 `0xF4` 的 `flush` 失败同理 ——
+好在 `iv_config_save()` 只会在整表校验不过时失败，而我们刚写进去的只是一个 `1..4` 的枚举。
+
+=== 单测与证伪
+
+* `test_transport` 新增 **c12**：把一帧送进暂存（**不 step**）后 `close + open`（＝
+  `reload_server` 的重连路径），断言 `tx_pending == 0` **且对端一个字节都收不到**。
+  后一条才是判据 —— 只断言 pending==0 分不开"被清掉"和"已经写出去过"。
+* **反向证伪**：删掉 `iv_transport_close()` 的 `t->tx_len = 0;` ⇒
+  `FAIL: c12 close drops the staged frame`、`test_transport FAILED (1)`；还原后 md5
+  `be83855a34253f547c4e142bdaf64572` 逐字节一致、复绿。
+* 门禁（VM）：`make host` 0 告警、`make test` 46/46、`make asan` 46/46 零报告、
+  `setarch -R make tsan` 46/46 零报告、`make arm` 0 告警（md5
+  `36e38e3b42f57f73e3695f1f0970d28d`）、`make analyze` 先 `rm -rf build/analyze`
+  （70 条编译行）0 告警、`make itest` 17/17。
+
+=== 未做
+
+* `on_plat_mode()` 的**顺序本身**没有自动化用例：handler 是 `main.c` 里的 `static`，app 层
+  `.c` 不进静态库，要测就得真拉起 daemon ＋ 一个假平台 TCP（还得在 netns 里造网卡，
+  绕开 `bind_ifname` / `SO_BINDTODEVICE` 那个 D-01 陷阱）。**c12 钉的是机制，顺序靠代码走查
+  ＋ 板端复测。**
+* 已把**所有**平台下行命令过了一遍：能"动链路"的只有 `0xF4`（已修）与 `0xF3`（本次）。
+  `0xF8` 只重建探测表、不碰平台 TCP；`0xF5` 只改上报周期；`0xF7`（配置事务）只走 web 侧 ctl，
+  平台发不到。**以后新增任何会重连/改网口的命令，第一件事都是"ACK 在它前面"。**

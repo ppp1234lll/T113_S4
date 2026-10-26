@@ -946,6 +946,97 @@ static void c11_bind_if(void)
     chk(iv_transport_open(&t, &c) == IV_ERANGE, "c11 over-long ifname rejected at open");
 }
 
+/* ---------------------------------------------------------------------------
+ * c12 切链路会**丢掉暂存里还没刷出去的帧** —— 这就是 `0xF3`「平台点了没反应」的机制
+ * 本身（2026-10-26 板端实测：设备一路都对，平台却收不到 0x01）。
+ *
+ * `iv_transport_send()` 只把字节 memcpy 进 `tbuf`，真正的 `write()` 在
+ * `iv_transport_step()` 里按 reactor 节拍才发生；而 `iv_transport_close()` /
+ * `iv_transport_open()`（`iv_agent_reload_server()` 的重连就走这条）会把 `tx_len`
+ * 清零。于是"先切网、后 ACK"必然是：
+ *
+ *     ack → 进 tbuf（还没写） → 切网重连 ⇒ ACK 永久消失
+ *
+ * 断言"对端**一个字节都没收到**"才是判据 —— 只断言 pending==0 分不开"被清掉"和
+ * "已经写出去过"。
+ *
+ * 反向证伪：把 `iv_transport_close()` / `iv_transport_open()` 里的 `tx_len = 0`
+ * 删掉，本用例必红。
+ * ------------------------------------------------------------------------- */
+static void c12_link_change_drops_pending(void)
+{
+    static const uint8_t frame[] = {0x0f, 0x0f, 0x11, 0x0a, 0x00, 0x0b, 0x2c, 0xc1,
+                                    0xf3, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                    0xff, 0x01, 0x01, 0x45, 0xff, 0xff};
+    struct sockaddr_in  sa;
+    socklen_t           sl = sizeof sa;
+    iv_transport_t      t;
+    iv_transport_cfg_t  c;
+    uint64_t            now = 0;
+    uint16_t            port;
+    struct pollfd       pfd;
+    char                b[64];
+    int                 ls;
+    int                 cs;
+    int                 i;
+
+    ls = socket(AF_INET, SOCK_STREAM, 0);
+    chk(ls >= 0, "c12 socket");
+    if (ls < 0)
+        return;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family      = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port        = 0;
+    chk(bind(ls, (struct sockaddr *)&sa, sizeof sa) == 0, "c12 bind");
+    chk(listen(ls, 4) == 0, "c12 listen");
+    chk(getsockname(ls, (struct sockaddr *)&sa, &sl) == 0, "c12 getsockname");
+    port = (uint16_t)ntohs(sa.sin_port);
+
+    memset(&c, 0, sizeof c);
+    c.host = "127.0.0.1";
+    c.port = port;
+
+    iv_transport_init(&t);
+    chk(iv_transport_open(&t, &c) == IV_OK, "c12 open");
+
+    for (i = 0; i < 500 && iv_transport_state(&t) != IV_TRANSPORT_UP; i++) {
+        now += 10;
+        iv_transport_step(&t, now);
+    }
+    chk(iv_transport_state(&t) == IV_TRANSPORT_UP, "c12 reached UP");
+
+    pfd.fd      = ls;
+    pfd.events  = POLLIN;
+    pfd.revents = 0;
+    chk(poll(&pfd, 1, 2000) > 0, "c12 pending accept");
+    cs = accept(ls, NULL, NULL);
+    chk(cs >= 0, "c12 accept");
+    (void)close(ls);
+    if (cs < 0) {
+        (void)iv_transport_close(&t);
+        return;
+    }
+
+    /* 入暂存但**不 step** —— 等价于"ACK 刚发完、还没到下一个节拍" */
+    chk(iv_transport_send(&t, frame, sizeof frame) == IV_OK, "c12 send queues");
+    chk(iv_transport_tx_pending(&t) == sizeof frame,
+        "c12 frame sits in the staging buffer, not yet on the wire");
+
+    /* 切链路：`iv_agent_reload_server()` 走的就是 close + open */
+    chk(iv_transport_close(&t) == IV_OK, "c12 close");
+    chk(iv_transport_tx_pending(&t) == 0u,
+        "c12 close drops the staged frame (this is exactly what 0xF3 hit)");
+    chk(iv_transport_open(&t, &c) == IV_OK, "c12 reopen");
+    chk(iv_transport_tx_pending(&t) == 0u, "c12 reopen keeps it dropped");
+
+    chk(recv(cs, b, sizeof b, MSG_DONTWAIT) <= 0,
+        "c12 peer receives nothing: the frame is gone, not merely delayed");
+
+    (void)iv_transport_close(&t);
+    (void)close(cs);
+}
+
 int main(void)
 {
     c01_args();
@@ -959,6 +1050,7 @@ int main(void)
     c09_eof();
     c10_real_loopback();
     c11_bind_if();
+    c12_link_change_drops_pending();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_transport FAILED (%d)\n", g_fail);
@@ -966,6 +1058,6 @@ int main(void)
     }
     printf("test_transport passed (args, connect/send/rx, async-connect, "
            "partial-write, backoff, pump-order-ack, send-guard, drop-repull, "
-           "eof, real-loopback, bind-if)\n");
+           "eof, real-loopback, bind-if, link-change-drops-pending)\n");
     return 0;
 }

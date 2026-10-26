@@ -1184,10 +1184,20 @@ static void probe_drive(iv_agent_t *a, uint64_t now_ms)
     int n;
     int i;
 
-    (void)iv_probe_tick(&a->pb, now_ms);
-
-    /* 活动 fd 逐个补可读/可写处理；两者对"不认识的 fd"只返回错误码、不误处理，
-     * 故循环调用安全（见 iv_agent.h 的取舍说明）。 */
+    /* ⚠ **顺序不能反：先读回包，再判超时**（2026-10-26 修）。
+     *
+     * 本函数由 `on_pb_timer` 每 `IV_AGENT_PROBE_TICK_MS`(=200 ms) 驱动一次，
+     * 而 `iv_probe_tick()` 里第一件事就是"在飞且已超时 ⇒ 记丢包"。原来先 tick
+     * 后 drain，于是：**只要 `probe.timeout_ms` 不大于一个驱动节拍，回包就永远
+     * 等不到被读的那一刻** —— 上一拍判超时、下一拍才轮到读，循环往复，该探测项
+     * 稳定 100% 丢包（`fail_n` 攒满 ⇒ `wan_up` 归 0 ⇒ 界面「链路断开」，
+     * 而链路其实是好的）。
+     *
+     * 这不是理论上的边界：`0xFE` / 网页都能把超时设成 100 ms（配置下界就是 100），
+     * 现场一旦填 100，无线那一路立刻全红 —— 2026-10-26 17:12 用户遇到的就是这个，
+     * 表象是「双链路断开 / 主网1 断开」，实际平台 TCP 正常、上报正常。
+     *
+     * 先 drain 的语义也是对的：**先看有没有已到达的回包，再判"该来的没来"**。 */
     n = iv_probe_fd_count(&a->pb);
     for (i = 0; i < n; i++) {
         int fd = iv_probe_fd_at(&a->pb, i);
@@ -1196,6 +1206,8 @@ static void probe_drive(iv_agent_t *a, uint64_t now_ms)
         (void)iv_probe_on_readable(&a->pb, fd, now_ms);
         (void)iv_probe_on_writable(&a->pb, fd, now_ms);
     }
+
+    (void)iv_probe_tick(&a->pb, now_ms);
 }
 
 static void netmgr_feed(iv_agent_t *a, uint64_t now_ms)

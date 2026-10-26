@@ -373,9 +373,24 @@ static int item_alloc(iv_probe_t *p, iv_probe_layer_t layer, int ifindex,
     return p->n_items - 1;
 }
 
-/* 重复检测：同层且同目标（ICMP/TCP）视为重复 */
+/* 重复检测：同层、同目标、**同出口网口**才视为重复。
+ *
+ * ⚠ `ifindex` 必须参与比较（2026-10-26 修）。原来只比 (layer, dst[, port])，
+ * 而装配层 `agent_probe_build()` 是**逐 WAN 建项、所有 WAN 用同一个 dst**
+ * （`agent_probe_dst()` 取 target1，空则 target2）—— 于是第二个 WAN 必然拿到
+ * `IV_EEXIST`，`wan_probe_idx[wired]` 被置 -1，`netmgr_feed()` 直接 `continue`
+ * ⇒ **有线链路永远不参与判定**，`wan_up[WIRED]` 恒 0：
+ *   - 界面「主网2」恒"断开"、「网络状态」永远不可能是"有线已连接"；
+ *   - 自动切换模式下的"有线断则回切无线"永远不成立。
+ * 症状一直被掩盖着，因为 4G 正常时状态停在 WIRELESS_UP 看着没毛病；
+ * 一旦无线探测也失败（如探测目标从 4G 不可达），就直接掉到 BOTH_DOWN。
+ * 板端每次开机的那条 `probe item add failed for wan eth0 (-9)` 就是它
+ * （-9 = `IV_EEXIST`）。
+ *
+ * 同一个目标走不同网口是**合法且必要**的：判的是"这条链路通不通"，
+ * 两条 WAN 当然要各探一次。 */
 static int find_dup(const iv_probe_t *p, iv_probe_layer_t layer, uint32_t dst_be,
-                    uint16_t port)
+                    uint16_t port, int ifindex)
 {
     int i;
 
@@ -383,6 +398,8 @@ static int find_dup(const iv_probe_t *p, iv_probe_layer_t layer, uint32_t dst_be
         const iv_probe_item_t *it = &p->item[i];
 
         if (it->layer != layer)
+            continue;
+        if (it->ifindex != ifindex)
             continue;
         if (layer == IV_PROBE_ICMP && it->dst_be == dst_be)
             return i;
@@ -407,7 +424,7 @@ int iv_probe_add_icmp(iv_probe_t *p, uint32_t dst_be, int ifindex, const char *n
 
     if (p == NULL)
         return IV_EINVAL;
-    if (find_dup(p, IV_PROBE_ICMP, dst_be, 0) >= 0)
+    if (find_dup(p, IV_PROBE_ICMP, dst_be, 0, ifindex) >= 0)
         return IV_EEXIST;
     idx = item_alloc(p, IV_PROBE_ICMP, ifindex, name);
     if (idx < 0)
@@ -425,7 +442,7 @@ int iv_probe_add_tcp(iv_probe_t *p, uint32_t dst_be, uint16_t port, int ifindex,
         return IV_EINVAL;
     if (port == 0u)
         return IV_EINVAL;
-    if (find_dup(p, IV_PROBE_TCP, dst_be, port) >= 0)
+    if (find_dup(p, IV_PROBE_TCP, dst_be, port, ifindex) >= 0)
         return IV_EEXIST;
     idx = item_alloc(p, IV_PROBE_TCP, ifindex, name);
     if (idx < 0)

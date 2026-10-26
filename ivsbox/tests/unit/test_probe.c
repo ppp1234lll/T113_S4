@@ -747,6 +747,36 @@ static void c14_icmp_seq_engine_unique(void)
     (void)iv_probe_stop(&p);
 }
 
+/* 同一探测目标、不同出口网口：必须能各建一项（2026-10-26）。
+ *
+ * 装配层 `agent_probe_build()` 是**逐 WAN 建项、所有 WAN 共用同一个 dst**
+ * （`agent_probe_dst()` 取 target1，空则取 target2）。原来的去重只看
+ * `(layer, dst[, port])`、不含 ifindex，于是第二个 WAN 必拿 `IV_EEXIST`
+ * ⇒ `wan_probe_idx[wired] = -1` ⇒ `netmgr_feed()` 直接 `continue`
+ * ⇒ **有线链路永远不参与判定**，`wan_up[WIRED]` 恒 0：
+ * 界面「主网2」恒"断开"、状态永远到不了"有线已连接"、自动切换的"有线断→回切无线"
+ * 永不成立。板端每次开机那条 `probe item add failed for wan eth0 (-9)` 就是它
+ * （-9 = `IV_EEXIST`）——这功能从上线起就没真正跑起来过。 */
+static void c15_dual_wan_shared_dst(void)
+{
+    iv_probe_t     p;
+    iv_probe_cfg_t c = mk_cfg();
+
+    (void)iv_probe_init(&p, &c);
+    chk(iv_probe_add_icmp(&p, DST, 8, "usb0") == 0, "c15 wan0 icmp idx0");
+    chk(iv_probe_add_icmp(&p, DST, 4, "eth0") == 1,
+        "c15 同 dst 不同 ifindex 各建一项（否则有线链路永远不判定）");
+    chk(iv_probe_add_icmp(&p, DST, 8, "dup") == IV_EEXIST,
+        "c15 同 dst 同 ifindex 仍是重复");
+    chk(iv_probe_add_tcp(&p, DST, 80, 8, "t-w0") == 2, "c15 wan0 tcp idx2");
+    chk(iv_probe_add_tcp(&p, DST, 80, 4, "t-w1") == 3,
+        "c15 tcp 同端口不同 ifindex 各建一项");
+    chk(iv_probe_add_tcp(&p, DST, 80, 4, "t-dup") == IV_EEXIST,
+        "c15 tcp 同 ifindex 同端口仍是重复");
+    chk(iv_probe_count(&p) == 4, "c15 一共 4 项");
+    (void)iv_probe_stop(&p);
+}
+
 int main(void)
 {
     c01_args_and_guards();
@@ -763,6 +793,7 @@ int main(void)
     c12_icmp_packet_bytes();
     c13_retune();
     c14_icmp_seq_engine_unique();
+    c15_dual_wan_shared_dst();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_probe FAILED (%d)\n", g_fail);
@@ -770,6 +801,6 @@ int main(void)
     }
     printf("test_probe passed (args, stat window, hysteresis, degrade, link event, "
            "icmp disable/reply/packet-bytes/seq-unique, tcp result, timeout, lifecycle, "
-           "retune)\n");
+           "retune, dual-wan-shared-dst)\n");
     return 0;
 }

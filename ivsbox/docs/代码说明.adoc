@@ -6921,3 +6921,88 @@ cj_int(&j, "pn", (long long)(v / 1000));   /* 100 ms 的配置 ⇒ 平台读到 
   另外三个非法值各被各自那条判据拦住（5000→周期、2.5→整数、空→空值），还原后全绿。
 * 7 个前端 jsdom 用例 **194 断言 0 失败**；`node --check` 过。前端不参与编译，
   `make host/arm/test/analyze` 不受影响。
+
+== 2026-10-26 17:24 「链路断开」但设备一切正常：判定链上两个缺陷
+
+=== 症状与反证
+
+板端 Web「链路状态」：**网络状态＝双链路断开，主网1＝断开，主网2＝断开**。
+同一时刻的事实：
+
+[cols="1,2", options="header"]
+|===
+| 事实来源 | 读数
+
+| `/sys/class/net/*/carrier` | `eth0=1`、`usb0=1`，两个口都 up
+| 平台链路 | TCP `10.62.35.221:xxxxx → 47.104.250.225:6013` ESTABLISHED
+| 上行 | 心跳每 30 s、周期上报每 3 min，一条不缺
+| `sys.overview` | `wan.transport=up`、`bound=usb0`、`switches=0`、`txn_fail=0`
+|===
+
+`switches=0` 是最有说服力的一个数：状态机**从没执行过一次切换事务**，它只是"看不见"可用链路。
+所以问题在**判定**，链路本身没坏。
+
+=== 缺陷 1：去重键少了 ifindex
+
+`agent_probe_build()` 逐 WAN 建项，但**所有 WAN 用同一个 dst**
+（`agent_probe_dst()` 取 `probe.target1`，为空才取 `target2`）：
+
+[source,c]
+----
+for (w = 0; w < IV_WAN_N; w++) {
+    idx = iv_probe_add_icmp(&a->pb, dst, a->wan_ifindex[w], a->cfg.wan_name[w]);
+    a->wan_probe_idx[w] = (idx >= 0) ? idx : -1;   /* ← 第二个 WAN 拿到 -9 */
+}
+----
+
+而 `find_dup()` 只比 `(layer, dst[, port])`，不看 `ifindex` ⇒ 第二个 WAN 必然 `IV_EEXIST`(-9)。
+连环后果：
+
+[cols="1,3", options="header"]
+|===
+| 环节 | 结果
+
+| `wan_probe_idx[WIRED] = -1` | 有线那一路没有探测项
+| `netmgr_feed()` 见 `idx < 0` 就 `continue` | `wan_up[WIRED]` **永远是 0**
+| 界面 | 主网2 恒"断开"；状态永远到不了"有线已连接"
+| AUTO 状态机 | "有线断 → 回切无线"永不成立；双链路等于只有一条
+|===
+
+**为什么一直没被发现**：4G 正常时 `wan_up[WIRELESS]=1`，状态稳稳停在 `WIRELESS_UP`，
+界面看着"正常"；那条 `probe item add failed for wan eth0 (-9)` 每天开机都刷一次，
+但没人把它和"主网2 恒断开"对上号。**`-9` 是 `IV_EEXIST`，不是"加不上"那种"资源不够"。**
+
+修法：去重键改成 `(layer, dst, port, ifindex)` 四元组。同一目标走不同网口必须各建一项 ——
+判的是"这条链路通不通"。
+
+=== 缺陷 2：先判超时，后读回包
+
+`probe_drive()` 由 `on_pb_timer` 每 `IV_AGENT_PROBE_TICK_MS`（**200 ms**）驱动一次：
+
+[source,c]
+----
+(void)iv_probe_tick(&a->pb, now_ms);        /* ← 第一件事：在飞且超时 ⇒ 记丢包 */
+for (i = 0; i < n; i++)                      /* ← 然后才轮到读回包 */
+    (void)iv_probe_on_readable(&a->pb, fd, now_ms);
+----
+
+于是 **只要 `probe.timeout_ms` ≤ 一个驱动节拍，回包永远等不到被读的那一刻**：
+上一拍判超时、下一拍才轮到读，循环往复 ⇒ 该探测项稳定 100% 丢包。
+
+这不是理论边界 —— `probe.timeout_ms` 的配置下界就是 **100 ms**，`0xFE` 与网页都能设到它。
+这次正是用户 16:37:57 把「有线网络超时时间」设成 100 之后踩中的：
+无线那一路本来是好的，一设 100 就全红，于是从 `WIRELESS_UP` 掉到 `BOTH_DOWN`。
+
+修法：**先 drain 再 tick**。语义也更对 —— 先看有没有已到达的回包，再判"该来的没来"。
+代价是超时的实际分辨率不细于一拍（200 ms），但**再也不会把已经躺在缓冲区里的成功判成失败**。
+
+=== 验证
+
+* 单测 `c15_dual_wan_shared_dst()`：同 dst 不同 ifindex 各建一项、同 dst 同 ifindex 仍 EEXIST、
+  TCP 同端口不同 ifindex 亦然。
+* **反向证伪**：去掉 `find_dup()` 的 ifindex 比较（**保留参数使用**，否则撞
+  `-Werror=unused-parameter` 编译失败 ⇒ 跑旧二进制 ⇒ **假证伪**）⇒ `c15` 4 条全红。
+* **真机（决定性的）**：部署后 `probe.timeout_ms` **仍是 100**（就是踩坑值），而
+  `probe item add failed` 归零、`link seed: eth0 up` 出现、
+  `state` 由 `BOTH_DOWN` → **`WIRELESS_UP`**、`mn` 由 `[2,2]` → **`[1,1]`**、
+  `switches=0`、`bound=usb0`（**平台链路没换口**）。

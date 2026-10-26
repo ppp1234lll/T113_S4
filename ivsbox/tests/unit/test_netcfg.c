@@ -15,7 +15,9 @@
  *   c05 网络地址/广播地址必须被拒 —— 去掉那条判定，`192.168.2.0`、`192.168.2.255`
  *       就会通过，c05 必红；
  *   c04 掩码必须**连续** —— 用 `255.0.255.0` 探，"只要非 0 就收"的实现会放过去，必红；
- *   c07 多余字节要**按前 12 解析**而不是整体拒绝 —— 改成"必须恰好 12"后 c07 必红。
+ *   c07 多余字节要**按前 12 解析**而不是整体拒绝 —— 改成"必须恰好 12"后 c07 必红；
+ *   c12 `0xF8` 检测目标允许填 `0.0.0.0`（＝该路不检测），而 `0xF4` 的本机 IP
+ *       不允许 —— 把 `host_ip_ok()` 的 `allow_zero` 参数写反，c12/c03 会同时红。
  *
  * 临时产物：无（全内存、无文件、无真实网络）。AGENTS.md 规则 6。
  */
@@ -209,8 +211,76 @@ int main(void)
     chk(iv_netcfg_apply(&c, "eth0") == IV_OK, "c11 DRY run with explicit ifname");
     (void)unsetenv("IVSBOX_NETCFG_DRY");
 
+    /* ---------------- c12 0xF8 主网检测 IP：真实黄金样本 ---------------- */
+    {
+        /* 板端实抓（2026-10-26 11:40:46）：
+         * `f0f0110a000b2cc1 f8 ffffffffffffffff 08 c0a80201 c0a80202 68 ffff` */
+        static const uint8_t f8[8] = {
+            0xc0, 0xa8, 0x02, 0x01, /* 192.168.2.1 */
+            0xc0, 0xa8, 0x02, 0x02  /* 192.168.2.2 */
+        };
+        uint32_t t1 = 0xdeadbeefu;
+        uint32_t t2 = 0xdeadbeefu;
+        uint8_t  wide[12];
+
+        chk(iv_netcfg_parse_targets(f8, sizeof f8, &t1, &t2) == IV_OK,
+            "c12 real 0xF8 payload parses");
+        chk(ntohl(t1) == 0xC0A80201u, "c12 target1 = 192.168.2.1");
+        chk(ntohl(t2) == 0xC0A80202u, "c12 target2 = 192.168.2.2");
+
+        /* 两路都填 0 ＝ 界面清空 ＝ 都不检测，**必须放行**。
+         * 这条是给 `allow_zero` 参数上的保险：0xF4 的本机 IP 不允许 0，
+         * 同一个判定函数在这里必须允许 —— 参数写反了这条就红。 */
+        (void)memset(wide, 0, sizeof wide);
+        t1 = t2 = 0xdeadbeefu;
+        chk(iv_netcfg_parse_targets(wide, 8u, &t1, &t2) == IV_OK &&
+            t1 == 0u && t2 == 0u,
+            "c12 both-zero targets accepted (means 'stop probing that side')");
+
+        /* 只清一路也是合法的 */
+        (void)memcpy(wide, f8, 4u);
+        (void)memset(wide + 4, 0, 4u);
+        chk(iv_netcfg_parse_targets(wide, 8u, &t1, &t2) == IV_OK &&
+            ntohl(t1) == 0xC0A80201u && t2 == 0u,
+            "c12 only target2 cleared is fine");
+    }
+
+    /* ---------------- c13 0xF8 的长度与地址校验 ---------------- */
+    {
+        uint8_t  b8[12]; /* mk() 一次写 12 字节，别用 8 字节缓冲接 */
+        uint32_t t1;
+        uint32_t t2;
+
+        chk(iv_netcfg_parse_targets(NULL, 8u, &t1, &t2) == IV_EINVAL,
+            "c13 NULL data => EINVAL");
+        chk(iv_netcfg_parse_targets(b8, 8u, NULL, &t2) == IV_EINVAL,
+            "c13 NULL t1 => EINVAL");
+        mk(b8, "192.168.2.1", "192.168.2.2", "0.0.0.0"); /* 12 字节数组，取前 8 */
+        chk(iv_netcfg_parse_targets(b8, 7u, &t1, &t2) == IV_EINVAL,
+            "c13 7 bytes => EINVAL");
+
+        mk(b8, "127.0.0.1", "192.168.2.2", "0.0.0.0");
+        chk(iv_netcfg_parse_targets(b8, 8u, &t1, &t2) == IV_EINVAL,
+            "c13 loopback target1 rejected");
+        mk(b8, "192.168.2.1", "224.0.0.9", "0.0.0.0");
+        chk(iv_netcfg_parse_targets(b8, 8u, &t1, &t2) == IV_EINVAL,
+            "c13 multicast target2 rejected");
+
+        /* 多于 8 字节只取前 8（与 0xF4 同口径） */
+        {
+            uint8_t wide[12];
+
+            mk(wide, "192.168.2.1", "192.168.2.2", "0.0.0.0");
+            wide[8] = 0xAAu;
+            wide[9] = 0xBBu;
+            chk(iv_netcfg_parse_targets(wide, 10u, &t1, &t2) == IV_OK &&
+                ntohl(t1) == 0xC0A80201u && ntohl(t2) == 0xC0A80202u,
+                "c13 10-byte payload still parses the first 8");
+        }
+    }
+
     if (g_fail == 0) {
-        fprintf(stderr, "test_netcfg passed (parse/prefix/guards/dry-apply)\n");
+        fprintf(stderr, "test_netcfg passed (parse/prefix/guards/targets/dry-apply)\n");
         return 0;
     }
     fprintf(stderr, "test_netcfg FAILED (%d checks)\n", g_fail);

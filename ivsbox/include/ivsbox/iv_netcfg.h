@@ -75,6 +75,24 @@ typedef struct {
 int iv_netcfg_parse(const uint8_t *data, size_t len, iv_netcfg_t *out);
 
 /*
+ * 解析平台 0xF8「主网检测 IP」载荷：8 B ＝ 主网 4 B ＋ 副网 4 B（**均网络序**）。
+ *
+ * 板端实抓真帧（2026-10-26 11:40:46）：
+ *   `f0f0110a000b2cc1 f8 ffffffffffffffff 08 c0a80201 c0a80202 68 ffff`
+ *                                        ↑len  ↑.1        ↑.2
+ * 界面「主网检测 IP 1 / IP 2」就是这两个值 ⇒ 落到 `probe.target1` / `probe.target2`。
+ *
+ * 与 `0xF4` 的区别是**不涉及掩码和网关**，所以只做单播地址判定：
+ *   - `0.0.0.0` 合法，语义＝**该路不检测**（界面清空就是把它填 0）；
+ *   - 非 0 时排除 `127.0.0.0/8`、`224.0.0.0/4`、`255.255.255.255`。
+ *
+ * 返回 IV_OK / IV_EINVAL（指针空 / 不足 8 字节 / 地址非法）。
+ * 多于 8 字节按**前 8** 解析（与 `iv_netcfg_parse` 同口径：平台追加字段不该让整条命令瘫掉）。
+ */
+int iv_netcfg_parse_targets(const uint8_t *data, size_t len,
+                            uint32_t *t1, uint32_t *t2);
+
+/*
  * 点分掩码 → 前缀长度（0..32）。掩码不连续、或为 0 时返回 -1。
  * 入参是**网络序**的 32 位值（即 `inet_pton` 写出来的那种）。
  */

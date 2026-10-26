@@ -1650,6 +1650,126 @@ static void on_plat_local_net(const iv_proto_frame_t *f, void *arg)
                  ipbuf, maskbuf, gwbuf);
 }
 
+/* ---------------------------------------------------------------------------
+ * 平台下行 0xF8「主网检测 IP」
+ *
+ * 载荷 8 字节：主网 4 B ＋ 副网 4 B（**大端**）。板端实抓真帧（11:40:46）：
+ *   `f0f0110a000b2cc1 f8 ffffffffffffffff 08 c0a80201 c0a80202 68 ffff`
+ *                                    ↑len      ↑192.168.2.1 ↑192.168.2.2
+ * 界面「主网检测 IP 1 / IP 2」正是这两个值，落到 `probe.target1` / `probe.target2`
+ * （配置项注释就写着"主网检测 IP 1/2"，不是新造键）。
+ *
+ * ============================ 为什么不回 0x74 ============================
+ * 这条此前落"未注册 ⇒ 0x74"，平台点「配置主网检测IP」一直失败。但**数据我们
+ * 全都有**：`probe.*` 五个键早在 `iv_agent_reload_probe()` 里接好了热更，缺的
+ * 只是"把平台给的 8 字节翻译成那两个键"这一层。属于"该补"，不是"该回 0x74"。
+ *
+ * 与 `0xF4` 的关键区别：**不碰网口**，所以没有"断链"那一串顺序约束 ——
+ * 落盘成功 → 生效 → 回 0x01 即可，不需要先 ack 再动手。
+ * ------------------------------------------------------------------------- */
+static void on_plat_ping_target(const iv_proto_frame_t *f, void *arg)
+{
+    static const char *const keys[2] = {"probe.target1", "probe.target2"};
+    uint32_t tgt[2];
+    char     val[2][INET_ADDRSTRLEN];
+    char     oldv[2][INET_ADDRSTRLEN];
+    const char *cur0 = NULL;
+    const char *cur1 = NULL;
+    int      rc;
+    int      i;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+
+    rc = iv_netcfg_parse_targets(f->data, f->len, &tgt[0], &tgt[1]);
+    if (rc != IV_OK) {
+        IV_LOG_W(APP_MOD, "0xF8 payload rejected (rc=%d, %u bytes), ack 0x74",
+                 rc, (unsigned)f->len);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    for (i = 0; i < 2; i++) {
+        if (inet_ntop(AF_INET, &tgt[i], val[i], sizeof val[i]) == NULL) {
+            (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+            return;
+        }
+    }
+
+    /* 同值早返回：`probe.*` 的热更会重建探测条目表，等于把"已经攒了多久没丢包"
+     * 一起清掉。平台重复点同一个值不该白清一次。**两个目标都要比** ——
+     * 只比主网会让"只改副网"变成静默不生效。 */
+    if (iv_config_get_str(g_cfg, keys[0], &cur0) == IV_OK && cur0 != NULL &&
+        iv_config_get_str(g_cfg, keys[1], &cur1) == IV_OK && cur1 != NULL &&
+        strcmp(cur0, val[0]) == 0 && strcmp(cur1, val[1]) == 0) {
+        IV_LOG_I(APP_MOD, "0xF8 unchanged (%s / %s), ack 0x01, probe untouched",
+                 val[0], val[1]);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+
+    /* ---- 落盘：先写两个键，任何一个写不进去就把已写的退回旧值 ---- */
+    (void)memset(oldv, 0, sizeof oldv);
+    for (i = 0; i < 2; i++) {
+        const char *o = NULL;
+        int         j;
+
+        if (iv_config_get_str(g_cfg, keys[i], &o) == IV_OK && o != NULL)
+            (void)snprintf(oldv[i], sizeof oldv[i], "%s", o);
+        if (iv_config_set_str(g_cfg, keys[i], val[i]) == IV_OK)
+            continue;
+        for (j = 0; j < i; j++)
+            (void)iv_config_set_str(g_cfg, keys[j], oldv[j]);
+        IV_LOG_W(APP_MOD, "0xF8 set %s failed, rolled back, ack 0x74", keys[i]);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    {
+        int save_rc = iv_config_save(g_cfg, NULL, 0);
+
+        if (save_rc != IV_OK) {
+            for (i = 0; i < 2; i++)
+                (void)iv_config_set_str(g_cfg, keys[i], oldv[i]);
+            IV_LOG_W(APP_MOD, "0xF8 save failed (%d), rolled back, ack 0x74", save_rc);
+            (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+            return;
+        }
+    }
+
+    /* ---- 生效：与 `on_cfg_committed` 的 PROBE 分支**同一个入口**。
+     * `iv_config_save()` 内部已经触发过一次 reload 事件（订阅里含 PROBE），订阅
+     * 路径会走到这里；仍显式再调一次，口径与 `on_plat_mode()` 一致：
+     * 应答必须真的对应"已经生效"，不能把生效挂在"订阅有没有订上"这种装配层
+     * 细节上 —— 那正是本项目栽过五次的坑。函数内部对同值早返回，重复调用无害。 */
+    {
+        int64_t  pv   = 0;
+        uint32_t i_ms = 0;
+        uint32_t t_ms = 0;
+        uint32_t f_n  = 0;
+        int      prc;
+
+        if (iv_config_get_int(g_cfg, "probe.interval_ms", &pv) == IV_OK)
+            i_ms = (uint32_t)pv;
+        if (iv_config_get_int(g_cfg, "probe.timeout_ms", &pv) == IV_OK)
+            t_ms = (uint32_t)pv;
+        if (iv_config_get_int(g_cfg, "probe.max_fail", &pv) == IV_OK)
+            f_n = (uint32_t)pv;
+        prc = iv_agent_reload_probe(&g_agent, tgt[0], tgt[1], i_ms, t_ms, f_n,
+                                    iv_clock_monotonic_ms());
+        if (prc != IV_OK) {
+            /* 配置已落盘但没生效：如实回失败，别让平台以为成功（下次重启会生效，
+             * 这条日志是现场唯一能看出"存了没生效"的地方）。 */
+            IV_LOG_E(APP_MOD, "0xF8 saved but probe reload failed (%d), ack 0x74", prc);
+            (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+            return;
+        }
+    }
+
+    IV_LOG_I(APP_MOD, "platform set ping targets -> %s / %s (saved + applied)",
+             val[0], val[1]);
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
 /* 开机时把配置里存的静态地址（`net.ip`）真正应用到网口。
  *
  * ============================ 为什么必须有这一段 ============================
@@ -1903,6 +2023,11 @@ static int agent_setup(void)
      * （2026-10-26 补；此前落默认分支回 0x74，平台点「配置IP和网关」一直失败）。 */
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_LOCAL_NET,
                          on_plat_local_net, NULL);
+    /* 平台下行 0xF8「主网检测 IP」：8 B → `probe.target1/2` ＋ 立刻热更。
+     * 数据我们本来就有（`probe.*` 五键已接好），此前只是没人把它翻译过去
+     * （2026-10-26 补；此前落默认分支回 0x74，平台点「配置主网检测IP」一直失败）。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_MAIN_NET,
+                         on_plat_ping_target, NULL);
     return 0;
 }
 

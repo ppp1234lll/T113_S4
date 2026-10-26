@@ -189,6 +189,53 @@ int iv_netcfg_parse(const uint8_t *data, size_t len, iv_netcfg_t *out)
     return IV_OK;
 }
 
+/* 单播主机地址判定：返回 1 合法 / 0 非法。
+ * `allow_zero` 决定 `0.0.0.0` 算不算合法 —— `0xF4` 的本机 IP 不允许（等于没填），
+ * `0xF8` 的检测目标允许（0 ＝ 这一路不检测，界面清空就是把它填 0）。 */
+static int host_ip_ok(uint32_t ip_h, int allow_zero)
+{
+    if (ip_h == 0u)
+        return allow_zero;
+    if ((ip_h >> 24) == 127u || ip_h == 0xFFFFFFFFu ||
+        (ip_h & 0xF0000000u) == 0xE0000000u) /* 127/8 回环、受限广播、224/4 组播 */
+        return 0;
+    return 1;
+}
+
+int iv_netcfg_parse_targets(const uint8_t *data, size_t len,
+                            uint32_t *t1, uint32_t *t2)
+{
+    uint32_t a;
+    uint32_t b;
+
+    if (data == NULL || t1 == NULL || t2 == NULL)
+        return IV_EINVAL;
+    if (len < 8u)
+        return IV_EINVAL;
+    /* 多于 8 字节只取前 8，理由同 `iv_netcfg_parse()`：平台若在尾部追加字段，
+     * 按固定偏移解析仍然是对的，"多一字节就整体拒绝"会让平台一升级就全瘫。 */
+    if (len > 8u) {
+        IV_LOG_W(NC_MOD, "0xF8 payload %u bytes (expect 8), using the first 8",
+                 (unsigned)len);
+    }
+
+    (void)memcpy(&a, data, 4u);
+    (void)memcpy(&b, data + 4, 4u);
+    if (!host_ip_ok(ntohl(a), 1)) {
+        IV_LOG_W(NC_MOD, "0xF8 target1=0x%08x is loopback/broadcast/multicast",
+                 (unsigned)ntohl(a));
+        return IV_EINVAL;
+    }
+    if (!host_ip_ok(ntohl(b), 1)) {
+        IV_LOG_W(NC_MOD, "0xF8 target2=0x%08x is loopback/broadcast/multicast",
+                 (unsigned)ntohl(b));
+        return IV_EINVAL;
+    }
+    *t1 = a;
+    *t2 = b;
+    return IV_OK;
+}
+
 int iv_netcfg_if_ip_equals(const char *ifname, uint32_t ip_be)
 {
     struct ifaddrs *list = NULL;

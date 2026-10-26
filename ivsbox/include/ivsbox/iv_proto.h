@@ -86,8 +86,14 @@ extern "C" {
 /* ## 帧数据段上限：参考实现上报样例约 415 字符，取 1 KiB 整数上限。 */
 #define IV_PROTO_TXT_DATA_MAX 1024u
 
-/* 默认设备类型（参考 General_Version/main 的 DEVICE_TYPE；配置可覆盖） */
-#define IV_PROTO_DEVTYPE_DEFAULT 0x0400u
+/* 默认设备类型。
+ * 参考实现 `General_Version/main/Include/main.h` 的 `DEVICE_TYPE` 是 **0x0400**，
+ * 那是对应第一代箱子；本工程（T113 运维终端）按平台口径改为 **0x0A00**。
+ * `DEVTYPE` 出现在**数据段头**（`QN=0;TID=..;VER=..;DEVTYPE=..;CP=&&`），
+ * 以 `%04x` **小写**四位十六进制发出，故线上是 `0A00` → `0a00`。
+ * **它与查询应答的 `devtype` 必须同源**：`iv_report_build_seg()` 由调用方把
+ * `cfg.devtype`（0 → 本默认值）传进来，不再像早先那样在拼接处写死常量。 */
+#define IV_PROTO_DEVTYPE_DEFAULT 0x0A00u
 
 /* ---------------------------------------------------------------------------
  * 命令字（《指令-通用版 20260623.xlsx》"指令和错误字典"）

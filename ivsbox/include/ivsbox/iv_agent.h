@@ -265,7 +265,7 @@ typedef struct {
     int (*on_query_cfg)(char *out, size_t cap, void *arg);
     void *on_query_cfg_arg;
     uint32_t    devid;       /* 设备标识（TID） */
-    uint16_t    devtype;     /* 0 → 默认 0x0400 */
+    uint16_t    devtype;     /* 0 → 默认 0x0A00（`IV_PROTO_DEVTYPE_DEFAULT`） */
     uint32_t    report_ms;   /* 周期上报间隔；0 → 默认 300 s */
     uint32_t    heartbeat_ms;/* 心跳间隔；0 → 默认 30 s */
     uint32_t    poll_ms;     /* 0xE1 轮询间隔；0 → 默认 30 s */

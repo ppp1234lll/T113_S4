@@ -520,8 +520,8 @@ static int rep_send_report(iv_report_t *rp)
     int      rc;
 
     now_dt14(dt, sizeof(dt));
-    n = iv_report_build_seg(&rp->st, &rp->env, rp->pf.id.devid, dt,
-                            seg, sizeof(seg));
+    n = iv_report_build_seg(&rp->st, &rp->env, rp->pf.id.devtype,
+                            rp->pf.id.devid, dt, seg, sizeof(seg));
     if (n <= 0)
         return (n == 0) ? IV_EINVAL : n;
 
@@ -1014,7 +1014,7 @@ void iv_report_close(iv_report_t *rp)
  * 纯函数：上报数据段 / 查询应答
  * ------------------------------------------------------------------------- */
 int iv_report_build_seg(const iv_status_t *st, const iv_report_env_t *env,
-                        uint32_t devid, const char *dt14,
+                        uint16_t devtype, uint32_t devid, const char *dt14,
                         char *out, size_t cap)
 {
     const iv_status_data_t *d;
@@ -1034,11 +1034,16 @@ int iv_report_build_seg(const iv_status_t *st, const iv_report_env_t *env,
     }
     d = (st != NULL) ? &st->data : NULL;
 
-    /* ---- 数据段头（字段表：QN/TID/VER/DEVTYPE/CP） ---- */
+    /* ---- 数据段头（字段表：QN/TID/VER/DEVTYPE/CP） ----
+     * `DEVTYPE` **必须与查询应答同源**：早先这里直接写 `IV_PROTO_DEVTYPE_DEFAULT`
+     * 常量，于是 `cfg.devtype` 改了以后"查询应答里的 devtype 变了、上报帧的没变"，
+     * 平台按上报帧认设备类型就永远看不到新值。现在由调用方把
+     * `cfg.devtype`（0 → 默认）传进来。 */
     APPEND(out, cap, n, "QN=0;");
     APPEND(out, cap, n, "TID=%x;", (unsigned)devid);
     APPEND(out, cap, n, "VER=%02x;", (unsigned)IV_PROTO_VER);
-    APPEND(out, cap, n, "DEVTYPE=%04x;", (unsigned)IV_PROTO_DEVTYPE_DEFAULT);
+    APPEND(out, cap, n, "DEVTYPE=%04x;",
+           (unsigned)((devtype != 0u) ? devtype : IV_PROTO_DEVTYPE_DEFAULT));
     APPEND(out, cap, n, "CP=&&");
 
     /* ---- 数据区：**逐字段对齐参考实现 `com.c:com_report_normally_function()`**
@@ -1112,7 +1117,7 @@ uint8_t iv_report_query_crc(uint16_t devtype, uint32_t devid, uint8_t cmd)
 
     /* 与参考实现 sprintf(crc_buff,"%02x%04x%xE3",...) 同构：
      * ver 与 devtype/tid 用小写十六进制、cmd 用**大写**（`%02X`）。
-     * cmd 取"被应答的命令号"：E3 → `110400101E3` → CRC8=0x06。 */
+     * cmd 取"被应答的命令号"：E3 → `110a00101E3` → CRC8=0xb2。 */
     n = snprintf(s, sizeof(s), "%02x%04x%x%02X",
                  (unsigned)IV_PROTO_VER, (unsigned)devtype,
                  (unsigned)devid, (unsigned)cmd);

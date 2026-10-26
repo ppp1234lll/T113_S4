@@ -286,7 +286,7 @@ static int seg_csq(const char *seg, size_t seg_len)
  * ------------------------------------------------------------------------- */
 int main(void)
 {
-    static const char want_hdr[] = "QN=0;TID=101;VER=11;DEVTYPE=0400;CP=&&";
+    static const char want_hdr[] = "QN=0;TID=101;VER=11;DEVTYPE=0a00;CP=&&";
 
     char            slave_path[128];
     char            qdir[256];
@@ -626,11 +626,11 @@ int main(void)
             chk(strstr(rx, "\"qn\":\"20210121143412008\"") != NULL,
                 "c07 QN echoed verbatim");
             chk(strstr(rx, "\"cmd\":\"E3\"") != NULL, "c07 cmd E3");
-            chk(strstr(rx, "\"crc\":\"06\"") != NULL,
-                "c07 crc = CRC8(110400101E3) = 06");
+            chk(strstr(rx, "\"crc\":\"b2\"") != NULL,
+                "c07 crc = CRC8(110a00101E3) = b2");
             chk(strstr(rx, "\"mod\":\"E2E-MOD\"") != NULL, "c07 mod");
             chk(strstr(rx, "\"sv\":\"E2E-SV\"") != NULL, "c07 sv");
-            chk(strstr(rx, "\"type\":\"0400\"") != NULL, "c07 devtype");
+            chk(strstr(rx, "\"type\":\"0a00\"") != NULL, "c07 devtype");
             chk(iv_report_query_responses(&rp) == 1u, "c07 counter");
         }
     }

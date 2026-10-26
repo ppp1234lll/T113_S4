@@ -26,7 +26,7 @@
  * ＋ 参考实现 `General_Version/main/APP/User/src/com.c` 的
  * `com_report_normally_function()`（现场已量产、平台侧一直正常的那份）：
  *
- *   数据段 = `QN=0;TID=<hex>;VER=11;DEVTYPE=0400;CP=&&<数据区>&&`
+ *   数据段 = `QN=0;TID=<hex>;VER=11;DEVTYPE=0a00;CP=&&<数据区>&&`
  *   数据区（**逐字段对齐 com.c 的拼接顺序**；未取到值的字段不上传，表内注明
  *   "未用到的字段无需上传"）：
  *     DT(14 位 YYYYMMDDhhmmss) CNS(6 路) MN(2 路) V A APOWER AKW H T P DS
@@ -61,9 +61,9 @@
  * ============================ 查询响应（## + JSON + ##） ============================
  * 与上报帧**不同壳**：`##` + JSON + `##`（**无 4 位长度、无尾 CRC**）。
  * JSON 内 `crc` 字段 = CRC8(ASCII of `ver+devtype+tid+cmd`)，其中 cmd 是**被应答
- * 的那条命令**。E3 应答即 `11`+`0400`+`101`+`E3` → 字符串 `110400101E3`
- * → 取其 ASCII 字节算 CRC8 = **0x06**（与参考实现
- * `sprintf(crc_buff,"%02x%04x%xE3",...)` 同构；`E1` 对应 `110400101E1`→0x08）。
+ * 的那条命令**。E3 应答即 `11`+`0a00`+`101`+`E3` → 字符串 `110a00101E3`
+ * → 取其 ASCII 字节算 CRC8 = **0xb2**（与参考实现
+ * `sprintf(crc_buff,"%02x%04x%xE3",...)` 同构；`E1` 对应 `110a00101E1`→0xbc）。
  * 本步只落 **E3（查版本）** 与 **E2（立即上报）** 两条做通路径；其余查询命令
  * 由 `iv_proto` 的未命中默认分支回 ACK(0x01)——**各命令的完整 JSON schema 属 M4**。
  *
@@ -165,7 +165,7 @@ typedef struct {
                                * 运行期改口走 iv_report_set_bind_if()（按活动出口选）。 */
     const char *queue_dir;    /* NULL → IV_QUEUE_DIR_DEFAULT */
     uint32_t    devid;        /* 设备唯一标识（TID，以 %x 十六进制上报） */
-    uint16_t    devtype;      /* 0 → IV_PROTO_DEVTYPE_DEFAULT(0x0400) */
+    uint16_t    devtype;      /* 0 → IV_PROTO_DEVTYPE_DEFAULT(0x0A00) */
     uint32_t    report_ms;    /* 0 → IV_REPORT_REPORT_MS */
     uint32_t    heartbeat_ms; /* 0 → IV_REPORT_HEARTBEAT_MS */
     uint32_t    poll_ms;      /* 0 → IV_REPORT_POLL_MS */
@@ -463,7 +463,7 @@ void iv_report_close(iv_report_t *rp);
  * 字段顺序与条件见文件头；缓冲不足返回 IV_ERANGE（不写半截）。
  */
 int iv_report_build_seg(const iv_status_t *st, const iv_report_env_t *env,
-                        uint32_t devid, const char *dt14,
+                        uint16_t devtype, uint32_t devid, const char *dt14,
                         char *out, size_t cap);
 
 /* 查询响应 JSON 内的 `crc` 字段：CRC8(ASCII of "%02x%04x%x%02X"(ver,devtype,devid,cmd)) */
@@ -471,9 +471,9 @@ uint8_t iv_report_query_crc(uint16_t devtype, uint32_t devid, uint8_t cmd);
 
 /*
  * 组装 E3（查设备软硬件版本）的 **JSON 响应体**（不含 ## 壳）：
- *   {"code":0,"qn":"<qn>","data":{"ver":"11","devtype":"0400","type":"0400",
+ *   {"code":0,"qn":"<qn>","data":{"ver":"11","devtype":"0a00","type":"0a00",
  *     "tid":"b2cc1","cmd":"E3","mod":"FN_RZTY_PY","sysver":"1.0.0.20261020",
- *     "sv":"1.0.0.20261020","tsn":"934072007C00","crc":"06"}}
+ *     "sv":"1.0.0.20261020","tsn":"934072007C00","crc":"16"}}
  *
  * 字段名对齐参考实现 `com.c:com_version_information()`：`devtype` / `sysver` / `tsn`。
  * 同时保留旧名 `type` / `sv` 作**别名**（值完全相同）——协议 Excel 的字段表写的是
@@ -492,7 +492,7 @@ int iv_report_build_query_json(uint16_t devtype, uint32_t devid,
  *
  * 形如（**照抄** `com.c:com_query_configuration_function()` 的层级）：
  *
- *   ##{"code":0,"data":{"ver":"11","devtype":"0400","qn":"<qn>","tid":"b2cc1",
+ *   ##{"code":0,"data":{"ver":"11","devtype":"0a00","qn":"<qn>","tid":"b2cc1",
  *        "cmd":"E1",<pairs>,"crc":"xx"}}##
  *
  * ⚠ 两处与 E3 **刻意不同**，别"统一"：

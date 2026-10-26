@@ -750,7 +750,7 @@ static void c12_cns_segment(void)
     env.cns[5] = IV_CAMDET_DELAY;   /* 4 */
     env.mn[0]  = 1;
 
-    n = iv_report_build_seg(NULL, &env, 0x101u, "20250725171635", seg, sizeof(seg));
+    n = iv_report_build_seg(NULL, &env, 0u, 0x101u, "20250725171635", seg, sizeof(seg));
     chk(n > 0, "c12: segment built");
     chk(strstr(seg, "CNS=1,0,2,0,0,4;") != NULL,
         "c12: CNS carries the camdet five-state codes as-is");

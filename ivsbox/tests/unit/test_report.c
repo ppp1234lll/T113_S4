@@ -104,7 +104,7 @@ int main(void)
         static iv_status_t      st;
         iv_report_env_t         env;
         const char *want =
-            "QN=0;TID=5947;VER=11;DEVTYPE=0400;CP=&&"
+            "QN=0;TID=5947;VER=11;DEVTYPE=0a00;CP=&&"
             "DT=20250725171635;CNS=0,0,0,0,0,0;MN=3,0;"
             "V=234.17;A=0.00;APOWER=0.00;AKW=0.00;H=50.01;T=31.33;P=0;DS=1;"
             "RELAY=1,1,1;"
@@ -121,7 +121,7 @@ int main(void)
         env.mn[0] = 3;
         env.mn[1] = 0;
 
-        n = iv_report_build_seg(&st, &env, 22855u, "20250725171635",
+        n = iv_report_build_seg(&st, &env, 0u, 22855u, "20250725171635",
                                 seg, sizeof(seg));
         chk(n > 0, "c01 seg built");
         chk((size_t)n == strlen(want), "c01 seg length");
@@ -181,7 +181,7 @@ int main(void)
         memset(&env, 0, sizeof(env));
         env.csq = -1;
 
-        chk(iv_report_build_seg(&st, &env, 0x101u, "20250101000000",
+        chk(iv_report_build_seg(&st, &env, 0u, 0x101u, "20250101000000",
                                 seg, sizeof(seg)) > 0, "c02 built");
         chk(strstr(seg, "V=12.50;") != NULL, "c02 V present");
         chk(strstr(seg, "A=;") != NULL, "c02 A empty (not valid)");
@@ -207,7 +207,7 @@ int main(void)
         memset(&env, 0, sizeof(env));
         env.csq = -1;
 
-        (void)iv_report_build_seg(&st, &env, 1u, "20250101000000",
+        (void)iv_report_build_seg(&st, &env, 0u, 1u, "20250101000000",
                                   seg, sizeof(seg));
         chk(strstr(seg, "DS=2;") != NULL, "c03 DS passthrough (2)");
         chk(strstr(seg, "RELAY=1,1,1;") != NULL, "c03 RELAY 3 entries");
@@ -228,7 +228,7 @@ int main(void)
         env.lng = 116.654321;
         env.err = "4,10100000";
 
-        chk(iv_report_build_seg(&st, &env, 0x101u, "20250101000000",
+        chk(iv_report_build_seg(&st, &env, 0u, 0x101u, "20250101000000",
                                 seg, sizeof(seg)) > 0, "c04 built");
         chk(strstr(seg, "CNS=1,0,2,0,0,4;") != NULL, "c04 CNS 6 slots");
         chk(strstr(seg, "MN=1,2;") != NULL, "c04 MN 2 slots");
@@ -245,22 +245,22 @@ int main(void)
 
         iv_status_init(&st);
 
-        chk(iv_report_build_seg(NULL, NULL, 0x101u, "20250101000000",
+        chk(iv_report_build_seg(NULL, NULL, 0u, 0x101u, "20250101000000",
                                 seg, sizeof(seg)) > 0, "c05 NULL st/env ok");
-        chk(strstr(seg, "QN=0;TID=101;VER=11;DEVTYPE=0400;CP=&&DT=") == seg,
+        chk(strstr(seg, "QN=0;TID=101;VER=11;DEVTYPE=0a00;CP=&&DT=") == seg,
             "c05 NULL st keeps header");
         chk(strstr(seg, "CSQ=;") != NULL, "c05 NULL env -> empty CSQ slot");
         chk(strstr(seg, "MIU=;") != NULL && strstr(seg, "ERR=0;") != NULL,
             "c05 MIU/ERR slots always present");
 
-        chk(iv_report_build_seg(&st, NULL, 1u, NULL, seg, sizeof(seg)) == IV_EINVAL,
+        chk(iv_report_build_seg(&st, NULL, 0u, 1u, NULL, seg, sizeof(seg)) == IV_EINVAL,
             "c05 NULL dt EINVAL");
-        chk(iv_report_build_seg(&st, NULL, 1u, "2025010100", seg, sizeof(seg)) == IV_EINVAL,
+        chk(iv_report_build_seg(&st, NULL, 0u, 1u, "2025010100", seg, sizeof(seg)) == IV_EINVAL,
             "c05 short dt EINVAL");
-        chk(iv_report_build_seg(&st, NULL, 1u, "20250101000000", NULL, 0u) == IV_EINVAL,
+        chk(iv_report_build_seg(&st, NULL, 0u, 1u, "20250101000000", NULL, 0u) == IV_EINVAL,
             "c05 NULL out EINVAL");
 
-        n = iv_report_build_seg(&st, NULL, 1u, "20250101000000", seg, 10u);
+        n = iv_report_build_seg(&st, NULL, 0u, 1u, "20250101000000", seg, 10u);
         chk(n == IV_ERANGE, "c05 small cap ERANGE");
     }
 
@@ -718,6 +718,33 @@ int main(void)
             "c17 oversized payload rejected");
         chk(iv_report_send_thresh(&rp, "{}", 2u, 1000u) == IV_ESTATE,
             "c17 not-opened rejected (ESTATE, not silent OK)");
+    }
+
+    /* ---- c18 DEVTYPE 跟随传入的设备类型，不是写死常量 ----
+     * 早先拼接处直接写 `IV_PROTO_DEVTYPE_DEFAULT`，于是 `cfg.devtype` 改过之后
+     * 「查询应答里的 devtype 变了、上报帧没变」，平台按上报帧认设备类型就永远
+     * 看不到新值。三条断言分别钉：非默认值原样落地、**另一个**非默认值也落地
+     * （证明是跟传参走，而不是"默认值刚好改成它"）、传 0 回落默认。 */
+    {
+        static iv_status_t st;
+        int n;
+
+        fill_mirror(&st);
+
+        n = iv_report_build_seg(&st, NULL, 0x0500u, 0x101u, "20250101000000",
+                                seg, sizeof(seg));
+        chk(n > 0 && strstr(seg, "DEVTYPE=0500;") != NULL,
+            "c18 devtype follows the caller (0x0500)");
+
+        n = iv_report_build_seg(&st, NULL, 0x0A00u, 0x101u, "20250101000000",
+                                seg, sizeof(seg));
+        chk(n > 0 && strstr(seg, "DEVTYPE=0a00;") != NULL,
+            "c18 0x0A00 emitted as four lowercase hex digits");
+
+        n = iv_report_build_seg(&st, NULL, 0u, 0x101u, "20250101000000",
+                                seg, sizeof(seg));
+        chk(n > 0 && strstr(seg, "DEVTYPE=0a00;") != NULL,
+            "c18 devtype 0 -> IV_PROTO_DEVTYPE_DEFAULT");
     }
 
     if (g_fail == 0)

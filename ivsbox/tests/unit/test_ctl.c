@@ -296,6 +296,23 @@ int main(void)
      * 这个收尾就不再成立）；③ 键顺序未被无意改动。 */
     chk(strstr(raw, "\"storage\":{\"enabled\":false}}") != NULL,
         "c04: overview carries storage={enabled:false} and nothing else when no agent is attached");
+    /* c04b 设备身份段：2026-10-26 用户要求 Web 上显示「软件版本 / 硬件型号 /
+     * 设备类型」。钉住三样真的都出了口，且**设备类型只有一个来源**：
+     * `IV_PROTO_DEVTYPE_DEFAULT`，与上报帧头 `DEVTYPE=`、查询应答 CRC 是同一个宏。
+     * `devtype` 用小写 4 位（与上报帧 `%04x` 一致），前端再转大写显示 ——
+     * 同一个码在两个界面上不能一处大写一处小写。 */
+    chk(strstr(raw, "\"devtype\":\"0a00\"") != NULL,
+        "c04b: device.devtype is 0a00 (IV_PROTO_DEVTYPE_DEFAULT)");
+    chk(strstr(raw, "\"devtype_name\"") == NULL,
+        "c04b: no devtype_name in JSON (Chinese labels live in app.js, not in C)");
+    chk(strstr(raw, "\"sysver\":\"") != NULL, "c04b: device.sysver present");
+    chk(strstr(raw, "\"hw_model\":\"FN_RZTY_PY\"") != NULL,
+        "c04b: device.hw_model comes from sys.device.model default");
+    /* 新旧两个「型号」必须并存、且互不顶替：`model` 是设备树串（宿主机上没有 ⇒
+     * null，这一条由 b08 在集成侧钉），`hw_model` 是配置键。把 hw_model 写成
+     * model 的别名会在这里变红。 */
+    chk(strstr(raw, "\"model\":null") != NULL,
+        "c04b: device.model stays the device-tree string (null on host)");
     if (j != NULL)
         json_object_put(j);
 

@@ -404,6 +404,18 @@ int main(void)
 
         chk(strstr(js, "\"device\":{") != NULL, "b08 overview has device block");
         chk(strstr(js, "\"version\":\"") != NULL, "b08 device.version present");
+        /* b08b 2026-10-26：Web 上要显示「设备类型 / 平台口径软件版本 / 硬件型号」。
+         * 三样都由 device 段给出，且**设备类型与上报帧头同源**（同一个宏）。 */
+        chk(strstr(js, "\"devtype\":\"0a00\"") != NULL,
+            "b08b device.devtype is 0a00, same macro as the report frame header");
+        chk(strstr(js, "\"sysver\":\"") != NULL,
+            "b08b device.sysver present (platform-caliber software version)");
+        /* `hw_model` 来自**配置**，本源没有挂 cfg（`g_ctx.cfg` 为 NULL），所以正确
+         * 结果就是 JSON null —— 与 model/soc/id_mac 同口径：读不到给 null，
+         * **不给空串**（空串的语义是"读到了但值是空的"）。
+         * "有配置时给FN_RZTY_PY"那一半由 test_ctl 的 c04b 钉（那边开了真配置）。 */
+        chk(strstr(js, "\"hw_model\":null") != NULL,
+            "b08b device.hw_model is JSON null when no config is attached");
         chk(strstr(js, "\"hostname\":\"") != NULL, "b08 device.hostname present");
         chk(strstr(js, "\"kernel\":\"") != NULL, "b08 device.kernel present");
         chk(strstr(js, "\"machine\":\"") != NULL, "b08 device.machine present");

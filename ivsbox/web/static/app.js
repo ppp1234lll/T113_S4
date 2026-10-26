@@ -85,6 +85,12 @@
   var CNS_NAME = { 0: '无IP', 1: '正常', 2: '故障', 4: '延时', 5: '丢包' };
   var MN_NAME = { 0: '未判定', 1: '正常', 2: '断开' };
   var SNMP_STATE = { 0: '空闲', 1: '采集中', 2: '就绪' };
+  /* 设备类型（上报帧头 `DEVTYPE=` 的码值）→ 可读名。
+   * 码值由后端 `sys.overview.device.devtype` 给：**出厂定死、没有配置入口**
+   * （2026-10-26 用户拍板）。表只有这一张，加类型只改这里；
+   * 表里没有的码值就只显示十六进制、**不编一个名字** —— 显示错的类型名比显示码值
+   * 更误导现场。键用小写，与后端 `%04x` 的写法一致。 */
+  var DEVTYPE_NAME = { '0a00': '嵌入式T113' };
 
   /* ==================== 状态 ==================== */
   var PAGES = [
@@ -700,8 +706,23 @@
           + '实时状态请看「网络」「摄像机」「控制板」各页。';
         grid.appendChild(kv('设备名称', dv.name || '未命名',
           dv.name ? null : 'warn'));
-        grid.appendChild(kv('软件版本', fmtVer(dv.version || d.version)));
-        grid.appendChild(kv('硬件型号', dv.model || '—'));
+        /* 设备类型：**出厂定死**，没有配置入口（2026-10-26 用户拍板）。
+         * 后端给码值 `devtype`（4 位小写十六进制），名字取自本文件的
+         * `DEVTYPE_NAME` —— 后端只给标识符、中文全在前端，是这个工程的既有分工。 */
+        var dtHex = String(dv.devtype || '').toLowerCase();
+        var dtName = DEVTYPE_NAME[dtHex];
+        grid.appendChild(kv('设备类型',
+          dtHex ? (dtHex.toUpperCase() + (dtName ? '（' + dtName + '）' : '')) : '—'));
+        /* 软件版本用**平台口径** `sysver`（`1.0.0.<构建日期>`）；工程串 `version`
+         * 带 `+g<短哈希>`，只在后端没给 sysver 时兜底（旧后端兼容）。 */
+        grid.appendChild(kv('软件版本', dv.sysver || fmtVer(dv.version || d.version)));
+        /* 「硬件型号」与「板卡型号」是两件事，别合并：
+         *   硬件型号 ＝ 配置键 `sys.device.model`，也就是平台 0xE3 应答的 `mod`，
+         *              随箱体变体走、配置页可改；
+         *   板卡型号 ＝ 设备树 compatible 串，由板卡决定、现场改不了。
+         * 改前这两者只显示了后者却标成"硬件型号"，与平台报上去的 mod 对不上号。 */
+        grid.appendChild(kv('硬件型号', dv.hw_model || '—'));
+        grid.appendChild(kv('板卡型号', dv.model || '—'));
         grid.appendChild(kv('主控芯片', dv.soc || '—'));
         /* 设备 SN 缺省值＝1（2026-10-17 用户定）：工厂身份分区没写入时后端就回 "1"。
          * 但来源要标出来（`sn_source`），否则售后会把默认值当成产线写入的真 SN ——

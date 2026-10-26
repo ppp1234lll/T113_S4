@@ -45,7 +45,7 @@
  *
  * ============================ 方法表 ============================
  *   system.snapshot    —                   进程与版本快照（老格式）
- *   sys.overview       —                   总览页数据（version/uptime/net/cameras/devices/snmp/status/storage；见 iv_ctl.c）
+ *   sys.overview       —                   总览页数据（version/uptime/device/net/cameras/devices/snmp/status/storage；见 iv_ctl.c）
  *   config.get         {"key":"net.wan"}   取一个键的值与来源
  *   config.class       {"cls":"net"}       取一个一级分类下的全部键（配置页）
  *   config.all         —                   取全部键（导出/备份）

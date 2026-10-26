@@ -5923,4 +5923,104 @@ crc = CRC8( sprintf("%02x%04x%x%02X", ver, devtype, devid, cmd) )
 * 前端与出厂工装都不涉及 `devtype`（已 grep 确认），所以没有页面/工装侧改动。
 
 
+== 2026-10-26 10:21 Web 显示软件版本 / 硬件型号 / 设备类型（`sys.overview.device`）
+
+=== 需求与核对出来的三处不一致
+
+用户要求「在 web 界面显示设备的软件、硬件版本号、设备类型等参数」。核对现有代码，
+**三个"版本/型号"的说法互相打架**，直接加行只会把错的东西显示得更醒目：
+
+[cols="1,2,3"]
+|===
+| 要显示的 | 原来有没有 | 有没有坑
+
+| 设备类型
+| **没有**（前端与工装都 grep 不到 `devtype`）
+| 必须新开一条通路。字段值 `IV_PROTO_DEVTYPE_DEFAULT` 已经是上报帧头 `DEVTYPE=` 与
+  查询应答 CRC 的输入，**不能在这里再写一份常量**
+
+| 软件版本
+| 有 `device.version`
+| 它是**工程串** `1.0.0+nogit` / `1.0.0+g<短哈希>`。`iv_version.h` 写明它与平台串
+  **不能互相替代**：工程串给现场定位提交，平台串 `1.0.0.<构建日期>` 才是 E3 应答的
+  `sysver`。界面上摆一个 `+nogit` 当"版本号"，售后没法拿去和平台对
+
+| 硬件型号
+| 有 `device.model`，但**答的不是这个**
+| `model` 是设备树 compatible 串（`embedsky,tqt113-core`），板卡决定、现场改不了；
+  平台认的硬件型号是配置键 `sys.device.model`（默认 `FN_RZTY_PY`）＝ E3 应答的 `mod`。
+  两者同名不同物，界面上只显示前者还标成"硬件型号" ⇒ 拿界面的串去对平台永远对不上
+|===
+
+=== 做法
+
+`sys.overview` 的 `device` 段（`iv_ctl.c:add_device_info()`）**只增不改**，新增三个键：
+
+* `devtype` —— `"0a00"`，四位**小写**十六进制。
+  小写不是为了好看：上报帧头走的是 `sprintf("DEVTYPE=%04x;")`，同一个码在两个界面上
+  一处大写一处小写，人眼对账时会漏。前端显示时再转大写，那是显示层的事。
+* `sysver` —— `iv_version_sysver()`，`1.0.0.<构建日期>`。
+* `hw_model` —— 配置键 `sys.device.model`。原有 `model` / `soc` / `sn` 等一字未动。
+
+==== 设备类型为什么不带中文名
+
+后端（含 `libivmodules`）的 JSON 值一律是**标识符或原样数值**，中文标签全在前端 ——
+`app.js` 的 `CNS_NAME` / `MN_NAME` / `SNMP_STATE` 都是这个套路。所以：
+
+* 后端只给码值 `0a00`；
+* 名字在 `app.js` 的 `DEVTYPE_NAME = { '0a00': '嵌入式T113' }`，**表只有一张**，
+  加类型只改这一处；
+* 表里查不到的码值**只显示十六进制、不编名字**。显示一个错的类型名比显示码值更
+  误导现场 —— 现场会据此判"这箱子和手册上写的是一类"。
+
+代价是前端漏更新时名字缺失，但那时的显示是 `0A01` 而不是错误的名字，可以接受。
+
+==== 两个"型号"在前端拆成两行
+
+[cols="1,2"]
+|===
+| 界面标签 | 取值
+
+| 硬件型号 | `dv.hw_model`（配置键 `sys.device.model` ＝ E3 的 `mod`）
+| 板卡型号 | `dv.model`（设备树 compatible 串）
+|===
+
+软件版本行写 `dv.sysver || fmtVer(dv.version || d.version)` —— 旧后端没有 `sysver` 时
+退回原来的工程串，页面不会出现空行。
+
+=== 验证
+
+* 前端（本机 jsdom，`tests/web/ui_device_name.mjs`）**23/23**。`v02c~v02f` 钉"哪个字段
+  放到哪一行"，其中 `v02e`（`FN_RZTY_PY`）与 `v02f`（`embedsky,tqt113-core`）一旦写成
+  同一个来源，必有一条红。`v06` 钉"未知码值只显示十六进制"。
+* 后端单测 `test_ctl` **c04b** 五条：`devtype` 是 `0a00`、**JSON 里不许出现
+  `devtype_name`**（中文标签不进 C 代码）、`sysver` 在、`hw_model` 等于默认值
+  `FN_RZTY_PY`、`model` 仍是 `null`（宿主机无设备树）—— 最后一条防的是"把 hw_model
+  写成 model 的别名"。
+* 集成用例 `test_agent_board` **b08b** 三条。`hw_model` 在这一侧是 **JSON null**：
+  该用例的 `g_ctx.cfg` 本来就没挂配置，正确结果就是 null（与 `model`/`soc`/`id_mac`
+  同口径，**不给空串**）。"有配置时给 FN_RZTY_PY"那一半由 c04b 钉。
+* **真 daemon 取证**（VM 起 `build/host/ivsboxd` ＋ 本地通道一次性探针，用后即删）：
+  `device` 段 15 个键，`"devtype":"0a00"`、`"sysver":"1.0.0.20261026"`、
+  `"hw_model":"FN_RZTY_PY"`、`"model":null`、`"version":"1.0.0+nogit"`。
+* **反向证伪两次**（改 VM 上的 `iv_ctl.c`，改前 md5 `4057c0da533701b3ddd3a3b32aba113c`）：
+  **A** 码值换回 `0x0400u` ⇒ 编译 0 告警、二进制 mtime 变新、`test_ctl` 恰好 c04b 的
+  devtype 一条红；**B** `hw_model` 改传 `NULL` ⇒ 恰好 c04b 的 hw_model 一条红。
+  两次还原后 md5 与改前逐字节一致、复绿。
+* 门禁：`make host` 0 告警、`make test` **45/45**、`make asan` **45/45 零报告**、
+  `setarch -R make tsan` **45/45 零报告**、`make arm` 0 告警（md5
+  `d14eb4cd0371a0037f0e5f1a79a6b151`）、`make analyze`（先 `rm -rf build/analyze`，
+  62 条 `-fanalyzer` 编译行 ⇒ 确为全量）0 告警、`make itest` **17 条（16 ＋ 1 SKIP）**。
+
+=== 未做 / 风险
+
+* **没有板端换版**。这批改动只动 Web 显示，但同一份 ARM 二进制里还带着 `a4737f4` 的
+  `DEVTYPE=0a00` —— 查询应答 CRC 由 `ver+devtype+devid+cmd` 算出，会变成 `0x06→0xb2`、
+  `0x08→0xbc`。平台不同步会把应答全判失败，故与平台**同批上线**。
+* `0x0A00` 在《设备类型》sheet 里仍无条目，`DEVTYPE_NAME` 的"嵌入式T113"是本地说法，
+  平台补录后若名称不同，改 `app.js` 那一处即可。
+* 设备类型仍**没有配置键**（用户 2026-10-26 拍板"出厂定死、暂时不需要配置"）。
+
+
+
 

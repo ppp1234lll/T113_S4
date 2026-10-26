@@ -10,6 +10,10 @@
  *   - 点保存只发 **1 个键** `sys.device.name`，且版本号是**现取**的
  *     （本页没有 configCard 帮忙缓存版本号，拿旧值提交必撞 e=-3）；
  *   - 保存成功后回读、输入框跟着更新；清空后回到「未命名」。
+ *   - **设备类型 / 软件版本 / 硬件型号**三行（2026-10-26 用户要求）：设备类型显示
+ *     「码值（中文名）」、软件版本取平台口径 `sysver`、硬件型号取 `hw_model`
+ *     且与设备树串（板卡型号）分开；码值在 `DEVTYPE_NAME` 里查不到时只显示
+ *     十六进制，不编名字。
  *
  * 后端那一半（配置落盘、overview.device.name、重启后仍在）由 VM 上的真 HTTP
  * 端到端取证，见 docs/修改记录.md 2026-10-22 条目。
@@ -56,6 +60,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ---------------- fetch 桩：模拟后端三件事 ---------------- */
 let name = '';        /* sys.device.name 的当前值 */
+let devtype = '0a00'; /* 设备类型码值；v06 会改成表里没有的码，验"不编名字" */
 let ver = 3;          /* 故意不从 0 开始：能证明"版本号是现取的" */
 const applyCalls = [];
 const rsp = (obj) => ({ status: 200, text: () => Promise.resolve(JSON.stringify(obj)) });
@@ -68,7 +73,13 @@ window.fetch = function (u, o) {
             d: {
                 version: 'test',
                 device: {
-                    version: 'test', model: 'FN_RZTY_PY', soc: 'sun8iw20p1',
+                    /* 真实后端的三样：`sysver` 是平台口径版本号，`devtype` 是设备类型
+                     * 码值（出厂定死），`hw_model` 是配置键 sys.device.model。
+                     * `model` 是**设备树**串 —— 和 hw_model 不是一回事，故意给成
+                     * 不同的值，好让"两者被混成一个"在断言里露出来。 */
+                    version: 'test', sysver: '1.0.0.20261026', devtype: devtype,
+                    hw_model: 'FN_RZTY_PY', model: 'embedsky,tqt113-core',
+                    soc: 'sun8iw20p1',
                     sn: '1', sn_source: 'default', id_mac: null, eth0_mac: null,
                     hostname: 'ivsbox', kernel: '5.4.61-rt37', machine: 'armv7l',
                     wall_sec: 1761000000,
@@ -146,6 +157,19 @@ const main = async () => {
     const cardText = content.textContent;
     chk(cardText.indexOf('未命名') >= 0, 'v02b: 只读行显示「未命名」而不是空白/undefined');
 
+    /* v02c ~ v02f：2026-10-26 用户要求「显示设备的软件、硬件版本号、设备类型」。
+     * 这里钉的是**前端把哪个字段放到哪一行**，不是后端有没有值（那是 c04b / b08b）。
+     * 特别是「硬件型号」与「板卡型号」必须取**两个不同字段**：改前只显示了设备树串
+     * 却标成"硬件型号"，与平台按 `mod` 归档的口径对不上号 —— 这两条一旦写成同一个
+     * 来源，其中一条必红。 */
+    chk(cardText.indexOf('0A00（嵌入式T113）') >= 0,
+        'v02c: 设备类型显示为「码值（中文名）」');
+    chk(cardText.indexOf('1.0.0.20261026') >= 0,
+        'v02d: 软件版本取平台口径 sysver，不是带 +g 的工程串');
+    chk(cardText.indexOf('FN_RZTY_PY') >= 0, 'v02e: 硬件型号取自 hw_model');
+    chk(cardText.indexOf('embedsky,tqt113-core') >= 0,
+        'v02f: 板卡型号（设备树串）与硬件型号分开两行，没有被合并');
+
     console.log('v03 填名称并保存');
     nameInp.value = '  3 号换热站  ';      /* 故意带空白：前端要去掉 */
     nameInp.dispatchEvent(new window.Event('input'));
@@ -175,10 +199,24 @@ const main = async () => {
     chk(applyCalls[1] !== undefined && applyCalls[1].ver === 4,
         'v05c: 版本号跟上一次返回值（ver=4）');
     chk(content.textContent.indexOf('未命名') >= 0, 'v05d: 清空后回到「未命名」');
+
+    /* v06 表里没有的码值：只显示十六进制，**不编一个名字**。
+     * 这条是设计口径而不是实现细节 —— 显示错的类型名比显示码值更误导现场，
+     * 所以 DEVTYPE_NAME 查不到时只降级到码值，不回退成"未知/其他"之类的猜测。 */
+    console.log('v06 未知设备类型码');
+    devtype = '0a01';
+    nav.click();
+    await sleep(80);
+    {
+        const t = doc.getElementById('content').textContent;
+
+        chk(t.indexOf('0A01') >= 0, 'v06a: 未知码值仍显示十六进制（0A01）');
+        chk(t.indexOf('嵌入式T113') < 0, 'v06b: 未知码值不被套上别的类型名');
+    }
 };
 
 main().then(() => {
-    console.log(fail === 0 ? 'ui_device_name passed (15 assertions)' : fail + ' FAILED');
+    console.log(fail === 0 ? 'ui_device_name passed (23 assertions)' : fail + ' FAILED');
     process.exit(fail === 0 ? 0 : 1);
 }).catch((e) => {
     console.error('HARNESS ERROR', e);

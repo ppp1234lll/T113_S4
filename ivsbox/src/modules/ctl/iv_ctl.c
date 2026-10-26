@@ -778,8 +778,15 @@ static json_object *build_storage(const iv_ctl_ctx_t *ctx)
  * 身份信息归它；网络状态归网络页、摄像机六路归摄像机页、采集板镜像（含箱门／
  * 总功率）归控制板页 —— 各归各位，不再往总览页堆。
  *
+ * ============================ 「型号」有两个，别混 ============================
+ *   `hw_model` ＝ 配置键 `sys.device.model`，平台 0xE3 应答里的 `mod`，
+ *                随箱体变体走、Web 可改 —— **平台认的硬件型号**；
+ *   `model`    ＝ 设备树板级 compatible 串，由板卡决定、现场改不了。
+ * 2026-10-26 之前总览页只显示后者却标成"硬件型号"，与平台报上去的 `mod`
+ * 对不上号；现在两个都给，标签在前端分开写（「硬件型号」/「板卡型号」）。
+ *
  * ============================ 三个来源，各有各的坑 ============================
- * 1. **硬件型号／SoC**：`/proc/device-tree/model` 是**带尾随 NUL 的定长串**（实测还
+ * 1. **板级型号／SoC**：`/proc/device-tree/model` 是**带尾随 NUL 的定长串**（实测还
  *    带尾随空格），`fread` 拿回来的长度不能用 `strlen` 算 —— 值域里真有 NUL。
  *    `compatible` 更是 NUL 分隔的多段（`embedsky,tqt113-core\0arm,sun8iw20p1`），
  *    取第一段即板级 compatible；C 字符串天然在第一个 NUL 处结束，不必额外截断。
@@ -871,6 +878,27 @@ static void add_str_or_null(json_object *o, const char *k, const char *v)
         json_object_object_add(o, k, NULL);
 }
 
+/* 设备类型的码值（4 位小写十六进制，与上报帧头 `DEVTYPE=%04x` 同一种写法）。
+ *
+ * ============================ 码值只有一个来源 ============================
+ * `IV_PROTO_DEVTYPE_DEFAULT`（iv_proto.h）同时是**上报帧头 `DEVTYPE=`**、
+ * **查询应答 CRC 的输入**、以及本处的显示值 —— 不是三处各写一份。
+ * 2026-10-26 用户拍板「出厂定死 0x0A00，暂时不需要配置」，所以这里**没有配置键**：
+ * 要改只能改那个宏并重编。
+ *
+ * ============================ 只给码值，不给中文名 ============================
+ * 本文件（及整个后端）的 JSON 值一律是**标识符或原样数值**，中文标签全在前端
+ * （`web/static/app.js` 的 `CNS_NAME` / `MN_NAME` / `SNMP_STATE` 都是这个套路）。
+ * 设备类型的可读名同理放在 `app.js` 的 `DEVTYPE_NAME` 里 —— 表只有一张，
+ * 加类型只改那一处；前端漏了也有码值可看，不会显示成错误的名字。 */
+static void add_devtype(json_object *dev)
+{
+    char hex[8];
+
+    (void)snprintf(hex, sizeof hex, "%04x", (unsigned)IV_PROTO_DEVTYPE_DEFAULT);
+    json_object_object_add(dev, "devtype", json_object_new_string(hex));
+}
+
 static void add_device_info(json_object *d, const iv_config_t *cfg)
 {
     json_object          *dev = json_object_new_object();
@@ -881,11 +909,32 @@ static void add_device_info(json_object *d, const iv_config_t *cfg)
     char                  ethmac[20] = "";
     char                  host[64]   = "";
     const char           *name       = NULL;
+    const char           *hwm        = NULL;
 
     if (dev == NULL)
         return;
 
     json_object_object_add(dev, "version", json_object_new_string(iv_version_string()));
+
+    /* ============================ 设备类型 / 硬件型号 / 平台口径版本 ============================
+     * 2026-10-26 用户要求 Web 上「显示设备的软件、硬件版本号、设备类型等参数」。
+     * 三个"版本/型号"必须各自说清来源，否则"版本号"这一个词会有三个互相打架的答案：
+     *
+     *   `devtype`
+     *       出厂定死的设备类型码值，见 add_devtype()。**没有配置键**。
+     *   `hw_model`
+     *       配置键 `sys.device.model`，就是平台 0xE3「查询设备版本号」应答里的 `mod`
+     *       —— 这才是平台认的**硬件型号**。它随箱体变体走，Web 配置页可改。
+     *       与下面的 `model` **不是一回事**：`model` 是设备树的板级 compatible 串
+     *       （如 `embedsky,tqt113-core`），由板卡决定、现场改不了。
+     *   `sysver`
+     *       平台口径的软件版本 `1.0.0.<构建日期>`（见 iv_version.h 的分工）：
+     *       工程串 `version` 带 `+g<短哈希>` 供定位提交，平台串只带日期。
+     *
+     * 缺值的处置与本函数其他字段同口径：空串 ⇒ JSON null（前端显示"—"）。 */
+    add_devtype(dev);
+    json_object_object_add(dev, "sysver",
+                           json_object_new_string(iv_version_sysver()));
 
     /* 设备名称来自配置 `sys.device.name`（不是身份分区）：它是**称呼**、不是唯一标识，
      * 现场随时会改，写进工厂分区既没必要也不该动。空串＝没起名 ⇒ 给 null，
@@ -894,6 +943,11 @@ static void add_device_info(json_object *d, const iv_config_t *cfg)
         add_str_or_null(dev, "name", name);
     else
         add_str_or_null(dev, "name", NULL);
+
+    if (cfg != NULL && iv_config_get_str(cfg, "sys.device.model", &hwm) == IV_OK)
+        add_str_or_null(dev, "hw_model", hwm);
+    else
+        add_str_or_null(dev, "hw_model", NULL);
 
     read_dt_string("/proc/device-tree/model", model, sizeof model);
     read_dt_string("/proc/device-tree/compatible", soc, sizeof soc);

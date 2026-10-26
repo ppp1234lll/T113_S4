@@ -519,8 +519,15 @@
   /* 拉一个分类的配置，渲染成「分组 → 表单」。classes 可以是数组。
    * onReady(items, reload)：数据就绪后的回调。渲染循环只画"已经存在的键"，
    * 于是「按需建槽」那类配置（camera.ch.N.*）在没有任何键时无输入框可画，
-   * 得靠调用方自己补一个入口 —— 回调就是为了把 items 与 reload 交出去。 */
-  function configCard(title, classes, note, onReady) {
+   * 得靠调用方自己补一个入口 —— 回调就是为了把 items 与 reload 交出去。
+   *
+   * skip：**本卡片不画**的键名数组。存在的唯一理由是"同一个键只能有一个编辑器"：
+   * `net.ip`/`net.mask`/`net.gateway` 与 `probe.target1/2` 现在有专门的
+   * 「本机网络」卡片（对齐平台那一组字段），若通用卡片再画一遍，页面上就有两个
+   * 表单写同一批键 —— 后提交的那个必然带着过期的 `st.ver`，撞 e=-3。 */
+  function configCard(title, classes, note, onReady, skip) {
+    var skipMap = {};
+    (skip || []).forEach(function (k) { skipMap[k] = 1; });
     var scope = el('div');
     var card = el('div', 'card');
     card.appendChild(el('h3', null, title));
@@ -550,6 +557,7 @@
         st.ver = ver;
         var groups = {};
         Object.keys(items).sort().forEach(function (k) {
+          if (skipMap[k]) return;          /* 有专门卡片的键，这里不画第二遍 */
           var g = groupOf(k);
           (groups[g] = groups[g] || []).push(k);
         });
@@ -817,6 +825,161 @@
     return root;
   }
 
+  /* ==================== 本机网络与主网检测（对齐平台那一组） ====================
+   * 平台「参数设置」里这几项是摆在一起的：网关 IP ／ 「配置IP和网关」／ MAC 地址 ／
+   * 主网检测 IP 1、2 ／ 「配置主网检测IP」。我们这边它们在配置里分属 `net` 与
+   * `probe` 两个分类，通用 configCard 只能按分类画，摆不到一起（用户 2026-10-26
+   * 要求"收成一组"）。所以单独一块卡片，两个按钮各提交自己那几个键。
+   *
+   * 生效口径（两个按钮不一样，别混）：
+   *   - **本机地址**：`config.apply` 返回后，后端 NET 分支会**延迟 800 ms** 才调
+   *     `apply_saved_local_net()` 去改网口 —— 要等 HTTP 响应先回到浏览器，否则
+   *     浏览器看到的是"请求失败"，而配置其实已经存进去了。所以按下之后本页会断，
+   *     必须按新地址重开。
+   *   - **主网检测**：`probe` 分类本来就有订阅者，`config.apply` 一返回就已热更，
+   *     不断链、本页能继续用。
+   *
+   * 前端先做一遍格式校验（IPv4 合法性 ＋ 掩码连续性）：后端 `apply_saved_local_net()`
+   * 在 800 ms 后才跑，校验失败只会进日志，界面上却已经显示"已保存"—— 那是最难查的
+   * 一种"假成功"。能在前端挡住的一定挡住。 */
+  function isIPv4(s) {
+    var p = String(s).split('.');
+    if (p.length !== 4) return false;
+    for (var i = 0; i < 4; i++) {
+      if (!/^\d{1,3}$/.test(p[i])) return false;
+      if (Number(p[i]) > 255) return false;
+    }
+    return true;
+  }
+
+  /* 掩码必须"前面全 1、后面全 0"。`255.0.255.0` 这种看着像掩码的写法后端会拒
+   * （`iv_netcfg_prefix()` 返回 -1），前端也一并挡掉。 */
+  function maskOk(s) {
+    if (!isIPv4(s)) return false;
+    var v = 0, seen0 = false, i;
+    var p = String(s).split('.');
+    for (i = 0; i < 4; i++) v = (v << 8) | Number(p[i]);
+    if (v === 0) return false;
+    for (i = 31; i >= 0; i--) {
+      if (((v >>> i) & 1) === 0) seen0 = true;
+      else if (seen0) return false;
+    }
+    return true;
+  }
+
+  function netParamsCard() {
+    var card = el('div', 'card');
+    card.appendChild(el('h3', null, '本机网络与主网检测'));
+    var hint = el('p', 'hint',
+      '「配置 IP 和网关」会立刻改本机地址：保存后约 1 秒网口切换，本页连接会断，' +
+      '请按新地址重新打开。三项留空＝不在此处指定（沿用系统网络配置）。');
+    card.appendChild(hint);
+
+    var grid = el('div', 'grid');
+    card.appendChild(grid);
+
+    var bar = el('div', 'actions');
+    var btnNet = el('button', null, '配置 IP 和网关');
+    var btnProbe = el('button', null, '配置主网检测 IP');
+    var btnReload = el('button', 'ghost', '重新载入');
+    btnNet.type = 'button'; btnProbe.type = 'button'; btnReload.type = 'button';
+    bar.appendChild(btnNet); bar.appendChild(btnProbe); bar.appendChild(btnReload);
+    card.appendChild(bar);
+
+    var ver = 0;
+    var descs = {};
+
+    function load() {
+      grid.innerHTML = '';
+      var reqs = [api('/api/config?cls=net'), api('/api/config?cls=probe'),
+                  api('/api/overview')];
+      reqs.push(loadDescs());
+      Promise.all(reqs).then(function (rs) {
+        var d = rs.pop() || {};
+        var rn = rs[0] || {}, rp = rs[1] || {}, ro = rs[2] || {};
+        if (!rn.ok || !rp.ok) {
+          grid.appendChild(kv('配置', '读取失败：' + ((rn.msg || rp.msg) || '不可用'), 'err'));
+          return;
+        }
+        descs = d;
+        ver = rn.d.version;
+        var it = {};
+        Object.keys(rn.d.items).forEach(function (k) { it[k] = rn.d.items[k]; });
+        Object.keys(rp.d.items).forEach(function (k) { it[k] = rp.d.items[k]; });
+
+        grid.appendChild(fieldFor('net.ip', it['net.ip'], '本机 IP'));
+        grid.appendChild(fieldFor('net.mask', it['net.mask'], '子网掩码'));
+        grid.appendChild(fieldFor('net.gateway', it['net.gateway'], '网关 IP'));
+        grid.appendChild(fieldFor('probe.target1', it['probe.target1'], '主网检测 IP 1'));
+        grid.appendChild(fieldFor('probe.target2', it['probe.target2'], '主网检测 IP 2'));
+
+        /* MAC 只读：它是 eth0 的硬件事实（`/api/overview` → net.link），不是配置项。
+         * 平台那边同一个位置也是只读显示的，标成可编辑只会误导。 */
+        var mac = '—';
+        var lk = (ro.ok && ro.d && ro.d.net) ? ro.d.net.link : null;
+        if (lk && lk.ifaces) {
+          lk.ifaces.forEach(function (f) { if (f.name === 'eth0' && f.mac) mac = f.mac; });
+        }
+        var macBox = kv('MAC 地址（只读）', mac);
+        grid.appendChild(macBox);
+      }).catch(function () {
+        grid.appendChild(kv('配置', '请求失败', 'err'));
+      });
+    }
+
+    function pick(key) {
+      var inp = grid.querySelector('[data-key="' + key + '"]');
+      return inp ? String(inp.value).replace(/^\s+|\s+$/g, '') : '';
+    }
+
+    function submit(keys, okMsg) {
+      var items = {};
+      var bad = '';
+      var i;
+
+      for (i = 0; i < keys.length; i++) {
+        var k = keys[i];
+        var v = pick(k);
+        if (v !== '' && !isIPv4(v)) { bad = (descs[k] || k) + ' 不是合法的 IPv4 地址'; break; }
+        items[k] = v;
+      }
+      if (!bad && keys.indexOf('net.mask') >= 0) {
+        var ip = items['net.ip'], mask = items['net.mask'];
+        if (ip === '' && mask !== '') bad = '填了子网掩码就必须填本机 IP';
+        if (ip !== '' && mask === '') bad = '填了本机 IP 就必须填子网掩码';
+        if (!bad && mask !== '' && !maskOk(mask)) bad = '子网掩码必须是连续的前缀（如 255.255.255.0）';
+      }
+      if (bad) { toast(bad, 'err'); return; }
+
+      api('/api/config/apply', { method: 'POST', body: { ver: ver, items: items } })
+        .then(function (r) {
+          if (!r.ok) {
+            toast(r.e === -3 ? '配置已被别处改动，请刷新后重试'
+                             : '保存失败：' + (r.msg || r.e), 'err');
+            return;
+          }
+          ver = r.d.version;
+          toast(okMsg, 'ok');
+        })
+        .catch(function () {
+          /* 走到这里多半是**地址已经切了**（连接被拆），不是保存失败。 */
+          toast('连接已断开 —— 地址应该已经切换，请按新 IP 重新打开本页', 'warn');
+        });
+    }
+
+    btnNet.addEventListener('click', function () {
+      submit(['net.ip', 'net.mask', 'net.gateway'],
+             '已保存，正在切换地址…（约 1 秒后本页会断，请按新 IP 重开）');
+    });
+    btnProbe.addEventListener('click', function () {
+      submit(['probe.target1', 'probe.target2'], '已保存并生效（探测目标不重启、不断链）');
+    });
+    btnReload.addEventListener('click', load);
+
+    load();
+    return card;
+  }
+
   function pageNet() {
     var root = document.createDocumentFragment();
     root.appendChild(el('h2', 'page-title', '网络配置'));
@@ -939,9 +1102,14 @@
       }
     });
 
-    root.appendChild(configCard('网络参数（net.*）', ['net', 'sys'],
+    /* 本机地址与检测目标单独一组（对齐平台「参数设置」那一组字段）。顺序按现场
+     * 排查动线：先看真实地址（上两块只读），再改它，最后才是其余网络配置。 */
+    root.appendChild(netParamsCard());
+
+    root.appendChild(configCard('网络参数（net.server.* / sys.*）', ['net', 'sys'],
       '含内外网平台地址、无线/有线网口与传输模式。' +
-      '本机 IP / 掩码 / 网关留空表示"不在此处指定"，实际生效值见上方「当前生效」。'));
+      '本机 IP / 掩码 / 网关在上方「本机网络与主网检测」里改，这里不再重复。',
+      null, ['net.ip', 'net.mask', 'net.gateway']));
     return root;
   }
 
@@ -2128,7 +2296,9 @@
     loadLogs();
 
     root.appendChild(configCard('检测与自愈（probe.* / netthr.*）', ['probe', 'netthr'],
-      '探活目标与节拍、故障重启次数与冷却。'));
+      '探活节拍与超时、故障重启次数与冷却。主网检测 IP 1/2 已收进「网络配置」页的'
+      + '「本机网络与主网检测」卡片（与平台摆在一起），这里不再重复。',
+      null, ['probe.target1', 'probe.target2']));
     root.appendChild(configCard('电阈值与传感器（elec.* / sensor.*）', ['elec', 'sensor'],
       '上报判据用的物理量阈值。'));
     return root;

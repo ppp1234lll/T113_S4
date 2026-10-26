@@ -586,6 +586,9 @@ static int agent_sync_server_cfg(int force)
  * 开机装配与热更共用同一段，避免"开机一套、改配置另一套"。 */
 static void cfg_snmp_targets(iv_agent_snmp_cfg_t *sc);
 static int  cfg_rec_url_table(char (*buf)[IV_CFG_STR_MAX], int cap);
+/* 本机地址热生效（定义在 `apply_saved_local_net()` 旁边，那里才有完整的取值/校验
+ * 逻辑）。`on_cfg_committed()` 只负责"触发"，不重复一遍判定。 */
+static void schedule_local_net_apply(void);
 
 /* 配置事务通知（F7）。这里只接"改完必须马上生效"的：
  *   - `net` 分类：平台地址/端口（与出口网卡成对刷新）→ 断开旧连接、连新平台；
@@ -601,8 +604,18 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
     (void)c;
     (void)name;
     (void)user;
-    if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_NET)) != 0u)
+    if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_NET)) != 0u) {
         (void)agent_sync_server_cfg(1);
+        /* 本机地址（`net.ip`/`net.mask`/`net.gateway`）热生效 —— 这三个键此前是
+         * "改配置不生效"清单里的**最后一条**：只有平台 `0xF4` 与开机
+         * `apply_saved_local_net()` 两个消费者，网页上改完必须重启才应用。
+         *
+         * 这里只**触发**，真正判断（留空／非法／与内核现值相同）全在
+         * `apply_saved_local_net()` 里 —— 与开机走同一段代码，不另写一份判定。
+         * 触发是**延迟**的（见函数内注释）：本次回调发生在 `config.apply` 的
+         * 处理过程中，HTTP 响应还没回到浏览器。 */
+        schedule_local_net_apply();
+    }
     if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_SYS)) != 0u) {
         /* `sys.report.interval_s` 原先只在 app_init 里读一次，网页上改了等于没改
          * （必须重启进程）—— 现场"设了 5 分钟、平台上还是十分钟一条"正是这个。 */
@@ -1770,7 +1783,11 @@ static void on_plat_ping_target(const iv_proto_frame_t *f, void *arg)
     (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
 }
 
-/* 开机时把配置里存的静态地址（`net.ip`）真正应用到网口。
+/* 把配置里存的静态地址（`net.ip`/`net.mask`/`net.gateway`）真正应用到网口。
+ *
+ * 两个调用点**共用同一段判定**（这是刻意的，不另写一份）：
+ *   - 开机第 1b 步，见 `main()`；
+ *   - Web 改完 `net.*` 之后，由 `schedule_local_net_apply()` 延迟 800 ms 触发。
  *
  * ============================ 为什么必须有这一段 ============================
  * "落盘"的全部意义就是**重启后还在**。没有这一步，0xF4 改完地址、一重启又回到
@@ -1779,8 +1796,8 @@ static void on_plat_ping_target(const iv_proto_frame_t *f, void *arg)
  * 出厂默认 `net.ip` 是空串（"由 DHCP 分配"）⇒ **什么都不做**，绝不覆盖现场
  * 由 rootfs/DHCP 配出来的地址。这一条是安全底线：写错了也不能让设备一开机就没网。
  *
- * IP 已经等于目标时直接跳过：否则每次开机都要 flush 一遍地址，平台那条 TCP
- * 刚建好就被自己踹掉，日志上表现为"开机后平台反复重连"。
+ * 「IP ＋ 前缀长度」已经等于目标时直接跳过：否则每次开机都要 flush 一遍地址，
+ * 平台那条 TCP 刚建好就被自己踹掉，日志上表现为"开机后平台反复重连"。
  */
 static void apply_saved_local_net(void)
 {
@@ -1821,15 +1838,53 @@ static void apply_saved_local_net(void)
     }
 
     (void)snprintf(addrbuf, sizeof addrbuf, "%s/%d", ip, iv_netcfg_prefix(c.mask));
-    if (iv_netcfg_if_ip_equals(NULL, c.ip) == 1) {
+    /* 比到**前缀长度**这一级，不能只比 IP —— 网页上允许只改掩码（IP 不动），
+     * 只比 IP 就会判"已在位、不动链路"，改了个寂寞而界面显示已保存。 */
+    if (iv_netcfg_if_addr_equals(NULL, c.ip, c.mask) == 1) {
         IV_LOG_I(APP_MOD, "saved local net %s already in place, not touching the link",
                  addrbuf);
         return;
     }
     if (iv_netcfg_apply(&c, NULL) == IV_OK)
-        IV_LOG_I(APP_MOD, "saved local net applied at boot: %s gw %s", addrbuf, gw);
+        IV_LOG_I(APP_MOD, "saved local net applied: %s gw %s", addrbuf, gw);
     else
-        IV_LOG_E(APP_MOD, "saved local net %s could NOT be applied at boot", addrbuf);
+        IV_LOG_E(APP_MOD, "saved local net %s could NOT be applied", addrbuf);
+}
+
+/* ---------------------------------------------------------------------------
+ * 本机地址热生效（Web 改 `net.ip` / `net.mask` / `net.gateway` 之后）
+ *
+ * ============================ 为什么要延迟 ============================
+ * 触发点 `on_cfg_committed()` 是在 `config.apply` 的**处理过程中**被回调的 ——
+ * 此刻 ivsbox-web 还没拿到 ctl 应答，浏览器更没拿到 HTTP 响应。此时立刻
+ * `ip addr flush`，浏览器看到的是"请求失败"，而且这个失败是**真的**（连接被拆了），
+ * 现场会以为"保存没成功、再点一次"，实际配置已经存进去了。
+ *
+ * 800 ms 是给"ctl 应答 → ivsbox-web 写 HTTP 响应 → 浏览器收到并渲染 toast"留的
+ * 余量。局域网里这段通常是几毫秒，800 ms 已经很宽松，而人对"点完 1 秒后断线"
+ * 完全可以接受 —— 本来改 IP 就要断。
+ *
+ * ============================ 为什么用 reactor 定时器 ============================
+ * 不能用 `nanosleep` 睡在回调里：那会**卡住整个 reactor**（平台链路、串口、
+ * 通道全停 800 ms）。`iv_timer_add()` 是一次性定时器，回调结束即自动释放，
+ * 不需要任何收尾。
+ *
+ * 同一时刻可能有多次提交（连点两次「配置 IP 和网关」）⇒ 会挂多个定时器，
+ * 但 `apply_saved_local_net()` 自带"与内核现值相同就跳过"，第二次是空转，
+ * 不会把刚设好的地址再拆一遍。为这点额外挂一个"已排队"标志不值当。
+ * ------------------------------------------------------------------------- */
+static void on_local_net_apply_timer(void *arg)
+{
+    (void)arg;
+    apply_saved_local_net();
+}
+
+static void schedule_local_net_apply(void)
+{
+    if (g_reactor == NULL)
+        return;
+    if (iv_timer_add(g_reactor, 800u, on_local_net_apply_timer, NULL) == NULL)
+        IV_LOG_W(APP_MOD, "local net apply timer full -- net.* saved but NOT applied");
 }
 
 static int agent_setup(void)

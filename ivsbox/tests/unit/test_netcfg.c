@@ -17,7 +17,9 @@
  *   c04 掩码必须**连续** —— 用 `255.0.255.0` 探，"只要非 0 就收"的实现会放过去，必红；
  *   c07 多余字节要**按前 12 解析**而不是整体拒绝 —— 改成"必须恰好 12"后 c07 必红；
  *   c12 `0xF8` 检测目标允许填 `0.0.0.0`（＝该路不检测），而 `0xF4` 的本机 IP
- *       不允许 —— 把 `host_ip_ok()` 的 `allow_zero` 参数写反，c12/c03 会同时红。
+ *       不允许 —— 把 `host_ip_ok()` 的 `allow_zero` 参数写反，c12/c03 会同时红；
+ *   c14 同值判定要**比到前缀长度**，只比 IP 的话「网页上只改掩码」会被判成
+ *       "已在位、不动链路" —— 把掩码比较删掉，c14b 必红。
  *
  * 临时产物：无（全内存、无文件、无真实网络）。AGENTS.md 规则 6。
  */
@@ -71,6 +73,16 @@ static void mk(uint8_t *buf, const char *ip, const char *mask, const char *gw)
     (void)memcpy(buf + 4, &a, 4u);
     (void)inet_pton(AF_INET, gw, &a);
     (void)memcpy(buf + 8, &a, 4u);
+}
+
+/* 点分地址 → 网络序（就是 `sin_addr.s_addr` 里那个值，别自己移位拼） */
+static uint32_t a2n(const char *s)
+{
+    struct in_addr a;
+
+    a.s_addr = 0;
+    (void)inet_pton(AF_INET, s, &a);
+    return a.s_addr;
 }
 
 int main(void)
@@ -279,8 +291,30 @@ int main(void)
         }
     }
 
+    /* ---------------- c14 同值判定必须比到**前缀长度** ---------------- */
+    {
+        /* 反向证伪点：把 `iv_netcfg_if_addr_equals()` 里的掩码比较删掉、只留 IP 比，
+         * c14b 必红。它对应的真实缺陷是「网页上只改掩码、IP 不动」——
+         * 旧实现判"已在位、不动链路"，用户改了个寂寞而界面显示已保存。
+         *
+         * 用 `lo`（127.0.0.1/8）当靶子：它一定存在、一定带掩码、且不需要任何权限。 */
+        chk(iv_netcfg_if_addr_equals("lo", a2n("127.0.0.1"), a2n("255.0.0.0")) == 1,
+            "c14a lo 127.0.0.1/8 => equal");
+        chk(iv_netcfg_if_addr_equals("lo", a2n("127.0.0.1"), a2n("255.255.255.0")) == 0,
+            "c14b same IP but /24 must NOT count as equal");
+        chk(iv_netcfg_if_addr_equals("lo", a2n("127.0.0.2"), a2n("255.0.0.0")) == 0,
+            "c14c different IP => not equal");
+        chk(iv_netcfg_if_addr_equals("ivno0", a2n("127.0.0.1"), a2n("255.0.0.0")) == -1,
+            "c14d unknown interface => -1");
+        /* 非法掩码（不连续）没有"相等"可言 ⇒ 必须回 0，让调用方去走 apply 的校验。
+         * 写反了（比如内部 `iv_netcfg_prefix()` 回 -1 时当成功）就会把非法配置
+         * 悄悄当成"已在位"，永远不报错。 */
+        chk(iv_netcfg_if_addr_equals("lo", a2n("127.0.0.1"), a2n("255.0.255.0")) == 0,
+            "c14e non-contiguous mask => not equal (never silent-skip)");
+    }
+
     if (g_fail == 0) {
-        fprintf(stderr, "test_netcfg passed (parse/prefix/guards/targets/dry-apply)\n");
+        fprintf(stderr, "test_netcfg passed (parse/prefix/guards/targets/eq/dry-apply)\n");
         return 0;
     }
     fprintf(stderr, "test_netcfg FAILED (%d checks)\n", g_fail);

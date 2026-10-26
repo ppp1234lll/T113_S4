@@ -236,23 +236,43 @@ int iv_netcfg_parse_targets(const uint8_t *data, size_t len,
     return IV_OK;
 }
 
-int iv_netcfg_if_ip_equals(const char *ifname, uint32_t ip_be)
+int iv_netcfg_if_addr_equals(const char *ifname, uint32_t ip_be, uint32_t mask_be)
 {
     struct ifaddrs *list = NULL;
     struct ifaddrs *p;
     const char     *ifn;
+    int             want;
     int             found = 0;
+
+    /* 期望前缀长度先算出来。掩码非法（不连续）时**没有"相等"可言** —— 直接
+     * 回 0（"不等"），让调用方去走 `iv_netcfg_apply()`，那条路上有完整的
+     * 入参校验会把它按 EINVAL 打回日志，比在这里悄悄判"相等"安全得多。 */
+    want = iv_netcfg_prefix(mask_be);
 
     ifn = (ifname != NULL && ifname[0] != '\0') ? ifname : IV_NETCFG_IFNAME_DEFAULT;
     if (getifaddrs(&list) != 0)
         return -1;
     for (p = list; p != NULL; p = p->ifa_next) {
+        const struct sockaddr_in *sin;
+        int                       have;
+
         if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET)
             continue;
         if (p->ifa_name == NULL || strcmp(p->ifa_name, ifn) != 0)
             continue;
         found = 1;
-        if (((const struct sockaddr_in *)(const void *)p->ifa_addr)->sin_addr.s_addr == ip_be) {
+        sin = (const struct sockaddr_in *)(const void *)p->ifa_addr;
+        if (sin->sin_addr.s_addr != ip_be)
+            continue;
+        if (want < 1)
+            break;
+        /* `ifa_netmask` 在某些内核/驱动上可能是 NULL，此时**不能**判相等 ——
+         * 不知道当前前缀，就当"不等"，宁可多 flush 一次也不要漏应用。 */
+        if (p->ifa_netmask == NULL || p->ifa_netmask->sa_family != AF_INET)
+            break;
+        have = iv_netcfg_prefix(((const struct sockaddr_in *)
+                                 (const void *)p->ifa_netmask)->sin_addr.s_addr);
+        if (have == want) {
             (void)freeifaddrs(list);
             return 1;
         }

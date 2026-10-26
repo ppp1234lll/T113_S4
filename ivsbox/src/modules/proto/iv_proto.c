@@ -271,7 +271,16 @@ void iv_proto_parser_feed(iv_proto_parser_t *ps, const uint8_t *buf, size_t len,
             {
                 uint8_t crc = frame_crc(ps->buf, ps->pos);
                 if (crc != ps->buf[OFF_DATA + ps->want]) {
-                    /* CRC 错：整帧丢弃（pos 复位重新找头） */
+                    /* CRC 错：整帧丢弃（pos 复位重新找头）。
+                     * **必须留痕**（2026-10-26）：这是下行方向上最后一处"静默丢弃"。
+                     * `tr_on_rx()` 记了原始字节，但"收到了字节"与"字节被当成一帧"
+                     * 是两件事 —— 没有这一行，现场只能看到 `rx` 有、命令没执行，
+                     * 分不清是平台算错了 CRC 还是我们自己丢的。 */
+                    IV_LOG_W(PROTO_MOD, "downlink frame dropped: bad crc "
+                             "(cmd 0x%02X len %u, got 0x%02X want 0x%02X)",
+                             (unsigned)ps->buf[OFF_CMD], (unsigned)ps->want,
+                             (unsigned)crc,
+                             (unsigned)ps->buf[OFF_DATA + ps->want]);
                     parser_reset(ps);
                     continue;
                 }
@@ -280,6 +289,9 @@ void iv_proto_parser_feed(iv_proto_parser_t *ps, const uint8_t *buf, size_t len,
             /* CRC 不覆盖帧尾，必须单独校验，不能把坏帧交给命令路由。 */
             if (ps->buf[total - 2u] != (uint8_t)(IV_PROTO_TAIL >> 8) ||
                 ps->buf[total - 1u] != (uint8_t)IV_PROTO_TAIL) {
+                IV_LOG_W(PROTO_MOD, "downlink frame dropped: bad tail "
+                         "(cmd 0x%02X len %u)", (unsigned)ps->buf[OFF_CMD],
+                         (unsigned)ps->want);
                 parser_reset(ps);
                 continue;
             }

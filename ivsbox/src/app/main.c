@@ -1596,6 +1596,12 @@ static void on_plat_mode(const iv_proto_frame_t *f, void *arg)
     }
     if (iv_config_get_int(g_cfg, "sys.transport.mode", &cur) == IV_OK &&
         cur == (int64_t)mode) {
+        /* **同值也要留一行**（2026-10-26 补）：原来这里完全静默，于是平台点
+         * 「配置」后，若下发值与当前相同，设备侧一个字都没有 —— 与"平台压根没发"
+         * 在日志里长得一模一样，现场无法区分（15:32:19 那条 `f3 … 01` 就是这么
+         * 凭空消失的）。同值早返回本身是对的（不重连、不写 flash），只是要留痕。 */
+        IV_LOG_I(APP_MOD, "0xF3 mode=%d unchanged (already active), ack 0x01, "
+                 "link untouched", mode);
         (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
         return;
     }

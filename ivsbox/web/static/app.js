@@ -872,7 +872,8 @@
     card.appendChild(el('h3', null, '本机网络与主网检测'));
     var hint = el('p', 'hint',
       '「配置 IP 和网关」会立刻改本机地址：保存后约 1 秒网口切换，本页连接会断，' +
-      '请按新地址重新打开。三项留空＝不在此处指定（沿用系统网络配置）。');
+      '请按新地址重新打开。三项留空＝不在此处指定（沿用系统网络配置）。' +
+      '「配置有线超时」只改探测超时，不断链、不重启。');
     card.appendChild(hint);
 
     var grid = el('div', 'grid');
@@ -881,13 +882,20 @@
     var bar = el('div', 'actions');
     var btnNet = el('button', null, '配置 IP 和网关');
     var btnProbe = el('button', null, '配置主网检测 IP');
+    var btnTimeout = el('button', null, '配置有线超时');
     var btnReload = el('button', 'ghost', '重新载入');
-    btnNet.type = 'button'; btnProbe.type = 'button'; btnReload.type = 'button';
-    bar.appendChild(btnNet); bar.appendChild(btnProbe); bar.appendChild(btnReload);
+    btnNet.type = 'button'; btnProbe.type = 'button'; btnTimeout.type = 'button';
+    btnReload.type = 'button';
+    bar.appendChild(btnNet); bar.appendChild(btnProbe); bar.appendChild(btnTimeout);
+    bar.appendChild(btnReload);
     card.appendChild(bar);
 
     var ver = 0;
     var descs = {};
+    /* 最近一次载入的配置值（net + probe 合并）。点「配置有线超时」时要拿
+     * `probe.interval_ms` 做"超时必须小于探测周期"的前置校验，而那个键自己
+     * 没有输入框 —— 只能从这份快照里取。 */
+    var cur = {};
 
     function load() {
       grid.innerHTML = '';
@@ -912,6 +920,13 @@
         grid.appendChild(fieldFor('net.gateway', it['net.gateway'], '网关 IP'));
         grid.appendChild(fieldFor('probe.target1', it['probe.target1'], '主网检测 IP 1'));
         grid.appendChild(fieldFor('probe.target2', it['probe.target2'], '主网检测 IP 2'));
+        /* 平台「参数设置」页把这一项摆在"配置IP和网关 / 主网检测IP"同一组里，
+         * 名字是「有线网络超时时间(ms)」。我们原来只在「检测与自愈」页用配置键的
+         * 中文描述「单次探测超时」显示 —— 名字对不上、又换了一页，现场照着平台
+         * 找必然找不到（2026-10-26 用户第二次报同一类问题）。这里标成平台的叫法。 */
+        grid.appendChild(fieldFor('probe.timeout_ms', it['probe.timeout_ms'],
+                                  '有线网络超时时间(ms)'));
+        cur = it;
 
         /* MAC 只读：它是 eth0 的硬件事实（`/api/overview` → net.link），不是配置项。
          * 平台那边同一个位置也是只读显示的，标成可编辑只会误导。 */
@@ -930,6 +945,25 @@
     function pick(key) {
       var inp = grid.querySelector('[data-key="' + key + '"]');
       return inp ? String(inp.value).replace(/^\s+|\s+$/g, '') : '';
+    }
+
+    /* 真正提交（含版本号与失败/断链两套提示）。抽出来是因为下面还有一个
+     * **不走 IPv4 校验**的提交者：探测超时是数字，`submit()` 那套地址校验对它不适用。 */
+    function applyItems(items, okMsg) {
+      api('/api/config/apply', { method: 'POST', body: { ver: ver, items: items } })
+        .then(function (r) {
+          if (!r.ok) {
+            toast(r.e === -3 ? '配置已被别处改动，请刷新后重试'
+                             : '保存失败：' + (r.msg || r.e), 'err');
+            return;
+          }
+          ver = r.d.version;
+          toast(okMsg, 'ok');
+        })
+        .catch(function () {
+          /* 走到这里多半是**地址已经切了**（连接被拆），不是保存失败。 */
+          toast('连接已断开 —— 地址应该已经切换，请按新 IP 重新打开本页', 'warn');
+        });
     }
 
     function submit(keys, okMsg) {
@@ -951,20 +985,7 @@
       }
       if (bad) { toast(bad, 'err'); return; }
 
-      api('/api/config/apply', { method: 'POST', body: { ver: ver, items: items } })
-        .then(function (r) {
-          if (!r.ok) {
-            toast(r.e === -3 ? '配置已被别处改动，请刷新后重试'
-                             : '保存失败：' + (r.msg || r.e), 'err');
-            return;
-          }
-          ver = r.d.version;
-          toast(okMsg, 'ok');
-        })
-        .catch(function () {
-          /* 走到这里多半是**地址已经切了**（连接被拆），不是保存失败。 */
-          toast('连接已断开 —— 地址应该已经切换，请按新 IP 重新打开本页', 'warn');
-        });
+      applyItems(items, okMsg);
     }
 
     btnNet.addEventListener('click', function () {
@@ -973,6 +994,29 @@
     });
     btnProbe.addEventListener('click', function () {
       submit(['probe.target1', 'probe.target2'], '已保存并生效（探测目标不重启、不断链）');
+    });
+    /* 有线网络超时（`0xFE` 落的就是这个键）：整数毫秒，区间与配置默认值表一致
+     * `100..60000`，且必须**小于探测周期** —— 后端的跨键校验就是这么判的。
+     * 三样都在发请求前挡住：后端拒绝只会变成一句"保存失败：…"，而现场更常见的
+     * 理解是"我明明点了保存"（与上面 n07/n08 同一类假成功）。 */
+    btnTimeout.addEventListener('click', function () {
+      var raw = pick('probe.timeout_ms');
+      var n = Number(raw);
+      var itv = Number(cur['probe.interval_ms']);
+      var why = '';
+      var items = {};
+
+      if (raw === '' || !/^\d+$/.test(raw)) {
+        why = '有线网络超时时间必须是整数毫秒';
+      } else if (n < 100 || n > 60000) {
+        why = '有线网络超时时间必须在 100~60000 毫秒之间';
+      } else if (isFinite(itv) && itv > 0 && n >= itv) {
+        why = '超时时间必须小于探测周期（当前 ' + itv + ' ms）';
+      }
+      if (why) { toast(why, 'err'); return; }
+
+      items['probe.timeout_ms'] = n;
+      applyItems(items, '已保存并生效（探测超时即时生效，不断链）');
     });
     btnReload.addEventListener('click', load);
 
@@ -2296,9 +2340,10 @@
     loadLogs();
 
     root.appendChild(configCard('检测与自愈（probe.* / netthr.*）', ['probe', 'netthr'],
-      '探活节拍与超时、故障重启次数与冷却。主网检测 IP 1/2 已收进「网络配置」页的'
-      + '「本机网络与主网检测」卡片（与平台摆在一起），这里不再重复。',
-      null, ['probe.target1', 'probe.target2']));
+      '探活节拍与超时、故障重启次数与冷却。主网检测 IP 1/2 与有线网络超时时间'
+      + '（`probe.timeout_ms`）已收进「网络配置」页的「本机网络与主网检测」卡片'
+      + '（与平台摆在一起），这里不再重复。',
+      null, ['probe.target1', 'probe.target2', 'probe.timeout_ms']));
     root.appendChild(configCard('电阈值与传感器（elec.* / sensor.*）', ['elec', 'sensor'],
       '上报判据用的物理量阈值。'));
     return root;

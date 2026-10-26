@@ -274,6 +274,48 @@ const main = async () => {
     chk(applyCalls.length === 0 && toastText().indexOf('必须填本机 IP') >= 0,
         'n08b: 只填掩码不填 IP 被拦掉（否则后端拿到空 ip 直接返回，等于白填）');
 
+    /* n09：有线网络超时时间（平台 `0xFE` 落的是 `probe.timeout_ms`）。
+     * 2026-10-26 用户第二次报同一类问题：平台「参数设置」那一组里有
+     * 「有线网络超时时间(ms)」，我们只把它藏在「检测与自愈」页、还叫
+     * 「单次探测超时」—— 名字不对、页面也不对，照着平台找必然找不到。 */
+    console.log('n09 有线网络超时时间（probe.timeout_ms）');
+    const to = q(content, 'probe.timeout_ms');
+    chk(to !== null, 'n09a: 「本机网络与主网检测」里有超时输入框');
+    chk(to !== null && to.value === '2000', 'n09b: 带的是真实值 2000 ms');
+    chk(content.textContent.indexOf('有线网络超时时间(ms)') >= 0,
+        'n09c: 标签用的是平台的叫法，不是配置键描述');
+    chk(byText(content, 'button', '配置有线超时') !== null, 'n09d: 有「配置有线超时」按钮');
+    chk(content.querySelectorAll('[data-key="probe.timeout_ms"]').length === 1,
+        'n09e: 本页只有 1 个超时输入框（运维页那份已用 skip 清单去掉，这里不重复）');
+
+    applyCalls.length = 0;
+    to.value = '100';
+    to.dispatchEvent(new window.Event('input'));
+    byText(content, 'button', '配置有线超时').click();
+    await sleep(60);
+    chk(applyCalls.length === 1, 'n09f: 合法值只发一次 config.apply');
+    if (applyCalls.length === 1) {
+        const keys = Object.keys(applyCalls[0].items);
+        chk(keys.length === 1 && keys[0] === 'probe.timeout_ms',
+            'n09g: 只发 probe.timeout_ms 一个键（不多带 target/interval）');
+        chk(applyCalls[0].items['probe.timeout_ms'] === 100,
+            'n09h: 发的是数字 100 而不是字符串（后端按 int 收）');
+    }
+
+    /* 三个非法值都必须在**发请求之前**挡住：区间 100~60000、
+     * 必须小于探测周期（桩里 interval=5000）、整数。 */
+    const bads = [['50', '低于下界 100'], ['5000', '不小于探测周期'],
+                  ['2.5', '不是整数'], ['', '留空']];
+    for (const [v, tag] of bads) {
+        applyCalls.length = 0;
+        to.value = v;
+        to.dispatchEvent(new window.Event('input'));
+        byText(content, 'button', '配置有线超时').click();
+        await sleep(40);
+        chk(applyCalls.length === 0 && toastText().length > 0,
+            'n09i: ' + tag + ' 被前端拦住（不发请求、有提示）');
+    }
+
     if (fail === 0) {
         console.log('ui_net_params: ' + (applyCalls.length ? 'all' : 'all') + ' checks passed');
         process.exit(0);

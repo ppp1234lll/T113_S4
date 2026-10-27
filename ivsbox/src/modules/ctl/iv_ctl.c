@@ -2050,8 +2050,13 @@ static int m_relay_set(const iv_ctl_ctx_t *ctx, json_object *p,
     if (rc != IV_OK)
         return rsp_err(rc, "board link busy or down, retry later", out, cap, out_len);
 
-    /* 催一次全量查询：界面"下发→回读"之间不再空等一个轮询周期。 */
+    /* 催一次全量查询：界面"下发→回读"之间不再空等一个轮询周期。
+     * 并打"刷新后立刻补报"标记：`0xD1` 的应答不进镜像，只有 0xE1 应答才刷新，
+     * 而平台要的是"继电器一变就上报"（默认周期 60 s 太慢，用户 2026-10-27 报过）。
+     * 顺序不能反：先刷镜像、后上报，否则补报出去的是旧状态。
+     * 平台 `0xC4` 走的是 `main.c:on_plat_relay()`，同一对调用 —— 两处别只改一处。 */
     iv_report_request_poll(rp);
+    iv_report_request_report_after_poll(rp);
 
     d = json_object_new_object();
     if (d == NULL)

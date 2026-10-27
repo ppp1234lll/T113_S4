@@ -11,6 +11,7 @@
  *   c02 采集板 0xE1 应答 → 状态镜像被刷新（串口→帧→可靠层→镜像 全链路）；
  *   c03 平台链路建成 UP；
  *   c04 立即上报 → 经「队列 → 取件泵 → TCP」到平台，字段值/顺序/壳/CRC 正确；
+ *   c04b 继电器动作后：催 0xE1 → 镜像刷新 → **立刻补一帧上报**（不等周期）；
  *   c05 平台断开 → 上报入队积压（不丢）；
  *   c06 平台恢复 → 欠包按序补发（CSQ 11/12/13 的到达顺序即序号顺序）、队列清空；
  *   c07 平台下发 E3 查询 → `##`+JSON+`##` 应答、**QN 按平台原值回填**、crc=06；
@@ -533,6 +534,72 @@ int main(void)
         chk(g_door_last == 2, "c02c door hook got DS=2");
     }
 
+    /* ---- c04b 继电器动作后「催 0xE1 → 镜像刷新 → 立刻补报」 ----
+     * 用户原话：「点击断开时，设备继电器断开，但是设备没有上报实时状态，每次
+     * 继电器状态改变时，设备需要上报」。链路事实：`0xC4`（平台）与网页
+     * `relay.set` 都只下发一条 `0xD1`，而 `0xD1` 的应答**不刷新镜像**
+     * （见 `iv_report_send_cmd()`）⇒ 动作后必须再要一次 0xE1，拿到新状态后
+     * 立刻补一帧上报，否则平台得等下一个 30 s 周期才看到继电器变了。
+     * ⚠ 放在 c02c 之后：这里复用的镜像语义是「DS 已被 0xC1 改成 2」。 */
+    {
+        static const char json[] =
+            "{\"V\":234.17,\"A\":0.50,\"H\":50.01,\"T\":31.33,\"DS\":2,"
+            "\"P\":0,\"SPD\":1,\"PA\":1,\"PV\":1,\"APOWER\":\"0.00\","
+            "\"AKW\":\"0.00\",\"RELAY1\":0,\"RELAY2\":1,\"RELAY3\":1,"
+            "\"CHV1\":234.17,\"CHV2\":234.17,\"CHV3\":234.17,"
+            "\"CHA1\":0.0,\"CHA2\":0.0,\"CHA3\":0.0,"
+            "\"POWER1\":0.0,\"POWER2\":0.0,\"POWER3\":0.0,"
+            "\"ELEC1\":0.0,\"ELEC2\":0.0,\"ELEC3\":0.0}";
+        uint8_t  up[IV_FRAME_MAX];
+        char     rx[4096];
+        char     scratch[512];
+        const char *seg  = NULL;
+        size_t   sl   = 0u;
+        size_t   rn   = 0u;
+        size_t   used = 0u;
+        int      un;
+        int      j;
+        uint64_t reps0;
+
+        reps0 = iv_report_reports(&rp);
+
+        /* 动作路径（装配层 `on_plat_relay()` 里的两行就是这两句） */
+        iv_report_request_poll(&rp);
+        iv_report_request_report_after_poll(&rp);
+        chk(rp.want_report == 1u, "c04b want_report armed");
+
+        /* 这一拍必须真的把 0xE1 发出去（request_poll 只拨时刻表，不直接发帧） */
+        (void)drain(master, scratch, sizeof scratch, 0);
+        g_now += STEP_MS;
+        (void)iv_report_step(&rp, g_now);
+        un = (int)drain(master, scratch, sizeof scratch, 200);
+        chk(un > 0, "c04b 0xE1 re-issued after relay action");
+
+        /* 采集板回一份「继电器 1 已断开」的全量状态 */
+        un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_QUERY, json,
+                            (uint16_t)(sizeof json - 1u), up, sizeof up);
+        chk(un > 0, "c04b upstream 0xE1 (relay off) built");
+        chk(write(master, up, (size_t)un) == un, "c04b feed 0xE1 relay-off");
+        pump(&rp, master, 2);
+
+        chk(rp.st.valid.RELAY == 1u && rp.st.data.RELAY[0] == 0,
+            "c04b mirror RELAY1=0 after the poll");
+        chk(rp.want_report == 0u, "c04b want_report consumed exactly once");
+        chk(iv_report_reports(&rp) == reps0 + 1u,
+            "c04b poll produced exactly one extra report");
+
+        for (j = 0; j < 50 && iv_report_queue_count(&rp) > 0u; j++)
+            pump(&rp, master, 1);
+        chk(iv_report_queue_count(&rp) == 0u, "c04b forced report delivered");
+
+        rn   = drain(cs, rx, sizeof rx, 1000);
+        used = next_report_frame(rx, rn, 0u, &seg, &sl);
+        chk(used > 0u, "c04b platform got the forced report");
+        if (used > 0u)
+            chk(strstr(seg, "RELAY=0,1,1;") != NULL,
+                "c04b forced report carries the new relay state");
+    }
+
     /* ---- c05 平台断开 → 上报入队积压（不丢） ---- */
     {
         int j;
@@ -556,7 +623,8 @@ int main(void)
             pump(&rp, master, 1);
         }
         chk(iv_report_queue_count(&rp) == 3u, "c05 3 items queued while down");
-        chk(iv_report_reports(&rp) == 4u, "c05 total reports=4");
+        /* 4 → 5：c04b 的「继电器动作后补报」也计了一笔（c04 1 + c04b 1 + 这里 3） */
+        chk(iv_report_reports(&rp) == 5u, "c05 total reports=5");
         chk(iv_report_queue_full(&rp) == 0u, "c05 nothing dropped");
     }
 
@@ -716,7 +784,7 @@ int main(void)
     if (g_fail == 0)
         printf("test_e2e_report passed "
                "(poll/mirror/power-0xD1/door-event/report/queue/replay/query/ack/"
-               "serial-reconnect)\n");
+               "relay-forced-report/serial-reconnect)\n");
     else
         printf("test_e2e_report FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

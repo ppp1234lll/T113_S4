@@ -233,8 +233,52 @@ static void on_link_done(int rc, uint8_t cmd, const uint8_t *data, uint16_t len,
     iv_report_t *rp = arg;
 
     /* 只消费 0xE1 应答 → 全量刷新镜像（0xF1/0xD1/0xD2 应答本步不用） */
-    if (rc == IV_OK && cmd == IV_FRAME_CMD_QUERY)
+    if (rc == IV_OK && cmd == IV_FRAME_CMD_QUERY) {
         iv_status_handle_query(&rp->st, data, len);
+        /* 把采集板回的原样打一份（DEBUG，正常 30 s 一条）：
+         * "平台不显示通道电压/电流"这种问题，第一件事就是看采集板到底回没回
+         * `CHV1..3`/`CHA1..3` —— 镜像里 `valid.CHV` 要求**三项齐全**，
+         * 少一项就整组当 0，光看镜像分不清"没测到"还是"没回这个键"。 */
+        if (data != NULL && len > 0u) {
+            char jb[512];
+            uint16_t n = (uint16_t)((len < sizeof(jb)) ? len : sizeof(jb) - 1u);
+
+            memcpy(jb, data, n);
+            jb[n] = '\0';
+            IV_LOG_D(REP_MOD, "E1 from board (%u B): %s", (unsigned)len, jb);
+        }
+        /* 继电器动作后补报：镜像此刻已经换成新状态，这一帧带出去的才是真状态。 */
+        if (rp->want_report) {
+            rp->want_report = 0;
+            (void)iv_report_trigger(rp, rp->now_ms);
+        }
+    }
+}
+
+void iv_report_request_report_after_poll(iv_report_t *rp)
+{
+    if (rp != NULL)
+        rp->want_report = 1u;
+}
+
+/* 控制类命令（`0xD1` 电源 / `0xD2` 重启）的应答回调 —— **只用来留痕**。
+ *
+ * 原来这里传的是 NULL：应答被静默丢弃（`iv_link.c` 里 `if (done != NULL)`）。
+ * 代价是"平台点了继电器、板端一声不响"时无法区分两种情况：
+ * ① 采集板压根没收到 / 没回；② 采集板收到并**拒绝**了（例如 `0xD1` 的
+ * `status=2` 重启不被支持，回一个非 0x01 的码）。
+ * 2026-10-27 用户报「点重启设备没反应」正是被这件事卡住的 —— 只能靠加日志取证。
+ * 语义不变：`done` 只影响"要不要回调"，不影响重传（控制命令本来就只发一次）。 */
+static void on_ctrl_done(int rc, uint8_t cmd, const uint8_t *data, uint16_t len,
+                         void *arg)
+{
+    (void)arg;
+    if (rc != IV_OK) {
+        IV_LOG_W(REP_MOD, "board ctrl 0x%02X no ack (rc=%d)", (unsigned)cmd, rc);
+        return;
+    }
+    IV_LOG_I(REP_MOD, "board ctrl 0x%02X ack 0x%02X (%u B)", (unsigned)cmd,
+             (data != NULL && len > 0u) ? (unsigned)data[0] : 0u, (unsigned)len);
 }
 
 int iv_report_send_cmd(iv_report_t *rp, uint8_t cmd, const void *data,
@@ -244,9 +288,10 @@ int iv_report_send_cmd(iv_report_t *rp, uint8_t cmd, const void *data,
         return IV_EINVAL;
     if (!rp->opened)
         return IV_ESTATE;
-    /* 控制命令不登记 on_done：它的应答语义归应用层（本层不消费）。
-     * 传 NULL 的代价是"应答被静默丢弃"，对 0xD1 无害——见 iv_link.h。 */
-    return iv_link_send(&rp->lk, cmd, data, len, (uint32_t)now_ms, NULL, NULL);
+    /* 控制命令的应答**不刷新镜像**（状态靠 0xE1 轮询），但应答码本身要留痕 ——
+     * 见 `on_ctrl_done()`。 */
+    return iv_link_send(&rp->lk, cmd, data, len, (uint32_t)now_ms, on_ctrl_done,
+                        rp);
 }
 
 /* ---------------------------------------------------------------------------
@@ -325,6 +370,20 @@ static void on_link_upstream(uint8_t cmd, const uint8_t *data, uint16_t len,
 {
     iv_report_t *rp = arg;
 
+    /* 采集板**主动**发来的帧（不是我们请求的应答）原样留一份：
+     * 平台"通道电压/电流/用电量全显示 0"这类问题，得先看采集板到底把
+     * `CHV1..3` / `CHA1..3` 放在**哪一帧**里 —— 是 0xE1 应答，还是它自己的
+     * 周期上报（`0xC2`）。只看镜像分不清"没测到"还是"回了但我们没接住"。
+     * DEBUG 级，正常一分钟才几条。 */
+    if (data != NULL && len > 0u) {
+        char     nb[256];
+        uint16_t n = (uint16_t)((len < sizeof(nb)) ? len : (sizeof(nb) - 1u));
+
+        memcpy(nb, data, n);
+        nb[n] = '\0';
+        IV_LOG_D(REP_MOD, "board up cmd 0x%02X (%u B): %s", (unsigned)cmd,
+                 (unsigned)len, nb);
+    }
     iv_status_handle_upstream(cmd, data, len, &rp->st);
 }
 

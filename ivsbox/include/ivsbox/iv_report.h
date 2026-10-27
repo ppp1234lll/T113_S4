@@ -242,6 +242,11 @@ typedef struct {
      * —— 只看帧计数时这两种情况都是 0，现场没法判。 */
     uint64_t last_rx_ms;
     uint8_t  opened;
+    /* "下一次收到采集板 0xE1 应答后立刻补一帧上报"标志（2026-10-27 继电器实时上报用）。
+     * 为什么不在动作后立刻发：`0xD1` 的应答**不进**状态镜像，刚发完命令时镜像里
+     * 还是旧继电器状态，这时候上报等于把旧状态又发一遍 —— 平台界面看着"点了没反应"。
+     * 正确顺序＝动作 → 催 0xE1 → 收到新镜像 → 立刻上报。 */
+    uint8_t  want_report;
 } iv_report_t;
 
 /* 填默认配置（serial/queue 用默认路径、devtype/report/hb/poll 用默认值、devid=0） */
@@ -272,6 +277,16 @@ void iv_report_on_serial(iv_report_t *rp, uint64_t now_ms);
 
 /* 立即触发一次上报入队（E2「立即上报设备状态」用；也供现场排障手动催报）。 */
 int iv_report_trigger(iv_report_t *rp, uint64_t now_ms);
+
+/* 打一个标记：**下一次**收到采集板 0xE1 应答（镜像刷新完）之后，立刻补一帧上报。
+ *
+ * 用途＝"继电器状态变了要立刻告诉平台"：
+ *   - 继电器在采集板侧，`0xD1` 的应答不进镜像（见 `iv_report.h` 头部口径），
+ *     所以动作完成后必须催一次 0xE1 才能拿到新状态；
+ *   - 拿到新状态后**自动**入一帧上报，平台不用等下一个周期（默认 60 s）。
+ * 只能置位、不能叠加：连点几次也只补一帧（多补没有意义，上报里是全量状态）。
+ * 采集板不回 0xE1 时标记保持置位，等下一次轮询成功再补报 —— 不会丢。 */
+void iv_report_request_report_after_poll(iv_report_t *rp);
 
 /*
  * 重连平台传输（S3.3 双 WAN 切换事务里 close_old_tcp + reconnect 两步的合体）：

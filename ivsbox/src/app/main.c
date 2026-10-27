@@ -2687,8 +2687,13 @@ static void on_plat_relay(const iv_proto_frame_t *f, void *arg)
         (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
         return;
     }
-    /* 催一次 0xE1：0xD1 的应答不进镜像，不催的话界面要等下一个轮询周期 */
+    /* 催一次 0xE1 ＋ 打"刷新后立刻补报"的标记：
+     *   ① `0xD1` 的应答**不进**状态镜像 ⇒ 不催的话镜像里的继电器状态还是旧的；
+     *   ② 平台要的是"状态一变就上报"，不是等下一个周期上报（默认 60 s）。
+     *   两件事有严格先后：先刷新镜像、后上报，否则补报出去的是旧状态 ——
+     *   界面上看就是"点了没反应"。真正入队发生在 `on_link_done()` 里。 */
     iv_report_request_poll(rp);
+    iv_report_request_report_after_poll(rp);
 
     IV_LOG_I(APP_MOD, "platform relay ch=%d act=%d -> port=%d status=%d %s",
              ch, act, port, status, payload);

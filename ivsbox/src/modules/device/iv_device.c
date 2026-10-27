@@ -744,6 +744,8 @@ static int handle_packet(iv_device_t *d, const uint8_t *buf, size_t len,
         d->dup++;
         return 0;
     }
+    /* 设备应过答了：本相位不必再补发（内容合不合法是另一回事）。 */
+    if (d->phase_hits < 0xFFu) d->phase_hits++;
     /* 报文里没带 IP ⇒ 用发送方地址兜底（SADP 走二层，没有对端 IP，保持报文里的值）。 */
     if (desc.ip_be == 0u) {
         uint32_t pip = 0;
@@ -810,14 +812,32 @@ static iv_dev_phase_t next_phase(iv_dev_phase_t p) {
     }
 }
 
+/* 每相位的收包窗口（ms）。实测依据（2026-10-27 16:5x，VM 上复刻同一份探测包）：
+ *   - 海康 SADP / UDP：应答 <100 ms；
+ *   - **大华：约 300 ms 才回，而且连发探测会被忽略** —— 只发 1 轮时 302 ms 就回；
+ *     连发 3 轮（间隔 300 ms）首回应反而要 905 ms。
+ * 这正是现场"192.168.1.106 时有时无"的原因：老逻辑窗口＝rounds×round_ms＝3×300
+ * ＝900 ms，刚好压在它应答的边界上，抢进窗口就搜到、差一点就漏。
+ * ⇒ 大华组播改成"发一次 + 等 1000 ms"，比"连发三次"又快又稳。
+ * 顺带把总时长从 9 s 压到 ~3 s（原逻辑每相位都是 3 轮 × 300 ms，而设备根本不看第 2、3 轮）。 */
+static uint32_t phase_window_ms(iv_dev_phase_t p) {
+    switch (p) {
+    case IV_DEV_PHASE_DAHUA_MCAST: return 1000u;
+    case IV_DEV_PHASE_HIK_SADP:    return 500u;
+    default:                       return 400u;
+    }
+}
+
 /* 进入阶段并跳过不可用者（无 SADP 权能时跳过 HIK_SADP）。 */
 static void enter_phase(iv_device_t *d, iv_dev_phase_t p, uint64_t now_ms) {
     while (p == IV_DEV_PHASE_HIK_SADP && !d->sadp_ok)
         p = next_phase(p);
     d->phase = p;
-    d->round = 0;
+    d->round = 0;               /* 本相位已发次数（0＝还没发） */
     d->dport_idx = 0;
-    d->next_round_ms = now_ms;
+    d->phase_hits = 0;          /* 本相位收到的应答数（决定要不要补发） */
+    /* 注意：next_round_ms 现在的语义是**本相位截止时刻**（不再是"下一轮起点"）。 */
+    d->next_round_ms = now_ms + (uint64_t)phase_window_ms(p);
 }
 
 /* 构造并发出某 UDP 目的地的一包。 */
@@ -945,10 +965,28 @@ int iv_device_tick(iv_device_t *d, uint64_t now_ms) {
     n += drain_fd(d, d->fd4);
 
     if (!d->searching) return n;
+
+    /* ① 相位刚进入：先发一轮（每个相位至少发一次）。 */
+    if (d->round == 0u) {
+        (void)send_round(d);
+        d->round = 1u;
+        return n;
+    }
+    /* ② 半程仍没收到任何应答，才补发一次 —— 同相位连发只会被设备忽略
+     *    （大华实测：连发 3 轮反而比发 1 轮更慢），补发是对"丢包"的兜底，
+     *    不是重复轰炸；次数上限仍受 cfg.rounds 约束。 */
+    {
+        uint32_t half = phase_window_ms(d->phase) / 2u;
+        if (d->phase_hits == 0u && d->round < d->cfg.rounds &&
+            now_ms + (uint64_t)half >= d->next_round_ms) {
+            (void)send_round(d);
+            d->round++;
+        }
+    }
     if (now_ms < d->next_round_ms) return n;
 
-    if (d->round >= d->cfg.rounds) {
-        /* 本阶段完成 → 进入下一阶段 */
+    /* ③ 窗口到点 → 下一相位 */
+    {
         iv_dev_phase_t np = next_phase(d->phase);
         if (np == IV_DEV_PHASE_DONE) {
             d->searching = 0;
@@ -960,11 +998,6 @@ int iv_device_tick(iv_device_t *d, uint64_t now_ms) {
         IV_LOG_D(DEV_MOD, "phase -> %s", iv_dev_phase_name(d->phase));
         return n;
     }
-
-    (void)send_round(d);
-    d->round++;
-    d->next_round_ms = now_ms + d->cfg.round_ms;
-    return n;
 }
 
 /* ---------------------------------------------------------------------------

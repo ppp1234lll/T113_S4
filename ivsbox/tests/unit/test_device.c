@@ -343,8 +343,15 @@ static void d08_state_machine(void) {
     }
     chk(!iv_device_is_searching(&d), "d08 search finished");
     chk(iv_device_phase(&d) == IV_DEV_PHASE_DONE, "d08 ended at DONE");
-    /* 发送数：hik-udp 2 + dahua-5050 2 + dahua-mcast 2*3 + unv 2 + onvif 2 = 14 */
-    chk(iv_device_sent(&d) == 14, "d08 total sends == 14");
+    /* 2026-10-27 起改为**时间窗驱动**（原来按"轮数×round_ms"）：
+     * 每相位窗口 hik-udp/dahua-5050/unv/onvif＝400 ms、dahua-mcast＝1000 ms，
+     * 无 SADP 时 5 个相位合计 2600 ms。
+     * 发包次数：各相位"进相位发 1 次 + 半程无应答补发 1 次"；注意 dahua-mcast
+     * 一次 send_round 会向 3 个组播端口各发一包 ⇒ 该相位 2×3＝6 包。
+     * 合计 2+2+6+2+2＝14。这条把"总时长"和"发包次数"同时钉住，防止有人再把
+     * 3 轮 × 300 ms 那种"看起来合理、实际设备根本不看第 2/3 轮"的节奏加回来。 */
+    chk(iv_device_sent(&d) == 14, "d08 total sends == 14（各相位至多 2 轮，mcast 一轮 3 包）");
+    chk(t >= 2600 && t <= 3000, "d08 总时长 ≈ 2.6 s（时间窗驱动，而不是 6 相位 × 900 ms）");
 
     /* 阶段名与品牌名 */
     chk(strcmp(iv_dev_phase_name(IV_DEV_PHASE_DAHUA_MCAST), "dahua-mcast") == 0,
@@ -596,7 +603,7 @@ int main(void) {
         return 1;
     }
     printf("test_device passed (sadp csum/build/parse, hik probe, dahua probe/parse, "
-           "onvif probe/parse, discovery fsm, archive dedup/full/clear, malformed, "
+           "onvif probe/parse, discovery time-window fsm, archive dedup/full/clear, malformed, "
            "peer-ip fallback, hik-udp xml model/ip)\n");
     return 0;
 }

@@ -219,13 +219,14 @@ typedef struct {
     int             n_items;
 
     iv_dev_phase_t  phase;
-    uint32_t        round;        /* 当前阶段已发轮数 */
+    uint32_t        round;        /* 本相位已发次数（0＝还没发） */
+    uint8_t         phase_hits;   /* 本相位收到的应答数（0 ⇒ 半程补发一次） */
     int             fd4;          /* UDP v4 socket，-1=无 */
     int             fd_pkt;       /* AF_PACKET socket，-1=无 */
     int             sadp_ok;      /* AF_PACKET 是否可用 */
     uint16_t        sadp_counter; /* SADP 事务计数（初值 0x1000） */
     uint64_t        next_rx_ms;   /* 本阶段本轮收包窗口截止 */
-    uint64_t        next_round_ms;/* 本阶段下一轮起点 */
+    uint64_t        next_round_ms;/* **本相位截止时刻**（2026-10-27 由"下一轮起点"改为时间窗驱动） */
     uint32_t        dport_idx;    /* 大华组播：当前端口下标 */
     char            tx[IV_DEV_PROBE_MAX];
     size_t          tx_len;

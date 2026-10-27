@@ -470,6 +470,43 @@ def main():
             chk(as_int(bd.get('pl')) == want_pl,
                 'B2d pl 仍送秒（配置 %d ms，应答 %s）' % (want_pl * 1000, bd.get('pl')))
 
+        # ---- B2e~B2h 阈值/重启参数必须"读的是配置"，不是常量 ----
+        # 2026-10-27 现场：平台参数设置页「温度阈值 / 湿度阈值 / 配置重启网络传输
+        # 设备电源」三组全显示 0。根因是 `query_cfg_json()` 把 `ft`/`fh`/`lannum`/
+        # `lantime` 写死成常量（"0,0"/0），而板端 `netthr.reboot_interval_s` 实际是
+        # 60 s —— **值对不上**才是硬证据（不是"恰好都是 0"）。
+        # 这里把三组配成互相可区分的非默认值（温度下限特意给负数），再查一次。
+        se0 = cls_items('sensor')
+        nt0 = cls_items('netthr')
+        apply_cls('sensor', {'sensor.temp_high': 28.0, 'sensor.temp_low': -5.0,
+                             'sensor.humi_high': 80.0, 'sensor.humi_low': 20.0})
+        apply_cls('netthr', {'netthr.reboot_max': 2,
+                             'netthr.reboot_interval_s': 45})
+        plat.clear()
+        plat.send(build_downlink(0xE1))
+        f = plat.wait(0xE1, kind='json')
+        bd2 = {}
+        if f is not None:
+            try:
+                bd2 = (json.loads(f['data'].decode('utf-8', 'replace')) or {}).get('data') or {}
+            except Exception:
+                bd2 = {}
+        chk(bd2.get('ft') == '28,-5',
+            'B2e ft 送温度阈值"上限,下限"（含负温；应答 %r）' % bd2.get('ft'))
+        chk(bd2.get('fh') == '80,20',
+            'B2f fh 送湿度阈值"上限,下限"（应答 %r）' % bd2.get('fh'))
+        chk(as_int(bd2.get('lannum')) == 2,
+            'B2g lannum 送重启次数（配置 2，应答 %s）' % bd2.get('lannum'))
+        chk(as_int(bd2.get('lantime')) == 45,
+            'B2h lantime 送重启时间秒（配置 45，应答 %s）' % bd2.get('lantime'))
+        # 立刻还原，不指望结尾的批量还原 —— 那条路径的"原值"可能是上一轮污染的。
+        apply_cls('sensor', {k: se0[k] for k in
+                             ('sensor.temp_high', 'sensor.temp_low',
+                              'sensor.humi_high', 'sensor.humi_low') if k in se0})
+        apply_cls('netthr', {k: nt0[k] for k in
+                             ('netthr.reboot_max', 'netthr.reboot_interval_s')
+                             if k in nt0})
+
         print('B3 0xE2 立即上报 ⇒ 回 ACK 0x01')
         plat.clear()
         plat.send(build_downlink(0xE2))

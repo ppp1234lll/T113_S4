@@ -1184,6 +1184,25 @@ static void cj_int(struct cfg_json *j, const char *key, long long v)
     cj_str(j, key, b);
 }
 
+/* 取整型配置，取不到按 0 —— 与 `cfg_str()` 同一口径。 */
+static int64_t cfg_int(const char *key)
+{
+    int64_t v = 0;
+
+    (void)iv_config_get_int(g_cfg, key, &v);
+    return v;
+}
+
+/* 取 double 配置（`elec.*` / `sensor.*`）。取不到按 0 —— 与 `cfg_str()` 同一口径：
+ * 0xE1 应答里"没配"和"配了 0"在平台上都是 0，没必要区分。 */
+static double cfg_dbl(const char *key)
+{
+    double d = 0.0;
+
+    (void)iv_config_get_dbl(g_cfg, key, &d);
+    return d;
+}
+
 static int query_cfg_json(char *out, size_t cap, void *arg)
 {
     struct cfg_json       j;
@@ -1273,9 +1292,27 @@ static int query_cfg_json(char *out, size_t cap, void *arg)
         v = 0;
     cj_int(&j, "pn", (long long)v);
 
-    /* 风扇温湿度 / 网络延时：本板无风扇、无该配置项 ⇒ 0，不编 */
-    cj_str(&j, "ft", "0,0");
-    cj_str(&j, "fh", "0,0");
+    /* 温度阈值 / 湿度阈值 —— **平台「参数设置」页那两组「上限/下限」输入框读的就是
+     * 这两个键**（键名沿用参考实现的 `ft`/`fh`，"上限,下限" 两元组）。
+     *
+     * 2026-10-27 之前这里写死 `"0,0"`（理由是"本板无风扇"），而平台界面把 `ft`/`fh`
+     * 直接渲染成「温度阈值/湿度阈值」⇒ **不管设备上配了什么，页面永远显示 0**，
+     * 现场表现为"阈值参数没上报"。
+     *
+     * 落点取箱内温湿度传感器阈值 `sensor.temp_*` / `sensor.humi_*`：与 `0xF1`
+     * 下发给采集板的是**同一批值**（见 `on_cfg_committed()` 的 ELEC/SENSOR 分支），
+     * 读写同源，不会出现"配了 A、读回 B"。 */
+    (void)snprintf(pair, sizeof(pair), "%lld,%lld",
+                   (long long)cfg_dbl("sensor.temp_high"),
+                   (long long)cfg_dbl("sensor.temp_low"));
+    cj_str(&j, "ft", pair);
+    (void)snprintf(pair, sizeof(pair), "%lld,%lld",
+                   (long long)cfg_dbl("sensor.humi_high"),
+                   (long long)cfg_dbl("sensor.humi_low"));
+    cj_str(&j, "fh", pair);
+
+    /* 网络延时（`pt`）：语义与 `pn`（有线网络超时）不是一回事，没有确定键 ⇒ 仍送 0。
+     * 不拿 `probe.*` 硬凑 —— 凑错了平台会显示一个"看着对其实不对"的数。 */
     cj_int(&j, "pt", 0);
 
     /* 六路摄像机 IP（c1..c6） */
@@ -1289,14 +1326,24 @@ static int query_cfg_json(char *out, size_t cap, void *arg)
         cj_str(&j, key, camip);
     }
 
-    /* 电压/电流/漏电/倾斜阈值与网络电源次数：本板无对应采集 ⇒ 0 */
-    cj_int(&j, "ov", 0);
-    cj_int(&j, "uv", 0);
-    cj_int(&j, "oc", 0);
-    cj_int(&j, "angle", 0);
+    /* 电压/电流/倾斜阈值：配置键早有（`elec.*` / `sensor.tilt`，与 0xF1 下发采集板
+     * 的是同一批值），此前也一律送常量 0 ⇒ 平台「电流电压阈值」页同样读回 0。
+     * 同批接上（**纯读**：写端 0xA4 的五字段序仍未确证，见 `docs/代码说明.adoc`）。
+     * `miu` 来源未定，不猜，仍送 0；漏电 `elec.leak_current` 在 0xE1 键表里没有
+     * 对应键，也没有界面读它。 */
+    cj_int(&j, "ov", (long long)cfg_dbl("elec.volt_high"));
+    cj_int(&j, "uv", (long long)cfg_dbl("elec.volt_low"));
+    cj_int(&j, "oc", (long long)cfg_dbl("elec.over_current"));
+    cj_int(&j, "angle", (long long)cfg_dbl("sensor.tilt"));
     cj_int(&j, "miu", 0);
-    cj_int(&j, "lannum", 0);
-    cj_int(&j, "lantime", 0);
+
+    /* 重启网络传输设备电源（平台「配置重启网络传输设备电源」那一组）：
+     *   「重启次数」  ＝ `netthr.reboot_max`（0 ＝ 禁用自愈）
+     *   「重启时间(s)」＝ `netthr.reboot_interval_s`（两次重启之间的最短间隔）
+     * 此前**两个都送常量 0**：板端 `reboot_interval_s` 实际 60 s、页面显示 0
+     * —— 这是"没上报"最硬的一条证据（不是"恰好都是 0"，是值根本对不上）。 */
+    cj_int(&j, "lannum", (long long)cfg_int("netthr.reboot_max"));
+    cj_int(&j, "lantime", (long long)cfg_int("netthr.reboot_interval_s"));
 
     return j.ovf ? IV_ERANGE : (int)j.n;
 }

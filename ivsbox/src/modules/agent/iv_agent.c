@@ -787,7 +787,8 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
  * 由 tick 在相位机 DONE 时补 JSON"两段式。到点（15 s）还没搜完也发，
  * 带当时已发现的条目 —— 平台宁可拿到 3 台，也不要拿到超时。 */
 #define IV_AGENT_IPC_WAIT_MS   15000u
-#define IV_AGENT_IPC_JSON_MAX  1024
+/* `IV_AGENT_IPC_JSON_MAX` 挪到 `ivsbox/iv_agent.h`：它是"组包结果放不放得下"的
+ * 契约，用例要能直接断言（否则改了没人管，改回 1024 也不会红）。 */
 
 /* 纯函数：把当前发现档案拼成 `0xE4` 应答 JSON（不碰链路，便于单测钉字符串）。
  * 返回长度（>0）或负的错误码；缓冲不够返回 `IV_ERANGE` —— **绝不发半截**。
@@ -843,7 +844,9 @@ int iv_agent_build_ipc_json(const iv_agent_t *a, const char *qn, char *out, size
     /* 字段顺序照 `指令-通用版 20260623.xlsx` 的「查询摄像机信息」应答模板：
      * ver → devtype → tid → cmd → num → ip0/mac0/bd0/mod0/osd0 → … → crc。
      * `type` 是 devtype 的别名（与 0xE3 一样两边都发，平台用哪个都不会落空）。
-     * **下标 0 基**：表里从 `ip0` 起，最多 6 路。 */
+     * **下标 0 基**：表里从 `ip0` 起。表上只举了 6 行，但参考固件的循环是
+     * `for (i = 0; i < ipc_num; i++)`、`ipc_param[IPC_NUM_MAX]`＝**10 路**，
+     * 所以路数上限取 `IV_DEV_MAX`（＝10），不按模板行数截断。 */
     n = snprintf(out, cap,
                  "{\"code\":0,\"qn\":\"%s\",\"data\":{"
                  "\"ver\":\"%02x\",\"devtype\":\"%04x\",\"type\":\"%04x\","

@@ -83,8 +83,12 @@ extern "C" {
 
 /* 二进制帧 DATA 上限。LEN 字段 1 字节（0~255）；255 同时留足心跳/ACK 空间。 */
 #define IV_PROTO_BIN_DATA_MAX 255u
-/* ## 帧数据段上限：参考实现上报样例约 415 字符，取 1 KiB 整数上限。 */
-#define IV_PROTO_TXT_DATA_MAX 1024u
+/* ## 帧数据段上限。参考实现上报样例约 415 字符，但 `0xE4`「查询摄像机信息」
+ * 按 `IPC_NUM_MAX`（10 路）循环拼接：实测 7 路 ≈ 974 字节、10 路 ≈ 1.3 KiB，
+ * 现场固件给的缓冲是 `SEND_MSG_BUF_SIZE 2048`（`APP/Task/inc/send.h`）。
+ * 取 1024 会让 8 路以上**整帧被 IV_ERANGE 拒发**（半截 JSON 平台解析必失败），
+ * 故对齐到 2048。 */
+#define IV_PROTO_TXT_DATA_MAX 2048u
 
 /* 默认设备类型。
  * 参考实现 `General_Version/main/Include/main.h` 的 `DEVICE_TYPE` 是 **0x0400**，

@@ -869,6 +869,44 @@ static int scenario(void)
         dv->n_items = 0; /* 归还：后面的用例不该看见这两台假摄像机 */
     }
 
+    /* m03b 路数上限与缓冲：**现场固件是 10 路**，我们曾经按指令表模板的 6 行截断，
+     * 现场 7 台时第 7 台被静默丢弃（`IV_EFULL` 无日志）⇒ 平台上一台设备"时有时无"。
+     * 这条用例同时钉住两件事：① 10 台都进得了档案、`num` 说实话；
+     * ② JSON 超过旧的 1 KiB（7 路就接近、10 路必然超）不能再被 `IV_ERANGE` 拒发。 */
+    {
+        iv_device_t *dv = iv_agent_device(&g_agent);
+        static char  js2[2048];
+        int          jn;
+        int          i;
+
+        memset(dv->item, 0, sizeof dv->item);
+        for (i = 0; i < IV_DEV_MAX; i++) {
+            dv->item[i].brand = (i < 5) ? IV_DEV_BRAND_HIKVISION : IV_DEV_BRAND_DAHUA;
+            dv->item[i].ip_be = htonl(0xC0A80240u + (uint32_t)i); /* .64 起 */
+            dv->item[i].mac[0] = 0x28u;
+            dv->item[i].mac[5] = (uint8_t)i;
+            (void)snprintf(dv->item[i].model, sizeof dv->item[i].model, "%s",
+                           (i < 5) ? "DS-2CD3T46WDV3-I3" : "DH-IPC-HFW1433M-A-IL2");
+        }
+        dv->n_items = (uint8_t)IV_DEV_MAX;
+
+        jn = iv_agent_build_ipc_json(&g_agent, "0", js2, sizeof js2);
+        chk(IV_DEV_MAX == 10, "m03b 档案上限 = 10（对齐现场固件 IPC_NUM_MAX）");
+        chk(jn > 0, "m03b 10 路 ipc json 建得出来（不因缓冲不足被拒）");
+        chk(jn > 1024, "m03b 10 路 JSON > 1 KiB（旧缓冲必 ERANGE）");
+        chk(strstr(js2, "\"num\":10") != NULL, "m03b num=10（按实际台数，不按模板 6 行截断）");
+        chk(strstr(js2, "\"ip6\":\"192.168.2.70\"") != NULL,
+            "m03b ip6 存在 —— 第 7 台不再被丢（现场就是丢在这）");
+        chk(strstr(js2, "\"ip9\":\"192.168.2.73\"") != NULL, "m03b ip9 存在（下标一路到 9）");
+        chk(strstr(js2, "\"bd5\":1") != NULL, "m03b 第 6 台起是大华（bd=1）");
+        /* 真链路用的是 `ipc_reply_tick()` 里那块 `IV_AGENT_IPC_JSON_MAX` 缓冲：
+         * 组出来的串必须装得下，否则到点整帧不发（症状同样是"平台没数据"）。 */
+        chk(IV_AGENT_IPC_JSON_MAX >= jn,
+            "m03b 组包缓冲 >= 满档案 JSON（否则到点整帧不发）");
+
+        dv->n_items = 0; /* 归还 */
+    }
+
     /* =======================================================================
      * m04 S4.3 SNMP：启动 / 在飞唯一 / 未配槽位不发包 / 无值不乱填
      * ======================================================================= */

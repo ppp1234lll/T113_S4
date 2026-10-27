@@ -858,9 +858,9 @@ iv_device_t *iv_agent_device(iv_agent_t *a);
  * 参考固件 `General_Version/main/APP/User/src/com.c:com_ipc_device_information()`：
  *
  *   {"code":0,"qn":"…","data":{"ver":"11","devtype":"0a00","type":"0a00",
- *    "tid":"b2cc1","cmd":"E4","num":6,
+ *    "tid":"b2cc1","cmd":"E4","num":7,
  *    "ip0":"192.168.2.102","mac0":"18:68:…","bd0":0,"mod0":"HS-AFS-MAGE20","osd0":"",
- *    …（**0 基**，最多 6 路）,"crc":"ff"}}
+ *    …（**0 基**，最多 `IV_DEV_MAX`＝10 路，见 `IPC_NUM_MAX`）,"crc":"ff"}}
  *
  * 三条最容易写错的：① 下标 **0 基**（表里从 `ip0` 起）；② `bd%d` 是**整数品牌码**
  * （0=海康 1=大华 2=宇视，与自己的 `iv_dev_brand_t` 序号不同，必须映射）；
@@ -868,6 +868,12 @@ iv_device_t *iv_agent_device(iv_agent_t *a);
  * 返回长度或 `IV_ERANGE`（缓冲不够时**整条不拼**，绝不发半截）/ `IV_EINVAL`。 */
 int iv_agent_build_ipc_json(const iv_agent_t *a, const char *qn, char *out,
                             size_t cap);
+
+/* 组包缓冲上限（`ipc_reply_tick()` 的栈上缓冲）。**必须 >= 满档案时的 JSON 长度**：
+ * 10 路实测 ≈ 1.3~1.4 KiB，现场固件的 `SEND_MSG_BUF_SIZE` 也是 2048。
+ * 原先取 1024 ⇒ 8 路以上整帧 `IV_ERANGE` 不发（半截 JSON 平台解析必失败），
+ * 症状与"没数据"完全一样。这里是公开契约，`test_agent_m4` 的 m03b 直接断言。 */
+#define IV_AGENT_IPC_JSON_MAX 2048
 
 /* ---------------------------------------------------------------------------
  * S4.3 SNMP 采集（慢任务池内执行）

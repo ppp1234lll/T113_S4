@@ -121,8 +121,8 @@ typedef struct {
     unsigned             index; /* camera:/media: 的下标；web 恒 0 */
 } iv_tunnel_svc_t;
 
-/* 摄像机档案上限 6（探测侧口径，`IV_DEV_MAX`）；媒体 8（录像侧口径）。
- * 两处路数与配置模块一样**故意不同**。 */
+/* 摄像机隧道上限 6（与 `IV_DEV_MAX` 无关：探测档案 2026-10-27 起放到 10 台，
+ * 但每台隧道要占一个 frpc 代理，产品只开 6 条）；媒体 8（录像侧口径）。 */
 #define IV_TUNNEL_CAM_MAX   6u
 #define IV_TUNNEL_MEDIA_MAX 8u
 

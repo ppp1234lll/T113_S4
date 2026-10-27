@@ -28,13 +28,15 @@ static void chk(int cond, const char *what) {
  * 注入点：假 socket + 发送记录 + 收包队列
  * ------------------------------------------------------------------------- */
 static int g_next_fd = 100;
-static uint8_t g_sent[16][IV_DEV_PROBE_MAX];
-static size_t g_sent_len[16];
+/* 发送/注入队列深度：**必须 >= IV_DEV_MAX**，否则"档案能装 10 台、脚手架只塞得进
+ * 8 包"会让用例假红（2026-10-27 把 IV_DEV_MAX 提到 10 时就这样红过一次）。 */
+static uint8_t g_sent[32][IV_DEV_PROBE_MAX];
+static size_t g_sent_len[32];
 static int g_sent_n;
 static int g_last_sent_fd = -1;
 
-static uint8_t g_queue[8][IV_DEV_RX_MAX];
-static size_t g_queue_len[8];
+static uint8_t g_queue[16][IV_DEV_RX_MAX];
+static size_t g_queue_len[16];
 static int g_queue_n;
 static int g_queue_i; /* FIFO 读游标 */
 static int g_queue_fd = -1; /* 只对某个 fd 出队；-1=任意 */
@@ -66,7 +68,7 @@ static ssize_t io_sendto(int fd, const void *buf, size_t len, int flags,
     (void)flags;
     (void)a;
     (void)al;
-    if (g_sent_n < 16 && len <= IV_DEV_PROBE_MAX) {
+    if (g_sent_n < (int)(sizeof g_sent / sizeof g_sent[0]) && len <= IV_DEV_PROBE_MAX) {
         memcpy(g_sent[g_sent_n], buf, len);
         g_sent_len[g_sent_n] = len;
         g_sent_n++;
@@ -125,7 +127,7 @@ static void io_reset(void) {
     g_now = 0;
 }
 static void io_push(const void *data, size_t len) {
-    if (g_queue_n < 8) {
+    if (g_queue_n < (int)(sizeof g_queue / sizeof g_queue[0])) {
         memcpy(g_queue[g_queue_n], data, len);
         g_queue_len[g_queue_n] = len;
         g_queue_n++;

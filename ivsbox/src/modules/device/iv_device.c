@@ -698,7 +698,15 @@ static int add_item(iv_device_t *d, const iv_dev_desc_t *desc) {
             return 0;
         }
     }
-    if (d->n_items >= IV_DEV_MAX) return IV_EFULL;
+    if (d->n_items >= IV_DEV_MAX) {
+        /* 满了就丢 ⇒ 平台上那台设备"时有时无"，而且**完全不留痕**：2026-10-27 板端
+         * 现场 7 台、档案 6 格，被挤掉的是 `.106` 球机，日志里连个影子都没有
+         * （`raw[]` 只在入档成功后才打）。这种丢弃必须喊出来，否则下次还是靠猜。 */
+        IV_LOG_W(DEV_MOD, "archive full (%d), drop %02x:%02x:%02x:%02x:%02x:%02x",
+                 (int)IV_DEV_MAX, desc->mac[0], desc->mac[1], desc->mac[2],
+                 desc->mac[3], desc->mac[4], desc->mac[5]);
+        return IV_EFULL;
+    }
     d->item[d->n_items] = *desc;
     if (d->cfg.on_found != NULL) d->cfg.on_found(&d->item[d->n_items], d->cfg.cb_arg);
     d->n_items++;

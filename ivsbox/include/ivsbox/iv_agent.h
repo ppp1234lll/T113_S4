@@ -854,11 +854,17 @@ iv_device_t *iv_agent_device(iv_agent_t *a);
 
 /* 把当前发现档案拼成平台 `0xE4` 应答 JSON（**纯函数**，不碰链路）。
  *
- * 形如 `{"code":0,"qn":"…","data":{"num":2,"ip1":"192.168.2.64",
- * "mac1":"aa:bb:..","bd1":"hikvision","mod1":"…","osd1":"", …}}` —— data 里的
- * 字段名取自参考实现的 `0xE4` 应答（`ip%d`/`mac%d`/`bd%d`/`mod%d`/`osd%d`，
- * **1 基**，见 `docs/代码说明.adoc` 命令表）；封套按 `0xE3`/`0xE1` 同一套
- * （`code`/`qn`/`data`），**这是全实现里唯一靠推断的一处**。
+ * 口径**不再靠推断**：`指令-通用版 20260623.xlsx`「查询摄像机信息」应答模板 ＋
+ * 参考固件 `General_Version/main/APP/User/src/com.c:com_ipc_device_information()`：
+ *
+ *   {"code":0,"qn":"…","data":{"ver":"11","devtype":"0a00","type":"0a00",
+ *    "tid":"b2cc1","cmd":"E4","num":6,
+ *    "ip0":"192.168.2.102","mac0":"18:68:…","bd0":0,"mod0":"HS-AFS-MAGE20","osd0":"",
+ *    …（**0 基**，最多 6 路）,"crc":"ff"}}
+ *
+ * 三条最容易写错的：① 下标 **0 基**（表里从 `ip0` 起）；② `bd%d` 是**整数品牌码**
+ * （0=海康 1=大华 2=宇视，与自己的 `iv_dev_brand_t` 序号不同，必须映射）；
+ * ③ 要带 `ver`/`devtype`/`tid`/`crc`（crc 与 0xE1/0xE3 同一算法）。
  * 返回长度或 `IV_ERANGE`（缓冲不够时**整条不拼**，绝不发半截）/ `IV_EINVAL`。 */
 int iv_agent_build_ipc_json(const iv_agent_t *a, const char *qn, char *out,
                             size_t cap);

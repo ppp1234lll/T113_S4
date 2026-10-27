@@ -8096,3 +8096,88 @@ dahua      192.168.1.106   40:7a:a4:86:95:62   DH-SD6223-DGQ-i      dahua-mcast
   这三条要一起改成"平台没给就回 0"。
 * 大华组播的 `client.notifyDevInfo` JSON 里应该也有自己的 IP 字段，本轮先靠源地址
   兜底，等拿到完整 JSON 再改成读报文。
+
+== 2026-10-27 16:51 0xE4 应答体对齐权威：0 基下标、整数品牌码、crc
+
+=== 16:40 那一轮：数据对了，格式还是不对
+
+上一节修完 IP 与型号后，板端真帧已经是"看着完全正确"的：
+
+[source,text]
+----
+16:40:01 E4 reply: {"code":0,"qn":"...","data":{"cmd":"E4","num":6,
+          "ip1":"192.168.2.102",...,"bd1":"hikvision","mod1":"HS-AFS-MAGE20","osd1":"",...}}
+----
+
+6 台、IP 齐、型号真 —— 平台依旧是「已完成 0 个查询」「暂无数据」。
+**数据对不代表格式对**，停止推断，去找权威。
+
+=== 两份权威，三处不符
+
+. `F:/debug/General_Version - 无SADP\指令-通用版 20260623.xlsx`
+  「查询摄像机信息（上报配置：设备->服务器）」应答模板。
+. `General_Version\main\APP\User\src\com.c` 的 `com_ipc_device_information()`
+  —— 现场真正在跑的那份固件。
+
+模板（节选）：
+
+[source,json]
+----
+##{ "code": 0, "qn": "20210121143412008",
+    "data": { "ver": "11", "tid": "1234", "cmd": "E4", "num": 3,
+              "ip0": "192.168.0.111", "mac0": "11:22:33:44:55:66", "bd0": 1,
+              "mod0": "NVR3S-01", "osd0": "…",
+              "ip1": …, "bd1": 2, …, "crc": "ff" } }##
+----
+
+对照下来三处不符，每一处都足以让平台"0 台"：
+
+[cols="1,2,2"]
+|===
+| 项 | 我们原来 | 权威要求
+
+| 下标 | `ip1`…`ip6`（1 基） | **`ip0`…`ip5`（0 基）**，平台从 `ip0` 起取
+| `bd%d` | 字符串 `"hikvision"` | **整数码** `0`=海康 `1`=大华 `2`=宇视
+| 封套 | 只有 `cmd`/`num` | 还要 `ver`/`devtype`/`tid`/**`crc`**
+|===
+
+`crc` 算法与 0xE1/0xE3 同一套（`iv_report_query_crc()`：`"%02x%04x%x%02X"`
+＝ver+devtype+tid+cmd，再 CRC8）。指令表把它简写成 "ver+tid+cmd"，但参考固件
+`com_ipc_device_information()` 是 `sprintf(crc_buff,"%02x%04x%xE4", …)`，**含 devtype**，
+且平台吃得下我们同算法的 E3 ⇒ 不另起一套。
+
+=== 一个坑：品牌码不是我们的枚举
+
+[source,c]
+----
+/* iv_dev_brand_t: UNKNOWN=0, HIKVISION=1, DAHUA=2, UNV=3, ONVIF=4
+ * 平台/参考固件 : HIKVISION=0, DAHUA=1, UNW=2, KEDACOM=3, JOVISION=4
+ * 直接把枚举值发出去 ⇒ 海康被写成 1（＝大华）。必须映射。 */
+static int ipc_brand_code(iv_dev_brand_t b);   /* hik 0 / dahua 1 / unv 2 / 其它 3 */
+----
+
+=== 验证
+
+* 生成的应答体（e2e 真链路日志，VM 上 5 台）：
+
+[source,json]
+----
+{"code":0,"qn":"2874540201432778632","data":{"ver":"11","devtype":"0a00","type":"0a00",
+ "tid":"0","cmd":"E4","num":5,
+ "ip0":"192.168.2.100","mac0":"e0:ba:ad:da:ab:dd","bd0":0,"mod0":"DS-7804N-F1(C)","osd0":"",
+ "ip3":"192.168.1.106","mac3":"40:7a:a4:86:95:62","bd3":1,"mod3":"DH-SD6223-DGQ-i","osd3":"",
+ "crc":"25"}}
+----
+
+* `test_agent_m4` m03 重写断言：`ip0`/`mac0`/`mod1`/`bd0=0`/`bd1=1`、品牌不许是英文词、
+  `ver`/`devtype`/`tid`/`cmd`/`crc` 必须在、截断仍返回 `IV_ERANGE`。
+* 反向证伪：下标改回 `i + 1` ⇒ FAILED(3)（`ip0`/`mac0`/`ip1` 三条红），还原复绿。
+* 全量：test/asan/tsan 各 47/47、analyze 0 报告、arm 0 告警（md5 `a5ad3f09…`）、
+  e2e 118 PASS、itest 16 passed ＋ 1 SKIP。
+
+=== 教训（写给下一次）
+
+`0xE4` 这一条前后错了三版：只回 ACK（没数据）→ 先 ACK 再补 JSON（平台拿去当应答解析失败）
+→ 1 基/英文品牌/缺 crc（平台按 `ip0` 取不到）。三次都是"**看着发出去了**"。
+判据只能是平台侧真的显示出数据；拿不到平台源码时，去翻**现场在跑的固件**
+（`General_Version`）和**指令表**，比照着自己的实现推要快得多。

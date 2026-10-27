@@ -797,13 +797,32 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
  * 的 `0xE4` 应答体只说明了 data 里有什么（`num` ＋ 每路 `ip%d`/`mac%d`/`bd%d`/
  * `mod%d`/`osd%d`，1 基），没写封套。**这是本实现里唯一靠推断的一处**：
  * 若平台仍不认，需要平台侧给一份真实的 0xE4 应答样例再对齐字段名。 */
+/* 平台侧品牌码（`指令-通用版 20260623.xlsx`「查询摄像机信息」：0=海康 1=大华 2=宇视；
+ * 参考固件 `ipc_brand_t` 同为 HIKVISION=0/DAHUA=1/UNW=2，另加 KEDACOM=3/JOVISION=4）。
+ * 我们的 `iv_dev_brand_t` 序号不同（UNKNOWN=0/HIK=1/DAHUA=2/UNV=3/ONVIF=4）
+ * ⇒ **必须映射，不能把枚举值直接发出去**：直接发会把海康写成 1（＝大华）。 */
+static int ipc_brand_code(iv_dev_brand_t b)
+{
+    switch (b) {
+    case IV_DEV_BRAND_HIKVISION: return 0;
+    case IV_DEV_BRAND_DAHUA:     return 1;
+    case IV_DEV_BRAND_UNV:       return 2;
+    case IV_DEV_BRAND_ONVIF:     return 3; /* 泛 ONVIF：表里只定义 0/1/2，取"其它" */
+    case IV_DEV_BRAND_UNKNOWN:
+    default:                     return 3;
+    }
+}
+
 int iv_agent_build_ipc_json(const iv_agent_t *a, const char *qn, char *out, size_t cap)
 {
-    int n = 0;
-    int i;
-    int cnt;
+    int      n = 0;
+    int      i;
+    int      cnt;
+    uint16_t devtype;
+    uint32_t devid;
+    char     crc2[3];
 
-    if (a == NULL || out == NULL || cap < 32u)
+    if (a == NULL || out == NULL || cap < 64u)
         return IV_EINVAL;
 
     cnt = iv_agent_device_count(a);
@@ -812,10 +831,26 @@ int iv_agent_build_ipc_json(const iv_agent_t *a, const char *qn, char *out, size
     if (cnt > IV_DEV_MAX)
         cnt = IV_DEV_MAX;
 
+    devtype = a->rp.pf.id.devtype;
+    devid   = a->rp.pf.id.devid;
+    /* 与 0xE1/0xE3 同一套签名口径（参考固件：`sprintf("%02x%04x%xE4", …)` 再算 CRC8）。
+     * 指令表把它简写成 "ver+tid+cmd"，但参考实现是**含 devtype** 的，且平台吃得下
+     * E3 的同款算法 ⇒ 不另起一套。 */
+    (void)snprintf(crc2, sizeof crc2, "%02x",
+                   (unsigned)iv_report_query_crc(devtype, devid,
+                                                 IV_PROTO_CMD_QUERY_IPC_IP));
+
+    /* 字段顺序照 `指令-通用版 20260623.xlsx` 的「查询摄像机信息」应答模板：
+     * ver → devtype → tid → cmd → num → ip0/mac0/bd0/mod0/osd0 → … → crc。
+     * `type` 是 devtype 的别名（与 0xE3 一样两边都发，平台用哪个都不会落空）。
+     * **下标 0 基**：表里从 `ip0` 起，最多 6 路。 */
     n = snprintf(out, cap,
-                 "{\"code\":0,\"qn\":\"%s\",\"data\":{\"cmd\":\"%02X\",\"num\":%d",
+                 "{\"code\":0,\"qn\":\"%s\",\"data\":{"
+                 "\"ver\":\"%02x\",\"devtype\":\"%04x\",\"type\":\"%04x\","
+                 "\"tid\":\"%x\",\"cmd\":\"%02X\",\"num\":%d",
                  (qn != NULL && qn[0] != '\0') ? qn : "0",
-                 (unsigned)IV_PROTO_CMD_QUERY_IPC_IP, cnt);
+                 (unsigned)IV_PROTO_VER, (unsigned)devtype, (unsigned)devtype,
+                 (unsigned)devid, (unsigned)IV_PROTO_CMD_QUERY_IPC_IP, cnt);
     if (n < 0 || (size_t)n >= cap)
         return IV_ERANGE;
     for (i = 0; i < cnt; i++) {
@@ -830,21 +865,25 @@ int iv_agent_build_ipc_json(const iv_agent_t *a, const char *qn, char *out, size
             in.s_addr = d.ip_be;
             (void)inet_ntop(AF_INET, &in, ip, sizeof ip);
         }
+        /* `bd%d` 是**整数**品牌码（表里 0/1/2），不是英文词；`osd%d` 恒空字符串
+         * （发现链路拿不到 OSD 名，表里允许空串）。 */
         k = snprintf(out + n, cap - (size_t)n,
                      ",\"ip%d\":\"%s\",\"mac%d\":\"%02x:%02x:%02x:%02x:%02x:%02x\","
-                     "\"bd%d\":\"%s\",\"mod%d\":\"%s\",\"osd%d\":\"\"",
-                     i + 1, ip, i + 1, d.mac[0], d.mac[1], d.mac[2], d.mac[3],
-                     d.mac[4], d.mac[5], i + 1, iv_dev_brand_name(d.brand),
-                     i + 1, d.model, i + 1);
+                     "\"bd%d\":%d,\"mod%d\":\"%s\",\"osd%d\":\"\"",
+                     i, ip, i, d.mac[0], d.mac[1], d.mac[2], d.mac[3],
+                     d.mac[4], d.mac[5], i, ipc_brand_code(d.brand),
+                     i, d.model, i);
         if (k < 0 || (size_t)k >= cap - (size_t)n)
             return IV_ERANGE; /* 截断就整条不发：半截 JSON 平台解析必失败 */
         n += k;
     }
-    if ((size_t)n + 3u > cap)
-        return IV_ERANGE;
-    out[n++] = '}';  /* 关 data */
-    out[n++] = '}';  /* 关顶层 */
-    out[n]   = '\0';
+    {
+        int k = snprintf(out + n, cap - (size_t)n, ",\"crc\":\"%s\"}}", crc2);
+
+        if (k < 0 || (size_t)k >= cap - (size_t)n)
+            return IV_ERANGE;
+        n += k;
+    }
     return n;
 }
 

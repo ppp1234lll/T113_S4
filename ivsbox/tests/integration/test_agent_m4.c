@@ -818,8 +818,9 @@ static int scenario(void)
     chk(g_agent.ipc_pending == 1u, "m03 0xE4 armed the delayed JSON reply");
 
     /* 0xE4 的清单必须是"搜完再发"：这里不依赖真网卡，直接把假档案塞进发现句柄，
-     * 只验拼出来的 JSON（字段名/1 基/封套/不截断）。真链路上的收发由
-     * `platcmd_e2e.py` 的 C35 端到端钉住。 */
+     * 只验拼出来的 JSON（字段名/0 基/封套/crc/不截断）。口径来源：
+     * `指令-通用版 20260623.xlsx`「查询摄像机信息」应答模板 ＋
+     * 参考固件 `com_ipc_device_information()`。真链路收发由 `platcmd_e2e.py` C35 钉住。 */
     {
         iv_device_t *dv = iv_agent_device(&g_agent);
         char         js[512];
@@ -844,13 +845,25 @@ static int scenario(void)
         chk(jn > 0, "m03 ipc json built");
         chk((int)strlen(js) == jn, "m03 ipc json length matches strlen");
         chk(strstr(js, "\"num\":2") != NULL, "m03 ipc json num=2");
-        chk(strstr(js, "\"ip1\":\"192.168.2.64\"") != NULL, "m03 ipc json ip1 (1 基)");
-        chk(strstr(js, "\"mac1\":\"28:57:be:43:27:86\"") != NULL, "m03 ipc json mac1");
-        chk(strstr(js, "\"bd1\":\"hikvision\"") != NULL, "m03 ipc json bd1");
-        chk(strstr(js, "\"mod2\":\"DH-IPC-HFW1433\"") != NULL, "m03 ipc json mod2");
+        /* **0 基**：平台按 ip0 起取（表里示例就是 ip0/ip1/ip2），
+         * 发成 1 基 ⇒ 平台找 ip0 找不到，一路"0 台"（现场就是这症状）。 */
+        chk(strstr(js, "\"ip0\":\"192.168.2.64\"") != NULL, "m03 ipc json ip0（0 基）");
+        chk(strstr(js, "\"mac0\":\"28:57:be:43:27:86\"") != NULL, "m03 ipc json mac0");
+        chk(strstr(js, "\"mod1\":\"DH-IPC-HFW1433\"") != NULL, "m03 ipc json mod1（0 基，第 2 台）");
+        chk(strstr(js, "\"ip1\":\"192.168.2.65\"") != NULL, "m03 ipc json ip1 = 第 2 台");
+        /* 品牌是**整数码**：0=海康 1=大华 2=宇视（不是英文词，也不是我们的枚举值） */
+        chk(strstr(js, "\"bd0\":0") != NULL, "m03 ipc json bd0=0 海康（整数码）");
+        chk(strstr(js, "\"bd1\":1") != NULL, "m03 ipc json bd1=1 大华（整数码）");
+        chk(strstr(js, "\"bd0\":\"hikvision\"") == NULL, "m03 ipc json 品牌不是英文词");
         chk(strstr(js, "\"qn\":\"00000001000000002\"") != NULL,
             "m03 ipc json echoes the request QN");
-        chk(iv_agent_build_ipc_json(&g_agent, "0", js, 40) == IV_ERANGE,
+        /* 封套要素：ver/devtype/tid/cmd/crc 一样不能少（少了平台整帧丢，症状同样是"0 台"） */
+        chk(strstr(js, "\"ver\":\"11\"") != NULL, "m03 ipc json 带 ver");
+        chk(strstr(js, "\"devtype\":\"") != NULL, "m03 ipc json 带 devtype");
+        chk(strstr(js, "\"tid\":\"") != NULL, "m03 ipc json 带 tid");
+        chk(strstr(js, "\"cmd\":\"E4\"") != NULL, "m03 ipc json 带 cmd=E4");
+        chk(strstr(js, "\"crc\":\"") != NULL, "m03 ipc json 带 crc");
+        chk(iv_agent_build_ipc_json(&g_agent, "0", js, 200) == IV_ERANGE,
             "m03 ipc json refuses to truncate (IV_ERANGE, 不发半截)");
 
         dv->n_items = 0; /* 归还：后面的用例不该看见这两台假摄像机 */

@@ -7718,3 +7718,38 @@ iv_report_request_poll(rp);                        /* 0xD1 应答不进镜像，
 * **板端**：`app.js`（md5 换板前后记录在 `docs/修改记录.md`）与 `style.css` 换板后与
   `git show HEAD:` 逐字节一致；界面观感待用户浏览器确认。
 
+== 2026-10-27 14:48 「是否录像」改下拉（布尔用两选一下拉）
+
+=== 干了什么事
+
+* `fieldSelect()` 增加第 5 个参数 `kind`：`kind='boolean'` 时把布尔渲染成两选一下拉，
+  `data-kind='boolean'`、`data-orig=JSON.stringify(!!val)`，选中项与 `'true'/'false'` 互相映射。
+* `collectChanges()` 的布尔分支改为按元素类型取值：
+  `SELECT` ⇒ `inp.value === 'true'`；其余（勾选框）⇒ `inp.checked`。
+* `cameraParamsCard()` 里第 N 路「是否录像」由 `fieldFor()`（勾选框）换成
+  `fieldSelect(..., [['true','启用'], ['false','停用']], ..., 'boolean')`。
+* `tests/web/ui_camera_params.mjs` 新增 5 条断言（24→29）。
+
+=== 解决什么问题
+
+* 用户口径：这一项也要下拉。勾选框 ＋ 右侧"已启用/已停用"文字在窄列里更像"这一路的标记"。
+* 顺手堵掉一个会静默改值的坑：布尔若走字符串提交（`"true"`），配置模块按默认值表判
+  `type mismatch` ⇒ 整个 `camera` 分类回滚，而前端照样弹"已保存 N 项"；
+  若 `collectChanges()` 继续只认 `inp.checked`，下拉那一路读出来是 `undefined` ⇒ 提交 `false`，
+  用户选"启用"却被改成"停用"。两条都在用例里钉住（`p08i` 断言提交体是布尔 `true`）。
+
+=== 影响范围
+
+* 只用在新加的摄像机通道卡片；`fieldFor()` 的勾选框路径与其它页面的布尔项（`sys.debug.mode`
+  等）行为未变（`collectChanges()` 的新分支对 `INPUT` 仍是 `checked`）。
+* 后端零改动：`camera.ch.N.record` 仍是 bool，配置文件渲染格式不变。
+* 未覆盖：其它页面里的布尔项要不要也统一成下拉，没动（用户只提这一项）。
+
+=== 验证方式与结果
+
+* `NODE_PATH=… node tests/web/ui_camera_params.mjs` ⇒ **29/29 PASS**（新增 5 条）；
+  既有 7 个前端用例全绿；`node --check web/static/app.js` 通过。
+* 本次零 C 改动，未重跑 `make test` / `make arm`（上一提交 `b0df21f` 已验 47/47、arm 0 告警）。
+* 板端换 `app.js` 后 md5 与 `git show HEAD:` 一致；界面观感待用户浏览器确认。
+
+

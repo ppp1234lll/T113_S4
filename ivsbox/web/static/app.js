@@ -491,19 +491,24 @@
    * 于是 `collectChanges()` / `applyChanges()` 一个字都不用改就能收它，
    * 不必为下拉再写一套"收集＋脏标记"的逻辑（两套必然漂移）。
    *
-   * `opts` = `[[值, 显示文字], ...]`；`?` 项（值为空串）表示"未设置/用默认"。
+   * `opts` = `[[值, 显示文字], ...]`；空值项（值为空串）表示"未设置/用默认"。
+   * `kind='boolean'` ＝**布尔用两选一下拉**（启用/停用）：提交体里必须仍是布尔，
+   * 因为配置模块按默认值表的类型校验，"true" 这种字符串会被判 type mismatch、
+   * 整个分类回滚 —— 所以布尔有自己的取值/比较分支，不跟字符串那条混。
    *
    * **值不在选项里时补一个临时项**：存量配置可能存着表里没列的值（老版本手填、
    * 或平台写进来的），而 `sel.value = cur` 遇到不存在的值会静默落到第一项 ⇒
    * 用户只是点了一下保存，就把别人的配置改掉了，界面上还看不出来。
    */
-  function fieldSelect(key, val, opts, desc) {
+  function fieldSelect(key, val, opts, desc, kind) {
     var lab = el('label', 'field');
     lab.appendChild(el('span', null, desc || key));
     lab.title = key;
 
+    var isBool = (kind === 'boolean');
     var sel = document.createElement('select');
-    var cur = (val === null || val === undefined) ? '' : String(val);
+    var cur = isBool ? (val === true ? 'true' : 'false')
+                     : ((val === null || val === undefined) ? '' : String(val));
     var i, hit = false;
 
     for (i = 0; i < opts.length; i++) {
@@ -521,10 +526,11 @@
     }
     sel.value = cur;
     sel.dataset.key = key;
-    sel.dataset.kind = 'string';
-    sel.dataset.orig = JSON.stringify(cur);
+    sel.dataset.kind = isBool ? 'boolean' : 'string';
+    sel.dataset.orig = isBool ? JSON.stringify(val === true) : JSON.stringify(cur);
     sel.addEventListener('change', function () {
-      sel.className = (sel.value === JSON.parse(sel.dataset.orig)) ? '' : 'dirty';
+      var now = isBool ? (sel.value === 'true') : sel.value;
+      sel.className = (JSON.stringify(now) === sel.dataset.orig) ? '' : 'dirty';
     });
 
     lab.appendChild(sel);
@@ -536,7 +542,12 @@
     var inputs = scope.querySelectorAll('[data-key]');
     for (var i = 0; i < inputs.length; i++) {
       var inp = inputs[i], kind = inp.dataset.kind, cur, orig = JSON.parse(inp.dataset.orig);
-      if (kind === 'boolean') cur = inp.checked;
+      /* 布尔既可能是勾选框（`fieldFor`）也可能是两选一下拉（`fieldSelect` 的
+       * `kind='boolean'`）——2026-10-27「是否录像」改下拉后两条路都得认，
+       * 否则下拉那一路的 `inp.checked` 是 undefined ⇒ 提交体里出现 `false`，
+       * 用户选了"启用"却被静默改成停用。 */
+      if (kind === 'boolean')
+        cur = (inp.tagName === 'SELECT') ? (inp.value === 'true') : inp.checked;
       else if (kind === 'number') cur = Number(inp.value);
       else cur = inp.value;
       if (JSON.stringify(cur) !== inp.dataset.orig && (kind === 'boolean' || orig !== cur))
@@ -2020,7 +2031,12 @@
       var labPass = fieldFor(pre + 'pass', get('pass'), tag + ' 密码（明文）');
       var labBrand = fieldSelect(pre + 'vendor', get('vendor'), CAM_BRAND_OPT, tag + ' 品牌');
       var labStream = fieldSelect(pre + 'stream', get('stream'), CAM_STREAM_OPT, tag + ' 码流类型');
-      var labRec = fieldFor(pre + 'record', get('record') === true, tag + ' 是否录像');
+      /* 「是否录像」也用下拉（2026-10-27 用户要求）：勾选框 + 右侧"已启用/已停用"
+       * 在窄列里容易被读成"这一路的标记"，而"启用/停用"两选项没有歧义。
+       * 值仍是布尔（`kind='boolean'`），不是字符串 —— 见 `collectChanges()`。 */
+      var labRec = fieldSelect(pre + 'record', get('record') === true,
+                               [['true', '启用'], ['false', '停用']],
+                               tag + ' 是否录像', 'boolean');
       grid.appendChild(labIp);
       grid.appendChild(labUser);
       grid.appendChild(labPass);

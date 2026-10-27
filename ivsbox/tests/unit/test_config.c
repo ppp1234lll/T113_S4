@@ -1030,13 +1030,17 @@ static void case_array_support(void)
 static void case_comment_roundtrip(void)
 {
     char          pf[200];
-    char          buf[8192];
+    /* 16 KB：整份渲染文件当前约 8.4 KB（8 路摄像机 × 8 字段，每行带中文注释）。
+     * 旧值 8 KB 已经装不下 —— 而 `read_file()` 是**静默截断**的，截断后
+     * 后面的 contains() 断言会误报成"渲染器漏了注释"。产品真上限是 CFG_FILE_MAX 64 KB。 */
+    char          buf[16384];
     iv_config_t  *c;
     iv_cfg_stat_t st;
     double        dv = 0.0;
     int           bv = 0;
     int64_t       iv = 0;
     const char   *s  = NULL;
+    long          rd = 0;
 
     cfg_path(pf, sizeof(pf));
     (void)unlink(pf);
@@ -1059,7 +1063,14 @@ static void case_comment_roundtrip(void)
     iv_config_close(c);
 
     /* ① 中文注释确实写进了文件 */
-    chk(read_file(pf, buf, sizeof(buf)) > 0, "c11: re-read the rendered file");
+    rd = read_file(pf, buf, sizeof(buf));
+    chk(rd > 0, "c11: re-read the rendered file");
+    /* JSON 以 '}' 收尾（文件末尾还有换行，所以要跳过尾部的空白再看）。
+     * 最后一个非空白字节不是它 ⇒ 缓冲不够、内容被截断了。
+     * 没有这条，缓冲不足会伪装成"渲染器漏注释"，让人去查渲染器。 */
+    while (rd > 1 && (buf[rd - 1] == '\n' || buf[rd - 1] == '\r' || buf[rd - 1] == ' '))
+        buf[--rd] = '\0';
+    chk(rd > 1 && buf[rd - 1] == '}', "c11: probe buffer big enough (file not truncated)");
     chk(contains(buf, "// "), "c11: the rendered file carries line comments");
     chk(contains(buf, "基础配置"), "c11: the sys class carries its Chinese description");
     chk(contains(buf, "网络配置"), "c11: the net class carries its Chinese description");

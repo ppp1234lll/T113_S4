@@ -7662,3 +7662,59 @@ iv_report_request_poll(rp);                        /* 0xD1 应答不进镜像，
   `rm -rf build/analyze` 后 70 编译行 0 报告。
 * 板端 `b55dfba9…` → `6d9798a9…`（备份 `ivsboxd.bak-b55dfba9`），
   `ctl board.status` 的 `link.open=true`、`/dev/ttySAC5` 正常。
+
+== 2026-10-27 14:35 摄像机通道参数卡片（品牌/码流下拉 ＋ 拉流地址自动生成 ＋ 去 MAC）
+
+=== 干了什么事
+
+* `ivsbox/web/static/app.js`
+** 新增 `cameraParamsCard()`：按 `camera.ch.N.*` 逐路渲染一段表单 —— IP／用户名／密码（明文）／
+   品牌（下拉）／码流类型（下拉）／是否录像 ＋ 拉流地址（独占一行）。卡片底部一个「保存修改」，
+   走既有的 `applyChanges()`（只提交脏键、带 `st.ver`）。
+** 新增 `camUrlOf(brand, stream, user, pass, ip)`：品牌→RTSP 路径表的纯函数，
+   IP 为空返回空串（不生成半截地址），品牌为空/不认识回落海康。
+** 新增 `fieldSelect(key, val, opts, desc)`：下拉版 `fieldFor`，`data-*` 契约一致，
+   `collectChanges()` 无需改动；值不在选项里时补"（表中无此项）"临时项。
+** 新增 `skipMatch(skip, key)`：`configCard()` 的跳过名单支持通配（尾部 `*`＝前缀、中间 `*`＝单段）。
+** `pageCamera()`：挂上专用通道卡片；通用卡片改名「检测、录像与 SNMP 参数」并 `skip(['camera.ch.*'])`。
+** `pageConfig()`：「全部配置」页 `skip(['camera.ch.*.mac'])`。
+* `ivsbox/web/static/style.css`：`.chan-sec` —— 一张卡片里按「第 N 路」分段，首段不画上边框。
+* `ivsbox/src/modules/config/iv_config.c`：`pass` 描述改「明文存储，暂不加密」；`vendor` 描述改品牌并列出
+  五个取值；`mac` 描述改「无需配置：由摄像机发现自动获取」；分类注释里那句"存 SM4 密文"改成事实陈述。
+* `ivsbox/tests/web/ui_camera_params.mjs`（新增）：jsdom 里跑真实 index.html + app.js。
+* `ivsbox/tests/unit/test_config.c`：c11 探针缓冲 8 KB→16 KB ＋ "未被截断"断言。
+
+=== 解决什么问题
+
+* **做不到"该长什么样"**：`camera.ch.N.*` 原先由 `configCard()` 统一画成"键＝输入框"，于是
+  · 码流类型要人手填 `main`/`sub`（协议内部词，现场不知道填什么）；
+  · 品牌是自由文本（写"海康"还是"hik"全凭记忆，生成地址时无法识别）；
+  · 拉流地址要人自己按各厂 RTSP 规格一步步拼，拼错只表现为"录像拉不到流"，很难定位。
+* **MAC 是伪配置项**：MAC 由摄像机发现（`iv_device`）拿到并进档案，让用户手填既没意义又容易和档案打架。
+* **界面在撒谎**：`pass` 的 desc 写「SM4 密文」，而全仓没有任何加密路径（F8 未落地）⇒ 现场以为密文落盘，
+  实际是明文。第一版既已决定明文，标签就该说明文。
+
+=== 影响范围
+
+* **只影响 Web 展示与提交面**：键名、类型、校验、配置渲染格式一字未改 ⇒ 老配置文件照旧可读，
+  平台下发路径（`0xF7` 等）不受影响。`camera.ch.N.url` 的消费者（`main.c` 的 `cfg_rec_url_table()`，
+  录像源表）读到的仍是同一个键。
+* **`vendor` 的值域没有后端约束**：网页下拉只给 5 个值，但配置层收任意串（拼地址时不认识就按海康）。
+  这是刻意的 —— 加 enum 会让 `test_config` 的数组用例假绿/假红（见"验证"第 2 条）。
+* **本次没覆盖的**：① 五品牌 RTSP 路径未真机验证；② 中维世纪存在 `554/av0_0` 与 `8554/liveN.264`
+  两套写法，生成值取后者，页面提示里说明前者；③ 摄像机页仍没有"试拉流"按钮，检测只按 IP 判通断；
+  ④ 架构 §10.2 的 SM4 口径待批准后修订；⑤ 口令含 `@`/`:` 会拼出歧义 URL。
+
+=== 验证方式与结果
+
+* **jsdom（本机）**：`NODE_PATH=… node tests/web/ui_camera_params.mjs` ⇒ **24/24 PASS**；
+  既有 7 个前端用例（`ui_camera_slot` / `ui_camera_test` / `ui_device_name` / `ui_net_params` /
+  `ui_ops_factory` / `ui_ops_log` / `ui_ops_ota`）全绿无回归；`node --check web/static/app.js` 通过。
+* **VM `tqt113`**：`make test` 全绿（含 `test_config`）；`make clean` 后 `make arm` 0 告警 0 错误
+  （`build/arm/ivsboxd` 375344 B）；`make clean` 后 `make analyze` 0 报告。
+* **失败过的两次（都改对了根因，没有动断言口径）**：
+** 加 `vendor` enum ⇒ `test_config` 红 20 条（`c10: element 0 vendor` 等）⇒ 撤回 enum；
+** `c11` 缓冲不足 ⇒ `read_file()` 静默截断 ⇒ 报成"elec 注释缺失" ⇒ 缓冲 8 KB→16 KB ＋ 新增截断断言。
+* **板端**：`app.js`（md5 换板前后记录在 `docs/修改记录.md`）与 `style.css` 换板后与
+  `git show HEAD:` 逐字节一致；界面观感待用户浏览器确认。
+

@@ -486,6 +486,51 @@
     return lab;
   }
 
+  /* 下拉版 fieldFor（2026-10-27）。契约与 fieldFor **完全一致** ——
+   * `data-key` / `data-kind` / `data-orig` 挂在 select 元素上，
+   * 于是 `collectChanges()` / `applyChanges()` 一个字都不用改就能收它，
+   * 不必为下拉再写一套"收集＋脏标记"的逻辑（两套必然漂移）。
+   *
+   * `opts` = `[[值, 显示文字], ...]`；`?` 项（值为空串）表示"未设置/用默认"。
+   *
+   * **值不在选项里时补一个临时项**：存量配置可能存着表里没列的值（老版本手填、
+   * 或平台写进来的），而 `sel.value = cur` 遇到不存在的值会静默落到第一项 ⇒
+   * 用户只是点了一下保存，就把别人的配置改掉了，界面上还看不出来。
+   */
+  function fieldSelect(key, val, opts, desc) {
+    var lab = el('label', 'field');
+    lab.appendChild(el('span', null, desc || key));
+    lab.title = key;
+
+    var sel = document.createElement('select');
+    var cur = (val === null || val === undefined) ? '' : String(val);
+    var i, hit = false;
+
+    for (i = 0; i < opts.length; i++) {
+      var o = document.createElement('option');
+      o.value = String(opts[i][0]);
+      o.textContent = String(opts[i][1]);
+      sel.appendChild(o);
+      if (String(opts[i][0]) === cur) hit = true;
+    }
+    if (!hit) {
+      var ox = document.createElement('option');
+      ox.value = cur;
+      ox.textContent = (cur === '') ? '（未设置）' : (cur + '（表中无此项）');
+      sel.appendChild(ox);
+    }
+    sel.value = cur;
+    sel.dataset.key = key;
+    sel.dataset.kind = 'string';
+    sel.dataset.orig = JSON.stringify(cur);
+    sel.addEventListener('change', function () {
+      sel.className = (sel.value === JSON.parse(sel.dataset.orig)) ? '' : 'dirty';
+    });
+
+    lab.appendChild(sel);
+    return lab;
+  }
+
   function collectChanges(scope) {
     var items = {};
     var inputs = scope.querySelectorAll('[data-key]');
@@ -527,10 +572,36 @@
    * skip：**本卡片不画**的键名数组。存在的唯一理由是"同一个键只能有一个编辑器"：
    * `net.ip`/`net.mask`/`net.gateway` 与 `probe.target1/2` 现在有专门的
    * 「本机网络」卡片（对齐平台那一组字段），若通用卡片再画一遍，页面上就有两个
-   * 表单写同一批键 —— 后提交的那个必然带着过期的 `st.ver`，撞 e=-3。 */
+   * 表单写同一批键 —— 后提交的那个必然带着过期的 `st.ver`，撞 e=-3。
+   *
+   * **跳过名单支持通配**（2026-10-27）：`camera.ch.*` 跳过整片前缀、
+   * `camera.ch.*.mac` 只跳那一种字段。摄像机通道是"8 路 × 8 键"，
+   * 逐条列 64 个键名既写不下、也会漏（加一路就多 8 个）。
+   * 两种写法必须分清：**尾部 `*` ＝ 整片前缀**（`camera.ch.*` 吃掉
+   * `camera.ch.0.ip`），**中间的 `*` 只吃一段**（不跨点号，`camera.ch.*.mac`
+   * 匹配 `camera.ch.5.mac` 而不会顺手吃掉 `camera.ch.5.record`）。
+   */
+  function skipMatch(skip, key) {
+    for (var i = 0; i < skip.length; i++) {
+      var pat = skip[i];
+      if (pat === key) return true;
+      if (pat.indexOf('*') < 0) continue;
+      if (pat.charAt(pat.length - 1) === '*') {
+        if (key.indexOf(pat.slice(0, -1)) === 0) return true;
+        continue;
+      }
+      var re = '^' + pat.split('*').map(function (part) {
+        /* `.` 必须转义：否则 `camera.ch.0.mac` 里的 `.` 会匹配任意字符，
+         * 把 `cameraXchY0Zmac` 这种不存在的键也判进来。 */
+        return part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      }).join('[^.]*') + '$';
+      if (new RegExp(re).test(key)) return true;
+    }
+    return false;
+  }
+
   function configCard(title, classes, note, onReady, skip) {
-    var skipMap = {};
-    (skip || []).forEach(function (k) { skipMap[k] = 1; });
+    var skipList = skip || [];
     var scope = el('div');
     var card = el('div', 'card');
     card.appendChild(el('h3', null, title));
@@ -560,7 +631,7 @@
         st.ver = ver;
         var groups = {};
         Object.keys(items).sort().forEach(function (k) {
-          if (skipMap[k]) return;          /* 有专门卡片的键，这里不画第二遍 */
+          if (skipMatch(skipList, k)) return;   /* 有专门卡片的键，这里不画第二遍 */
           var g = groupOf(k);
           (groups[g] = groups[g] || []).push(k);
         });
@@ -1853,6 +1924,183 @@
     return { node: card, reload: show };
   }
 
+  /* ==================== 摄像机通道参数（2026-10-27 用户口径） ====================
+   * 五条口径：
+   *   ① 用户名/密码**明文**（首版不加密；F8 密钥分离仍未做，属已知欠账）；
+   *   ② 码流类型用下拉，不再让人手填 `main`/`sub` 这种协议内部词；
+   *   ③ 品牌下拉：海康／大华／宇视／华为／中维世纪，未选＝海康；
+   *   ④ 拉流地址按「品牌＋用户名＋密码＋IP」**自动生成**（仍可手改）；
+   *   ⑤ **不配 MAC**：MAC 是发现阶段的产物，不是现场该填的配置。
+   *
+   * 为什么不再用 configCard()：那张卡是"后端给什么键就画什么框"，
+   * 做不出下拉，也做不出"改 IP 就重算地址"这种联动。它的价值在于后端加键前端
+   * 零改动，而摄像机这 8 个字段是**已经定型的业务字段**，值得专门的表单。
+   */
+  var CAM_BRAND = [
+    /* 路径取自各厂公开的 RTSP 取流格式（2026-10-27 核对）。**固件版本不同会有差异**，
+     * 所以生成出来的地址永远是"可改的草稿"，不是唯一答案。 */
+    { v: 'hik',      label: '海康',     port: 554, main: '/Streaming/Channels/101',
+      sub: '/Streaming/Channels/102' },
+    { v: 'dahua',    label: '大华',     port: 554,
+      main: '/cam/realmonitor?channel=1&subtype=0',
+      sub: '/cam/realmonitor?channel=1&subtype=1' },
+    { v: 'uniview',  label: '宇视',     port: 554, main: '/media/video1',
+      sub: '/media/video2' },
+    { v: 'huawei',   label: '华为',     port: 554, main: '/LiveMedia/ch1/Media1',
+      sub: '/LiveMedia/ch1/Media2' },
+    /* 中维世纪两套写法都常见：`554/av0_0`（多数 IPC／NVR）与 `8554/live0.264`
+     * （部分机型）。这里取公开资料里成对给出的后者；前者写在页面提示里，
+     * 现场拉不通就直接改这一格地址。 */
+    { v: 'jovision', label: '中维世纪', port: 8554, main: '/live0.264',
+      sub: '/live1.264' }
+  ];
+  /* 「（默认：主码流）」这一项是显式的空值：`camera.ch.N.stream` 的出厂值就是空串，
+   * 拼地址时按主码流处理 —— 与其在界面上显示"未设置"，不如直接说清它等于主码流。 */
+  var CAM_STREAM_OPT = [['', '（默认：主码流）'], ['main', '主码流（main）'],
+    ['sub', '子码流（sub）']];
+  var CAM_BRAND_OPT = [['', '（默认：海康）']].concat(CAM_BRAND.map(function (b) {
+    return [b.v, b.label];
+  }));
+
+  /* 拼 RTSP 地址。IP 为空 ⇒ 返回空串（不生成半截地址，免得被当成"已配好"）。
+   * 没品牌／品牌不认识 ⇒ 海康（用户口径：没有品牌默认用海康）。
+   * 用户名密码**原样拼**，不做百分号编码：多数 IPC 不认 `%XX`，反而认证失败；
+   * 含 `@`/`:` 的密码会拼出语法歧义的地址 —— 登记为已知限制，现场口令别带这两个字符。 */
+  function camUrlOf(brand, stream, user, pass, ip) {
+    var b = null, i, auth = '';
+
+    ip = String((ip === undefined || ip === null) ? '' : ip).replace(/^\s+|\s+$/g, '');
+    if (!ip) return '';
+    for (i = 0; i < CAM_BRAND.length; i++) {
+      if (CAM_BRAND[i].v === brand) { b = CAM_BRAND[i]; break; }
+    }
+    if (!b) b = CAM_BRAND[0];
+    user = String((user === undefined || user === null) ? '' : user).replace(/^\s+|\s+$/g, '');
+    pass = String((pass === undefined || pass === null) ? '' : pass);
+    if (user) auth = user + (pass ? ':' + pass : '') + '@';
+    return 'rtsp://' + auth + ip + ':' + b.port + (stream === 'sub' ? b.sub : b.main);
+  }
+
+  function cameraParamsCard() {
+    var card = el('div', 'card');
+    card.appendChild(el('h3', null, '摄像机通道参数'));
+    card.appendChild(el('p', 'hint',
+      '每路填 IP、用户名、密码，选品牌与码流类型；拉流地址按「品牌＋账号＋IP」自动生成，' +
+      '固件不一致时可以直接改这一格（录像侧读的就是它）。' +
+      '密码按明文保存（首版不加密）。中维世纪部分机型是 `8554/live0.264`、' +
+      '部分机型要 `554/av0_0`，拉不通就改地址。MAC 不在这里配 —— 它由摄像机发现过程自动获得。'));
+
+    var body = el('div');
+    card.appendChild(body);
+
+    var bar = el('div', 'actions');
+    var save = el('button', null, '保存修改');
+    save.type = 'button';
+    var reload = el('button', 'ghost', '重新载入');
+    reload.type = 'button';
+    bar.appendChild(save); bar.appendChild(reload);
+    card.appendChild(bar);
+
+    /* 一路一个区块。`camera.ch.N.*` 是"按需变长数组"：哪一路有键就画哪一路；
+     * 建槽入口在下面的「新增摄像机通道」卡片（只发 ip 一个键，其余由后端补齐）。 */
+    function channelSection(n, items) {
+      var pre = 'camera.ch.' + n + '.';
+      var tag = '第 ' + (n + 1) + ' 路';
+      function get(f) {
+        var v = items[pre + f];
+        return (v === undefined || v === null) ? '' : v;
+      }
+
+      var sec = el('div', 'chan-sec');
+      sec.appendChild(el('h3', null, tag + '（camera.ch.' + n + '）'));
+
+      var grid = el('div', 'grid');
+      var labIp = fieldFor(pre + 'ip', get('ip'), tag + ' IP');
+      var labUser = fieldFor(pre + 'user', get('user'), tag + ' 用户名（明文）');
+      var labPass = fieldFor(pre + 'pass', get('pass'), tag + ' 密码（明文）');
+      var labBrand = fieldSelect(pre + 'vendor', get('vendor'), CAM_BRAND_OPT, tag + ' 品牌');
+      var labStream = fieldSelect(pre + 'stream', get('stream'), CAM_STREAM_OPT, tag + ' 码流类型');
+      var labRec = fieldFor(pre + 'record', get('record') === true, tag + ' 是否录像');
+      grid.appendChild(labIp);
+      grid.appendChild(labUser);
+      grid.appendChild(labPass);
+      grid.appendChild(labBrand);
+      grid.appendChild(labStream);
+      grid.appendChild(labRec);
+      sec.appendChild(grid);
+
+      /* 地址单独占一行（它最长），且**跟着上面几个字段联动**。 */
+      var labUrl = fieldFor(pre + 'url', get('url'), tag + ' 拉流地址（自动生成，可改）');
+      sec.appendChild(labUrl);
+
+      var ipInp = labIp.querySelector('input');
+      var userInp = labUser.querySelector('input');
+      var passInp = labPass.querySelector('input');
+      var brandSel = labBrand.querySelector('select');
+      var streamSel = labStream.querySelector('select');
+      var urlInp = labUrl.querySelector('input');
+
+      /* 手动改过地址就不再自动覆盖 —— 否则"现场手调好的地址"会被下一次改密码的
+       * 联动冲掉。把这一格清空＝交回自动生成。 */
+      var manual = false;
+
+      function regen() {
+        if (manual) return;
+        var v = camUrlOf(brandSel.value, streamSel.value, userInp.value,
+                         passInp.value, ipInp.value);
+        urlInp.value = v;
+        urlInp.className = (v === JSON.parse(urlInp.dataset.orig)) ? '' : 'dirty';
+      }
+
+      ipInp.addEventListener('input', regen);
+      userInp.addEventListener('input', regen);
+      passInp.addEventListener('input', regen);
+      brandSel.addEventListener('change', regen);
+      streamSel.addEventListener('change', regen);
+      urlInp.addEventListener('input', function () { manual = (urlInp.value !== ''); });
+
+      /* 老配置里地址为空、IP 已填 ⇒ 进页面就把草稿摆出来（此时还没落盘，
+       * 用户点「保存修改」才会写进配置；`dirty` 高亮就是"待保存"）。 */
+      if (urlInp.value === '' && ipInp.value !== '') regen();
+
+      return sec;
+    }
+
+    function load() {
+      body.innerHTML = '';
+      api('/api/config?cls=camera').then(function (r) {
+        if (!r || !r.ok) {
+          body.appendChild(el('p', 'msg', (r && r.msg) || '配置不可用'));
+          return;
+        }
+        st.ver = r.d.version;
+        var items = r.d.items || {};
+        var idx = [], seen = {};
+        Object.keys(items).forEach(function (k) {
+          var m = /^camera\.ch\.(\d+)\./.exec(k);
+          if (m === null) return;
+          var n = Number(m[1]);
+          if (!seen[n]) { seen[n] = 1; idx.push(n); }
+        });
+        idx.sort(function (a, b) { return a - b; });
+        if (!idx.length) {
+          body.appendChild(el('p', 'hint',
+            '尚未配置任何通道 —— 用下方的「新增摄像机通道」建第一路。'));
+          return;
+        }
+        idx.forEach(function (n) { body.appendChild(channelSection(n, items)); });
+      }).catch(function () {
+        body.innerHTML = '';
+        body.appendChild(el('p', 'msg', '请求失败'));
+      });
+    }
+
+    save.addEventListener('click', function () { applyChanges(body, load); });
+    reload.addEventListener('click', load);
+    load();
+    return card;
+  }
+
   function pageCamera() {
     var root = document.createDocumentFragment();
     root.appendChild(el('h2', 'page-title', '摄像机'));
@@ -1872,10 +2120,18 @@
       '读第 1 路摄像机（camera.ch.0.ip）的 SNMP 槽位 —— 对应参考 web 系统操作里的' +
       '「查摄像机1」。采集是阻塞式 UDP 事务，落在慢任务池里跑，点完约 2~3 秒回读结果。').node);
 
+    /* 通道参数走专用卡片（2026-10-27）：品牌/码流要是下拉、拉流地址要能自动生成、
+     * MAC 不给入口 —— 通用表单只会渲染成"键＝输入框"，这三件事都做不到。 */
+    root.appendChild(cameraParamsCard());
+
     var slot = cameraSlotCard();
-    root.appendChild(configCard('摄像机参数与账号（camera.*）', ['camera'],
-      '6 路 IP/账号/端口，以及 SNMP OID 槽位（按机型填值）。检测方式见上方卡片。',
-      function (items, reload) { slot.sync(items, reload); }));
+    /* 通用卡片从此刻起只管 `camera.ch.*` **之外**的键（检测参数、录像节拍、
+     * SNMP 连接与 OID 槽位）。通道那 8 个字段已经在新卡片里画过，
+     * 再画一遍就是同一个键两个编辑器 ⇒ 后提交的那个必然带过期 `st.ver`、撞 e=-3。 */
+    root.appendChild(configCard('检测、录像与 SNMP 参数（camera.*）', ['camera'],
+      'OID 槽位按机型填值；录像节拍与检测参数在此。通道（IP／账号／品牌／码流／拉流地址）见上方卡片。',
+      function (items, reload) { slot.sync(items, reload); },
+      ['camera.ch.*']));
     root.appendChild(slot.node);
     return root;
   }
@@ -1948,9 +2204,14 @@
   function pageConfig() {
     var root = document.createDocumentFragment();
     root.appendChild(el('h2', 'page-title', '全部配置'));
+    /* `camera.ch.*.mac` 不给入口（2026-10-27 用户口径）：MAC 是摄像机发现阶段
+     * 自己拿到的档案字段，不是现场该手填的配置。键仍留在默认值表里兼容老配置，
+     * 只是两处界面都不再画它（摄像机页连整片 `camera.ch.*` 都交给专用卡片）。 */
     root.appendChild(configCard('八个一级分类（全量）',
       ['sys', 'net', 'probe', 'camera', 'switch', 'elec', 'netthr', 'sensor'],
-      '这一页是原始视图（含未归入专用页的阈值项）。改动后保存会带版本号提交。'));
+      '这一页是原始视图（含未归入专用页的阈值项）。改动后保存会带版本号提交。' +
+      '摄像机 MAC 由发现过程自动获取，此处不提供配置项。',
+      null, ['camera.ch.*.mac']));
 
     var card = el('div', 'card');
     card.appendChild(el('h3', null, '出厂默认值对照'));

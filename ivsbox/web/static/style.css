@@ -114,6 +114,11 @@ h2.page-title {
 }
 .card h3 { margin: 0 0 12px; font-size: 15px; color: var(--text); }
 
+/* 摄像机通道：一张卡片里按「第 N 路」分段（2026-10-27）。
+ * 第一段不要上边框 —— 它紧接在卡片标题下面，多一条线只是视觉噪音。 */
+.chan-sec { padding-top: 14px; margin-top: 14px; border-top: 1px solid var(--line); }
+.chan-sec:first-child { padding-top: 0; margin-top: 0; border-top: 0; }
+
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
 .kv { padding: 10px 12px; background: #fafbfc; border: 1px solid var(--line); border-radius: 4px; }
 .kv .k { color: var(--dim); font-size: 12px; }

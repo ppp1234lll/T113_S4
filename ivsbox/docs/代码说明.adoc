@@ -7887,6 +7887,9 @@ relay.set ch=3 on=true  → {"port":2,"status":1}  → RELAY3: 2 → 1
 
 == 2026-10-27 15:47 平台 `0xE4`「搜索摄像机」：只回 ACK 等于没回
 
+NOTE: 本节的"先 ACK 再补 JSON"已于 16:03 推翻 —— 见下一节。补 JSON 的部分仍然有效，
+*只有 ACK 那一步是错的*。
+
 === 现场现象
 
 用户 15:33 报「在平台搜索摄像机，设备为什么没有返回消息，应该没有那么慢」。
@@ -7947,3 +7950,56 @@ relay.set ch=3 on=true  → {"port":2,"status":1}  → RELAY3: 2 → 1
 * 「慢」的一半是物理的：6 相位 × 3 轮 × 300 ms ≈ 5.4 s 打底，实测 8 s 收工。
   要更快只能缩短 `round_ms`/`rounds`（`iv_device_cfg_t` 默认值，当前无配置键），
   代价是漏发现。平台侧若等不到 8 s，得先确认它的超时是多久。
+
+== 2026-10-27 16:03 `0xE4` 不回 ACK：查询类命令的成功应答只有那一帧 JSON
+
+=== 为什么要推翻上一节
+
+用户 15:5x 只问了一句：「**你返回01干什么**」。这一问点到的正是上一节最要命的地方。
+
+平台按 `0xE4` 收到第一帧就会拿去当应答解析：15:47 那版先塞的 1 字节 `0x01`
+在平台眼里就是"应答体 ＝ `01`"，不是 JSON ⇒ 解析失败 ⇒ 界面**还是空白**。
+换句话说，"先回 ACK 让平台安心"只安了设备侧的自我安慰，平台侧什么都没变。
+
+对照同族命令就能看出问题：`0xE1`（查询状态）、`0xE3`（查询版本）**成功都只发一帧
+JSON**（`iv_report.c:h_query_version()`：`iv_proto_send_json()`，失败才走 `0x74`
+兜底），从来没有"先 ACK"。`0xE4` 是同一类查询，口径必须一致。
+
+=== 改成什么
+
+[source,c]
+----
+rc = iv_agent_device_search(a, a->now_ms);
+if (rc != IV_OK) {                                  /* 起不来：0x74，别沉默 */
+    (void)iv_proto_ack(&a->rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+    IV_LOG_W(AG_MOD, "platform 0xE4 camera search -> rc=%d, ack 0x%02X", rc, 0x74);
+    return;
+}
+a->ipc_pending     = 1u;                            /* 只置"欠平台一条 JSON" */
+a->ipc_deadline_ms = a->now_ms + 15000u;
+(void)snprintf(a->ipc_qn, sizeof a->ipc_qn, "%08u%09u", f->qn1, f->qn2);
+IV_LOG_I(AG_MOD, "platform 0xE4 camera search -> rc=%d (JSON after search)", rc);
+----
+
+分界线很清楚：**成功 ⇒ 一帧 JSON，什么都没有别多；失败 ⇒ `0x74`**。
+`ipc_reply_tick()` 与 `iv_agent_build_ipc_json()` 一个字没动（那部分是对的）。
+
+=== 测试侧的连带修正
+
+* `platcmd_e2e.py` C35a 由"必须先收到 ACK `0x01`"**反转**成
+  ``chk(a4 is None, 'C35a 0xE4 不先回 ACK（查询类成功只该有 JSON）')``，
+  1.5 s 内出现任何二进制 `0xE4` 即判红。
+* 删掉旧用例 B4/B4a（断言的正是被否掉的行为），否则新老口径互骂、
+  谁改代码都会被另一条判红。删除处留了注释，说明为什么不保留半截：
+  `0xE4` 每下发一次就真跑一轮约 8 s 的发现，多起一次不但拖慢，
+  还会和 C35 撞 `IV_EBUSY`（发现状态机在跑时再下发 ⇒ 回 `0x74`）。
+
+=== 验证结果
+
+* VM `tqt113` 两端 `md5sum` 对账 `iv_agent.c = a2e6fa3e67278e2eb12cb9cacc2c0156`。
+* `make host` 0 告警；`make test` 47/47；`make asan` 47/47；`setarch -R make tsan` 47/47；
+  `rm -rf build/analyze` 后重跑 `make analyze` 0 报告；`make arm` 0 告警。
+* `platcmd_e2e.py` **rc=0、118 PASS / 0 FAIL**（少一条是因为删了 B4a）。
+  DIAG 抓到的上行首字节 `23237b22636f646522…` ＝ `##{"code":0,…` —— 只有 JSON，没有 ACK。
+* `make itest` 16 passed ＋ 1 SKIP（tunnel 缺 sn，与基线一致）。
+* `build/arm/ivsboxd` md5 **`de7ca4d648661db3376cbc49450af695`**。

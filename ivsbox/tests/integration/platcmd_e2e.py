@@ -513,11 +513,11 @@ def main():
         f = plat.wait(0xE2, kind='bin')
         chk(f is not None and f['code'] == 0x01, 'B3a 0xE2 ack=0x01')
 
-        print('B4 0xE4 搜索摄像机 ⇒ 回 ACK 0x01（发现是异步的）')
-        plat.clear()
-        plat.send(build_downlink(0xE4))
-        f = plat.wait(0xE4, kind='bin')
-        chk(f is not None and f['code'] == 0x01, 'B4a 0xE4 ack=0x01')
+        # B4 原来在这里断言"0xE4 回 ACK 0x01"，2026-10-27 15:5x 口径反转：
+        # 查询类命令成功只回 JSON、不回 ACK（先塞 1 字节 ACK 会让平台拿它当应答去解析 JSON，
+        # 解析失败 ⇒ 界面永远空白 —— 这正是"点搜索设备没反应"的现场）。整条用例搬到 C35。
+        # 这里不留半截：0xE4 会起一次 6 相位 × 3 轮的真发现（约 8 s），多起一次只会白白拖慢，
+        # 还可能和 C35 撞车（发现状态机在跑时再下发 ⇒ IV_EBUSY ⇒ 回 0x74）。
 
         print('B5 0xE7 查询 SNMP ⇒ 应答码必须与实际执行结果一致（不许谎报成功）')
         plat.clear()
@@ -984,19 +984,19 @@ def main():
         chk(wait_log(r'platform relay ch=1 act=2', start=start) is None,
             'C34c 没打出"已下发"那条成功日志（没发出去就不许说成功）')
 
-        print('C35 0xE4 搜索摄像机 ⇒ 先 ACK，搜完再补一帧 JSON 清单')
+        print('C35 0xE4 搜索摄像机 ⇒ 只回 JSON 清单，**不回 ACK**')
         # 2026-10-27 之前这里**只回 ACK**（连 JSON 都不发），平台点"搜索设备"永远转圈。
-        # VM 上搜不到摄像机（没有真网卡/真摄像机）⇒ 断言只要求"有这一帧且带 num"，
-        # 设备数量随环境变化，不当黄金值。
+        # 15:47 那一版改成"先 ACK 再补 JSON"，仍然错：平台收到一帧 1 字节的 0xE4 会当成
+        # 应答去解析 JSON，解析失败 ⇒ 界面还是空白。查询类的成功应答只有那帧 JSON。
+        # VM 上搜不到摄像机（没有真网卡/真摄像机）⇒ 只断言"有这一帧且带 num"。
         start = len(logtext())
         plat.clear()
         plat.send(build_downlink(0xE4, b'\x00'))
-        a4 = plat.wait(0xE4, kind='bin')
-        chk(a4 is not None and a4['code'] == 0x01,
-            'C35a 0xE4 先回 ACK 0x01（发现是异步的，不能同步等）')
+        a4 = plat.wait(0xE4, kind='bin', timeout=1.5)
+        chk(a4 is None, 'C35a 0xE4 不先回 ACK（查询类成功只该有 JSON）')
         # 发现状态机 6 相位 × 3 轮，实测 8 s 左右；留一倍余量
         f = plat.wait(0xE4, kind='json', timeout=20.0)
-        chk(f is not None, 'C35b 搜索结束后补了一帧 JSON 清单')
+        chk(f is not None, 'C35b 搜索结束后回了一帧 JSON 清单')
         if f is not None:
             chk(b'"num"' in f['data'], 'C35c 清单里有 num')
             chk(b'"qn":"287454020' in f['data'],

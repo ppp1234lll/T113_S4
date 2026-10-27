@@ -1152,8 +1152,16 @@ static void env_feed(iv_agent_t *a, uint64_t now_ms)
 }
 
 /* 平台 0xE4（搜索摄像机信息）：重开一轮多品牌发现，与现网"摄像机搜索"按钮等价。
- * 发现是**异步**的（非阻塞相位机，约 6 相位 × 3 轮）⇒ 这里先回 ACK，
- * 清单由 `ipc_reply_tick()` 在相位机 DONE（或 15 s 到点）后补发 —— 见上面那段注释。 */
+ *
+ * **这是一条查询命令，只回 JSON，不回 ACK** —— 与 `0xE1`/`0xE3` 同一口径
+ * （见 `iv_report.c:h_query_version()`：成功发 `##{...}##`，失败才回 `0x74`）。
+ * 2026-10-27 15:47 那一版先塞了一帧 1 字节的 `0xE4` ACK，等于给平台喂了一个
+ * "长得像应答、其实不是 JSON"的帧 —— 平台按 `0xE4` 收到后去解析 JSON 必然失败，
+ * 结果还是什么都不显示。**查询类的成功应答只有一种：那一帧 JSON。**
+ *
+ * 发现是异步的（非阻塞相位机，6 相位 × 3 轮 ≈ 8 s），所以 JSON 由
+ * `ipc_reply_tick()` 在相位机 DONE（或 15 s 到点）后发；这里只置标志。
+ * 起不来（未装配/链路异常）才回 `0x74` —— 明确失败胜过沉默。 */
 static void on_query_ipc(const iv_proto_frame_t *f, void *arg)
 {
     iv_agent_t *a = (iv_agent_t *)arg;
@@ -1162,17 +1170,19 @@ static void on_query_ipc(const iv_proto_frame_t *f, void *arg)
     if (f == NULL || a == NULL)
         return;
     rc = iv_agent_device_search(a, a->now_ms);
-    (void)iv_proto_ack(&a->rp.pf, f->cmd,
-                       (rc == IV_OK) ? IV_PROTO_ACK_OK : IV_PROTO_ERR_EXEC);
-    if (rc == IV_OK) {
-        /* 只留一个"欠平台一条 JSON"的标志：连点两次就重新计时，不排队。 */
-        a->ipc_pending     = 1u;
-        a->ipc_deadline_ms = a->now_ms + (uint64_t)IV_AGENT_IPC_WAIT_MS;
-        /* QN 与 0xE3 同构（`sprintf("QN=%08d%09d")`），应答原样回填。 */
-        (void)snprintf(a->ipc_qn, sizeof a->ipc_qn, "%08u%09u",
-                       (unsigned)f->qn1, (unsigned)f->qn2);
+    if (rc != IV_OK) {
+        (void)iv_proto_ack(&a->rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        IV_LOG_W(AG_MOD, "platform 0xE4 camera search -> rc=%d, ack 0x%02X",
+                 rc, (unsigned)IV_PROTO_ERR_EXEC);
+        return;
     }
-    IV_LOG_I(AG_MOD, "platform 0xE4 camera search -> rc=%d", rc);
+    /* 只留一个"欠平台一条 JSON"的标志：连点两次就重新计时，不排队。 */
+    a->ipc_pending     = 1u;
+    a->ipc_deadline_ms = a->now_ms + (uint64_t)IV_AGENT_IPC_WAIT_MS;
+    /* QN 与 0xE3 同构（`sprintf("QN=%08d%09d")`），应答原样回填。 */
+    (void)snprintf(a->ipc_qn, sizeof a->ipc_qn, "%08u%09u",
+                   (unsigned)f->qn1, (unsigned)f->qn2);
+    IV_LOG_I(AG_MOD, "platform 0xE4 camera search -> rc=%d (JSON after search)", rc);
 }
 
 /* 平台 0xE7（查询 SNMP 信息）：把采集任务丢进慢任务池，回 ACK；

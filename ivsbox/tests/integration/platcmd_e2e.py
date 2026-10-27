@@ -694,6 +694,30 @@ def main():
             chk((cls_items('camera').get('camera.ch.1.ip') or '') == '',
                 'C15b camera.ch.1.ip 已清空（全 0 ＝清除，与参考实现一致）')
 
+        # C16 = 2026-10-27 现场"配第 2 路 ⇒ 整机卡死重启"的回归钉子。
+        # 机理：再加一路时 `pb_rebuild()` 会把 PING 引擎每个条目的 sent/lost 归零，
+        # 而**老通道**的采样游标 `pv_sent/pv_lost` 还留着重建前的值 ⇒ `uint32` 下溢
+        # （0-3 = 0xFFFFFFFD）⇒ `sample_ping()` 的 while 要转约 42 亿次：主控单核
+        # 100%、日志一条不写、ctl 不再应答，16 s 后看门狗复位整机。平台看到的是
+        # 「配置第 N 路摄像机失败」，设备侧却是整机重启 —— 两者极难对上号。
+        # 判据：**连配 6 路**每一条都要 ack 0x01，并且每一路之后 ctl 都得应答。
+        print('C16 0xF7 连配 6 路 ⇒ 每路 ack 0x01 且主控始终响应（回归 10-27 卡死）')
+        alive_n = 0
+        for ch in range(1, 7):
+            ip_ch = '192.168.2.%d' % (240 + ch)   # 现场不会撞的网段
+            plat.clear()
+            plat.send(build_downlink(0xF7, bytes([ch]) + socket.inet_aton(ip_ch)))
+            f = plat.wait(0xF7, kind='bin')
+            ok = (f is not None and f['code'] == 0x01)
+            chk(ok, 'C16 ch%d=%s ⇒ ack=0x01' % (ch, ip_ch))
+            try:
+                ctl('system.snapshot')
+                alive_n += 1
+            except Exception:                     # noqa: BLE001
+                chk(False, 'C16 ch%d 之后主控无应答（又把主循环转死了）' % ch)
+                break
+        chk(alive_n == 6, 'C16b 连配 6 路之后主控仍活着（ctl 6/6 应答）')
+
         # ---- 收尾：把动过的键按**原值**还原 ----
         print('Z 收尾：还原现场配置')
         keep = ('net.ip', 'net.mask', 'net.gateway',

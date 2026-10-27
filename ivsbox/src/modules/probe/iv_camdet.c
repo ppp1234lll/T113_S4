@@ -195,6 +195,24 @@ static void pb_rebuild(iv_camdet_t *d)
     pc.iops                 = d->cfg.pb_iops;
     (void)iv_probe_init(&d->pb, &pc);
 
+    /* ⚠ 采样游标必须跟着引擎一起归零 —— 2026-10-27 板端"配第 2 路摄像机整机卡死"
+     * 的根因就在这里。
+     *
+     * `pv_sent/pv_lost` 的语义是"上一次读到的引擎累计计数"，而引擎刚被 init 过，
+     * 每个条目的 sent/lost 都从 0 重新数。可 `set_channels()` 只给**改了 IP 的那
+     * 几路**清游标，其余通道的游标还留着重建前的旧值 ⇒ `sample_ping()` 里
+     * `s.sent - d->pv_sent[ch]` 做的是**无符号减法**，`0 - 3` = 0xFFFFFFFD，
+     * 那个 `while (dsent > 0u)` 要转约 **42 亿次**：主控单核 100%、日志一条不写、
+     * ctl 不再应答，16 s 后被看门狗复位整机。
+     *
+     * 现场症状之所以难认：0→1 路**看不出问题**（唯一有 IP 的那一路正好是被改的
+     * 那一路，游标被 set_channels 清过）；已有 1 路再加一路就必卡 —— 平台表现为
+     * 「配置第 N 路摄像机失败」，设备侧却是整机重启。 */
+    for (ch = 0; ch < IV_CAMDET_CH_N; ch++) {
+        d->pv_sent[ch] = 0u;
+        d->pv_lost[ch] = 0u;
+    }
+
     for (ch = 0; ch < IV_CAMDET_CH_N; ch++) {
         char name[IV_PROBE_NAME_LEN];
         int  idx;
@@ -510,10 +528,27 @@ static int sample_ping(iv_camdet_t *d, uint64_t now_ms)
         if (iv_probe_stat_get(&d->pb, d->ch_idx[ch], &s) != IV_OK)
             continue;
 
+        /* 统计值比游标**小** ⇒ 引擎被重建过（`pb_rebuild()` 里 init 会把计数清零）。
+         * 先对齐再相减：否则 `uint32_t` 下溢成 ~42 亿，下面的 while 直接把主控
+         * 转死（2026-10-27 现场）。正常运行时计数只增，这条分支不会进。 */
+        if (s.sent < d->pv_sent[ch] || s.lost < d->pv_lost[ch]) {
+            d->pv_sent[ch] = 0u;
+            d->pv_lost[ch] = 0u;
+        }
         dsent = s.sent - d->pv_sent[ch];
         dlost = s.lost - d->pv_lost[ch];
         if (dsent == 0u)
             continue;
+        /* 第二道防线：一个 tick 至多结算 1 个样本（包间隔 5 s ≫ tick 200 ms）。
+         * 真出现更大的增量只可能是计数错乱 —— **宁可少记几个样本，也绝不能让
+         * 主循环在这里空转**，那是整机卡死。 */
+        if (dsent > IV_CAMDET_PING_MAX_STEP) {
+            IV_LOG_W(CD_MOD, "ch%d sample step %u clamped to %u (counters reset?)",
+                     ch, (unsigned)dsent, (unsigned)IV_CAMDET_PING_MAX_STEP);
+            dsent = IV_CAMDET_PING_MAX_STEP;
+        }
+        if (dlost > dsent) /* 丢包数不可能多于本次新增样本数，防脏计数 */
+            dlost = dsent;
         d->pv_sent[ch] = s.sent;
         d->pv_lost[ch] = s.lost;
 

@@ -12,6 +12,7 @@
 #include <netinet/ip_icmp.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h> /* c14：量"重建后那次 tick 有没有空转" */
 
 #include "ivsbox/iv_camdet.h"
 #include "ivsbox/iv_report.h" /* c12：CNS 字段编码一致性 */
@@ -864,6 +865,62 @@ static void c13_probe_now_and_rtt(void)
     iv_camdet_close(&f.d);
 }
 
+/* 回归 c14（2026-10-27 板端"平台配第 2 路摄像机 ⇒ 整机卡死重启"）：
+ *
+ * 已有 1 路在采样时**再加一路** ⇒ `pb_rebuild()` 重建 PING 引擎，`iv_probe_init()`
+ * 把每个条目的 sent/lost 归零；而老通道的采样游标 `pv_sent/pv_lost` 是"上次读到的
+ * 计数"，还留着旧值 ⇒ `sample_ping()` 里 `s.sent - d->pv_sent[ch]` 做**无符号减法**
+ * 下溢成 0xFFFFFFFD ⇒ 那个 `while (dsent > 0u)` 要转约 42 亿次：主控单核 100%、
+ * 日志一条不写、ctl 不再应答、16 s 后看门狗复位整机。
+ *
+ * 为什么现场难认：0→1 路不卡（唯一有 IP 的那路正好被 `set_channels()` 清过游标），
+ * 已有 1 路再加一路就必卡；平台看到的是「配置失败」，设备侧却是整机重启。
+ *
+ * 判据：加完通道后那一次 tick 必须在毫秒级返回（老实现要转几十秒），且老通道
+ * 的样本照常继续结算（不是"把采样整个扔掉"）。
+ */
+static void t_rebuild_no_underflow(void)
+{
+    fx_t     f;
+    uint32_t ips[IV_CAMDET_CH_N];
+    uint64_t t = 1000;
+    struct timespec a;
+    struct timespec b;
+    long     ms;
+
+    fx_open(&f, IV_CAMDET_MODE_PING, 0);
+    one_cam(ips);
+    (void)iv_camdet_set_channels(&f.d, ips, t);
+
+    /* 先让 ch0 攒两个成功样本 ⇒ 游标 pv_sent/pv_lost 变成非零 */
+    ping_pkt(&f, &t, 1, 10);
+    ping_pkt(&f, &t, 1, 10);
+
+    /* 再加一路：引擎重建，ch0 的引擎计数归零、游标还是 2 */
+    ips[1] = CAM1_BE;
+    (void)iv_camdet_set_channels(&f.d, ips, t);
+
+    (void)clock_gettime(CLOCK_MONOTONIC, &a);
+    ping_pkt(&f, &t, 1, 10);           /* 老实现在这一步空转几十秒 */
+    (void)clock_gettime(CLOCK_MONOTONIC, &b);
+    ms = (long)((b.tv_sec - a.tv_sec) * 1000L) + (b.tv_nsec - a.tv_nsec) / 1000000L;
+    chk(ms < 2000,
+        "c14a rebuild 后的第一个 tick 必须立刻返回（防计数下溢转成死循环）");
+
+    /* 采样没被吞掉：再走满一轮（4 个样本）就能算出结论。
+     * 这里**不追究结论是哪个**：引擎刚重建，mock 回包与重建的相对时序会让第一个
+     * 样本偶尔记成"过渡期丢包"，那不是本用例要守的东西 —— 本用例守的是
+     * "不能把主循环转死" ＋ "采样不能整个停掉"。所以只要求 vd 从 NO_IP 变成
+     * 任何一个真结论（NORMAL / LOSS / FAULT / DELAY 都算通过）。 */
+    ping_pkt(&f, &t, 1, 10);
+    ping_pkt(&f, &t, 1, 10);
+    ping_pkt(&f, &t, 1, 10);
+    ping_pkt(&f, &t, 1, 10);
+    chk(iv_camdet_verdict(&f.d, 0) != IV_CAMDET_NO_IP,
+        "c14b rebuild 之后老通道仍在采样（一轮样本能算出结论）");
+    iv_camdet_close(&f.d);
+}
+
 int main(void)
 {
     c01_args_and_guards();
@@ -879,12 +936,14 @@ int main(void)
     c11_cns();
     c12_cns_segment();
     c13_probe_now_and_rtt();
+    t_rebuild_no_underflow();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_camdet FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_camdet passed (guards, ping normal/delay/loss/fault, link-down, "
-           "channel refresh, port scan, rtsp, mode switch, cns, probe-now/rtt)\n");
+           "channel refresh, port scan, rtsp, mode switch, cns, probe-now/rtt, "
+           "rebuild-no-underflow)\n");
     return 0;
 }

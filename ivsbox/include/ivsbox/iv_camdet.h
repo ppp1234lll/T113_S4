@@ -109,6 +109,14 @@ extern "C" {
 #define IV_CAMDET_PING_TIMEOUT_MS  5000u
 #define IV_CAMDET_PING_SAMPLES     4u
 
+/* 单个 tick 允许结算的样本数上限（防"计数错乱变成死循环"的第二道防线）。
+ *
+ * 物理上限是 1（包间隔 5 s ≫ tick 200 ms），留到 8 只为容忍调度抖动。超过它只
+ * 可能是引擎被重建后"统计归零、采样游标没归零"造成的**无符号下溢**
+ * （`0 - 3` = 0xFFFFFFFD ⇒ 约 42 亿次循环 ⇒ 主控单核吃满、ctl 不再应答、
+ * 看门狗 16 s 后复位整机）。见 `pb_rebuild()` / `sample_ping()` 的注释。 */
+#define IV_CAMDET_PING_MAX_STEP    8u
+
 /* 延时判定阈值默认值：现网 `DEFALUT_NETWORK_DELAY` = 200 ms。
  *
  * ⚠ **RTT 的采样分辨率＝调用方 tick 周期**（`IV_AGENT_PROBE_TICK_MS`，200 ms）：

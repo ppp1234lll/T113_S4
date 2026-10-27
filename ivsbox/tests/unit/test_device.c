@@ -38,6 +38,8 @@ static size_t g_queue_len[8];
 static int g_queue_n;
 static int g_queue_i; /* FIFO 读游标 */
 static int g_queue_fd = -1; /* 只对某个 fd 出队；-1=任意 */
+/* 对端地址（网络序）。0＝recvfrom 不回填，模拟二层 SADP 那类没有 IP 的来源。 */
+static uint32_t g_from_ip;
 
 static int io_socket(int d, int t, int p) {
     (void)d;
@@ -75,8 +77,6 @@ static ssize_t io_sendto(int fd, const void *buf, size_t len, int flags,
 static ssize_t io_recvfrom(int fd, void *buf, size_t len, int flags,
                            struct sockaddr *a, socklen_t *al) {
     (void)flags;
-    (void)a;
-    (void)al;
     if (g_queue_i >= g_queue_n || (g_queue_fd >= 0 && fd != g_queue_fd)) {
         errno = EAGAIN;
         return -1;
@@ -86,6 +86,15 @@ static ssize_t io_recvfrom(int fd, void *buf, size_t len, int flags,
         return -1;
     }
     memcpy(buf, g_queue[g_queue_i], g_queue_len[g_queue_i]);
+    /* 对端地址：只有用例显式设了 g_from_ip 才填（d13 用）。
+     * 默认不写，模拟"没有对端地址"——生产代码读 ss_family 前必须自己清零。 */
+    if (g_from_ip != 0u && a != NULL) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)a;
+        memset(sin, 0, sizeof(*sin));
+        sin->sin_family = AF_INET;
+        sin->sin_addr.s_addr = g_from_ip;
+        if (al != NULL) *al = sizeof(*sin);
+    }
     ssize_t r = (ssize_t)g_queue_len[g_queue_i];
     g_queue_i++;
     return r;
@@ -112,6 +121,7 @@ static void io_reset(void) {
     g_queue_n = 0;
     g_queue_i = 0;
     g_queue_fd = -1;
+    g_from_ip = 0;
     g_now = 0;
 }
 static void io_push(const void *data, size_t len) {
@@ -468,6 +478,103 @@ static void d12_malformed(void) {
     iv_device_close(&d);
 }
 
+/* ---------------------------------------------------------------------------
+ * d13：报文里没有 IP 时用对端地址兜底（2026-10-27 现场：ip1..ip5 全空）
+ *
+ * 板端真帧：平台点「搜索设备」后设备回了 5 条档案，`ip` 全为空串，
+ * 平台那张表按 IP 建行 ⇒ 一行都落不下来、"已完成 0 个查询"。
+ * 海康 UDP 37020 / 大华组播的应答体里没有可解析的 IP，但应答方一定是从
+ * 自己的 IP 发出来的 ⇒ recvfrom 的对端地址就是答案。
+ * ------------------------------------------------------------------------- */
+static void d13_peer_ip_fallback(void) {
+    iv_device_t d;
+    iv_device_cfg_t cfg;
+    iv_dev_desc_t e;
+
+    /* ① 有对端地址：ONVIF 报文里**故意不带 XAddrs**，IP 只能来自对端 */
+    io_reset();
+    iv_device_cfg_default(&cfg);
+    cfg.iops = &g_io;
+    cfg.ifname = NULL;
+    cfg.round_ms = 100;
+    cfg.rounds = 1;
+    iv_device_init(&d, &cfg);
+    iv_device_open(&d, &cfg, 0);
+    g_from_ip = inet_addr("192.168.2.64");
+    const char *noip =
+        "<ProbeMatch><MAC>3a:82:b4:1d:3c:bf</MAC>"
+        "<DeviceType>DS-2CD3T46</DeviceType></ProbeMatch>";
+    io_push(noip, strlen(noip));
+    iv_device_start_search(&d, 0);
+    iv_device_tick(&d, 0);
+    chk(iv_device_count(&d) == 1, "d13 archived without XAddrs");
+    chk(iv_device_get(&d, 0, &e) == IV_OK, "d13 get ok");
+    chk(e.ip_be == inet_addr("192.168.2.64"), "d13 ip taken from peer address");
+    iv_device_close(&d);
+
+    /* ② 没有对端地址（模拟二层 SADP）：不能凭空造 IP，保持 0 */
+    io_reset();
+    iv_device_init(&d, &cfg);
+    iv_device_open(&d, &cfg, 0);
+    io_push(noip, strlen(noip));
+    iv_device_start_search(&d, 0);
+    iv_device_tick(&d, 0);
+    chk(iv_device_count(&d) == 1, "d13 archived, no peer");
+    chk(iv_device_get(&d, 0, &e) == IV_OK, "d13 get ok 2");
+    chk(e.ip_be == 0u, "d13 no peer -> ip stays 0 (不编造)");
+    iv_device_close(&d);
+
+    /* ③ 报文自带 IP 时**不被对端地址覆盖**（SADP 应答报文里有真 IP） */
+    io_reset();
+    iv_device_init(&d, &cfg);
+    iv_device_open(&d, &cfg, 0);
+    g_from_ip = inet_addr("10.0.0.9"); /* 故意给一个不同的 */
+    const char *withip =
+        "<ProbeMatch><MAC>3a:82:b4:1d:3c:bf</MAC>"
+        "<XAddrs>http://192.168.1.200/onvif/device_service</XAddrs>"
+        "<DeviceType>DS-2CD</DeviceType></ProbeMatch>";
+    io_push(withip, strlen(withip));
+    iv_device_start_search(&d, 0);
+    iv_device_tick(&d, 0);
+    chk(iv_device_get(&d, 0, &e) == IV_OK, "d13 get ok 3");
+    chk(e.ip_be == inet_addr("192.168.1.200"), "d13 payload ip wins over peer");
+    iv_device_close(&d);
+    io_reset();
+}
+
+/* ---------------------------------------------------------------------------
+ * d14：海康 UDP 37020 的 XML —— 型号取 `DeviceDescription`、IP 取 `<IPv4Address>`
+ *
+ * 报文头部逐字取自 2026-10-27 16:24 现场抓包（`192.168.2.100:37020`）。
+ * 板端旧实现在这条报文上给出 `model=46672`、`ip=""`：
+ *   - `46672` 是 `<DeviceType>`，**类型码不是型号**，真型号是 `DS-7804N-F1(C)`；
+ *   - 旧代码只从 `XAddrs` 取 IP，海康 XML 用的是 `<IPv4Address>` ⇒ 全空。
+ * 两者一起把平台那张表打空（IP 空 ⇒ 按 IP 建行建不出来）。
+ * ------------------------------------------------------------------------- */
+static void d14_hik_udp_xml(void) {
+    static const char *xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<ProbeMatch>\n"
+        "<Uuid>00000000-0000-0000-0000-000000000000</Uuid>\n"
+        "<Types>inquiry</Types>\n"
+        "<DeviceType>46672</DeviceType>\n"
+        "<DeviceDescription>DS-7804N-F1(C)</DeviceDescription>\n"
+        "<DeviceSN>DS-7804N-F1(C)0420230310CCRRL27272938WVU</DeviceSN>\n"
+        "<CommandPort>8000</CommandPort>\n"
+        "<MAC>e0-ba-ad-da-ab-dd</MAC>\n"
+        "<IPv4Address>192.168.2.100</IPv4Address>\n"
+        "<IPv4SubnetMask>255.255.255.0</IPv4SubnetMask>\n"
+        "</ProbeMatch>\n";
+    iv_dev_desc_t out;
+    chk(iv_onvif_parse(xml, strlen(xml), &out) == IV_OK, "d14 parse ok");
+    chk(out.brand == IV_DEV_BRAND_HIKVISION, "d14 brand from <MAC>");
+    chk(out.ip_be == inet_addr("192.168.2.100"), "d14 ip from <IPv4Address>");
+    chk(strcmp(out.model, "DS-7804N-F1(C)") == 0,
+        "d14 model = DeviceDescription（不是 DeviceType 的 46672）");
+    chk(strcmp(out.model, "46672") != 0, "d14 model is not the type code");
+    chk(strncmp(out.serial, "DS-7804N-F1(C)", 14) == 0, "d14 serial from DeviceSN");
+    chk(memcmp(out.mac, "\xE0\xBA\xAD\xDA\xAB\xDD", 6) == 0, "d14 mac dash form");
+}
+
 int main(void) {
     d01_sadp_checksum();
     d02_sadp_build_parse();
@@ -481,12 +588,15 @@ int main(void) {
     d10_dedup();
     d11_full_and_clear();
     d12_malformed();
+    d13_peer_ip_fallback();
+    d14_hik_udp_xml();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_device FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_device passed (sadp csum/build/parse, hik probe, dahua probe/parse, "
-           "onvif probe/parse, discovery fsm, archive dedup/full/clear, malformed)\n");
+           "onvif probe/parse, discovery fsm, archive dedup/full/clear, malformed, "
+           "peer-ip fallback, hik-udp xml model/ip)\n");
     return 0;
 }

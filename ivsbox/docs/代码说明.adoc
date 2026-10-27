@@ -8003,3 +8003,96 @@ IV_LOG_I(AG_MOD, "platform 0xE4 camera search -> rc=%d (JSON after search)", rc)
   DIAG 抓到的上行首字节 `23237b22636f646522…` ＝ `##{"code":0,…` —— 只有 JSON，没有 ACK。
 * `make itest` 16 passed ＋ 1 SKIP（tunnel 缺 sn，与基线一致）。
 * `build/arm/ivsboxd` md5 **`de7ca4d648661db3376cbc49450af695`**。
+
+== 2026-10-27 16:32 摄像机清单能发出去还不够：得带得上 IP 和真型号
+
+=== 现象：JSON 发出去 700 多字节，平台一行都不显示
+
+16:10 平台点「搜索设备」，板端日志证明**回了**：
+
+[source,text]
+----
+16:10:13 platform 0xE4 camera search -> rc=0 (JSON after search)
+16:10:21 search done, 5 found
+16:10:21 E4 reply: {"code":0,"qn":"42949672954294967295","data":{"cmd":"E4","num":5,
+          "ip1":"","mac1":"e0:ba:ad:da:ab:dd","bd1":"hikvision","mod1":"46672","osd1":"",
+          "ip2":"","mac2":"18:68:cb:e2:ed:e6","bd2":"hikvision","mod2":"12345", …}}
+----
+
+`num` 有、MAC 有，**IP 全是空串**；`mod` 是 `46672`/`12345`/`148040` 这种数字。
+平台那张表是「区域 / 运维编码 / 摄像机品牌 / 型号 / 类型 / IP地址 / 点位描述 / 状态」，
+按 IP 建行 —— IP 空，一行都落不下来，进度自然永远停在「已完成 0 个查询」。
+
+=== 抓真报文，别猜字段
+
+VM 上发同一份海康 UDP 探测（`<Probe><Uuid>…<Types>inquiry</Types></Probe>` →
+`239.255.255.250:37020`），收到 1727 B 应答，摘关键的几行：
+
+[source,xml]
+----
+<DeviceType>46672</DeviceType>                              <!-- 类型码，不是型号 -->
+<DeviceDescription>DS-7804N-F1(C)</DeviceDescription>       <!-- 这才是型号 -->
+<DeviceSN>DS-7804N-F1(C)0420230310CCRRL27272938WVU</DeviceSN>
+<MAC>e0-ba-ad-da-ab-dd</MAC>
+<IPv4Address>192.168.2.100</IPv4Address>                    <!-- 旧代码根本没读 -->
+----
+
+旧代码两处都错：
+
+. **IP** 只从 `XAddrs` 里取（那是 ONVIF WS-Discovery 的字段），海康这份 XML 用
+  `<IPv4Address>` ⇒ 全部为空。开机那一轮 4 台"看着有 IP"，是因为它们先被 SADP
+  二层应答命中了，SADP 报文自带 IP。
+. **型号**把 `DeviceType` 当型号 ⇒ 界面"型号"列变成 `46672`。
+
+=== 改了两层
+
+[source,c]
+----
+/* ① 报文里没有 IP 时，用 recvfrom 给的对端地址兜底（与品牌/报文格式无关） */
+if (desc.ip_be == 0u) { uint32_t pip = 0; peer_ip_be(from, &pip); if (pip) desc.ip_be = pip; }
+
+/* ② 真报文里的字段：IP 优先 <IPv4Address>，型号优先 DeviceDescription */
+uint32_t ip = ip_after_xml_tag(tmp, "<IPv4Address>");
+if (ip != 0u) out->ip_be = ip;
+extract_after_key(tmp, "DeviceDescription", out->model, sizeof(out->model));  /* 型号 */
+if (out->model[0] == '\0') extract_after_key(tmp, "DeviceType", …);           /* 大华 JSON 只有它 */
+extract_after_key(tmp, "DeviceSN", out->serial, sizeof(out->serial));
+----
+
+两层都要：①让"报文没带 IP"这一类（大华组播 JSON、部分 ONVIF）不至于空着；
+②让"报文带了 IP"这一类拿到**设备自己声明的**地址（比源地址更可信）。
+`drain_fd()` 里那个 `struct sockaddr_storage from` 必须 `memset` —— 单测注入的
+`recvfrom` 不写这个出参，不清零就是读未初始化栈，家族碰巧等于 `AF_INET` 时会给
+档案塞随机 IP。
+
+=== 验证
+
+* `test_device` 新增两组：
+  **d13** 三条（有对端 → 用对端；无对端 → 保持 0 不编造；报文自带 IP → 不被对端覆盖）；
+  **d14** 用**上面那段现场报文**逐字构造，钉 `ip=192.168.2.100`、
+  `model=DS-7804N-F1(C)`、`model != "46672"`、`serial`、dash 形式 MAC。
+* 反向证伪：型号来源改回 `DeviceType` ⇒ d14 两条红（FAILED(2)）；
+  `if (pip != 0u)` 改 `if (0)` ⇒ d13 红（FAILED(1)）。均还原复绿。
+* 全量：test/asan/tsan 各 47/47、analyze 0 报告、arm 0 告警、e2e 118 PASS、
+  itest 16 passed ＋ 1 SKIP。
+* 上板 `d44cbd0c…` 后 `/api/devices` 六台全部带 IP 与真型号：
+
+[source,text]
+----
+hikvision  192.168.2.102   18:68:cb:e2:ed:e6   HS-AFS-MAGE20        hik-sadp
+hikvision  192.168.1.200   08:3b:c1:c5:3d:34   DS-2DC4425DW-D       hik-sadp
+hikvision  192.168.2.18    d4:e8:53:5c:0e:46   DS-IPC-T12HV3-IA     hik-sadp
+hikvision  192.168.1.78    44:47:cc:69:3c:3f   DS-2CD3T27EDWD-L     hik-sadp
+hikvision  192.168.2.100   e0:ba:ad:da:ab:dd   DS-7804N-F1(C)       hik-udp
+dahua      192.168.1.106   40:7a:a4:86:95:62   DH-SD6223-DGQ-i      dahua-mcast
+----
+
+=== 仍未对齐（下一轮要真样例）
+
+* `bd%d` 仍是内部品牌词（`hikvision`/`dahua`），平台"摄像机品牌"列若是中文或数字编码
+  就得再映射一次。
+* `qn` 平台送的是全 `FF`（＝不跟踪），我们照 `0xE1`/`0xE3` 的老口径回成
+  `"42949672954294967295"`。E1/E3 平台能吃，所以暂时不动；若平台开始按 qn 配对，
+  这三条要一起改成"平台没给就回 0"。
+* 大华组播的 `client.notifyDevInfo` JSON 里应该也有自己的 IP 字段，本轮先靠源地址
+  兜底，等拿到完整 JSON 再改成读报文。

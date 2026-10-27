@@ -191,6 +191,26 @@ static int mac_is_zero(const uint8_t mac[6]) {
  * 同时适配 JSON（`DeviceType":"X"`）与 XML（`<DeviceType>X</DeviceType>`）两种形态。
  * 未命中时把 out[0] 置空。
  */
+/* 从 `<Key>1.2.3.4</Key>` 形态的 XML 里取 IPv4。取不到返回 0（保持原值）。 */
+static uint32_t ip_after_xml_tag(const char *txt, const char *open_tag) {
+    const char *p = strstr(txt, open_tag);
+    char        buf[24];
+    size_t      i = 0;
+    struct in_addr ia;
+
+    if (p == NULL) return 0u;
+    p += strlen(open_tag);
+    while (p[i] != '\0' && p[i] != '<' && i + 1u < sizeof(buf)) {
+        buf[i] = p[i];
+        i++;
+    }
+    buf[i] = '\0';
+    if (i == 0u) return 0u;
+    ia.s_addr = 0;
+    if (inet_pton(AF_INET, buf, &ia) != 1) return 0u;
+    return ia.s_addr;
+}
+
 static void extract_after_key(const char *txt, const char *key, char *out,
                               size_t cap) {
     const char *p = strstr(txt, key);
@@ -474,30 +494,47 @@ int iv_onvif_parse(const char *buf, size_t len, iv_dev_desc_t *out) {
         }
     }
 
-    /* IP：XAddrs 里的主机名（http://x.x.x.x[:port]/...） */
-    p = strstr(tmp, "XAddrs");
-    if (p == NULL) p = strstr(tmp, "xaddrs");
-    if (p != NULL) {
-        const char *q = strstr(p, "http://");
-        if (q != NULL) {
-            q += 7;
-            char ipbuf[24];
-            size_t i = 0;
-            while (q[i] && q[i] != ':' && q[i] != '/' && i + 1 < sizeof(ipbuf)) {
-                ipbuf[i] = q[i];
-                i++;
+    /* IP：① `<IPv4Address>`（海康 UDP 37020 的 XML 带这一项，2026-10-27 16:24 实测
+     * 报文：`<IPv4Address>192.168.2.100</IPv4Address>`）；② XAddrs 里的主机名
+     * （ONVIF WS-Discovery：`http://x.x.x.x[:port]/...`）。
+     * 原来只有 ② ⇒ 海康 UDP 那一轮的 5 台**全部 ip 为空**，平台按 IP 建行，
+     * 结果一行都落不下来（界面"暂无数据"、进度卡在"已完成 0 个查询"）。 */
+    {
+        uint32_t ip = ip_after_xml_tag(tmp, "<IPv4Address>");
+        if (ip != 0u) out->ip_be = ip;
+    }
+    if (out->ip_be == 0u) {
+        p = strstr(tmp, "XAddrs");
+        if (p == NULL) p = strstr(tmp, "xaddrs");
+        if (p != NULL) {
+            const char *q = strstr(p, "http://");
+            if (q != NULL) {
+                q += 7;
+                char ipbuf[24];
+                size_t i = 0;
+                while (q[i] && q[i] != ':' && q[i] != '/' && i + 1 < sizeof(ipbuf)) {
+                    ipbuf[i] = q[i];
+                    i++;
+                }
+                ipbuf[i] = '\0';
+                struct in_addr ia;
+                if (inet_pton(AF_INET, ipbuf, &ia) == 1) out->ip_be = ia.s_addr;
             }
-            ipbuf[i] = '\0';
-            struct in_addr ia;
-            if (inet_pton(AF_INET, ipbuf, &ia) == 1) out->ip_be = ia.s_addr;
         }
     }
 
-    /* 型号：`DeviceType`（海康/大华，JSON 或 XML 形态）或 onvif.org/name/xxx */
-    extract_after_key(tmp, "DeviceType", out->model, sizeof(out->model));
+    /* 型号：`DeviceDescription` 才是型号；`DeviceType` 在海康 UDP 报文里是**类型码**
+     * （实测 `<DeviceType>46672</DeviceType>` ＋ `<DeviceDescription>DS-7804N-F1(C)
+     * </DeviceDescription>`）—— 拿它当型号，界面上"型号"列就是一串没意义的数字。
+     * 大华的 JSON 只有 `DeviceType`（值是型号），所以顺序是 Description → Type → name。 */
+    extract_after_key(tmp, "DeviceDescription", out->model, sizeof(out->model));
+    if (out->model[0] == '\0')
+        extract_after_key(tmp, "DeviceType", out->model, sizeof(out->model));
     if (out->model[0] == '\0')
         extract_after_key(tmp, "onvif.org/name/", out->model,
                           sizeof(out->model));
+    /* 序列号：海康 UDP/ONVIF XML 的 `DeviceSN`（建档主键仍是 MAC，这里只补全信息） */
+    extract_after_key(tmp, "DeviceSN", out->serial, sizeof(out->serial));
     return IV_OK;
 }
 
@@ -671,8 +708,27 @@ static int add_item(iv_device_t *d, const iv_dev_desc_t *desc) {
 /* ---------------------------------------------------------------------------
  * 收包
  * ------------------------------------------------------------------------- */
+/* 对端 IPv4（网络序）。AF_PACKET 的 sockaddr_ll 没有 IP ⇒ 回 0，由调用方保持原值。
+ *
+ * 2026-10-27 16:10 板端真帧证据：平台点「搜索设备」，设备回了 5 条档案，
+ * `ip1..ip5` **全是空串**（`/api/devices` 同样 ip=""）：
+ *   {"num":5,"ip1":"","mac1":"e0:ba:ad:da:ab:dd","bd1":"hikvision","mod1":"46672",…}
+ * 平台那张表要按 IP 建行（区域/运维编码/品牌/型号/类型/IP地址/点位描述/状态），
+ * IP 空 ⇒ 一行都落不下来 ⇒ 界面永远"暂无数据"、进度永远"已完成 0 个查询"。
+ * 根因是海康 UDP 37020 与大华组播的应答体里**没有可解析的 IP 字段**（SADP 有，
+ * 所以开机那一轮 4 台是带 IP 的）。而应答方一定是从自己的 IP 发出来的 ——
+ * 用 recvfrom 给的对端地址兜底，与品牌/报文格式无关，一次覆盖全部解析器。 */
+static void peer_ip_be(const struct sockaddr_storage *from, uint32_t *out) {
+    if (from == NULL || out == NULL) return;
+    if (from->ss_family == AF_INET) {
+        const struct sockaddr_in *a = (const struct sockaddr_in *)from;
+        *out = a->sin_addr.s_addr;
+    }
+}
+
 /* 解析一包并尝试入档；返回 1=入档/更新，0=丢弃，负码=解析失败。 */
-static int handle_packet(iv_device_t *d, const uint8_t *buf, size_t len) {
+static int handle_packet(iv_device_t *d, const uint8_t *buf, size_t len,
+                         const struct sockaddr_storage *from) {
     iv_dev_desc_t desc;
     int rc = 0;
     if (len >= IV_SADP_ETH_HDR_LEN && buf[12] == 0x80 && buf[13] == 0x33) {
@@ -688,12 +744,32 @@ static int handle_packet(iv_device_t *d, const uint8_t *buf, size_t len) {
         d->dup++;
         return 0;
     }
+    /* 报文里没带 IP ⇒ 用发送方地址兜底（SADP 走二层，没有对端 IP，保持报文里的值）。 */
+    if (desc.ip_be == 0u) {
+        uint32_t pip = 0;
+        peer_ip_be(from, &pip);
+        if (pip != 0u) desc.ip_be = pip;
+    }
     if (desc.ip_be == 0 && mac_is_zero(desc.mac)) {
         d->dup++;
         return 0;
     }
     desc.found_by = d->phase;
-    return add_item(d, &desc);
+    if (add_item(d, &desc) > 0) {
+        /* 留一笔原始报文头：海康 UDP 的型号实测是 `46672`/`12345`/`148040` 这种
+         * 数字（正文里没有 DeviceType 可取，`extract_after_key()` 抓到了别的字段），
+         * 没有原始字节就只能靠猜字段名。只记入档那一包，不刷屏。 */
+        char head[97];
+        size_t k = len < sizeof(head) - 1u ? len : sizeof(head) - 1u;
+        size_t i;
+        for (i = 0; i < k; i++) {
+            uint8_t c = buf[i];
+            head[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+        }
+        head[k] = '\0';
+        IV_LOG_D(DEV_MOD, "raw[%u] %s", (unsigned)len, head);
+    }
+    return 1;
 }
 
 /* 排空 fd 的全部可读报文。返回收包数。 */
@@ -703,12 +779,18 @@ static int drain_fd(iv_device_t *d, int fd) {
     for (;;) {
         struct sockaddr_storage from;
         socklen_t fl = sizeof(from);
-        ssize_t r = d->cfg.iops->recvfrom(fd, d->rx, sizeof(d->rx), MSG_DONTWAIT,
-                                          (struct sockaddr *)&from, &fl);
+        ssize_t r;
+
+        /* 必须清零：`peer_ip_be()` 会读 `ss_family`，而单测注入的 recvfrom
+         * 不写这个出参 —— 不清零就是读未初始化栈，家族碰巧等于 AF_INET 时
+         * 会给档案塞一个随机 IP，测试随栈内容飘。 */
+        memset(&from, 0, sizeof(from));
+        r = d->cfg.iops->recvfrom(fd, d->rx, sizeof(d->rx), MSG_DONTWAIT,
+                                  (struct sockaddr *)&from, &fl);
         if (r < 0) break; /* EAGAIN 或错误：本轮结束 */
         if (r == 0) break;
         d->rx_pkts++;
-        if (handle_packet(d, d->rx, (size_t)r) != 0) n++;
+        if (handle_packet(d, d->rx, (size_t)r, &from) != 0) n++;
     }
     return n;
 }

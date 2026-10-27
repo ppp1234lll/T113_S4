@@ -178,6 +178,7 @@ const main = async () => {
     const user = key('camera.ch.0.user');
     const pass = key('camera.ch.0.pass');
     const url = key('camera.ch.0.url');
+    const rec = key('camera.ch.0.record');
 
     console.log('p02 字段是下拉/明文/无 MAC');
     chk(ip !== null && brand !== null && stream !== null && url !== null,
@@ -203,6 +204,15 @@ const main = async () => {
     chk(pass.type === 'text', 'p02h: 密码是明文输入框（首版不加密），type=' +
         (pass ? pass.type : '?'));
     chk(key('camera.ch.0.mac') === null, 'p02i: 页面上没有 MAC 输入框');
+    chk(rec !== null && rec.tagName === 'SELECT', 'p02j: 「是否录像」也是下拉，不是勾选框');
+    {
+        const txt = rec ? Array.from(rec.options).map((o) => o.textContent).join('/') : '';
+
+        chk(rec !== null && rec.options.length === 2 && /启用/.test(txt) && /停用/.test(txt),
+            'p02k: 两个选项＝启用/停用，实得 ' + txt);
+        chk(rec !== null && rec.value === 'false', 'p02l: 配置里 record=false ⇒ 选中「停用」，实得 ' +
+            (rec ? rec.value : '?'));
+    }
 
     console.log('p03 进页面即按「默认海康＋IP」生成地址');
     chk(url.value === 'rtsp://192.168.1.64:554/Streaming/Channels/101',
@@ -238,6 +248,14 @@ const main = async () => {
 
     console.log('p08 保存：只提交改动过的键');
     {
+        /* 录像下拉切到「启用」：用来钉住 **提交体里必须是布尔** ——
+         * 下拉那条路若走字符串，配置模块会判 type mismatch、整个 camera 分类回滚，
+         * 界面还显示"已保存"。 */
+        rec.value = 'true';
+        fire(rec, 'change');
+        chk(rec.className === 'dirty', 'p08a0: 改下拉后标脏（提示待保存），实得「' +
+            rec.className + '」');
+
         const sec = ip.closest('.chan-sec');
         const card = sec ? sec.closest('.card') : null;
         const btn = card ? byText(card, 'button', '保存修改') : null;
@@ -259,6 +277,9 @@ const main = async () => {
             'p08f: 手改的地址原样提交');
         chk(it['camera.ch.0.ip'] === undefined, 'p08g: 没改过的 IP 不进提交体（脏值才发）');
         chk(it['camera.ch.0.mac'] === undefined, 'p08h: MAC 永不出现在提交体');
+        chk(it['camera.ch.0.record'] === true,
+            'p08i: 录像提交的是**布尔 true**（不是 "true" 字符串），实得 ' +
+            JSON.stringify(it['camera.ch.0.record']));
     }
 
     console.log('p09 「全部配置」页也不给 MAC 入口（skip 通配）');
@@ -282,7 +303,7 @@ const main = async () => {
 };
 
 main().then(() => {
-    console.log(fail === 0 ? 'ui_camera_params passed (24 assertions)' : fail + ' FAILED');
+    console.log(fail === 0 ? 'ui_camera_params passed (29 assertions)' : fail + ' FAILED');
     process.exit(fail === 0 ? 0 : 1);
 }).catch((e) => {
     console.error('HARNESS ERROR', e);

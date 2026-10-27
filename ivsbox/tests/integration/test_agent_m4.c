@@ -815,6 +815,46 @@ static int scenario(void)
     }
     chk(iv_device_is_searching(iv_agent_device(&g_agent)) == 1,
         "m03 platform 0xE4 routed to on_query_ipc -> search restarted");
+    chk(g_agent.ipc_pending == 1u, "m03 0xE4 armed the delayed JSON reply");
+
+    /* 0xE4 的清单必须是"搜完再发"：这里不依赖真网卡，直接把假档案塞进发现句柄，
+     * 只验拼出来的 JSON（字段名/1 基/封套/不截断）。真链路上的收发由
+     * `platcmd_e2e.py` 的 C35 端到端钉住。 */
+    {
+        iv_device_t *dv = iv_agent_device(&g_agent);
+        char         js[512];
+        int          jn;
+
+        memset(dv->item, 0, sizeof dv->item);
+        dv->item[0].brand   = IV_DEV_BRAND_HIKVISION;
+        dv->item[0].ip_be   = htonl(0xC0A80240u); /* 192.168.2.64 */
+        dv->item[0].mac[0]  = 0x28u;
+        dv->item[0].mac[1]  = 0x57u;
+        dv->item[0].mac[2]  = 0xbeu;
+        dv->item[0].mac[3]  = 0x43u;
+        dv->item[0].mac[4]  = 0x27u;
+        dv->item[0].mac[5]  = 0x86u;
+        (void)snprintf(dv->item[0].model, sizeof dv->item[0].model, "%s", "DS-2CD3T46");
+        dv->item[1].brand   = IV_DEV_BRAND_DAHUA;
+        dv->item[1].ip_be   = htonl(0xC0A80241u); /* 192.168.2.65 */
+        (void)snprintf(dv->item[1].model, sizeof dv->item[1].model, "%s", "DH-IPC-HFW1433");
+        dv->n_items = 2;
+
+        jn = iv_agent_build_ipc_json(&g_agent, "00000001000000002", js, sizeof js);
+        chk(jn > 0, "m03 ipc json built");
+        chk((int)strlen(js) == jn, "m03 ipc json length matches strlen");
+        chk(strstr(js, "\"num\":2") != NULL, "m03 ipc json num=2");
+        chk(strstr(js, "\"ip1\":\"192.168.2.64\"") != NULL, "m03 ipc json ip1 (1 基)");
+        chk(strstr(js, "\"mac1\":\"28:57:be:43:27:86\"") != NULL, "m03 ipc json mac1");
+        chk(strstr(js, "\"bd1\":\"hikvision\"") != NULL, "m03 ipc json bd1");
+        chk(strstr(js, "\"mod2\":\"DH-IPC-HFW1433\"") != NULL, "m03 ipc json mod2");
+        chk(strstr(js, "\"qn\":\"00000001000000002\"") != NULL,
+            "m03 ipc json echoes the request QN");
+        chk(iv_agent_build_ipc_json(&g_agent, "0", js, 40) == IV_ERANGE,
+            "m03 ipc json refuses to truncate (IV_ERANGE, 不发半截)");
+
+        dv->n_items = 0; /* 归还：后面的用例不该看见这两台假摄像机 */
+    }
 
     /* =======================================================================
      * m04 S4.3 SNMP：启动 / 在飞唯一 / 未配槽位不发包 / 无值不乱填
@@ -1016,7 +1056,8 @@ static int scenario(void)
     rm_tmpdir(qdir);
 
     if (g_fail == 0)
-        printf("test_agent_m4 passed (device discovery wiring + 0xE4 route; snmp "
+        printf("test_agent_m4 passed (device discovery wiring + 0xE4 route + "
+               "0xE4 delayed JSON; snmp "
                "collect through the taskpool: scalar GET / table GETNEXT / "
                "no-value slots; 0xE7 route; snmp results landed to control.db)\n");
     else

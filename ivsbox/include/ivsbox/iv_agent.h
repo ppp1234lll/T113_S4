@@ -473,6 +473,14 @@ typedef struct {
     uint64_t     door_events;             /* S4.5 累计门开事件次数（M4 阶段可观测用） */
 
     uint8_t      mn_last[IV_RECOVERY_MASTER_N]; /* S4.4 主网每路上一次 MN 状态（1/2） */
+    /* 平台 `0xE4`「搜索摄像机」的**延迟应答**：该命令先回 1 字节 ACK，真正的
+     * 摄像机清单要等发现状态机跑完（约 6 相位 × 3 轮）才发，参考实现给的上限是
+     * 15 s。这里只存"还欠平台一条 JSON"和它的最晚时刻；到点或搜完就发，
+     * 见 `iv_agent.c:ipc_reply_tick()`。
+     * 2026-10-27 之前**根本没有这条回复**（只回 ACK），平台点搜索永远转圈。 */
+    uint8_t      ipc_pending;
+    uint64_t     ipc_deadline_ms;
+    char         ipc_qn[32];   /* 请求里的 QN（`%08u%09u`），应答原样回填 */
     uint8_t      snmp_state[IV_AGENT_SNMP_TARGET_N]; /* 0 空闲 / 1 在飞 / 2 就绪 */
     uint8_t      snmp_stale[IV_AGENT_SNMP_TARGET_N]; /* 1 = 配置换了但作业正在飞，
                                                       * 等它落地后由 start 重装 */
@@ -843,6 +851,17 @@ int iv_agent_device_get(const iv_agent_t *a, int i, iv_dev_desc_t *out);
 
 /* 设备发现句柄（测试/诊断；未装配时返回未 open 的句柄，字段可读）。 */
 iv_device_t *iv_agent_device(iv_agent_t *a);
+
+/* 把当前发现档案拼成平台 `0xE4` 应答 JSON（**纯函数**，不碰链路）。
+ *
+ * 形如 `{"code":0,"qn":"…","data":{"num":2,"ip1":"192.168.2.64",
+ * "mac1":"aa:bb:..","bd1":"hikvision","mod1":"…","osd1":"", …}}` —— data 里的
+ * 字段名取自参考实现的 `0xE4` 应答（`ip%d`/`mac%d`/`bd%d`/`mod%d`/`osd%d`，
+ * **1 基**，见 `docs/代码说明.adoc` 命令表）；封套按 `0xE3`/`0xE1` 同一套
+ * （`code`/`qn`/`data`），**这是全实现里唯一靠推断的一处**。
+ * 返回长度或 `IV_ERANGE`（缓冲不够时**整条不拼**，绝不发半截）/ `IV_EINVAL`。 */
+int iv_agent_build_ipc_json(const iv_agent_t *a, const char *qn, char *out,
+                            size_t cap);
 
 /* ---------------------------------------------------------------------------
  * S4.3 SNMP 采集（慢任务池内执行）

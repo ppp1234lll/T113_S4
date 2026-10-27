@@ -771,6 +771,110 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     return IV_OK;
 }
 
+/* ---------------------------------------------------------------------------
+ * 平台 `0xE4`「搜索摄像机」的**延迟 JSON 应答**（2026-10-27 补）
+ * ------------------------------------------------------------------------- */
+/* 参考实现的口径（见 `docs/代码说明.adoc` 命令表 `0xE4` 行）：收到 `0xE4`
+ * 先起多品牌发现，**≤15 s 后**回一帧 JSON —— `num` ＋ 每路
+ * `ip%d`/`mac%d`/`bd%d`/`mod%d`/`osd%d`（1 基）。
+ *
+ * 2026-10-27 之前这里**只回 1 字节 ACK 就完事**（`on_query_ipc()` 的注释写着
+ * "应答体 schema 尚未冻结"），于是平台点「搜索设备」永远等不到清单 ——
+ * 板端日志只有一行 `platform 0xE4 camera search -> rc=0`，平台上什么都没有。
+ *
+ * 为什么不能"搜完再回 ACK"：发现是**非阻塞相位机**（6 相位 × 3 轮 ≈ 8 s），
+ * 在路由回调里同步等结果会把 Reactor 卡住（架构 §4.2）。所以是"先 ACK，
+ * 由 tick 在相位机 DONE 时补 JSON"两段式。到点（15 s）还没搜完也发，
+ * 带当时已发现的条目 —— 平台宁可拿到 3 台，也不要拿到超时。 */
+#define IV_AGENT_IPC_WAIT_MS   15000u
+#define IV_AGENT_IPC_JSON_MAX  1024
+
+/* 纯函数：把当前发现档案拼成 `0xE4` 应答 JSON（不碰链路，便于单测钉字符串）。
+ * 返回长度（>0）或负的错误码；缓冲不够返回 `IV_ERANGE` —— **绝不发半截**。
+ *
+ * 封套与 `0xE3`/`0xE1` 保持一致（`{"code":0,"qn":"…","data":{…}}`）：这三条都是
+ * "平台点一下、设备回一份 JSON"的查询类，平台侧的解析器大概率是同一个；而参考实现
+ * 的 `0xE4` 应答体只说明了 data 里有什么（`num` ＋ 每路 `ip%d`/`mac%d`/`bd%d`/
+ * `mod%d`/`osd%d`，1 基），没写封套。**这是本实现里唯一靠推断的一处**：
+ * 若平台仍不认，需要平台侧给一份真实的 0xE4 应答样例再对齐字段名。 */
+int iv_agent_build_ipc_json(const iv_agent_t *a, const char *qn, char *out, size_t cap)
+{
+    int n = 0;
+    int i;
+    int cnt;
+
+    if (a == NULL || out == NULL || cap < 32u)
+        return IV_EINVAL;
+
+    cnt = iv_agent_device_count(a);
+    if (cnt < 0)
+        cnt = 0;
+    if (cnt > IV_DEV_MAX)
+        cnt = IV_DEV_MAX;
+
+    n = snprintf(out, cap,
+                 "{\"code\":0,\"qn\":\"%s\",\"data\":{\"cmd\":\"%02X\",\"num\":%d",
+                 (qn != NULL && qn[0] != '\0') ? qn : "0",
+                 (unsigned)IV_PROTO_CMD_QUERY_IPC_IP, cnt);
+    if (n < 0 || (size_t)n >= cap)
+        return IV_ERANGE;
+    for (i = 0; i < cnt; i++) {
+        iv_dev_desc_t  d;
+        char           ip[INET_ADDRSTRLEN] = "";
+        struct in_addr in;
+        int            k;
+
+        if (iv_agent_device_get(a, i, &d) != IV_OK)
+            continue;
+        if (d.ip_be != 0u) {
+            in.s_addr = d.ip_be;
+            (void)inet_ntop(AF_INET, &in, ip, sizeof ip);
+        }
+        k = snprintf(out + n, cap - (size_t)n,
+                     ",\"ip%d\":\"%s\",\"mac%d\":\"%02x:%02x:%02x:%02x:%02x:%02x\","
+                     "\"bd%d\":\"%s\",\"mod%d\":\"%s\",\"osd%d\":\"\"",
+                     i + 1, ip, i + 1, d.mac[0], d.mac[1], d.mac[2], d.mac[3],
+                     d.mac[4], d.mac[5], i + 1, iv_dev_brand_name(d.brand),
+                     i + 1, d.model, i + 1);
+        if (k < 0 || (size_t)k >= cap - (size_t)n)
+            return IV_ERANGE; /* 截断就整条不发：半截 JSON 平台解析必失败 */
+        n += k;
+    }
+    if ((size_t)n + 3u > cap)
+        return IV_ERANGE;
+    out[n++] = '}';  /* 关 data */
+    out[n++] = '}';  /* 关顶层 */
+    out[n]   = '\0';
+    return n;
+}
+
+static void ipc_reply_tick(iv_agent_t *a, uint64_t now_ms)
+{
+    char json[IV_AGENT_IPC_JSON_MAX];
+    int  n;
+
+    if (a == NULL || a->ipc_pending == 0u)
+        return;
+    if (iv_device_is_searching(&a->dev) && now_ms < a->ipc_deadline_ms)
+        return;
+
+    n = iv_agent_build_ipc_json(a, a->ipc_qn, json, sizeof json);
+    if (n <= 0) {
+        IV_LOG_W(AG_MOD, "E4 json build failed (%d), reply skipped", n);
+        a->ipc_pending = 0u;
+        return;
+    }
+    if (iv_proto_send_json(&a->rp.pf, json, (size_t)n) == IV_OK) {
+        a->ipc_pending = 0u;
+        /* 原样回显：平台"还是没反应"时，第一件事就是看板端到底发了什么。 */
+        IV_LOG_I(AG_MOD, "E4 reply: %s", json);
+    } else {
+        /* 链路不在 UP。再存着只会在下一拍重复失败，而平台早超时了 ⇒ 丢弃并留痕。 */
+        a->ipc_pending = 0u;
+        IV_LOG_W(AG_MOD, "E4 reply send failed (link down?), dropped");
+    }
+}
+
 int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
 {
     if (a == NULL)
@@ -787,6 +891,7 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
         (void)iv_camdet_tick(&a->cd, now_ms);
     if (iv_device_is_open(&a->dev))
         (void)iv_device_tick(&a->dev, now_ms);
+    ipc_reply_tick(a, now_ms); /* 0xE4 的延迟清单：相位机 DONE 时补那一帧 */
     env_feed(a, now_ms);
     (void)iv_recovery_tick(&a->rec, now_ms);
     storage_drive(a, now_ms); /* M6-S6.5：SD 水位闸门（先于 rec_drive，同拍生效） */
@@ -1047,8 +1152,8 @@ static void env_feed(iv_agent_t *a, uint64_t now_ms)
 }
 
 /* 平台 0xE4（搜索摄像机信息）：重开一轮多品牌发现，与现网"摄像机搜索"按钮等价。
- * 发现是**异步**的（非阻塞相位机，约 6 相位 × 3 轮），故这里只回 ACK；
- * 结果由 0xE4 的应答体另出（**其 JSON schema 尚未冻结**，见计划 §S4.2 未做条）。 */
+ * 发现是**异步**的（非阻塞相位机，约 6 相位 × 3 轮）⇒ 这里先回 ACK，
+ * 清单由 `ipc_reply_tick()` 在相位机 DONE（或 15 s 到点）后补发 —— 见上面那段注释。 */
 static void on_query_ipc(const iv_proto_frame_t *f, void *arg)
 {
     iv_agent_t *a = (iv_agent_t *)arg;
@@ -1059,6 +1164,14 @@ static void on_query_ipc(const iv_proto_frame_t *f, void *arg)
     rc = iv_agent_device_search(a, a->now_ms);
     (void)iv_proto_ack(&a->rp.pf, f->cmd,
                        (rc == IV_OK) ? IV_PROTO_ACK_OK : IV_PROTO_ERR_EXEC);
+    if (rc == IV_OK) {
+        /* 只留一个"欠平台一条 JSON"的标志：连点两次就重新计时，不排队。 */
+        a->ipc_pending     = 1u;
+        a->ipc_deadline_ms = a->now_ms + (uint64_t)IV_AGENT_IPC_WAIT_MS;
+        /* QN 与 0xE3 同构（`sprintf("QN=%08d%09d")`），应答原样回填。 */
+        (void)snprintf(a->ipc_qn, sizeof a->ipc_qn, "%08u%09u",
+                       (unsigned)f->qn1, (unsigned)f->qn2);
+    }
     IV_LOG_I(AG_MOD, "platform 0xE4 camera search -> rc=%d", rc);
 }
 
@@ -1401,6 +1514,7 @@ static void on_pb_timer(void *arg)
         (void)iv_camdet_tick(&a->cd, now);
     if (iv_device_is_open(&a->dev))
         (void)iv_device_tick(&a->dev, now);
+    ipc_reply_tick(a, now); /* 0xE4 延迟清单：Reactor 下 step() 不被调用 */
     env_feed(a, now);
     (void)iv_recovery_tick(&a->rec, now);
     thresh_drive(a, now); /* 阈值下发重试（0xF1）：Reactor 下 step() 不被调用 */

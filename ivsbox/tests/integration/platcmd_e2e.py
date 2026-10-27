@@ -984,6 +984,26 @@ def main():
         chk(wait_log(r'platform relay ch=1 act=2', start=start) is None,
             'C34c 没打出"已下发"那条成功日志（没发出去就不许说成功）')
 
+        print('C35 0xE4 搜索摄像机 ⇒ 先 ACK，搜完再补一帧 JSON 清单')
+        # 2026-10-27 之前这里**只回 ACK**（连 JSON 都不发），平台点"搜索设备"永远转圈。
+        # VM 上搜不到摄像机（没有真网卡/真摄像机）⇒ 断言只要求"有这一帧且带 num"，
+        # 设备数量随环境变化，不当黄金值。
+        start = len(logtext())
+        plat.clear()
+        plat.send(build_downlink(0xE4, b'\x00'))
+        a4 = plat.wait(0xE4, kind='bin')
+        chk(a4 is not None and a4['code'] == 0x01,
+            'C35a 0xE4 先回 ACK 0x01（发现是异步的，不能同步等）')
+        # 发现状态机 6 相位 × 3 轮，实测 8 s 左右；留一倍余量
+        f = plat.wait(0xE4, kind='json', timeout=20.0)
+        chk(f is not None, 'C35b 搜索结束后补了一帧 JSON 清单')
+        if f is not None:
+            chk(b'"num"' in f['data'], 'C35c 清单里有 num')
+            chk(b'"qn":"287454020' in f['data'],
+                'C35d qn 原样回填（否则平台对不上这次请求）')
+        chk(wait_log(r'E4 reply: ', start=start) is not None,
+            'C35e 板端把发出去的 JSON 原样留痕（不用抓包就能对账）')
+
         # 立刻还原这五个键（别指望末尾的批量还原：那条路径的"原值"可能已被污染）
         for k, src in (('elec.volt_high', el0), ('elec.volt_low', el0),
                        ('elec.over_current', el0), ('elec.leak_current', el0),

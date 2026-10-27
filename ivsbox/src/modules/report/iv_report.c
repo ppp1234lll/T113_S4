@@ -234,6 +234,14 @@ static void on_link_done(int rc, uint8_t cmd, const uint8_t *data, uint16_t len,
 
     /* 只消费 0xE1 应答 → 全量刷新镜像（0xF1/0xD1/0xD2 应答本步不用） */
     if (rc == IV_OK && cmd == IV_FRAME_CMD_QUERY) {
+        int32_t prev[3];
+        uint8_t had_relay = rp->st.valid.RELAY;
+        int     relay_moved;
+
+        prev[0] = rp->st.data.RELAY[0];
+        prev[1] = rp->st.data.RELAY[1];
+        prev[2] = rp->st.data.RELAY[2];
+
         iv_status_handle_query(&rp->st, data, len);
         /* 把采集板回的原样打一份（DEBUG，正常 30 s 一条）：
          * "平台不显示通道电压/电流"这种问题，第一件事就是看采集板到底回没回
@@ -247,9 +255,24 @@ static void on_link_done(int rc, uint8_t cmd, const uint8_t *data, uint16_t len,
             jb[n] = '\0';
             IV_LOG_D(REP_MOD, "E1 from board (%u B): %s", (unsigned)len, jb);
         }
-        /* 继电器动作后补报：镜像此刻已经换成新状态，这一帧带出去的才是真状态。 */
-        if (rp->want_report) {
+        /* **继电器一变就上报**：不区分是谁改的（我们下发的 `0xD1`、网页、
+         * 采集板自己的动作）。2026-10-27 实测：平台点「通道3 重启」后采集板
+         * 把 `RELAY3` 从 1 改成 2（断电），十几秒后**自己**又改回 1（上电）；
+         * 回来这一下没有任何命令触发它，`want_report` 早被消费掉了 ⇒ 平台
+         * 界面一直停在"断电"，用户看到的就是"点重启没反应"。
+         * 判据只看 0xE1 里 `RELAY1..3` 的值，与 `want_report` 去重
+         * （两者都成立也只报一帧，上报本来就是全量状态）。 */
+        relay_moved = (had_relay != 0u && rp->st.valid.RELAY != 0u &&
+                       (prev[0] != rp->st.data.RELAY[0] ||
+                        prev[1] != rp->st.data.RELAY[1] ||
+                        prev[2] != rp->st.data.RELAY[2]));
+        if (relay_moved || rp->want_report) {
             rp->want_report = 0;
+            if (relay_moved)
+                IV_LOG_I(REP_MOD, "relay changed %ld,%ld,%ld -> %ld,%ld,%ld, report",
+                         (long)prev[0], (long)prev[1], (long)prev[2],
+                         (long)rp->st.data.RELAY[0], (long)rp->st.data.RELAY[1],
+                         (long)rp->st.data.RELAY[2]);
             (void)iv_report_trigger(rp, rp->now_ms);
         }
     }

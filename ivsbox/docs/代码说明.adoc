@@ -7820,3 +7820,67 @@ iv_report_request_report_after_poll(rp); /* ② 刷新完立刻补报 */
   既有 7 个前端用例全绿；`node --check web/static/app.js` 通过。
 * 本次零 C 改动，未重跑 `make test` / `make arm`（上一提交 `b0df21f` 已验 47/47、arm 0 告警）。
 * 板端换 `app.js` 后 md5 与 `git show HEAD:` 一致；界面观感待用户浏览器确认。
+
+== 2026-10-27 15:19 继电器「变了就报」：判据是镜像里的 RELAY，不是"我们刚发过命令"
+
+=== 现场现象
+
+用户 15:12 报「通道3 点击重启后，设备没反应」（平台截图里通道3 显示"断电"）。
+
+=== 板端取证（15:11:28 ~ 15:12:31）
+
+[source,text]
+----
+15:11:28  rx 23: f0f0110a000b2cc1 c4 ... 02 03 03 8c ffff   ← 平台 0xC4 ch=3 act=3
+15:11:28  platform relay ch=3 act=3 -> port=2 status=2 {"port":2,"status":2}
+15:11:28  E1 from board: ..."RELAY1":1,"RELAY2":1,"RELAY3":2...   ← 采集板把 3 路断电了
+15:11:30  board ctrl 0xD1 no ack (rc=-5)                          ← 采集板从不回 0xD1 应答
+15:11:58  E1 from board: ..."RELAY1":1,"RELAY2":1,"RELAY3":1...   ← 它自己又上电了
+15:12:31  E1 from board: ..."RELAY3":1...
+----
+
+三条结论，缺一条都判不出来：
+
+1. **命令是对的**：`{"port":2,"status":2}` 与《单片机通信》表的「0x00 关闭 / 0x01 开启 /
+   **0x02 重启**」一致，接口序号也落在 0x00~0x08 内。
+2. **采集板确实执行了**：`RELAY3` 由 1 变 2，随后自己回到 1 —— 也就是说它把"重启"
+   实现成"断电若干秒再上电"。**但采集板从不回 `0xD1` 应答**（开/断/重启都一样，`rc=-5`
+   是本地等应答超时），而表里明确写了"单片机→主板 0xD1 返回参数 JSON" ⇒ 这是采集板
+   固件缺口，不是主控解析问题。主控因此既不能确认执行结果，也不能靠应答驱动上报。
+3. **真正让界面卡住的是第 3 跳**：状态是采集板自己改回来的，没有任何命令指向它，
+   上一版只在"下发动作后"补报（`want_report`），早消费完了 ⇒ 平台永远收不到"又上电了"。
+
+对照组（用 ctl 直接验编码，避免把 1/2 理解反）：
+
+[source,text]
+----
+relay.set ch=3 on=false → {"port":2,"status":0}  → RELAY3: 1 → 2
+relay.set ch=3 on=true  → {"port":2,"status":1}  → RELAY3: 2 → 1
+----
+
+=== 处理方式
+
+* `on_link_done()` 里做**变化检测**：`iv_status_handle_query()` 之前快照 `RELAY[0..2]`，
+  之后比对，不同就 `iv_report_trigger()`。判据只认镜像值，**不认"谁改的"** ——
+  我们下发的、网页点的、采集板自己动的，一视同仁。
+* 首轮 `valid.RELAY == 0` 时不算变化（开机那条 0xE1 不该多报一帧）。
+* 与 `want_report` **去重**：两者同时成立只报一帧（上报本来就是全量，多报是噪声）。
+* 日志留痕：`relay changed 1,1,2 -> 1,1,1, report`。
+
+=== 验证方式与结果
+
+* 新增 e2e 用例 `c04c`：喂一帧"继电器1 由 0 回到 1"的 0xE1（**没有任何命令**）⇒
+  断言上报数恰好 +1、平台收到的帧含 `RELAY=1,1,1;`；再喂**同值**一帧 ⇒ 断言不再多报。
+* **反向证伪**：把比对改成"自己比自己"（恒不变化）重编 ⇒ `test_e2e_report` **FAILED (3)**
+  （`c04c board-side relay change forced one report` / `c04c platform got the relay-change
+  report` / `c05 total reports=6`）；还原后复绿。
+* VM：`make test` 47/47、`make asan` 47/47、`make tsan` 47/47（`setarch -R`）、
+  `make analyze` 0 报告、`make arm` 0 告警、`platcmd_e2e.py` 114/114。
+* `build/arm/ivsboxd` md5 **`a7f529d44837fea09fc94b56a8b3e8ad`**（上一版 `6a5f15f0…`）。
+
+=== 遗留给采集板侧
+
+* `0xD1` 无应答：按表应回 JSON。主控现在只能"发出去就算成功"，实际执行结果无从确认；
+  平台"执行成功"的语义仍是猜的。
+* 「重启」的断电窗口多长（实测 ≤30 s，5 s 采样精度下未能量准）由固件决定；
+  主控只按 `0x02` 下发，不做任何补偿。

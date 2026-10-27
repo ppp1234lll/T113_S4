@@ -1207,6 +1207,8 @@ static int query_cfg_json(char *out, size_t cap, void *arg)
 {
     struct cfg_json       j;
     const iv_cell_snap_t *cs;
+    const iv_status_t    *st;
+    const iv_report_t    *rp;
     char                  ep[96];
     char                  ip[20];
     char                  mask[20];
@@ -1228,6 +1230,10 @@ static int query_cfg_json(char *out, size_t cap, void *arg)
     j.ovf = 0;
 
     cs = &g_agent.cell.snap;
+    /* 采集板（控制板）镜像 —— 阈值的**权威来源**，见下面 `ft`/`fh` 的注释。
+     * 链路没起来时 `iv_agent_report()` 回 NULL，各键退回配置值。 */
+    rp = iv_agent_report(&g_agent);
+    st = (rp != NULL) ? &rp->st : NULL;
     /* 参考实现的 `local->ip/nm/gw` 是 lwIP 的**本机网卡**（有线口），对应本板 eth0。 */
     if_facts("eth0", ip, mask, gw, mac);
 
@@ -1295,20 +1301,35 @@ static int query_cfg_json(char *out, size_t cap, void *arg)
     /* 温度阈值 / 湿度阈值 —— **平台「参数设置」页那两组「上限/下限」输入框读的就是
      * 这两个键**（键名沿用参考实现的 `ft`/`fh`，"上限,下限" 两元组）。
      *
-     * 2026-10-27 之前这里写死 `"0,0"`（理由是"本板无风扇"），而平台界面把 `ft`/`fh`
-     * 直接渲染成「温度阈值/湿度阈值」⇒ **不管设备上配了什么，页面永远显示 0**，
-     * 现场表现为"阈值参数没上报"。
+     * ==================== 值从哪来：采集板镜像，不是配置键 ====================
+     * 2026-10-27 用户指出「在控制板上是有默认参数的」。实测确认：控制板 0xE1 应答里
+     * `limit` 一直是 `tu=50 tl=-2 hu=80 hl=20`（`ctl board.status` 可现场核对），
+     * 而设备自己的 `sensor.*` 出厂是 0.0，且 `0xF1` 的约定是**值为 0 就不下发**
+     * ⇒ 配置键与"控制板的当前值"根本是两回事：前者是"我想让它变成什么"，
+     * 后者是"它现在是什么"。平台要看的是后者。
      *
-     * 落点取箱内温湿度传感器阈值 `sensor.temp_*` / `sensor.humi_*`：与 `0xF1`
-     * 下发给采集板的是**同一批值**（见 `on_cfg_committed()` 的 ELEC/SENSOR 分支），
-     * 读写同源，不会出现"配了 A、读回 B"。 */
-    (void)snprintf(pair, sizeof(pair), "%lld,%lld",
-                   (long long)cfg_dbl("sensor.temp_high"),
-                   (long long)cfg_dbl("sensor.temp_low"));
+     * 所以：**镜像 valid 位为真就用镜像**，只有在控制板还没回过一帧 0xE1 时
+     * （`valid.tu == 0`）才退回配置值，保证刚开机也有数可回。
+     *
+     * 更早的版本这里写死 `"0,0"`（理由"本板无风扇"）—— 那才是平台永远显示 0 的直接原因。 */
+    if (st != NULL && st->valid.tu && st->valid.tl) {
+        (void)snprintf(pair, sizeof(pair), "%d,%d",
+                       (int)st->data.tu, (int)st->data.tl);
+    } else {
+        (void)snprintf(pair, sizeof(pair), "%lld,%lld",
+                       (long long)cfg_dbl("sensor.temp_high"),
+                       (long long)cfg_dbl("sensor.temp_low"));
+    }
     cj_str(&j, "ft", pair);
-    (void)snprintf(pair, sizeof(pair), "%lld,%lld",
-                   (long long)cfg_dbl("sensor.humi_high"),
-                   (long long)cfg_dbl("sensor.humi_low"));
+
+    if (st != NULL && st->valid.hu && st->valid.hl) {
+        (void)snprintf(pair, sizeof(pair), "%d,%d",
+                       (int)st->data.hu, (int)st->data.hl);
+    } else {
+        (void)snprintf(pair, sizeof(pair), "%lld,%lld",
+                       (long long)cfg_dbl("sensor.humi_high"),
+                       (long long)cfg_dbl("sensor.humi_low"));
+    }
     cj_str(&j, "fh", pair);
 
     /* 网络延时（`pt`）：语义与 `pn`（有线网络超时）不是一回事，没有确定键 ⇒ 仍送 0。
@@ -1326,15 +1347,31 @@ static int query_cfg_json(char *out, size_t cap, void *arg)
         cj_str(&j, key, camip);
     }
 
-    /* 电压/电流/倾斜阈值：配置键早有（`elec.*` / `sensor.tilt`，与 0xF1 下发采集板
-     * 的是同一批值），此前也一律送常量 0 ⇒ 平台「电流电压阈值」页同样读回 0。
-     * 同批接上（**纯读**：写端 0xA4 的五字段序仍未确证，见 `docs/代码说明.adoc`）。
-     * `miu` 来源未定，不猜，仍送 0；漏电 `elec.leak_current` 在 0xE1 键表里没有
-     * 对应键，也没有界面读它。 */
-    cj_int(&j, "ov", (long long)cfg_dbl("elec.volt_high"));
-    cj_int(&j, "uv", (long long)cfg_dbl("elec.volt_low"));
-    cj_int(&j, "oc", (long long)cfg_dbl("elec.over_current"));
-    cj_int(&j, "angle", (long long)cfg_dbl("sensor.tilt"));
+    /* 电压/电流/倾斜阈值：同样**镜像优先** —— 控制板 `limit` 里一直有
+     * hv=280 lv=100 ov=400 sl=20（`ctl board.status` 可现场核对）。
+     *
+     * ⚠ **两边 `ov` 同名不同义**：平台 0xE1 的 `ov` 是 **over-voltage**（过压＝上限），
+     * 而采集板镜像的 `data.ov` 是 **over-current**（过流）。别按名字直连：
+     *   平台 `ov`(过压上限) ← 镜像 `hv`
+     *   平台 `uv`(欠压下限) ← 镜像 `lv`
+     *   平台 `oc`(过流)     ← 镜像 `ov`   ← 这里才是过流
+     *   平台 `angle`(倾斜)  ← 镜像 `sl`
+     * 镜像没刷新过（控制板还没回过 0xE1）才退回 `elec.*` / `sensor.tilt`。
+     *
+     * `miu` 来源未定（记忆里挂着"MIU 来源"待办），不猜，仍送 0；
+     * 漏电 `ld` 在 0xE1 键表里没有对应键，也没有界面读它。 */
+    cj_int(&j, "ov", (st != NULL && st->valid.hv)
+                         ? (long long)st->data.hv
+                         : (long long)cfg_dbl("elec.volt_high"));
+    cj_int(&j, "uv", (st != NULL && st->valid.lv)
+                         ? (long long)st->data.lv
+                         : (long long)cfg_dbl("elec.volt_low"));
+    cj_int(&j, "oc", (st != NULL && st->valid.ov)
+                         ? (long long)st->data.ov
+                         : (long long)cfg_dbl("elec.over_current"));
+    cj_int(&j, "angle", (st != NULL && st->valid.sl)
+                            ? (long long)st->data.sl
+                            : (long long)cfg_dbl("sensor.tilt"));
     cj_int(&j, "miu", 0);
 
     /* 重启网络传输设备电源（平台「配置重启网络传输设备电源」那一组）：

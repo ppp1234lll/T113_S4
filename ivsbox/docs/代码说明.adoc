@@ -7584,3 +7584,81 @@ WARN [proto] downlink cmd 0xBF not implemented (2 bytes), ack 0x74
 再点查询，`E1 reply` 的 `"lannum":"6" "lantime":"60"` 就是这两个值（`0xE1` 读的就是这两个键）。
 温度/湿度同理：`platform set temperature high=50 low=-2 … + 0xF1 queued`，再查询看
 `"ft":"50,-2" "fh":"80,20"`。
+
+== 2026-10-27 14:01 平台 0xC4「控制电源接口」：界面提示"操作成功"但继电器不动
+
+### 现象与判据
+
+用户在「通道信息」表里点「断」，界面弹出**「断电操作成功」**，但现场继电器没有任何动作。
+板端 `13.log` 13:53:17：
+
+[source,text]
+----
+rx 23 bytes: f0f0110a000b2cc1c4ffffffffffffffff020102a1ffff
+WARN [proto] downlink cmd 0xC4 not implemented (2 bytes), ack 0x74
+----
+
+载荷 `01 02`：通道 1、动作 `0x02`。命令没有注册，落默认分支回 `0x74`。
+
+> **比"缺 handler"更值得记的一条：平台对这条命令的应答不设防** —— 设备明明回了
+> `0x74`（失败），界面照样弹"成功"。所以现场判据只能是两样：
+> ① 继电器有没有响；② 日志里有没有 `platform relay ch=… act=… -> port=… status=…`。
+> 平台自己那个绿色提示不能当证据。
+
+### 动作码：不是 `0xD1` 的 status 编码
+
+`0xD1`（主板→采集板）的 `status` 是 `0=关 / 1=开 / 2=重启`（架构 §18.2）。
+但平台 `0xC4` 的 `0x02` 对应的界面提示是「断电操作成功」⇒ 平台用的是：
+
+[cols="1,1,2"]
+|===
+|平台动作码 |界面按钮 |转发给采集板的 `0xD1` status
+
+|`0x01` |开（绿） |`1`（`IV_RECOVERY_PWR_ON`）
+|`0x02` |断（红） |`0`（`IV_RECOVERY_PWR_OFF`）
+|`0x03` |重启（黄） |`2`（`IV_RECOVERY_PWR_RESTART`，采集板侧断电 15 s）
+|===
+
+`0x03` 目前只有界面按钮顺序作依据，**抓到真帧后要立刻校准**；日志里始终打印原始动作码，
+就是为了这件事。直接把平台码当 `status` 发下去会得到"点『断』变成了重启"这种灾难性错位。
+
+### 转发必须复用网页那条路径
+
+继电器在**采集板侧**，网关要把它翻译成 `0xD1`：
+
+[source,c]
+----
+port = ch - 1;                                    /* 平台 1 基 → 0xD1 的 0 基 */
+plen = iv_recovery_build_payload(port, status, payload, sizeof payload);
+rc   = iv_report_send_cmd(rp, IV_FRAME_CMD_POWER, payload, plen, rp->now_ms);
+iv_report_request_poll(rp);                        /* 0xD1 应答不进镜像，主动催一次 0xE1 */
+----
+
+* 载荷构造**必须**用 `iv_recovery_build_payload()`——网页 `relay.set` 用的也是它。
+  两处各拼一份 JSON，格式一漂就变成"网页能合闸、平台不能"，这种错只在现场暴露。
+* 时刻用 `rp->now_ms`，**不要**另取 `iv_clock_monotonic_ms()`：混用时钟域会让 `0xD1`
+  永不超时，后续继电器命令全被 `IV_EBUSY` 挡住（`m_relay_set()` 注释里有完整说明）。
+* 发完催一次 `0xE1`：`0xD1` 的应答不进状态镜像，不催的话界面要等下一个轮询周期
+  （默认 30 s）才看得到结果。
+
+### 三条拒绝路径 + 一条"绝不撒谎"
+
+|场景 |应答 |日志 |
+|---|---|---|
+|载荷 < 2 B |`0x74` |`0xC4 payload short (N bytes, need 2)` |
+|通道 > 3（镜像只有 3 路带测量的继电器，与 `relay.set` 同口径） |`0x74` |`0xC4 channel 4 out of 1..3` |
+|动作码不认识 |`0x74` |`0xC4 unknown action 9 (ch=1)` |
+|采集板链路没开 / 写串口失败 |`0x74` |`0xC4 ch=1 act=2 … failed` |
+
+最后一条是刻意的：**发不出去就回失败**，绝不"记账当已执行"——那正是"界面说成功、
+继电器不动"的成因。成功时才打 `platform relay ch=1 act=2 -> port=0 status=0 {"port":0,"status":0}`。
+
+### 验证
+
+* `platcmd_e2e` **114/114**（新增 C31~C34 共 6 条）：载荷不足 / 通道越界 / 未知动作 /
+  合法帧但发不出去（**断言"没打出成功日志"**）。VM 上没有采集板（`ttySAC5` 不存在），
+  所以成功路径自动化覆盖不到 —— 只能真机点一次，这是本次唯一的人工验证项。
+* `test` 47/47；host/arm 0 告警（md5 `6d9798a90afaf2496f4efe04bcff5a36`）；
+  `rm -rf build/analyze` 后 70 编译行 0 报告。
+* 板端 `b55dfba9…` → `6d9798a9…`（备份 `ivsboxd.bak-b55dfba9`），
+  `ctl board.status` 的 `link.open=true`、`/dev/ttySAC5` 正常。

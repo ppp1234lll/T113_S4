@@ -946,6 +946,44 @@ def main():
             'C30 sensor.temp_high 已还原（%r → %r）'
             % (se0.get('sensor.temp_high'), se.get('sensor.temp_high')))
 
+        # ---- C31~C34 0xC4「控制电源接口 / 继电器」----
+        # 真帧（2026-10-27 13:53:17 板端抓的，用户点「通道1 · 断」时）：
+        #   f0f0 110a 000b 2cc1 c4 ffffffffffffffff 02 01 02 a1 ffff
+        # 载荷 `01 02` ＝ 通道 1 ＋ 动作 0x02（界面提示「断电操作成功」⇒ 02＝断）。
+        # ⚠ VM 上没有采集板（`/dev/ttySAC5` 不存在）⇒ `iv_report_is_open()` 为假，
+        #   合法帧也只能回 0x74。所以这里能验的是"**注册到了、且不撒谎**"，
+        #   真正把 0xD1 发出去的成功路径只能在真机上点一次确认。
+        print('C31 0xC4 载荷不足 ⇒ 0x74')
+        plat.clear()
+        plat.send(build_downlink(0xC4, bytes([1])))
+        f = plat.wait(0xC4, kind='bin')
+        chk(f is not None and f['code'] == 0x74,
+            'C31a 1 B ⇒ ack=0x74（**不是**"not implemented"）')
+
+        print('C32 0xC4 通道越界（4）⇒ 0x74')
+        plat.clear()
+        plat.send(build_downlink(0xC4, bytes([4, 1])))
+        f = plat.wait(0xC4, kind='bin')
+        chk(f is not None and f['code'] == 0x74, 'C32a ch=4 ⇒ ack=0x74')
+
+        print('C33 0xC4 未知动作（9）⇒ 0x74')
+        plat.clear()
+        plat.send(build_downlink(0xC4, bytes([1, 9])))
+        f = plat.wait(0xC4, kind='bin')
+        chk(f is not None and f['code'] == 0x74, 'C33a act=9 ⇒ ack=0x74')
+
+        print('C34 0xC4 合法帧但发不出去（VM 无采集板）⇒ 0x74，**绝不假装成功**')
+        start = len(logtext())
+        plat.clear()
+        plat.send(build_downlink(0xC4, bytes([1, 2])))
+        f = plat.wait(0xC4, kind='bin')
+        chk(f is not None and f['code'] == 0x74,
+            'C34a 发不出去 ⇒ ack=0x74（记成功就是"界面说成功、继电器不动"）')
+        chk(wait_log(r'0xC4 ch=1 act=2', start=start) is not None,
+            'C34b 日志带上了 ch/act（现场第一眼看的就是这两个数）')
+        chk(wait_log(r'platform relay ch=1 act=2', start=start) is None,
+            'C34c 没打出"已下发"那条成功日志（没发出去就不许说成功）')
+
         # 立刻还原这五个键（别指望末尾的批量还原：那条路径的"原值"可能已被污染）
         for k, src in (('elec.volt_high', el0), ('elec.volt_low', el0),
                        ('elec.over_current', el0), ('elec.leak_current', el0),

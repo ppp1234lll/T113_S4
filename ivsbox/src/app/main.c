@@ -35,8 +35,10 @@
 #include "ivsbox/iv_health.h"
 #include "ivsbox/iv_log.h"
 #include "ivsbox/iv_netcfg.h"
+#include "ivsbox/iv_frame.h"
 #include "ivsbox/iv_provision.h"
 #include "ivsbox/iv_reactor.h"
+#include "ivsbox/iv_recovery.h"
 #include "ivsbox/iv_taskpool.h"
 #include "ivsbox/iv_tunnel.h"
 #include "ivsbox/iv_upd.h"
@@ -2593,6 +2595,106 @@ static void on_plat_th_pair(const iv_proto_frame_t *f, void *arg)
     (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
 }
 
+/* ---------------------------------------------------------------------------
+ * 平台 0xC4「控制电源接口」＝界面「通道 N 开 / 断 / 重启」
+ * ---------------------------------------------------------------------------
+ * 板端真帧（2026-10-27 13:53:17，用户点「通道1 · 断」时抓到的）：
+ *   f0f0 110a 000b 2cc1 c4 ffffffffffffffff 02 01 02 a1 ffff
+ *   ⇒ 载荷 `01 02` ＝ 通道 1 ＋ 动作 0x02。
+ *
+ * ⚠ **动作码不是 `0xD1` 的 status 编码**。`0xD1`（主板→采集板）是
+ *   0=关 / 1=开 / 2=重启，而这里的 0x02 对应的界面提示是「断电操作成功」
+ *   ⇒ 平台用的是 **1=开 / 2=断 / 3=重启**。03 尚未抓到真帧，先按界面按钮
+ *   顺序实现，日志里把原始动作码打出来，一有真帧立刻校准。
+ *
+ * 网关里**必须**转成 `0xD1` 再发给采集板（继电器在采集板侧），载荷用
+ * `iv_recovery_build_payload(port, status)` 构造 —— 与网页 `relay.set`
+ * 同一个函数。不另写一份的理由：两处各拼一次 JSON，格式一漂就变成
+ * "网页能合闸、平台不能"，而这种错只在现场才暴露。
+ *
+ * 通道号：界面/平台是 **1 基**，`0xD1` 的 `port` 是 **0 基**（继电器 1 ⇒ port 0），
+ * 换算只在这一处做。
+ * ------------------------------------------------------------------------- */
+#define IV_PLAT_RELAY_CH_MAX 3 /* 镜像里只有 3 路带测量的继电器，与 `relay.set` 同口径 */
+
+static void on_plat_relay(const iv_proto_frame_t *f, void *arg)
+{
+    char         payload[24];
+    iv_report_t *rp;
+    int          ch;
+    int          act;
+    int          status;
+    int          port;
+    int          plen;
+    int          rc;
+
+    (void)arg;
+    if (f == NULL)
+        return;
+    if (f->data == NULL || f->len < 2u) {
+        IV_LOG_W(APP_MOD, "0xC4 payload short (%u bytes, need 2), ack 0x74",
+                 (unsigned)f->len);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    ch  = f->data[0];
+    act = f->data[1];
+    if (ch < 1 || ch > IV_PLAT_RELAY_CH_MAX) {
+        IV_LOG_W(APP_MOD, "0xC4 channel %d out of 1..%d, ack 0x74", ch,
+                 IV_PLAT_RELAY_CH_MAX);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    switch (act) {
+    case 1: /* 开 */
+        status = (int)IV_RECOVERY_PWR_ON;
+        break;
+    case 2: /* 断 */
+        status = (int)IV_RECOVERY_PWR_OFF;
+        break;
+    case 3: /* 重启（采集板侧断电 15 s 再上电） */
+        status = (int)IV_RECOVERY_PWR_RESTART;
+        break;
+    default:
+        IV_LOG_W(APP_MOD, "0xC4 unknown action %d (ch=%d), ack 0x74", act, ch);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    port = ch - 1; /* 平台 1 基 → 0xD1 的 0 基 */
+    plen = iv_recovery_build_payload(port, status, payload, sizeof payload);
+    if (plen < 0) {
+        IV_LOG_W(APP_MOD, "0xC4 payload build failed (%d), ack 0x74", plen);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    rp = iv_agent_report(&g_agent);
+    if (rp == NULL || iv_report_is_open(rp) != 1) {
+        /* 采集板链路没开就回 0x74：绝不在网关里"记账当已执行" ——
+         * 那样界面显示成功、现场继电器纹丝不动，是最难查的一类。 */
+        IV_LOG_W(APP_MOD, "0xC4 ch=%d act=%d: board link not open, ack 0x74", ch,
+                 act);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    /* 时刻必须用 `rp->now_ms`（report 模块的时钟域），见 `m_relay_set()` 注释：
+     * 混用另一个时钟域会让 0xD1 永不超时，后续继电器命令全被 IV_EBUSY 挡住。 */
+    rc = iv_report_send_cmd(rp, IV_FRAME_CMD_POWER, payload, (uint16_t)plen,
+                            rp->now_ms);
+    if (rc != IV_OK) {
+        IV_LOG_W(APP_MOD, "0xC4 ch=%d act=%d send failed (%d), ack 0x74", ch, act,
+                 rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    /* 催一次 0xE1：0xD1 的应答不进镜像，不催的话界面要等下一个轮询周期 */
+    iv_report_request_poll(rp);
+
+    IV_LOG_I(APP_MOD, "platform relay ch=%d act=%d -> port=%d status=%d %s",
+             ch, act, port, status, payload);
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
 /* 把配置里存的静态地址（`net.ip`/`net.mask`/`net.gateway`）真正应用到网口。
  *
  * 两个调用点**共用同一段判定**（这是刻意的，不另写一份）：
@@ -2936,6 +3038,12 @@ static int agent_setup(void)
                          on_plat_th_pair, (void *)&TH_TEMP);
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_HUMI,
                          on_plat_th_pair, (void *)&TH_HUMI);
+    /* 平台下行 0xC4「控制电源接口」＝界面「通道 N 开/断/重启」：2 B（通道, 动作）
+     * → 转成采集板 `0xD1`（`{"port":N-1,"status":0|1|2}`）。此前未注册 ⇒ 平台点了
+     * 界面还弹"断电操作成功"，实际设备回的是 0x74、继电器纹丝不动
+     * （2026-10-27 13:53:17 真帧取证后补）。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CTL_OUT_PWR,
+                         on_plat_relay, NULL);
     return 0;
 }
 

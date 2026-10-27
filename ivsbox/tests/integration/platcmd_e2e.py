@@ -816,6 +816,136 @@ def main():
             'C20b 被拒时已写的三项回滚了（high=%r oc=%r）'
             % (el.get('elec.volt_high'), el.get('elec.over_current')))
 
+        # ---- C21~C27 0xBF/0xAD「配置重启网络传输设备电源」、0xF9/0xFA 温湿度阈值 ----
+        # 真帧（2026-10-27 11:19:43 板端抓的，用户点「配置」、界面 6 次 / 60 秒）：
+        #   f0f0 110a 000b 2cc1 bf ffffffffffffffff 02 06 3c 0e ffff
+        # 载荷 2 B ＝ 重启次数(6) ＋ 重启时间(60 秒)，各 1 字节。
+        # ⚠ 指令字典把这条记作 **0xAD**，平台实发 **0xBF** ⇒ 两个码都注册。
+        print('C21 0xBF 配置重启网络传输设备电源（2 B）⇒ ack 0x01 ＋ 两个键落盘')
+        nt0 = cls_items('netthr')
+        start = len(logtext())
+        plat.clear()
+        plat.send(build_downlink(0xBF, bytes([6, 60])))
+        f = plat.wait(0xBF, kind='bin')
+        chk(f is not None and f['code'] == 0x01,
+            'C21a 0xBF ⇒ ack=0x01（**本次修的**：原来必回 0x74）')
+        nt = cls_items('netthr')
+        chk(int(nt.get('netthr.reboot_max') or -1) == 6,
+            'C21b 重启次数 6 → netthr.reboot_max（实际 %r）'
+            % nt.get('netthr.reboot_max'))
+        chk(int(nt.get('netthr.reboot_interval_s') or -1) == 60,
+            'C21c 重启时间 60 → netthr.reboot_interval_s（实际 %r）'
+            % nt.get('netthr.reboot_interval_s'))
+        chk(wait_log(r'platform set reboot power max=6 interval=60s', start=start)
+            is not None, 'C21d 日志记了 max=6 interval=60s（现场唯一观测窗口）')
+
+        print('C22 0xBF 同值重发 ⇒ ack 0x01 且走 unchanged')
+        start = len(logtext())
+        plat.clear()
+        plat.send(build_downlink(0xBF, bytes([6, 60])))
+        f = plat.wait(0xBF, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'C22a 同值 ⇒ ack=0x01')
+        chk(wait_log(r'0xBF unchanged', start=start) is not None,
+            'C22b 走的是 unchanged 分支')
+
+        print('C23 0xAD（指令字典码，同一功能）也要接住')
+        plat.clear()
+        plat.send(build_downlink(0xAD, bytes([3, 30])))
+        f = plat.wait(0xAD, kind='bin')
+        chk(f is not None and f['code'] == 0x01,
+            'C23a 0xAD ⇒ ack=0x01（字典与平台对不上，两个码都注册）')
+        nt = cls_items('netthr')
+        chk(int(nt.get('netthr.reboot_max') or -1) == 3 and
+            int(nt.get('netthr.reboot_interval_s') or -1) == 30,
+            'C23b 0xAD 也真的改到了（max=%r interval=%r）'
+            % (nt.get('netthr.reboot_max'), nt.get('netthr.reboot_interval_s')))
+
+        print('C24 0xBF 载荷 1 B ⇒ 0x74（既不是 2 也不是 4）')
+        plat.clear()
+        plat.send(build_downlink(0xBF, bytes([6])))
+        f = plat.wait(0xBF, kind='bin')
+        chk(f is not None and f['code'] == 0x74, 'C24a 1 B ⇒ ack=0x74')
+        chk(int(cls_items('netthr').get('netthr.reboot_max') or -1) == 3,
+            'C24b 短载荷没把已存的值改坏')
+
+        print('C25 0xFA 配置温度阈值（1 字节有符号，50 / -2℃）⇒ 落 sensor.temp_*')
+        start = len(logtext())
+        plat.clear()
+        plat.send(build_downlink(0xFA, bytes([50, 0xFE])))
+        f = plat.wait(0xFA, kind='bin')
+        chk(f is not None and f['code'] == 0x01,
+            'C25a 0xFA ⇒ ack=0x01（**本次修的**：原来必回 0x74）')
+        se = cls_items('sensor')
+        chk(float(se.get('sensor.temp_high') or -1) == 50.0,
+            'C25b 温度上限 50 → sensor.temp_high（实际 %r）'
+            % se.get('sensor.temp_high'))
+        chk(float(se.get('sensor.temp_low') or 999) == -2.0,
+            'C25c 温度下限 **-2**（0xFE 按有符号解释）→ sensor.temp_low（实际 %r）'
+            % se.get('sensor.temp_low'))
+        chk(wait_log(r'platform set temperature high=50 low=-2', start=start)
+            is not None, 'C25d 日志记了 high=50 low=-2')
+        chk(wait_log(r'thresh queued', start=start) is not None,
+            'C25e 改完真的重新排了 0xF1（否则采集板还是旧阈值）')
+
+        print('C26 0xFA 4 字节大端（2 字节宽）也要接住：40 / 5℃')
+        plat.clear()
+        plat.send(build_downlink(0xFA, bytes([0x00, 40, 0x00, 5])))
+        f = plat.wait(0xFA, kind='bin')
+        chk(f is not None and f['code'] == 0x01,
+            'C26a 4 B 载荷 ⇒ ack=0x01（宽度按实收字节数分派，不赌一种）')
+        se = cls_items('sensor')
+        chk(float(se.get('sensor.temp_high') or -1) == 40.0 and
+            float(se.get('sensor.temp_low') or 999) == 5.0,
+            'C26b 4 B 真的解成了 40/5（实际 %r/%r）'
+            % (se.get('sensor.temp_high'), se.get('sensor.temp_low')))
+
+        print('C27 0xF9 配置湿度阈值（1 字节无符号，80 / 20%）⇒ 落 sensor.humi_*')
+        plat.clear()
+        plat.send(build_downlink(0xF9, bytes([80, 20])))
+        f = plat.wait(0xF9, kind='bin')
+        chk(f is not None and f['code'] == 0x01,
+            'C27a 0xF9 ⇒ ack=0x01（**本次修的**：原来必回 0x74）')
+        se = cls_items('sensor')
+        chk(float(se.get('sensor.humi_high') or -1) == 80.0 and
+            float(se.get('sensor.humi_low') or -1) == 20.0,
+            'C27b 湿度 80/20 → sensor.humi_high/low（实际 %r/%r）'
+            % (se.get('sensor.humi_high'), se.get('sensor.humi_low')))
+
+        print('C28 0xF9 上下限倒置（20 / 80）⇒ 0x74 且不改坏')
+        plat.clear()
+        plat.send(build_downlink(0xF9, bytes([20, 80])))
+        f = plat.wait(0xF9, kind='bin')
+        chk(f is not None and f['code'] == 0x74, 'C28a 倒置 ⇒ ack=0x74')
+        se = cls_items('sensor')
+        chk(float(se.get('sensor.humi_high') or -1) == 80.0 and
+            float(se.get('sensor.humi_low') or -1) == 20.0,
+            'C28b 倒置被拒后原值没被动（high=%r low=%r）'
+            % (se.get('sensor.humi_high'), se.get('sensor.humi_low')))
+
+        # 温湿度四键立刻还原（原值取自 C17 的 se0 快照）
+        se_restore = {k: se0[k] for k in ('sensor.temp_high', 'sensor.temp_low',
+                                          'sensor.humi_high', 'sensor.humi_low')
+                      if k in se0}
+        if se_restore:
+            apply_cls('sensor', se_restore)
+        # `netthr` 两键同理（reboot_max 原值可能是 0＝禁用自愈，别按出厂猜）
+        if nt0:
+            nt_restore = {k: nt0[k] for k in ('netthr.reboot_max',
+                                              'netthr.reboot_interval_s')
+                          if k in nt0}
+            if nt_restore:
+                apply_cls('netthr', nt_restore)
+        nt = cls_items('netthr')
+        chk(int(nt.get('netthr.reboot_max') or -1) ==
+            int(nt0.get('netthr.reboot_max') or -1),
+            'C29 netthr.reboot_max 已还原（%r → %r）'
+            % (nt0.get('netthr.reboot_max'), nt.get('netthr.reboot_max')))
+        se = cls_items('sensor')
+        chk(float(se.get('sensor.temp_high') or -1) ==
+            float(se0.get('sensor.temp_high') or -1),
+            'C30 sensor.temp_high 已还原（%r → %r）'
+            % (se0.get('sensor.temp_high'), se.get('sensor.temp_high')))
+
         # 立刻还原这五个键（别指望末尾的批量还原：那条路径的"原值"可能已被污染）
         for k, src in (('elec.volt_high', el0), ('elec.volt_low', el0),
                        ('elec.over_current', el0), ('elec.leak_current', el0),

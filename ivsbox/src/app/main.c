@@ -640,6 +640,35 @@ static void apply_thresh_cfg(void)
         IV_LOG_W(APP_MOD, "thresh.* not applied (%d)", trc);
 }
 
+/* `netthr.*` 三个键 → 自愈/切换模块热更。**`on_cfg_committed()` 的 NETTHR 分支
+ * 与平台 `0xBF` 的 handler 共用这一段**（理由同 `apply_thresh_cfg()`：两条路径
+ * 必须读同一批键、同一套归一化，否则会出"平台配 6 次、模块里还是 3 次"）。
+ *
+ * `-1` / `0` ＝ "这一项这次没给"（0 是 `reboot_max` 的合法值＝禁用自愈），
+ * 归一化与"同值早返回"都在 agent 侧一处做 —— 那里早返回是硬要求，因为
+ * `iv_recovery_set_limits()` 会重置每通道 credit，改个 `loss_count` 不该把
+ * 自愈次数补满。 */
+static void apply_netthr_cfg(void)
+{
+    int64_t  nv      = 0;
+    int      reb_max = -1;
+    uint32_t cd_s    = 0u;
+    uint32_t loss_n  = 0u;
+    int      nrc;
+
+    if (g_cfg == NULL)
+        return;
+    if (iv_config_get_int(g_cfg, "netthr.reboot_max", &nv) == IV_OK && nv >= 0)
+        reb_max = (int)nv;
+    if (iv_config_get_int(g_cfg, "netthr.reboot_interval_s", &nv) == IV_OK && nv > 0)
+        cd_s = (uint32_t)nv;
+    if (iv_config_get_int(g_cfg, "netthr.loss_count", &nv) == IV_OK && nv > 0)
+        loss_n = (uint32_t)nv;
+    nrc = iv_agent_reload_netthr(&g_agent, reb_max, cd_s, loss_n);
+    if (nrc != IV_OK)
+        IV_LOG_W(APP_MOD, "netthr.* not applied (%d)", nrc);
+}
+
 /* 配置事务通知（F7）。这里只接"改完必须马上生效"的：
  *   - `net` 分类：平台地址/端口（与出口网卡成对刷新）→ 断开旧连接、连新平台；
  *   - `sys` 分类里的 `sys.report.interval_s`：周期上报间隔 → 换节拍，**不断链**；
@@ -807,25 +836,9 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
          * 读一次、交给 `iv_agent_open()` 初始化 `iv_recovery` ⇒ 网页改完必须重启；
          * `netthr.loss_count` 更是**零消费方**的死键。
          *
-         * `-1` / `0` 在这里表示"这一项这次没给"（0 是 `reboot_max` 的合法值＝禁用），
-         * 与 `iv_agent_reload_camdet()` 同口径；归一化与"同值早返回"都在 agent 侧
-         * 一处做 —— 那里早返回是硬要求，因为 `iv_recovery_set_limits()` 会重置
-         * 每通道 credit，改个 `loss_count` 不该把自愈次数补满。 */
-        int64_t nv       = 0;
-        int     reb_max  = -1;
-        uint32_t cd_s    = 0u;
-        uint32_t loss_n  = 0u;
-        int     nrc;
-
-        if (iv_config_get_int(g_cfg, "netthr.reboot_max", &nv) == IV_OK && nv >= 0)
-            reb_max = (int)nv;
-        if (iv_config_get_int(g_cfg, "netthr.reboot_interval_s", &nv) == IV_OK && nv > 0)
-            cd_s = (uint32_t)nv;
-        if (iv_config_get_int(g_cfg, "netthr.loss_count", &nv) == IV_OK && nv > 0)
-            loss_n = (uint32_t)nv;
-        nrc = iv_agent_reload_netthr(&g_agent, reb_max, cd_s, loss_n);
-        if (nrc != IV_OK)
-            IV_LOG_W(APP_MOD, "netthr.* not applied (%d)", nrc);
+         * 归一化与"同值早返回"都收在 `apply_netthr_cfg()` 里，平台 `0xBF` 的
+         * handler 走的是同一段（2026-10-27 抽出来）。 */
+        apply_netthr_cfg();
     }
 }
 
@@ -2398,6 +2411,188 @@ static void on_plat_threshold(const iv_proto_frame_t *f, void *arg)
     (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
 }
 
+/* ---------------------------------------------------------------------------
+ * 两元组解码：宽度**按实收字节数**定，不猜
+ * ---------------------------------------------------------------------------
+ *   len == 2 ⇒ 各 1 字节（`sign` 为真时按有符号解释：-2℃ 就是 0xFE）
+ *   len == 4 ⇒ 各 2 字节大端（有符号同理）
+ *   其它     ⇒ `IV_ERANGE`
+ *
+ * 为什么两种都接：平台侧《指令-通用版》里这几条"配置温度/湿度阈值"**只写了
+ * 命令字，没写载荷宽度**（`iv_proto.h` 的注释也只有功能名）。温度 -2℃、湿度
+ * 80% 用 1 字节放得下，但打包成 u16 也完全可能 —— 与其赌一种、赌错就回 0x74
+ * 让平台弹"执行失败"，不如按实收长度分派，并在日志里写明这次用的是哪种。
+ * 真正该拒绝的是"长度既不是 2 也不是 4"。
+ * ------------------------------------------------------------------------- */
+static int pair_decode(const iv_proto_frame_t *f, int sign, long long v[2],
+                       const char **form)
+{
+    if (f->data == NULL || v == NULL || form == NULL)
+        return IV_EINVAL;
+    if (f->len == 2u) {
+        *form = "1B";
+        v[0]  = sign ? (long long)(int8_t)f->data[0] : (long long)f->data[0];
+        v[1]  = sign ? (long long)(int8_t)f->data[1] : (long long)f->data[1];
+        return IV_OK;
+    }
+    if (f->len == 4u) {
+        int16_t a = (int16_t)(uint16_t)(((uint16_t)f->data[0] << 8) | f->data[1]);
+        int16_t b = (int16_t)(uint16_t)(((uint16_t)f->data[2] << 8) | f->data[3]);
+
+        *form = "2B-be";
+        v[0]  = sign ? (long long)a : (long long)(uint16_t)a;
+        v[1]  = sign ? (long long)b : (long long)(uint16_t)b;
+        return IV_OK;
+    }
+    return IV_ERANGE;
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台 0xBF（指令字典里记的是 0xAD）「配置重启网络传输设备电源」
+ * ---------------------------------------------------------------------------
+ * 板端真帧（2026-10-27 11:19:43，用户在平台点「配置」、界面填 重启次数=6、
+ * 重启时间(s)=60）：
+ *   f0f0 110a 000b 2cc1 bf ffffffffffffffff 02 06 3c 0e ffff
+ *   ⇒ 载荷 2 B ＝ 重启次数(06=6) ＋ 重启时间(3c=60 秒)，各 1 字节，无符号。
+ *
+ * ⚠ **码点与指令字典对不上**：`iv_proto.h` 按《指令-通用版 20260623.xlsx》把
+ *   「配置重启网络传输设备电源」定义为 **0xAD**，平台实际下发的是 **0xBF**。
+ *   两个码都注册到本 handler —— 现场以真帧为准，字典码保留兼容。
+ *   这正是"照文档抄就不会错"不成立的一条实证：字典与平台本身不一致。
+ *
+ * 落点＝`netthr.reboot_max` / `netthr.reboot_interval_s`（`0xE1` 的
+ * `lannum`/`lantime` 读的就是这两个键），写完 `apply_netthr_cfg()` 热更自愈。
+ * ------------------------------------------------------------------------- */
+static void on_plat_reboot_power(const iv_proto_frame_t *f, void *arg)
+{
+    long long   n[2]  = { 0, 0 };
+    long long   omax;
+    long long   osl;
+    const char *form  = "";
+    int         rc;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+    if (pair_decode(f, 0, n, &form) != IV_OK) {
+        IV_LOG_W(APP_MOD, "0x%02X payload bad (%u bytes, need 2 or 4), ack 0x74",
+                 (unsigned)f->cmd, (unsigned)f->len);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    omax = cfg_int("netthr.reboot_max");
+    osl  = cfg_int("netthr.reboot_interval_s");
+    if (n[0] == omax && n[1] == osl) {
+        IV_LOG_I(APP_MOD, "0x%02X unchanged (max=%d interval=%ds), ack 0x01",
+                 (unsigned)f->cmd, (int)n[0], (int)n[1]);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+
+    rc = iv_config_set_int(g_cfg, "netthr.reboot_max", n[0]);
+    if (rc == IV_OK)
+        rc = iv_config_set_int(g_cfg, "netthr.reboot_interval_s", n[1]);
+    if (rc != IV_OK) {
+        /* 越界（次数 0..100、间隔 1..3600）或间隔 0：整套回滚，别留半新 */
+        (void)iv_config_set_int(g_cfg, "netthr.reboot_max", omax);
+        (void)iv_config_set_int(g_cfg, "netthr.reboot_interval_s", osl);
+        IV_LOG_W(APP_MOD, "0x%02X reject max=%d interval=%d (%d), ack 0x74",
+                 (unsigned)f->cmd, (int)n[0], (int)n[1], rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    rc = iv_config_save(g_cfg, NULL, 0);
+    if (rc != IV_OK) {
+        (void)iv_config_set_int(g_cfg, "netthr.reboot_max", omax);
+        (void)iv_config_set_int(g_cfg, "netthr.reboot_interval_s", osl);
+        IV_LOG_W(APP_MOD, "0x%02X save failed (%d), rolled back, ack 0x74",
+                 (unsigned)f->cmd, rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    apply_netthr_cfg();
+    IV_LOG_I(APP_MOD, "platform set reboot power max=%d interval=%ds (%s, saved)",
+             (int)n[0], (int)n[1], form);
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台 0xF9「配置湿度阈值」/ 0xFA「配置温度阈值」
+ * ---------------------------------------------------------------------------
+ * 平台界面这两组是「上限/下限」两个输入框 ＋ 一个「配置」按钮（2026-10-27 截图：
+ * 温度 50 / -2、湿度 80 / 20）。载荷是两个数、**宽度未在文档里规定** ⇒ 交给
+ * `pair_decode()` 按实收字节数分派；温度按有符号（-2℃）、湿度无符号（0..100）。
+ *
+ * 落点＝`sensor.temp_high/low`、`sensor.humi_high/low`（`0xE1` 的 `ft`/`fh`
+ * 读的是采集板镜像，镜像由 `0xF1` 推过去）⇒ 写完必须 `apply_thresh_cfg()`
+ * 把九项重新下发一次，否则"平台改了、控制板还是旧值"。
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    const char *hi;   /* 配置键：上限 */
+    const char *lo;   /* 配置键：下限 */
+    int         sign; /* 1＝有符号（温度），0＝无符号（湿度） */
+    const char *what; /* 日志用，别用配置键描述代替平台叫法 */
+} th_pair_t;
+
+static const th_pair_t TH_TEMP = { "sensor.temp_high", "sensor.temp_low", 1, "temperature" };
+static const th_pair_t TH_HUMI = { "sensor.humi_high", "sensor.humi_low", 0, "humidity" };
+
+static void on_plat_th_pair(const iv_proto_frame_t *f, void *arg)
+{
+    const th_pair_t *t = (const th_pair_t *)arg;
+    long long        n[2] = { 0, 0 };
+    const char      *form = "";
+    double           ohi;
+    double           olo;
+    int              rc;
+
+    if (f == NULL || g_cfg == NULL || t == NULL)
+        return;
+    if (pair_decode(f, t->sign, n, &form) != IV_OK) {
+        IV_LOG_W(APP_MOD, "0x%02X payload bad (%u bytes, need 2 or 4), ack 0x74",
+                 (unsigned)f->cmd, (unsigned)f->len);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    ohi = cfg_dbl(t->hi);
+    olo = cfg_dbl(t->lo);
+    if ((double)n[0] == ohi && (double)n[1] == olo) {
+        IV_LOG_I(APP_MOD, "0x%02X %s unchanged (%d,%d), ack 0x01",
+                 (unsigned)f->cmd, t->what, (int)n[0], (int)n[1]);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+
+    rc = iv_config_set_dbl(g_cfg, t->hi, (double)n[0]);
+    if (rc == IV_OK)
+        rc = iv_config_set_dbl(g_cfg, t->lo, (double)n[1]);
+    if (rc == IV_OK && n[0] != 0 && n[1] != 0 && n[0] < n[1])
+        rc = IV_EINVAL; /* 上下限倒置：`cross_check()` 会在 save 时拒，提前拦下更好定位 */
+    if (rc != IV_OK) {
+        (void)iv_config_set_dbl(g_cfg, t->hi, ohi);
+        (void)iv_config_set_dbl(g_cfg, t->lo, olo);
+        IV_LOG_W(APP_MOD, "0x%02X %s reject (%d,%d) rc=%d, ack 0x74",
+                 (unsigned)f->cmd, t->what, (int)n[0], (int)n[1], rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    rc = iv_config_save(g_cfg, NULL, 0);
+    if (rc != IV_OK) {
+        (void)iv_config_set_dbl(g_cfg, t->hi, ohi);
+        (void)iv_config_set_dbl(g_cfg, t->lo, olo);
+        IV_LOG_W(APP_MOD, "0x%02X %s save failed (%d), rolled back, ack 0x74",
+                 (unsigned)f->cmd, t->what, rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    apply_thresh_cfg();
+    IV_LOG_I(APP_MOD, "platform set %s high=%d low=%d (%s, saved + 0xF1 queued)",
+             t->what, (int)n[0], (int)n[1], form);
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
 /* 把配置里存的静态地址（`net.ip`/`net.mask`/`net.gateway`）真正应用到网口。
  *
  * 两个调用点**共用同一段判定**（这是刻意的，不另写一份）：
@@ -2725,6 +2920,22 @@ static int agent_setup(void)
      * 「配置阈值」必回 0x74（2026-10-27 板端真帧取证后补）。 */
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_THRESHOLD,
                          on_plat_threshold, NULL);
+    /* 平台下行 0xBF（字典码 0xAD）「配置重启网络传输设备电源」：2 B ＝
+     * 重启次数、重启时间(s) → `netthr.reboot_max` / `netthr.reboot_interval_s`
+     * ＋ `apply_netthr_cfg()` 热更自愈。**两个码都注册**：字典写 0xAD、
+     * 平台实发 0xBF（2026-10-27 11:19:43 真帧取证）。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_NET_PWR_BF,
+                         on_plat_reboot_power, NULL);
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_NET_PWR,
+                         on_plat_reboot_power, NULL);
+    /* 平台下行 0xFA「配置温度阈值」/ 0xF9「配置湿度阈值」：两个数（上限,下限）
+     * → `sensor.temp_high/low`、`sensor.humi_high/low` ＋ `apply_thresh_cfg()`
+     * 把九项重新 `0xF1` 下发（否则平台改了、采集板还是旧值）。
+     * 宽度未见于文档 ⇒ `pair_decode()` 按实收字节数分派（见其头部注释）。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_TEMP,
+                         on_plat_th_pair, (void *)&TH_TEMP);
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_HUMI,
+                         on_plat_th_pair, (void *)&TH_HUMI);
     return 0;
 }
 

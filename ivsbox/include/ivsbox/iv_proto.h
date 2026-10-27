@@ -130,7 +130,12 @@ extern "C" {
 #define IV_PROTO_CMD_CFG_VOLT_CH    0xA9u /* 配置电压通道 */
 #define IV_PROTO_CMD_CFG_SIG_TH     0xAAu /* 配置信号机电流阈值 */
 #define IV_PROTO_CMD_CFG_DOOR_TIME  0xACu /* 配置箱门工作时段 */
-#define IV_PROTO_CMD_CFG_NET_PWR    0xADu /* 配置重启网络传输设备电源 */
+#define IV_PROTO_CMD_CFG_NET_PWR    0xADu /* 配置重启网络传输设备电源（指令字典） */
+/* 同一个功能，平台**实际下发的是 0xBF**（2026-10-27 11:19:43 板端真帧：
+ * `f0f0 110a 000b 2cc1 bf … 02 06 3c …`，载荷 2 B ＝ 重启次数、重启时间(s)）。
+ * 两个码都注册到同一 handler —— 现场以真帧为准，字典码保留兼容。
+ * 这是"按文档抄就够了"不成立的一条实证：字典与平台本身对不上。 */
+#define IV_PROTO_CMD_CFG_NET_PWR_BF 0xBFu
 #define IV_PROTO_CMD_CFG_SNMP_OID   0xBEu /* 配置 SNMP 查询指令 */
 /* 控制 */
 #define IV_PROTO_CMD_CTL_REBOOT     0xD9u /* 设备重启 */

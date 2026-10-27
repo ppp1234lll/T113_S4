@@ -18,7 +18,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#define IV_LOG_MSG_MAX 256u                       /* 单条消息正文上限 */
+/* 单条消息正文上限。
+ *
+ * 2026-10-27 由 256 提到 1024：`0xE1` 的应答体（`E1 reply: {...}`）本身 500~600 B，
+ * 256 字节的截断**恰好切掉后半段键**（`ft`/`fh`/`ov`/`uv`/`oc`/`angle` 全在截断线之后），
+ * 现场排查"平台显示 0"时日志里什么也看不到 —— 可观测性不足本身就是缺陷，
+ * 不是"日志打多了"。堆栈占用只增 768 B，单条日志的成本可以忽略。 */
+#define IV_LOG_MSG_MAX 1024u                      /* 单条消息正文上限 */
 #define IV_LOG_BODY_MAX (IV_LOG_MSG_MAX + 64u)    /* 正文 + 码名前缀 */
 #define IV_LOG_SUP_MAX 32u                        /* 抑制表上限（有界，架构 §1.3） */
 

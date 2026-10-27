@@ -511,6 +511,27 @@ static uint16_t cfg_port(const char *key)
     return (uint16_t)v;
 }
 
+/* 取整型配置，取不到按 0 —— 与 `cfg_str()` 同一口径。 */
+static int64_t cfg_int(const char *key)
+{
+    int64_t v = 0;
+
+    (void)iv_config_get_int(g_cfg, key, &v);
+    return v;
+}
+
+/* 取 double 配置（`elec.*` / `sensor.*`）。取不到按 0 —— 与 `cfg_str()` 同一口径：
+ * 0xE1 应答里"没配"和"配了 0"在平台上都是 0，没必要区分。
+ * ⚠ 别用"一个 `double dv` 连着 9 次 `iv_config_get_dbl(&dv)`"的写法：get 失败时
+ * `dv` 保留**上一个键的值**，静默串味（2026-10-27 抽 `apply_thresh_cfg()` 时改掉）。 */
+static double cfg_dbl(const char *key)
+{
+    double d = 0.0;
+
+    (void)iv_config_get_dbl(g_cfg, key, &d);
+    return d;
+}
+
 /* ---------------------------------------------------------------------------
  * 平台地址热重载（2026-10-19）
  *
@@ -589,6 +610,35 @@ static int  cfg_rec_url_table(char (*buf)[IV_CFG_STR_MAX], int cap);
 /* 本机地址热生效（定义在 `apply_saved_local_net()` 旁边，那里才有完整的取值/校验
  * 逻辑）。`on_cfg_committed()` 只负责"触发"，不重复一遍判定。 */
 static void schedule_local_net_apply(void);
+
+/* 阈值九个键 → `0xF1` 下发。**`on_cfg_committed()` 的 ELEC/SENSOR 分支与平台
+ * `0xA4` 的 handler 共用这一段**。
+ *
+ * 为什么必须共用：`0xA4` 改完五个键之后要"立刻下发"，而 `iv_config_save()` 派发的
+ * reload 事件走的是 `on_cfg_committed()` —— 两条路径读的必须是同一批键、同一套
+ * 截断口径，否则"平台配 300、下发给采集板 299"这种错位只能靠人眼发现。
+ *
+ * `IV_ESTATE` ＝ 九项全为 0（没有可发的项），出厂态的正常情形，不该按告警打。 */
+static void apply_thresh_cfg(void)
+{
+    iv_thresh_t th;
+    int         trc;
+
+    (void)memset(&th, 0, sizeof(th));
+    th.hv = (int32_t)cfg_dbl("elec.volt_high");
+    th.lv = (int32_t)cfg_dbl("elec.volt_low");
+    th.ov = (int32_t)cfg_dbl("elec.over_current");
+    th.ld = (int32_t)cfg_dbl("elec.leak_current");
+    th.sl = (int32_t)cfg_dbl("sensor.tilt");
+    th.tu = (int32_t)cfg_dbl("sensor.temp_high");
+    th.tl = (int32_t)cfg_dbl("sensor.temp_low");
+    th.hu = (int32_t)cfg_dbl("sensor.humi_high");
+    th.hl = (int32_t)cfg_dbl("sensor.humi_low");
+
+    trc = iv_agent_apply_thresh(&g_agent, &th, iv_clock_monotonic_ms());
+    if (trc != IV_OK && trc != IV_ESTATE)
+        IV_LOG_W(APP_MOD, "thresh.* not applied (%d)", trc);
+}
 
 /* 配置事务通知（F7）。这里只接"改完必须马上生效"的：
  *   - `net` 分类：平台地址/端口（与出口网卡成对刷新）→ 断开旧连接、连新平台；
@@ -671,35 +721,7 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
          * 网页能改、能存，采集板一无所知。这里补上"改完就下发 0xF1"。
          * 值 0 ＝ 该项不设置（不下发该键），口径见 `iv_report_build_thresh()`；
          * 真发帧由 `thresh_drive()` 每拍重试（撞上在飞的 0xE1 是常态）。 */
-        iv_thresh_t th;
-        double      dv = 0.0;
-        int         trc;
-
-        (void)memset(&th, 0, sizeof(th));
-        if (iv_config_get_dbl(g_cfg, "elec.volt_high", &dv) == IV_OK)
-            th.hv = (int32_t)dv;
-        if (iv_config_get_dbl(g_cfg, "elec.volt_low", &dv) == IV_OK)
-            th.lv = (int32_t)dv;
-        if (iv_config_get_dbl(g_cfg, "elec.over_current", &dv) == IV_OK)
-            th.ov = (int32_t)dv;
-        if (iv_config_get_dbl(g_cfg, "elec.leak_current", &dv) == IV_OK)
-            th.ld = (int32_t)dv;
-        if (iv_config_get_dbl(g_cfg, "sensor.tilt", &dv) == IV_OK)
-            th.sl = (int32_t)dv;
-        if (iv_config_get_dbl(g_cfg, "sensor.temp_high", &dv) == IV_OK)
-            th.tu = (int32_t)dv;
-        if (iv_config_get_dbl(g_cfg, "sensor.temp_low", &dv) == IV_OK)
-            th.tl = (int32_t)dv;
-        if (iv_config_get_dbl(g_cfg, "sensor.humi_high", &dv) == IV_OK)
-            th.hu = (int32_t)dv;
-        if (iv_config_get_dbl(g_cfg, "sensor.humi_low", &dv) == IV_OK)
-            th.hl = (int32_t)dv;
-
-        trc = iv_agent_apply_thresh(&g_agent, &th, iv_clock_monotonic_ms());
-        /* IV_ESTATE 在这里的含义是"九项全为 0，没什么可发"——正常情形（出厂态
-         * 或用户把阈值全清空），不该按告警打。 */
-        if (trc != IV_OK && trc != IV_ESTATE)
-            IV_LOG_W(APP_MOD, "thresh.* not applied (%d)", trc);
+        apply_thresh_cfg();
     }
     if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_CAMERA)) != 0u) {
         /* `camera.detect.mode` / `camera.detect.rtt_ms` / `camera.ch.N.ip` 原先只在
@@ -1182,25 +1204,6 @@ static void cj_int(struct cfg_json *j, const char *key, long long v)
 
     (void)snprintf(b, sizeof(b), "%lld", v);
     cj_str(j, key, b);
-}
-
-/* 取整型配置，取不到按 0 —— 与 `cfg_str()` 同一口径。 */
-static int64_t cfg_int(const char *key)
-{
-    int64_t v = 0;
-
-    (void)iv_config_get_int(g_cfg, key, &v);
-    return v;
-}
-
-/* 取 double 配置（`elec.*` / `sensor.*`）。取不到按 0 —— 与 `cfg_str()` 同一口径：
- * 0xE1 应答里"没配"和"配了 0"在平台上都是 0，没必要区分。 */
-static double cfg_dbl(const char *key)
-{
-    double d = 0.0;
-
-    (void)iv_config_get_dbl(g_cfg, key, &d);
-    return d;
 }
 
 static int query_cfg_json(char *out, size_t cap, void *arg)
@@ -2292,6 +2295,109 @@ static void on_plat_camera_ip(const iv_proto_frame_t *f, void *arg)
     (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
 }
 
+/* ---------------------------------------------------------------------------
+ * 平台 0xA4「配置阈值」：5 × u16 大端 ＝ 高压/低压/电流/倾斜/漏电
+ * ---------------------------------------------------------------------------
+ * 板端真帧（2026-10-27 10:52:43，用户点「配置阈值」时抓到的）：
+ *   f0f0 110a 000b 2cc1 a4 ffffffffffffffff 0a 012c 0050 03e8 001e 0019 43 ffff
+ *   ⇒ 载荷 10 B，五项 u16 大端，与界面「配置设备的电压、电流、倾斜度、漏电电流、
+ *     功率阈值」**逐项吻合**：
+ *         012c = 300  高压(V)     0050 = 80    低压(V)    03e8 = 1000 电流(mA)
+ *         001e = 30   倾斜(°)      0019 = 25    漏电(mA)
+ *   ⚠ 界面上的「功率(W)」**不在载荷里** —— 协议只有 5 个 u16，那一格永远收不到值，
+ *     不是设备漏读（这一点把用户"有的阈值没有"的疑问钉死）。
+ *   这条真帧同时结掉了「0xA4 五字段序未知不猜」那个待办。
+ *
+ * 落点＝`elec.*` / `sensor.tilt` 五个配置键（double）。写完后立刻
+ * `apply_thresh_cfg()` 走 `0xF1` 把这几个值下发给采集板；采集板更新后回 `0xE1`
+ * ⇒ 镜像刷新 ⇒ 平台再查 0xE1 读到的就是新值。**读写同一批键**。
+ *
+ * ⚠ 单位不换算：平台标「电流值(mA)」而配置键 `elec.over_current` 的注释是「A」，
+ *   但 `0xF1` 下发与 `0xE1` 回读全程按同一整数原样传递（`iv_thresh_t.ov` 是 int32）。
+ *   这里若除以 1000，就变成"平台填 1000、采集板收到 1"的静默错位。
+ *   配置键注释与平台标注的单位不一致，登记为待办，不在协议层擅自换算。
+ * ------------------------------------------------------------------------- */
+#define IV_PLAT_TH_N 5
+
+static void on_plat_threshold(const iv_proto_frame_t *f, void *arg)
+{
+    /* 数组顺序**就是**载荷里的字段序：改这里等于改协议 */
+    static const char *const keys[IV_PLAT_TH_N] = {
+        "elec.volt_high",    /* 高压(V)  */
+        "elec.volt_low",     /* 低压(V)  */
+        "elec.over_current", /* 电流(mA) */
+        "sensor.tilt",       /* 倾斜(°)  */
+        "elec.leak_current"  /* 漏电(mA) */
+    };
+    double nv[IV_PLAT_TH_N];
+    double ov[IV_PLAT_TH_N];
+    int    same = 1;
+    int    i;
+    int    j;
+    int    rc;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+    if (f->data == NULL || f->len < 10u) {
+        IV_LOG_W(APP_MOD, "0xA4 payload short (%u bytes, need 10), ack 0x74",
+                 (unsigned)f->len);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    for (i = 0; i < IV_PLAT_TH_N; i++) {
+        const uint8_t *p = f->data + (size_t)i * 2u;
+
+        nv[i] = (double)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+    }
+
+    /* 同值早返回：五项全同 ⇒ 不落盘、不触发 0xF1 重发（重发＝把采集板重设一遍） */
+    for (i = 0; i < IV_PLAT_TH_N; i++) {
+        ov[i] = cfg_dbl(keys[i]);
+        if (ov[i] != nv[i])
+            same = 0;
+    }
+    if (same) {
+        IV_LOG_I(APP_MOD, "0xA4 unchanged (%d,%d,%d,%d,%d), ack 0x01",
+                 (int)nv[0], (int)nv[1], (int)nv[2], (int)nv[3], (int)nv[4]);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+
+    for (i = 0; i < IV_PLAT_TH_N; i++) {
+        rc = iv_config_set_dbl(g_cfg, keys[i], nv[i]);
+        if (rc != IV_OK) {
+            /* 越界/非法（如倾斜 > 90）：回滚已写的项，别留半套新值 */
+            IV_LOG_W(APP_MOD, "0xA4 %s=%d rejected by config (%d), ack 0x74",
+                     keys[i], (int)nv[i], rc);
+            for (j = 0; j < i; j++)
+                (void)iv_config_set_dbl(g_cfg, keys[j], ov[j]);
+            (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+            return;
+        }
+    }
+
+    rc = iv_config_save(g_cfg, NULL, 0);
+    if (rc != IV_OK) {
+        /* 不留"内存新、盘上旧"的中间态：重启后自己变回去最难查 */
+        for (i = 0; i < IV_PLAT_TH_N; i++)
+            (void)iv_config_set_dbl(g_cfg, keys[i], ov[i]);
+        IV_LOG_W(APP_MOD, "0xA4 save failed (%d), rolled back, ack 0x74", rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    /* 立刻下发 `0xF1`，不等 reload 事件 —— 应答必须真的对应"已经生效" */
+    apply_thresh_cfg();
+
+    IV_LOG_I(APP_MOD,
+             "platform set threshold hv=%d lv=%d oc=%d tilt=%d leak=%d "
+             "(saved + 0xF1 queued)",
+             (int)nv[0], (int)nv[1], (int)nv[2], (int)nv[3], (int)nv[4]);
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
 /* 把配置里存的静态地址（`net.ip`/`net.mask`/`net.gateway`）真正应用到网口。
  *
  * 两个调用点**共用同一段判定**（这是刻意的，不另写一份）：
@@ -2613,6 +2719,12 @@ static int agent_setup(void)
      * 写配置的下行命令只有装配层能接。 */
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_CAMERA,
                          on_plat_camera_ip, NULL);
+    /* 平台下行 0xA4「配置阈值」：10 B ＝ 高压/低压/电流/倾斜/漏电（5 × u16 大端）
+     * → `elec.volt_high` / `elec.volt_low` / `elec.over_current` / `sensor.tilt` /
+     * `elec.leak_current` ＋ 立刻 0xF1 下发给采集板。此前未注册 ⇒ 平台点
+     * 「配置阈值」必回 0x74（2026-10-27 板端真帧取证后补）。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_THRESHOLD,
+                         on_plat_threshold, NULL);
     return 0;
 }
 

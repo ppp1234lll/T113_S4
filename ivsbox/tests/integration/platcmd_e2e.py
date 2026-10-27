@@ -755,6 +755,75 @@ def main():
                 break
         chk(alive_n == 6, 'C16b 连配 6 路之后主控仍活着（ctl 6/6 应答）')
 
+        # ---- C17~C20 0xA4「配置阈值」----
+        # 真帧（2026-10-27 10:52:43 板端抓的，用户点「配置阈值」时）：
+        #   f0f0 110a 000b 2cc1 a4 ffffffffffffffff 0a 012c 0050 03e8 001e 0019 43 ffff
+        # 载荷 10 B ＝ 5 × u16 大端：高压300 低压80 电流1000 倾斜30 漏电25。
+        # 界面上还有一格「功率(W)」，但**协议里没有这个字段** —— 那格永远收不到值。
+        print('C17 0xA4 配置阈值（5×u16 大端）⇒ ack 0x01 ＋ 五个键落盘＋生效')
+        el0 = cls_items('elec')
+        se0 = cls_items('sensor')
+        th_ok = bytes([0x01, 0x2c, 0x00, 0x50, 0x03, 0xe8, 0x00, 0x1e, 0x00, 0x19])
+        start = len(logtext())
+        plat.clear()
+        plat.send(build_downlink(0xA4, th_ok))
+        f = plat.wait(0xA4, kind='bin')
+        chk(f is not None and f['code'] == 0x01,
+            'C17a 0xA4 ⇒ ack=0x01（**本次修的**：原来必回 0x74）')
+        el = cls_items('elec')
+        chk(float(el.get('elec.volt_high') or -1) == 300.0,
+            'C17b 高压 300 → elec.volt_high（实际 %r）' % el.get('elec.volt_high'))
+        chk(float(el.get('elec.volt_low') or -1) == 80.0,
+            'C17c 低压 80 → elec.volt_low（实际 %r）' % el.get('elec.volt_low'))
+        chk(float(el.get('elec.over_current') or -1) == 1000.0,
+            'C17d 电流 1000 → elec.over_current（**不换算成 A**：全链路同一量纲）')
+        chk(float(el.get('elec.leak_current') or -1) == 25.0,
+            'C17e 漏电 25 → elec.leak_current')
+        chk(float(cls_items('sensor').get('sensor.tilt') or -1) == 30.0,
+            'C17f 倾斜 30 → sensor.tilt')
+        ln = wait_log(r'platform set threshold hv=300 lv=80 oc=1000 tilt=30 leak=25',
+                      start=start)
+        chk(ln is not None, 'C17g 日志记了 (saved + 0xF1 queued)（现场唯一的观测窗口）')
+        chk(wait_log(r'thresh queued', start=start) is not None,
+            'C17h 真的排了 0xF1（配了不下发＝没配）')
+
+        print('C18 0xA4 同值重发 ⇒ ack 0x01 且走 unchanged（不重设采集板）')
+        start = len(logtext())
+        plat.clear()
+        plat.send(build_downlink(0xA4, th_ok))
+        f = plat.wait(0xA4, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'C18a 同值 ⇒ ack=0x01')
+        chk(wait_log(r'0xA4 unchanged', start=start) is not None,
+            'C18b 走的是 unchanged 分支')
+
+        print('C19 0xA4 载荷不足 ⇒ 0x74，且不改坏配置')
+        plat.clear()
+        plat.send(build_downlink(0xA4, th_ok[:8]))
+        f = plat.wait(0xA4, kind='bin')
+        chk(f is not None and f['code'] == 0x74, 'C19a 8 B ⇒ ack=0x74')
+        chk(float(cls_items('elec').get('elec.volt_high') or -1) == 300.0,
+            'C19b 短载荷没把已存的值改坏')
+
+        print('C20 0xA4 倾斜 91° 越界（上界 90）⇒ 0x74 且前几项一起回滚')
+        th_bad = bytes([0x01, 0x2c, 0x00, 0x50, 0x03, 0xe8, 0x00, 0x5b, 0x00, 0x19])
+        plat.clear()
+        plat.send(build_downlink(0xA4, th_bad))
+        f = plat.wait(0xA4, kind='bin')
+        chk(f is not None and f['code'] == 0x74, 'C20a 倾斜 91 ⇒ ack=0x74')
+        el = cls_items('elec')
+        chk(float(el.get('elec.volt_high') or -1) == 300.0 and
+            float(el.get('elec.over_current') or -1) == 1000.0,
+            'C20b 被拒时已写的三项回滚了（high=%r oc=%r）'
+            % (el.get('elec.volt_high'), el.get('elec.over_current')))
+
+        # 立刻还原这五个键（别指望末尾的批量还原：那条路径的"原值"可能已被污染）
+        for k, src in (('elec.volt_high', el0), ('elec.volt_low', el0),
+                       ('elec.over_current', el0), ('elec.leak_current', el0),
+                       ('sensor.tilt', se0)):
+            if k in src:
+                ctl('config.apply', {'ver': cls_ver('elec' if k.startswith('elec.') else 'sensor'),
+                                     'items': {k: src[k]}})
+
         # ---- 收尾：把动过的键按**原值**还原 ----
         print('Z 收尾：还原现场配置')
         keep = ('net.ip', 'net.mask', 'net.gateway',

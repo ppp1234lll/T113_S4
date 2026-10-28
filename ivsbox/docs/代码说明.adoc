@@ -59,7 +59,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | 控制命令 `0xD1/0xD2` 独立短应答窗口（`ctrl_timeout_ms`） | 已实现（`iv_link_cfg_t` 追加字段、默认 300 ms、0＝沿用 `timeout_ms`；`make test`/`asan` 全绿、`analyze` 0 报告、`arm` 0 告警；新增 3b 用例钉住"短窗口只给控制命令"；**板端未换版**） | 2026-10-28 17:19 | 平台「下发后设备反应慢」的真因：采集板从不回 0xD1 ⇒ 槽白占 2 s ⇒ 连点第二个通道撞 `IV_EBUSY(-3)` 回 `0x74`。详见本文件文末 2026-10-28 17:19 节。 |
 | 采集板 `0xC2`/`0xC1` 主动上报 → 立刻取全量 → 走正常上报报文 | 已实现（`iv_report.c:on_link_upstream()` 只认命令字、不解析事件内容；`rep_poll()` 回传返回码 ＋ `IV_REPORT_POLL_RETRY_MS` 200 ms 兜底重试；`test_e2e_report` 新增 c04d/c04e、扩展 c02c，c05 计数 6→9；`make test`/`asan`/`tsan` 49 passed、`arm` 0 告警、`analyze` 0 报告；反向证伪 14 条 ＋ 1 条；**板端未换版**） | 2026-10-28 17:45 | 事件（单 TAG 增量）不能直接当上报内容；改前平台要等 300 s 周期，箱门开启完全不上报。详见本文件文末 2026-10-28 17:45 节。 |
 | 抓拍可用性（目录自动创建 ＋ 摄像头热插拔）＋ Web 抓拍与图片显示 | 已实现（`capture.c` 写前 `mkdir -p` ＋ 按能力扫 `/dev/video0..31` ＋ 掉线后重开；`/capture` 失败改回 **500**；`iv_media` 侧同样建目录；新增 `POST /api/snapshot` 与 `/media/<目录>/` 列表 JSON；`app.js` 新增「抓拍（USB 摄像头）」卡；`test_web_media_e2e` 新增 m14a~m14n ＋ 新增 `tests/web/ui_media_snap.mjs` 18 条；`make test`/`asan`/`tsan` 49 passed、`make itest` 16 passed＋1 SKIP、`analyze` 0、`arm` 0 告警；反向证伪 2 条；**板端实测**：删目录后抓拍自建目录、拔插视频节点无需重启进程即可用、`/media/snap/` 列表与取图全通） | 2026-10-28 18:10 | 用户口径：没有目录就创建 / 摄像头插入没有先后顺序 / Web 要能抓拍和看图。详见本文件文末 2026-10-28 18:10 节。 |
-| 0xE1 **超时无应答 → 迟到应答**仍落地补报（现场 42 s 延迟的真因） | 已实现（`rep_apply_query()` 由 `on_link_done()` 与 `on_link_upstream()` 共用；超时且 `want_report` 挂着 → `rep_poll_soon()` 立刻再催；`test_e2e_report` 新增 c04f，c05 计数 9→10；`make test`/`asan`/`tsan` 49 passed、itest 16 passed＋1 SKIP、`platcmd_e2e.py` 全通过、`arm` 0 告警、`analyze` 0 报告；反向证伪 5 条 ＋ 1 条；**待再次换版上板**） | 2026-10-28 18:29 | 17:45 那条换版后现场实测暴露：采集板 13 s 后才回 0xE1 ⇒ 事务已摘槽 ⇒ 整帧被丢 ＋ 超时后无人再催 ⇒ 事件后 42 s 才上平台。详见本文件文末 2026-10-28 18:29 节。 |
+| 0xE1 **超时无应答 → 迟到应答**仍落地补报（现场 42 s 延迟的真因） | 已实现（`rep_apply_query()` 由 `on_link_done()` 与 `on_link_upstream()` 共用；超时且 `want_report` 挂着 → `rep_poll_soon()` 立刻再催；`test_e2e_report` 新增 c04f，c05 计数 9→10；`make test`/`asan`/`tsan` 49 passed、itest 16 passed＋1 SKIP、`platcmd_e2e.py` 全通过、`arm` 0 告警、`analyze` 0 报告；反向证伪 5 条 ＋ 1 条；**已换版上板（`0571271b`）待现场触发确认**） | 2026-10-28 18:29 | 17:45 那条换版后现场实测暴露：采集板 13 s 后才回 0xE1 ⇒ 事务已摘槽 ⇒ 整帧被丢 ＋ 超时后无人再催 ⇒ 事件后 42 s 才上平台。详见本文件文末 2026-10-28 18:29 节。 |
 |===
 
 
@@ -9299,9 +9299,21 @@ iv_status_handle_upstream(cmd, data, len, &rp->st);
 
 === 未做 / 待办
 
-* **待再次换版上板实测**：期望 `board up cmd 0xC2` → 同秒/数秒内 `E1 from board` →
-  `report #N`，不再出现 40 s 级延迟；本次未动真实继电器/断电。
+* **已换版上板**（2026-10-28 18:40，`ivsboxd` md5 `0571271b32c00632c7b1e11e7bbd5961`，
+  旧版备份 `ivsboxd.bak-91bbf49e`；启动干净：采集板 `E1` 回 393 B、设备发现 6 台、
+  `transport state -> 2`），**待现场触发箱门/水浸确认**：期望 `board up cmd 0xC2` →
+  同秒/数秒内 `E1 from board` → `report #N`，不再出现 40 s 级延迟；本次未动真实继电器/断电。
++
+[NOTE]
+====
+`0571271b` 是 `touch` 全部源文件后重编的产物。首次构建得 `91bbf49e`，但 `tar` 同步会保留
+源文件 mtime（比 VM 上的 `.o` 旧）⇒ `make` 判定"不用重编"，那个二进制里 media/web 部分是
+旧代码（`ivsbox-web` md5 与板端 `2c2d97fd` 对不上就是证据）。**同步后必须 `touch`
+源文件，或直接 `make -B`**。
+====
 * 现场 `0xC2` 载荷是**嵌套**的 `{"key":"mcuEvent","value":{"DS":2}}`，而
   `iv_status_handle_upstream()` 按扁平结构解析，把 `value` 当成 TAG ⇒ 该事件对镜像无影响。
   **当前无害**（触发只看命令字）；若将来要按 TAG 增量刷新单值，需要先支持嵌套结构。
+* 采集板每 10 s 推一帧 `0xE2`（载荷 1 B `0xFF`），`iv_frame.h` 无此定义、无人消费
+  （只打 DEBUG 一行）。判为采集板侧心跳，与本次触发链路无关。
 

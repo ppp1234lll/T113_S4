@@ -61,8 +61,10 @@ static void on_snmp_done(uint64_t id, int rc, const void *result,
                          size_t result_len, void *arg);
 static void rec_drive(iv_agent_t *a, uint64_t now);
 static void storage_drive(iv_agent_t *a, uint64_t now);
-static int  rec_media_start(int id, const char *url, void *arg);
+static int  rec_media_start(int id, const char *url, char *why, size_t whycap,
+                            void *arg);
 static int  rec_media_stop(int id, void *arg);
+static int  rec_media_status(int id, void *arg);
 
 /* 接口名 → 内核 ifindex；未解析到返回 0（该 WAN 视为未绑定） */
 static int wan_ifindex_of(const char *name)
@@ -990,9 +992,10 @@ void iv_agent_close(iv_agent_t *a)
     if (a->media.inited) {
         iv_recctl_ops_t ops;
 
-        ops.start = rec_media_start;
-        ops.stop  = rec_media_stop;
-        ops.arg   = a;
+        ops.start  = rec_media_start;
+        ops.stop   = rec_media_stop;
+        ops.status = rec_media_status;
+        ops.arg    = a;
         (void)iv_recctl_stop_all(&a->recm, &ops);
         iv_media_fini(&a->media);
     }
@@ -1063,11 +1066,12 @@ static void on_door_open(int ds, void *arg)
 /* ---------------------------------------------------------------------------
  * M6-S6.3 断网录像驱动（判据口径见 iv_recctl.h 文件头）
  * ------------------------------------------------------------------------- */
-static int rec_media_start(int id, const char *url, void *arg)
+static int rec_media_start(int id, const char *url, char *why, size_t whycap,
+                           void *arg)
 {
     iv_agent_t *a = arg;
 
-    return iv_media_record_start(&a->media, id, url);
+    return iv_media_record_start(&a->media, id, url, why, whycap);
 }
 
 static int rec_media_stop(int id, void *arg)
@@ -1077,21 +1081,36 @@ static int rec_media_stop(int id, void *arg)
     return iv_media_record_stop(&a->media, id);
 }
 
+/* 启动确认用：查该路**真实**在录状态。1 在录 / 0 未在录 / <0 桥接查不到。
+ * 这一条是账密错误唯一能被发现的路径（start 受理只看 TCP 通不通）。 */
+static int rec_media_status(int id, void *arg)
+{
+    iv_agent_t *a = arg;
+    int         rec = 0;
+
+    if (a == NULL || iv_media_record_status(&a->media, id, &rec) != IV_OK)
+        return -1;
+    return rec;
+}
+
 static void rec_drive(iv_agent_t *a, uint64_t now)
 {
     iv_recctl_ops_t ops;
-    int wan_up;
-    int plat_up;
+    int             main_up;
 
     if (!a->media.inited)
         return; /* 桥接不可用：状态机根本没装配（open 里 gate 过），双保险 */
-    wan_up  = iv_netmgr_wan_is_up(&a->nm, IV_WAN_WIRELESS) ||
-              iv_netmgr_wan_is_up(&a->nm, IV_WAN_WIRED);
-    plat_up = (iv_transport_state(&a->rp.tr) == IV_TRANSPORT_UP);
-    ops.start = rec_media_start;
-    ops.stop  = rec_media_stop;
-    ops.arg   = a;
-    (void)iv_recctl_step(&a->recm, wan_up, plat_up, now, &ops);
+
+    /* 判据**只看主网有线**（2026-10-28 用户拍板）：4G 与平台链路不参与。
+     * 旧口径"出口全断 ＋ 平台断"在现场被证伪 —— 主网断了但 4G 顶着、平台
+     * 走 4G 照常 ESTABLISHED ⇒ 双断永不成立 ⇒ 主网故障期间一段都不录，
+     * 而那时正是最需要留证据的时候。 */
+    main_up    = iv_netmgr_wan_is_up(&a->nm, IV_WAN_WIRED);
+    ops.start  = rec_media_start;
+    ops.stop   = rec_media_stop;
+    ops.status = rec_media_status;
+    ops.arg    = a;
+    (void)iv_recctl_step(&a->recm, main_up, now, &ops);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1108,9 +1127,10 @@ static void storage_drive(iv_agent_t *a, uint64_t now)
     (void)iv_storage_step(&a->stg, now);
     if (!a->media.inited)
         return; /* 无媒体链 ⇒ recctl 未装配（open 里 gate 过），闸门无处可喂 */
-    ops.start = rec_media_start;
-    ops.stop  = rec_media_stop;
-    ops.arg   = a;
+    ops.start  = rec_media_start;
+    ops.stop   = rec_media_stop;
+    ops.status = rec_media_status;
+    ops.arg    = a;
     (void)iv_recctl_gate(&a->recm, iv_storage_allow_new(&a->stg),
                          iv_storage_stop_rec(&a->stg), &ops);
 }
@@ -2153,10 +2173,11 @@ int iv_agent_reload_rec(iv_agent_t *a, const char *const *urls, int n,
         if (rcfg.url[i][0] != '\0')
             n_eff++;
 
-    ops.start = rec_media_start;
-    ops.stop  = rec_media_stop;
-    ops.arg   = a;
-    if (iv_recctl_set_cfg(&a->recm, &rcfg, &ops) != IV_OK) {
+    ops.start  = rec_media_start;
+    ops.stop   = rec_media_stop;
+    ops.status = rec_media_status;
+    ops.arg    = a;
+    if (iv_recctl_set_cfg(&a->recm, &rcfg, &ops, a->now_ms) != IV_OK) {
         IV_LOG_W(AG_MOD, "rec sources not applied");
         return IV_EFAIL;
     }

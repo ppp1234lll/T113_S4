@@ -65,6 +65,11 @@ extern "C" {
 
 /* 单次回环 HTTP 的收发超时（ms）。media 进程死了是立即拒连，这里只防"活着但卡死"。 */
 #define IV_MEDIA_HTTP_TIMEOUT_MS 2000u
+/* 录像启动前 TCP 预检的连接超时（ms）与原因文本上限。
+ * 500 ms 是权衡：太短会把"网线在、摄像机慢"误判成不通；太长会让 Reactor
+ * 单线程在多路全不通时明显卡顿（每路累加）。 */
+#define IV_MEDIA_PROBE_MS        500u
+#define IV_MEDIA_WHY_MAX         96
 
 /* ---------------------------------------------------------------------------
  * 配置与句柄
@@ -145,8 +150,25 @@ int iv_media_capture_async(iv_media_t *m, const char *path,
  * 录像（同步；会话表兼保活）
  * ------------------------------------------------------------------------- */
 
-/* 开始录第 id 路（0..7）到 url。media 进程不可达返回 IV_ECONN。 */
-int iv_media_record_start(iv_media_t *m, int id, const char *url);
+/*
+ * 开始录第 id 路（0..7）到 url。
+ *
+ * **先预检、后发 start**：配置类错误（不是 rtsp:// / 没有主机 / 主机不是 IPv4）
+ * 与网络类错误（连接超时 / 拒连 / 无路由）在这一步就分开，原因写进 why
+ * （why 可为 NULL）。这样"录像没起来"在日志里是一句人话，不是一个错误码。
+ *
+ * **受理 ≠ 在录**：bird_media 的 /record/start 只置标志，ffmpeg 在它的 worker
+ * 里异步拉流。账密错、编码/路径不匹配时这里照样回 IV_OK。真实状态必须由
+ * `iv_media_record_status()` 复查（`iv_recctl` 的启动确认就是这么做的）。
+ *
+ * 预检会建一次 TCP 连接，**最多阻塞 IV_MEDIA_PROBE_MS**；调用方（Reactor
+ * 单线程）必须接受这个量级，且必须自己做失败退避，否则每拍重试会累加卡顿。
+ *
+ * 返回：IV_OK（已受理）/ IV_EINVAL（入参或**配置**错）/ IV_ESTATE（未 init）/
+ *       IV_ECONN（media 进程不可达，或**摄像机网络**不可达）。
+ */
+int iv_media_record_start(iv_media_t *m, int id, const char *url,
+                          char *why, size_t whycap);
 
 /* 停第 id 路。 */
 int iv_media_record_stop(iv_media_t *m, int id);

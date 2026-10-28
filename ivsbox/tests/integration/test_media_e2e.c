@@ -161,9 +161,23 @@ int main(void)
         CHK(rec == 0, "e01: channel 0 idle at start");
     }
 
-    /* e02 无效 RTSP：受理 → 对端自动停 → 会话表被清 */
-    CHK(iv_media_record_start(&g_m, 0, "rtsp://127.0.0.1:1/nope") == IV_OK,
+    /* e02 无效 RTSP：受理 → 对端自动停 → 会话表被清
+     * 2026-10-28：start 前会做 TCP 预检 ⇒ 地址的 host:port 必须**连得上**，
+     * 否则会先被预检拦掉（那是 e02b 的覆盖）。这里指 media 自己的 18000：
+     * TCP 通、但不是 RTSP，ffmpeg 握手失败后自动停录。 */
+    CHK(iv_media_record_start(&g_m, 0, "rtsp://127.0.0.1:18000/nope", NULL, 0) == IV_OK,
         "e02: start accepted for bogus rtsp");
+    /* e02b 预检拦截（2026-10-28 新行为）：连不上的地址在发 start 之前就被拒，
+     * 并把原因写进 why —— 这是"录像没起来"能被现场读懂的前提。 */
+    {
+        char why[IV_MEDIA_WHY_MAX];
+
+        why[0] = '\0';
+        CHK(iv_media_record_start(&g_m, 1, "rtsp://127.0.0.1:1/nope", why,
+                                  sizeof(why)) == IV_ECONN,
+            "e02b: unreachable camera rejected by the precheck");
+        CHK(why[0] != '\0', "e02b: precheck explains why in plain words");
+    }
     {
         int rec = -1;
         CHK(iv_media_record_status(&g_m, 0, &rec) == IV_OK,

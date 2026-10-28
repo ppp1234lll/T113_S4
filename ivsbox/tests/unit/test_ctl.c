@@ -615,7 +615,8 @@ int main(void)
     {
         static const iv_ctl_media_ops_t ops = {
             media_fake_capture, media_fake_start, media_fake_stop,
-            media_fake_status,  NULL
+            media_fake_status,  NULL /* record_reason（2026-10-28 新增，本用例不测） */,
+            NULL
         };
 
         /* c16a 未挂 ops：四个方法一律 IV_ENOTSUP（"能调但没接"可辨） */

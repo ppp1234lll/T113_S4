@@ -2787,6 +2787,16 @@ static int m_media_record_status(const iv_ctl_ctx_t *ctx, json_object *p,
          * "端口没监听"在 ctl 这层分不出来，猜错会把人带偏）。 */
         json_object_object_add(d, "reason", json_object_new_string(
             (rc == IV_ECONN) ? "media bridge unreachable" : "media not ready"));
+    } else if (ctx->media->record_reason != NULL) {
+        /* 2026-10-28：带上状态机给出的**启动失败原因**（配置错 / 摄像机不可达 /
+         * 已受理但未进入录像）。只有失败过才出现 —— 在录却带着旧原因是最容易
+         * 把人带偏的一种"正确格式的错误信息"。 */
+        char why[128];
+
+        why[0] = '\0';
+        if (ctx->media->record_reason((int)id, why, sizeof(why), ctx->media_arg) == 1 &&
+            why[0] != '\0')
+            json_object_object_add(d, "reason", json_object_new_string(why));
     }
     return rsp_data(d, out, cap, out_len);
 }

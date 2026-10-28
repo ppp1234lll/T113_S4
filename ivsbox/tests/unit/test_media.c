@@ -322,8 +322,16 @@ int main(void)
     cfg.port     = port;
     cfg.snap_dir = g_dir; /* 自动命名落进临时目录（VM 上没有 /mnt/sdcard） */
     chk(iv_media_init(&g_m, &cfg) == IV_OK, "c01: init ok");
-    chk(iv_media_record_start(&g_m, 0, "rtsp://10.0.0.11/ch0") == IV_OK,
-        "c01: start accepted");
+    /* 2026-10-28：start 前会真连一次 host:port 做预检 ⇒ 地址必须指向**本测试的
+     * 假服务**（127.0.0.1:port）；沿用 `rtsp://10.0.0.11:554` 在 VM 上必然 500 ms
+     * 超时被预检拦下，用例会红在"start accepted"这一行。 */
+    {
+        char rurl[96];
+
+        (void)snprintf(rurl, sizeof(rurl), "rtsp://127.0.0.1:%d/ch0", port);
+        chk(iv_media_record_start(&g_m, 0, rurl, NULL, 0) == IV_OK,
+            "c01: start accepted");
+    }
     {
         int rec = -1;
         chk(iv_media_record_status(&g_m, 0, &rec) == IV_OK && rec == 1,
@@ -363,8 +371,15 @@ int main(void)
         memset(&m2, 0, sizeof(m2));
         cfg.port = dead_port;
         chk(iv_media_init(&m2, &cfg) == IV_OK, "c02: init ok (dead port)");
-        chk(iv_media_record_start(&m2, 0, "rtsp://x") == IV_ECONN,
-            "c02: start reports ECONN (f3)");
+        {
+            /* 预检走**活的**假服务（否则先红在预检、测不到"媒体不可达"），
+             * 真正的 ECONN 由 m2 的 cfg.port 指向死端口产生。 */
+            char rurl[96];
+
+            (void)snprintf(rurl, sizeof(rurl), "rtsp://127.0.0.1:%d/ch0", port);
+            chk(iv_media_record_start(&m2, 0, rurl, NULL, 0) == IV_ECONN,
+                "c02: start reports ECONN (f3)");
+        }
         chk(iv_media_record_stop(&m2, 0) == IV_ECONN, "c02: stop reports ECONN");
         {
             int rec = -1;
@@ -449,8 +464,13 @@ int main(void)
         cfg.port         = port;
         cfg.ka_period_ms = 200; /* 缩短验证周期 */
         chk(iv_media_init(&m3, &cfg) == IV_OK, "c06: init ok");
-        chk(iv_media_record_start(&m3, 3, "rtsp://10.0.0.99/ch3") == IV_OK,
-            "c06: session started");
+        {
+            char rurl[96];
+
+            (void)snprintf(rurl, sizeof(rurl), "rtsp://127.0.0.1:%d/ch3", port);
+            chk(iv_media_record_start(&m3, 3, rurl, NULL, 0) == IV_OK,
+                "c06: session started");
+        }
         chk(iv_media_sessions(&m3, NULL, NULL, 0) == 1, "c06: one active session");
         atomic_store(&g_srv_rec[3], 0); /* 对端 RTSP 断流自动停录后的镜像 */
         chk(wait_for(cond_sessions_zero, &m3, 3000) == 0,
@@ -463,7 +483,7 @@ int main(void)
         iv_media_t m4;
 
         memset(&m4, 0, sizeof(m4));
-        chk(iv_media_record_start(&m4, 0, "rtsp://x") == IV_ESTATE,
+        chk(iv_media_record_start(&m4, 0, "rtsp://x", NULL, 0) == IV_ESTATE,
             "c07: not inited -> ESTATE");
         chk(iv_media_capture_async(&m4, NULL, NULL, 0) == IV_ESTATE,
             "c07: capture not inited -> ESTATE");
@@ -471,10 +491,11 @@ int main(void)
     }
 
     /* ---------------- c08 id/参数防御 ---------------- */
-    chk(iv_media_record_start(&g_m, -1, "rtsp://x") == IV_EINVAL, "c08: bad id lo");
-    chk(iv_media_record_start(&g_m, IV_MEDIA_CH_N, "rtsp://x") == IV_EINVAL,
+    chk(iv_media_record_start(&g_m, -1, "rtsp://x", NULL, 0) == IV_EINVAL,
+        "c08: bad id lo");
+    chk(iv_media_record_start(&g_m, IV_MEDIA_CH_N, "rtsp://x", NULL, 0) == IV_EINVAL,
         "c08: bad id hi");
-    chk(iv_media_record_start(&g_m, 0, "") == IV_EINVAL, "c08: empty url");
+    chk(iv_media_record_start(&g_m, 0, "", NULL, 0) == IV_EINVAL, "c08: empty url");
 
     iv_media_fini(&g_m);
     srv_stop();

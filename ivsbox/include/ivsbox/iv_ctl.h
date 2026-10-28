@@ -137,6 +137,14 @@ typedef struct {
     int (*record_start)(int id, const char *url, void *arg);
     int (*record_stop)(int id, void *arg);
     int (*record_status)(int id, int *recording, void *arg);
+    /*
+     * 该路录像**最近一次启动失败的原因**（2026-10-28 加）：
+     *   1 = 有原因（写入 buf，永不为空串）；0 = 无（在录 / 未尝试过）。
+     * 可空 —— 为空时 record.status 不带 reason 字段（老装配不受影响）。
+     * 文本由状态机给出（"配置错误：…" / "摄像机网络不可达：…"），
+     * 目的是让现场**照着这句话就能修**，不是一个错误码。
+     */
+    int (*record_reason)(int id, char *buf, size_t cap, void *arg);
     void *arg;
 } iv_ctl_media_ops_t;
 

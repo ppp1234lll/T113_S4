@@ -436,7 +436,10 @@ static int media_op_capture(const char *path, char *out_path, size_t cap,
 
 static int media_op_record_start(int id, const char *url, void *arg)
 {
-    return iv_media_record_start(iv_agent_media((iv_agent_t *)arg), id, url);
+    /* ctl 是"人手动点一下"的路径：失败原因由 iv_media 自己打 W 日志，
+     * 不往这里接 why（状态机的自动路径才需要把原因存下来供 record.status 查）。 */
+    return iv_media_record_start(iv_agent_media((iv_agent_t *)arg), id, url,
+                                 NULL, 0);
 }
 
 static int media_op_record_stop(int id, void *arg)
@@ -450,11 +453,19 @@ static int media_op_record_status(int id, int *recording, void *arg)
                                   recording);
 }
 
+/* 2026-10-28：录像启动失败原因（"配置错误：…" / "摄像机网络不可达：…"）。
+ * 由状态机持有 —— 它才知道"受理了却没在录"这种桥接层看不出来的失败。 */
+static int media_op_record_reason(int id, char *buf, size_t cap, void *arg)
+{
+    return iv_recctl_fail_reason(iv_agent_recctl((iv_agent_t *)arg), id, buf, cap);
+}
+
 static const iv_ctl_media_ops_t s_media_ops = {
     media_op_capture,
     media_op_record_start,
     media_op_record_stop,
     media_op_record_status,
+    media_op_record_reason,
     NULL /* arg 在 app_init 里回填为 &g_agent（agent 此时才存在） */
 };
 

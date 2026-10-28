@@ -50,6 +50,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | S9 延伸：control.db 表结构与落盘（iv_store 四表 ＋ 四生产者接线） | 已实现（`iv_store` 模块 ＋ `iv_db_handle()` ＋ main.c 2b 步装配 ＋ test_store 9 组 ＋ 集成 m09/k04/c11a-c11b ＋ VM 全量验证 ＋ 反向证伪 7/7 含接线层 2 条；**Web 展示方法按需后补、板端实测随板端复跑组**） | 2026-10-15 12:20 | 新增 `include/ivsbox/iv_store.h` ＋ `src/modules/store/iv_store.c`：四张表（device 主键 MAC/first_seen 保留/上限 64；snmp_latest 最近值 ok=0 不乱填；audit 上限 512 detail 不含口令；net_event 上限 512）＋ schema 版本门（user_version >1 ⇒ IV_EPROTO 不降级）＋ 全 prepared statement ＋ 表名白名单 ＋ fail-open。`iv_db` 增 `iv_db_handle()`。四生产者接线（装配层）：`on_dev_found`→device_upsert、`on_snmp_done`→逐槽位 snmp_put、`iv_ctl` 三方法成功路径→audit（绝不记键值）、`agent_reconnect`→net_event；main.c 第 2b 步 open、关停先 store 后 db。**单测当场抓出 2 个真缺陷**：trim_table 对 device 引用不存在的 id 列（⇒键列/排序列按表参数化）；audit/net_event 占位符绑定错位 ⇒ result 列落错（⇒拆成一一对应的两个 insert）。**集成断言纠偏（登记）**：m09 初版断言 device==0 被环境证伪——ifname 不存在 ⇒ if_nametoindex()==0 ⇒ AF_PACKET 不绑定 ⇒ 测试机收到宿主机真实流量（环境产物非缺陷）；未配槽位也落 ok=0 行（15=cam 9+sw 6）。改为环境无关不变量（store 行数==档案条数、行数=已配槽位总数）。详见本文件 2026-10-15 12:20 节。 |
 | M8-S8.5 摄像机 Web 受控代理（专用环回监听 ＋ `/cam/<N>` 反代 ＋ URL/Location/Cookie 重写） | 已实现（`iv_web_cam.c` ＋ main.c 第二监听接线 ＋ 集成 test_web_cam_e2e 自包含 14 组 ＋ 反向证伪 6/6（含装配层 1 条）；**真机浏览器兼容性不承诺、端到端待 frps 就位**） | 2026-10-15 11:30 | 新增 `web/src/iv_web_cam.c`：只绑 `127.0.0.1` 的专用监听口（`--cam-port`，默认 8081 与 `sys.tunnel.cam.port` 同源），只认 `/cam/<N>/...`（N 0..7、禁前导零），目标 IP 只经本地通道查 `camera.ch.<N>.ip`、上游端口只有 `--cam-upstream` 一个 ⇒ "禁止任意 ip:port"是物理事实；环回护栏拒自指；凭据零下发（SM4 密文 Web 读都不读）。**集成用例当场抓出 2 个真缺陷**（绝对 URL 重写吞掉路径分隔符 `/`；纯 Set-Cookie 响应因 `has_extra` 未置位被整段丢弃）。详见本文件 2026-10-15 11:30 节。 |
 | M5-S5.5 Web 网络页：配置项中文化 ＋ 「当前生效」只读网口状态 | 已实现（新增 `iv_config_default_desc()`；`config.defaults` 每项加可选 `d`；`sys.overview` 加 `net.link`；前端标签改用键说明 ＋ `pageNet` 加「当前生效」卡片；**板端 `eth0 192.168.2.120/24`、网关 `192.168.2.1`、MAC 与 `ip -4 addr` 逐项一致**） | 2026-10-17 11:02 | 详见本文件文末 2026-10-17 11:02 节。 |
+| 断网录像判据改为「只看主网」＋ 录像启动失败原因可读 | 已实现（VM 单测 47/47、反向证伪 2/2 抓出、ARM 0 告警；**板端实测**：主网断 10 s 自动开录、3 s 确认成功、坏地址逐行报因；`record.status` 带 `reason`） | 2026-10-28 10:38 | 详见本文件文末 2026-10-28 10:38 节。 |
 |===
 
 
@@ -8332,3 +8333,90 @@ static int ipc_brand_code(iv_dev_brand_t b);   /* hik 0 / dahua 1 / unv 2 / 其�
 这个数是协议规定、还是我从样例里数出来的？后者一律要回参考实现里对一遍。
 另外，**满了要喊**：静默 `return IV_EFULL` 让一个纯数据问题看起来像网络故障，
 白查半天。
+
+== 2026-10-28 10:38 断网录像判据改为「只看主网」＋ 录像启动失败原因可读
+
+=== 干了什么事
+
+* **判据单参化**：`iv_recctl_step()` 从 `(r, wan_up, plat_up, now, ops)` 改为
+  `(r, main_up, now, ops)` —— 入参只剩「主网（有线 WAN）是否可用」。装配层
+  `rec_drive()` 的取值改为 `iv_netmgr_wan_is_up(&a->nm, IV_WAN_WIRED)`，4G 与
+  平台 TCP 链路**不再进入判据**。
+* **启动失败两级确认**（`iv_recctl`）：`ops->start` 增加 `why/whycap` 出参；
+  新增 `ops->status` 回调，在 `IV_RECCTL_CONFIRM_MS`(3 s) 后复查真实状态；
+  每路原因存 `ch_failed[]/ch_why[]`，由 `iv_recctl_fail_reason()` /
+  `iv_recctl_failed()` 读出，成功即清。
+* **失败退避**：全路起不来时 `next_try_ms = now + IV_RECCTL_RETRY_MS`(30 s)，
+  不再每拍重来。`iv_recctl_set_cfg()` 增加 `now_ms` 参数作为退避基准。
+* **录制前预检**（`iv_media`）：新增 `rtsp_target()`（解析 `rtsp://[user[:pass]@]host[:port]/path`，
+  只接受 IPv4 字面量）与 `tcp_probe()`（非阻塞 connect ＋ poll 500 ms），把
+  「配置错」与「摄像机网络不通」在**发 start 之前**分开；`iv_media_record_start()`
+  增加 `why/whycap`。
+* **原因可查**：`iv_ctl_media_ops_t` 新增 `record_reason` 回调，`record.status`
+  在失败时输出 `reason` 字段（中文，如「摄像机网络不可达：10.0.0.11:554 连接超时（500ms）」）。
+* 单测重写 `test_recctl.c`（c01~c11，新增启动确认/原因/退避/纯主网判据四组），
+  并适配 `test_media.c`、`test_media_e2e.c`（新增 e02b 预检拦截）、`test_ctl.c`。
+
+=== 解决什么问题
+
+现场形态把旧口径证伪了：主网（eth0）断了，但 4G 顶着、平台 TCP 走 4G 照样
+`ESTABLISHED` ⇒ 旧判据「4G 与有线全断 **且** 平台断」永不成立 ⇒ **主网故障
+期间一段视频都不录**，而那正是最需要留证据的时刻。用户 2026-10-28 明确
+「只有当主网断开时，就录像，和 4G 没有关系」。
+
+第二件事是**可诊断性**：桥接的 `/record/start` 只回 HTTP 200（bird_media 只
+置标志，ffmpeg 在它自己的 worker 里异步拉流），账密错、编码/路径不匹配时
+受理照样成功，然后静悄悄失败 —— 板子上只剩一个空目录。现在的结论是：
+配置错（非 `rtsp://`、无主机、主机不是 IPv4）与网络错（超时/拒连/无路由）
+在预检阶段分开；账密错则由 3 s 后的状态复查兜住（这是它唯一能被发现的路径）。
+
+=== 影响范围
+
+* **接口变更**（调用点已全部同步）：`iv_recctl_step()`、`iv_recctl_set_cfg()`、
+  `iv_media_record_start()` 三个签名；`iv_recctl_ops_t`（+`status`、`start` 加出参）、
+  `iv_ctl_media_ops_t`（+`record_reason`）两个结构体。
+* **纯 4G 部署的箱子会一直录**：没有绑有线 WAN 时 `wan_up(WIRED)` 恒 0 ⇒
+  视为「主网断」。这是用户口径的直接推论，刻意不设例外（登记在 `iv_recctl.h`）。
+* **预检要建 TCP 连接**：每路最坏阻塞 `IV_MEDIA_PROBE_MS`(500 ms)，多路同时
+  不通时按路数累加，走 Reactor 单线程。退避把「一直不通」的重复代价压到
+  30 s 一次；单次触发的卡顿是已知代价。
+* **未做**（登记，不冒充）：Web 前端的手动录像入口（`record.*` 仍只在 ctl 层）；
+  `monitor-media.sh` 的自启入口（S65 只拉 `monitor.sh`，媒体进程重启后仍会消失）；
+  平台侧录像故障码上报（`iv_err.h` 无对应码值）。
+
+=== 验证方式与结果
+
+* VM：`make test` **47/47**（0 FAIL）；`make arm` **0 告警**，
+  md5 `7f94308f2778e67a271105d43f15ddd8`。
+* **反向证伪 2 条**（真编译通过后跑，避开「编译失败照跑旧二进制」的假绿）：
+  ① 把 `confirm_pending()` 的 3 s 判断改成恒真 ⇒ `test_recctl` 6 条红
+  （`c10: confirmed NOT recording (f8)` 等）；
+  ② 把退避判断 `if (r->next_try_ms != 0 && now_ms < r->next_try_ms)` 改成
+  `if (0)` ⇒ 2 条红（`c05: no retry inside the backoff window (f7)`）。
+  还原后复绿。
+* **板端实测**（`192.168.1.120`，主网 eth0 确实不通、4G 在线、平台走 4G
+  `ESTABLISHED`，第 1 路配的是 `rtsp://…@192.168.1.200:554/Streaming/Channels/102`）：
+
+[source,text]
+----
+10:33:28 INFO  [recctl] main link down: recording started (1/1 ch), confirming in 3000ms
+10:33:31 INFO  [recctl] record confirm: 1 ch actually recording
+# 落盘 /mnt/sdcard/video/20261028/channel0_103329.mp4，40 s 后 3.6 MB 且在长
+----
+
+* **失败诊断实测**（临时把 `camera.ch.0.url` 改成不可达的 `192.168.1.250`，
+  验完立即还原 —— 配置由 v124→125→126）：
+
+[source,text]
+----
+10:35:14 WARN [media] record[0] precheck rejected: 摄像机网络不可达：192.168.1.250:554 连接超时（500ms）
+10:35:14 WARN [recctl] record ch0 start failed (-22): 摄像机网络不可达：192.168.1.250:554 连接超时（500ms）
+10:35:14 WARN [recctl] main link down but no channel could start; retry in 30s
+10:36:51 INFO [recctl] main link down: recording started (1/1 ch), confirming in 3000ms
+----
+
+* 这轮现场还抓出并修掉一个真缺陷：热更新重开失败时 `iv_recctl_set_cfg()` 没有
+  now 可传，退避基准变成 0 ⇒ **11 s 就重试**（10:35:14 → 10:35:25，每拍吃一次
+  500 ms 预检）。改为传 `a->now_ms` 后单测加 `c08 ⑥` 钉死。
+* 换版后复测（md5 `7f94308f`）：10:37:52 自动开录、10:37:55 确认成功、文件继续增长。
+

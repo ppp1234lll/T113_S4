@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -461,32 +462,244 @@ int iv_media_capture_async(iv_media_t *m, const char *path,
  * 录像
  * ------------------------------------------------------------------------- */
 
-int iv_media_record_start(iv_media_t *m, int id, const char *url)
+/* ---------------------------------------------------------------------------
+ * RTSP 预检：把"录像起不来"拆成「配置错」与「网络不通」两类可直接照着修的结论
+ *
+ * 为什么必须在 ivsboxd 侧做：bird_media 的 /record/start 只置标志，真正的失败
+ * 埋在它的 worker 里（写它自己的 /opt/log/media.log）。现场看不到那份日志时，
+ * "录像没起来"就变成一个没有任何线索的现象。这里在**发 start 之前**先把
+ * 确定的结论拿到手：地址写错、摄像机不通，各自一句话说清。
+ *
+ * 只接受 IPv4 字面量：现场摄像机都是 IP，而 getaddrinfo 没有超时 ——
+ * 在 Reactor 单线程里等 DNS 解析是不可接受的（解析慢的域名能把整机拖住）。
+ * ------------------------------------------------------------------------- */
+
+/* rtsp://[user[:pass]@]host[:port][/path] → host/port（port 缺省 554） */
+static int rtsp_target(const char *url, char *host, size_t hcap, int *port,
+                       char *why, size_t whycap)
+{
+    const char *p;
+    const char *at;
+    const char *slash;
+    const char *end;
+    const char *colon;
+    struct in_addr in;
+    size_t      n;
+    int         pnum = 554;
+
+    if (url == NULL || url[0] == '\0') {
+        (void)snprintf(why, whycap, "配置错误：拉流地址为空");
+        return IV_EINVAL;
+    }
+    if (strncasecmp(url, "rtsp://", 7u) != 0) {
+        (void)snprintf(why, whycap, "配置错误：拉流地址必须以 rtsp:// 开头");
+        return IV_EINVAL;
+    }
+    p     = url + 7;
+    slash = strchr(p, '/');
+    at    = strrchr(p, '@');
+    if (at != NULL && (slash == NULL || at < slash))
+        p = at + 1; /* 跳过 user:pass@（'@' 在路径之前的才算账密分隔符） */
+
+    end   = (slash != NULL) ? slash : (p + strlen(p));
+    colon = strchr(p, ':');
+    if (colon != NULL && colon < end) {
+        const char *q = colon + 1;
+        int         v = 0;
+
+        for (; q < end; q++) {
+            if (*q < '0' || *q > '9') {
+                (void)snprintf(why, whycap, "配置错误：端口不是数字");
+                return IV_EINVAL;
+            }
+            v = v * 10 + (*q - '0');
+            if (v > 65535) {
+                (void)snprintf(why, whycap, "配置错误：端口超出 1..65535");
+                return IV_EINVAL;
+            }
+        }
+        if (v <= 0) {
+            (void)snprintf(why, whycap, "配置错误：端口为 0");
+            return IV_EINVAL;
+        }
+        pnum = v;
+        n    = (size_t)(colon - p);
+    } else {
+        n = (size_t)(end - p);
+    }
+
+    if (n == 0 || n + 1u > hcap) {
+        (void)snprintf(why, whycap, "配置错误：地址里没有主机名");
+        return IV_EINVAL;
+    }
+    memcpy(host, p, n);
+    host[n] = '\0';
+
+    if (inet_pton(AF_INET, host, &in) != 1) {
+        (void)snprintf(why, whycap,
+                       "配置错误：主机不是 IPv4 地址（%s；本机不做 DNS 解析）",
+                       host);
+        return IV_EINVAL;
+    }
+    *port = pnum;
+    return IV_OK;
+}
+
+/* 非阻塞 connect + poll → 分出"拒连 / 超时 / 无路由"三种现场含义 */
+static int tcp_probe(const char *host, int port, char *why, size_t whycap)
+{
+    struct sockaddr_in sa;
+    struct pollfd      pfd;
+    socklen_t          elen = sizeof(int);
+    int                fd;
+    int                rc;
+    int                err = 0;
+    int                flags;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        (void)snprintf(why, whycap, "配置错误：主机不是 IPv4 地址（%s）", host);
+        return IV_EINVAL;
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        (void)snprintf(why, whycap, "本机 socket 创建失败（errno=%d）", errno);
+        return IV_EIO;
+    }
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc == 0) {
+        (void)close(fd);
+        return IV_OK; /* 立即连上（同网段常见） */
+    }
+    if (errno != EINPROGRESS) {
+        (void)snprintf(why, whycap,
+                       "摄像机网络不可达：%s:%d 连接失败（%s）", host, port,
+                       strerror(errno));
+        (void)close(fd);
+        return IV_ECONN;
+    }
+
+    pfd.fd     = fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+    rc = poll(&pfd, 1, (int)IV_MEDIA_PROBE_MS);
+    if (rc == 0) {
+        (void)snprintf(why, whycap,
+                       "摄像机网络不可达：%s:%d 连接超时（%ums）", host, port,
+                       (unsigned)IV_MEDIA_PROBE_MS);
+        (void)close(fd);
+        return IV_ECONN;
+    }
+    if (rc < 0) {
+        (void)snprintf(why, whycap, "本机 poll 失败（errno=%d）", errno);
+        (void)close(fd);
+        return IV_EIO;
+    }
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0)
+        err = errno;
+    (void)close(fd);
+
+    switch (err) {
+    case 0:
+        return IV_OK;
+    case ECONNREFUSED:
+        (void)snprintf(why, whycap,
+                       "摄像机端口未开放：%s:%d 拒绝连接（端口不对或 RTSP 服务未开）",
+                       host, port);
+        return IV_ECONN;
+    case EHOSTUNREACH:
+        (void)snprintf(why, whycap, "摄像机网络不可达：%s 无主机路由", host);
+        return IV_ECONN;
+    case ENETUNREACH:
+        (void)snprintf(why, whycap, "摄像机网络不可达：到 %s 无网络路由", host);
+        return IV_ECONN;
+    case ETIMEDOUT:
+        (void)snprintf(why, whycap,
+                       "摄像机网络不可达：%s:%d 连接超时（%ums）", host, port,
+                       (unsigned)IV_MEDIA_PROBE_MS);
+        return IV_ECONN;
+    default:
+        (void)snprintf(why, whycap,
+                       "摄像机网络不可达：%s:%d 连接失败（errno=%d）", host, port,
+                       err);
+        return IV_ECONN;
+    }
+}
+
+int iv_media_record_start(iv_media_t *m, int id, const char *url,
+                          char *why, size_t whycap)
 {
     char req[IV_MEDIA_URL_MAX * 3 + 32];
     char eurl[IV_MEDIA_URL_MAX * 3];
     char resp[256];
+    char host[64];
+    char wbuf[IV_MEDIA_WHY_MAX];
+    int  port = 554;
     int  status = 0;
     int  rc;
 
-    if (m == NULL || !m->inited)
+    if (why != NULL && whycap > 0)
+        why[0] = '\0';
+    wbuf[0] = '\0';
+
+    if (m == NULL || !m->inited) {
+        if (why != NULL && whycap > 0)
+            (void)snprintf(why, whycap, "媒体进程不可用（ivsbox-media 未运行）");
         return IV_ESTATE;
-    if (id < 0 || id >= IV_MEDIA_CH_N || url == NULL || url[0] == '\0')
+    }
+    if (id < 0 || id >= IV_MEDIA_CH_N || url == NULL || url[0] == '\0') {
+        if (why != NULL && whycap > 0)
+            (void)snprintf(why, whycap, "配置错误：通道号或拉流地址非法");
         return IV_EINVAL;
+    }
+
+    /* 预检 ①：地址语法 */
+    rc = rtsp_target(url, host, sizeof(host), &port, wbuf, sizeof(wbuf));
+    if (rc != IV_OK) {
+        IV_LOG_W(MD_MOD, "record[%d] precheck rejected: %s", id, wbuf);
+        if (why != NULL && whycap > 0)
+            (void)snprintf(why, whycap, "%s", wbuf);
+        return rc;
+    }
+    /* 预检 ②：摄像机网络可达性（这不等同于鉴权/编码正确 —— 那要等确认） */
+    rc = tcp_probe(host, port, wbuf, sizeof(wbuf));
+    if (rc != IV_OK) {
+        IV_LOG_W(MD_MOD, "record[%d] precheck rejected: %s", id, wbuf);
+        if (why != NULL && whycap > 0)
+            (void)snprintf(why, whycap, "%s", wbuf);
+        return rc;
+    }
 
     rc = url_encode(url, eurl, sizeof(eurl));
-    if (rc != IV_OK)
+    if (rc != IV_OK) {
+        if (why != NULL && whycap > 0)
+            (void)snprintf(why, whycap, "拉流地址过长，无法编码下发");
         return rc;
+    }
     (void)snprintf(req, sizeof(req), "/record/start?id=%d&url=%s", id, eurl);
-    if (http_get(host_of(m), m->cfg.port, req, resp, sizeof(resp), &status) != IV_OK || status != 200)
+    if (http_get(host_of(m), m->cfg.port, req, resp, sizeof(resp), &status) != IV_OK ||
+        status != 200) {
+        if (why != NULL && whycap > 0)
+            (void)snprintf(why, whycap,
+                           "媒体进程无应答（127.0.0.1:%d 未响应 /record/start）",
+                           m->cfg.port);
         return IV_ECONN;
+    }
 
     pthread_mutex_lock(&m->lock);
     m->rec_active[id] = 1;
     (void)snprintf(m->rec_url[id], sizeof(m->rec_url[id]), "%s", url);
     m->st.rec_starts++;
     pthread_mutex_unlock(&m->lock);
-    IV_LOG_I(MD_MOD, "record[%d] start accepted: %s", id, url);
+    IV_LOG_I(MD_MOD, "record[%d] start accepted (precheck passed %s:%d): %s",
+             id, host, port, url);
     return IV_OK;
 }
 

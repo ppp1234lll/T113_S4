@@ -93,6 +93,7 @@
 #include "ivsbox/iv_camdet.h"
 #include "ivsbox/iv_cellular.h"
 #include "ivsbox/iv_device.h"
+#include "ivsbox/iv_fault.h"
 #include "ivsbox/iv_gps.h"
 #include "ivsbox/iv_media.h"
 #include "ivsbox/iv_netlink.h"
@@ -410,6 +411,13 @@ typedef struct {
     iv_probe_t   pb;  /* S3.2 */
     iv_netmgr_t  nm;  /* S3.3 */
     iv_camdet_t  cd;  /* S4.1 摄像机网络状态探测（内嵌第二个 iv_probe 实例） */
+    /* 故障码表（2026-10-28）：电量/传感器来自采集板 0xE1 应答的 `ERR`，
+     * 网络由本层从 `mn[]` / 摄像机状态 / 有线载波算出，合并后经
+     * `iv_report_env_t::err` 进上报帧。口径见 iv_fault.h。 */
+    iv_fault_t   flt;
+    /* 上报 `ERR=` 段的成品串（`iv_fault_format()` 的落点）。`iv_report_set_env()`
+     * 只存指针、到出报那一刻才读 ⇒ 缓冲必须跟着 agent 活，不能是栈上临时量。 */
+    char         err_buf[IV_FAULT_STR_MAX];
     iv_recovery_t rec; /* S4.4 自愈：消费 cd 的"正常→故障"沿，发 0xD1 断电重启 */
     iv_device_t  dev;  /* S4.2 多品牌设备发现（开机一次 ＋ 0xE4 手动触发） */
     iv_agent_snmp_job_t snmp_job[IV_AGENT_SNMP_TARGET_N]; /* S4.3 采集作业与结果 */

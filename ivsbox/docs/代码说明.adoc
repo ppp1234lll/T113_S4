@@ -54,6 +54,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | 故障码（`ERR`）上报：采集板 JSON `ERR` ＋ 主板网络码合并 | 已实现（新增 `iv_fault` 模块；`iv_status` 落 `ERR`、`iv_agent` 合流；VM 单测 49/49、ASan 49/49、analyze 0、ARM 0 告警、反向证伪 4/4；**板端未换版**） | 2026-10-28 11:10 | 详见本文件文末 2026-10-28 11:10 节。 |
 | Web 手动录像入口 ＋ 媒体进程自启 ＋ 静态资源 413 闭环 | 已实现（VM 单测 48/48、集成 16 passed＋1 SKIP、前端 9 用例全绿、反向证伪 5 条；**板端实测**：整机重启后媒体进程自起并自动开录、`/app.js` 由 413 转 200、手动开关录像双向 `changed`） | 2026-10-28 11:32 | 上一节「未做」的两条（Web 手动入口、媒体自启）本轮闭环；另修掉加完前端后暴露的静态资源硬顶 413（整页白屏）。详见本文件文末 2026-10-28 11:32 节。 |
 | 采集板 0xE1 应答补 `ERR` 键 ＋ `Error_Get_Codesbuf()` 数量回填 | 已实现（**仓库外**采集板固件 `General_Version - 无SADP`；Keil 真实构建 0 Error 0 Warning、axf/hex 已产出；逻辑单测 9 例全通过含 ASan/UBSan；**未烧录实测、未提交采集板仓库**） | 2026-10-28 11:50 | 详见本文件文末 2026-10-28 11:50 节。 |
+| 采集板 `ERR` 扩容到 32 码（绕开 mycJSON 的 `pbuff[128]`） | 已实现（**仓库外**采集板固件；改 3 次 `strcat` 直拼 `pdata` ＋ 384 B 取值缓冲 ＋ 2048 溢出闸门；Keil 真实构建 0 Error 0 Warning；单测 10 例含 ASan/UBSan 全通过，32 码全带上） | 2026-10-28 15:55 | 解除 11:50 那条的"单帧最多 9 个码"限制。详见本文件文末 2026-10-28 15:55 节。 |
 |===
 
 
@@ -8777,4 +8778,95 @@ Build Time Elapsed: 00:00:07     Output/atk_f460.hex 913460 B (11:49)
   （违反规则 3「只提交本次修改」），故只改文件不提交。
 * 与主板联调时看两处日志：采集板侧 `ERR` 是否随 0xE1 应答发出；主板侧
   `iv_fault` 的 `board_rejected` / `board_mismatch` 计数是否保持 0。
+
+== 2026-10-28 15:55 采集板 ERR 扩容到 32 码（绕开 mycJSON 的 pbuff[128]）
+
+=== 干了什么事
+
+只改采集板固件 `F:\debug\General_Version - 无SADP\main\APP\USER\src\com.c` 一处：
+`com_query_configuration_function()`（0xE1 应答）里的 `ERR` 字段，从「交给
+`my_cjson_join_string_function()` 拼」改成「三次 `strcat` 直拼 `pdata`」。
+
+[source,c]
+----
+char   errbuf[384];                      /* "ERR=32" 6 B + 32*9 B + ';' = 295 */
+memset(errbuf,0,sizeof(errbuf));
+if (Error_Get_Codesbuf((uint8_t*)errbuf,sizeof(errbuf)) >= 0) {
+    if (strncmp(perr,"ERR=",4) == 0) perr += 4;                    /* 去文本协议前缀 */
+    elen = strlen(perr);
+    if ((elen > 0) && (perr[elen-1] == ';')) perr[elen-1] = '\0';   /* 去尾分号 */
+    if ((strlen((char*)pdata) + elen + 12u) < SEND_MSG_BUF_SIZE) {  /* 溢出闸门 */
+        strcat((char*)pdata,"\"ERR\":\"");
+        strcat((char*)pdata,perr);
+        strcat((char*)pdata,"\",");
+    }
+}
+----
+
+其余 40 多个键仍然走 `my_cjson_join_string_function()`。**中间件一个字没动** ——
+`Middlewares/cjson/mycJSON.c` 是共用件，改它的 `pbuff` 会影响全部 JSON 构造。
+
+=== 解决什么问题
+
+11:50 那版把 `ERR` 交给 `my_cjson_join_string_function()`，而它内部是
+`uint8_t pbuff[128]` + `sprintf` ⇒ JSON 值不能超过约 118 字节。为躲开溢出只能把
+取值压到 96 字节，代价是**单帧最多 9 个码**。可 `ErrorFault_t::fault_index[32]`
+本来能存 32 个 —— 现场同时 10 个以上故障时，后面的码会被静默丢掉，平台上就少报。
+
+现在取值缓冲 384 字节（32 码实测 290），`pdata` 是
+`send_msg_t.buf[SEND_MSG_BUF_SIZE=2048]`，装得下（实测整帧 317 字节）。
+
+=== 影响范围
+
+* **只影响 `ERR` 一个字段**，JSON 其余部分、文本协议应答（`com_report_normally_function()`）
+  的 `ERR=...;` 形状都不变。
+* 新加的一道闸门：`strlen(pdata) + 值长 + 12 < SEND_MSG_BUF_SIZE` 不成立时**跳过追加**
+  （发出去的 JSON 里就没有 `ERR` 键）。本函数其余键都没有长度检查，这是既有风格，
+  但至少不让新加的这段越过 `send_msg_t` 的边界 —— 越界方向是往上盖结构体别的字段，
+  而本工程 `configCHECK_FOR_STACK_OVERFLOW` 为 0，真坏了也查不出来。
+* **主板侧不需要任何改动**：`iv_fault_apply_board()` 一直是"数量字段不采信、以解析出的码为准"，
+  `board_mismatch` 只做留痕；码从 9 个变成 32 个，它照收。
+* 栈：`com_query_configuration_function()` 局部从约 280 B 涨到约 550 B，
+  `app_task` 栈 `APP_STK_SIZE 4096`（words ≈ 16 KB），余量充足。
+
+=== 验证方式与结果
+
+**1. Keil 真实构建**
+
+----
+UV4.exe -b atk_f460.uvprojx -j0
+  compiling com.c...
+  linking...
+  Program Size: Code=276216 RO-data=47792 RW-data=20896 ZI-data=439888
+  "..\..\Output\atk_f460.axf" - 0 Error(s), 0 Warning(s).
+----
+Code 比上一版多 44 字节（384 B 缓冲 + 闸门）。
+（构建尾部 `HexBin.bat` 的 `'-' 不是内部或外部命令` 是既有环境问题，见 11:50 那条。）
+
+**2. 逻辑单测 10 例**（编真 `error.c`，只把 `SYSTEM/sys/sys.h` 换成 stdint 桩；
+主机 gcc 与 VM `-fsanitize=address,undefined` 两侧逐条一致、无 sanitizer 报告）
+
+[cols="1,6,3",options="header"]
+|===
+| 用例 | 断言 | 结果
+
+| t1 | 健康态值 `0`（主板据此清空上一轮故障） | 通过
+| t2 | 两码 → `2,10300000,30500000` | 通过
+| t3 | 断电专有路径（表塌缩成单码）→ `1,10100000` | 通过
+| t4 | `Error_Clear` 后回 `0` | 通过
+| t5 | **塞满 32 个码 → `declared=32 / listed=32`、值 290 B**（旧实现只出 9 个） | 通过
+| t6 | 文本协议形状 `ERR=6,...;` 不变 | 通过
+| t7 | 完整 JSON 317 B < `SEND_MSG_BUF_SIZE`(2048) | 通过
+| t8 | 16 B 小缓冲 → `ERR=0;`，不越界 | 通过
+| t9 | 56 B 恰好装 5 码（数量回填 5） | 通过
+| t10 | `pdata` 预填到 2032 B → **跳过追加**、不溢出 | 通过
+|===
+
+=== 未做 / 待办
+
+* **未烧录实测**：验证只到"编译 + 链接 + 主机逻辑单测"，真机与平台联调仍需设备窗口。
+* **采集板仓库仍未提交**：`F:\debug\General_Version - 无SADP` 常驻 200+ 未提交改动
+  （含 bootloader 二进制），`com.c` 的 diff 里夹着本次之外的既有改动，`git add` 会连别人的
+  一起带上（规则 3），故只改文件，登记写到 T113 仓库。
+
 

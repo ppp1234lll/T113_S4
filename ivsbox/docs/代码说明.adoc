@@ -51,6 +51,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M8-S8.5 摄像机 Web 受控代理（专用环回监听 ＋ `/cam/<N>` 反代 ＋ URL/Location/Cookie 重写） | 已实现（`iv_web_cam.c` ＋ main.c 第二监听接线 ＋ 集成 test_web_cam_e2e 自包含 14 组 ＋ 反向证伪 6/6（含装配层 1 条）；**真机浏览器兼容性不承诺、端到端待 frps 就位**） | 2026-10-15 11:30 | 新增 `web/src/iv_web_cam.c`：只绑 `127.0.0.1` 的专用监听口（`--cam-port`，默认 8081 与 `sys.tunnel.cam.port` 同源），只认 `/cam/<N>/...`（N 0..7、禁前导零），目标 IP 只经本地通道查 `camera.ch.<N>.ip`、上游端口只有 `--cam-upstream` 一个 ⇒ "禁止任意 ip:port"是物理事实；环回护栏拒自指；凭据零下发（SM4 密文 Web 读都不读）。**集成用例当场抓出 2 个真缺陷**（绝对 URL 重写吞掉路径分隔符 `/`；纯 Set-Cookie 响应因 `has_extra` 未置位被整段丢弃）。详见本文件 2026-10-15 11:30 节。 |
 | M5-S5.5 Web 网络页：配置项中文化 ＋ 「当前生效」只读网口状态 | 已实现（新增 `iv_config_default_desc()`；`config.defaults` 每项加可选 `d`；`sys.overview` 加 `net.link`；前端标签改用键说明 ＋ `pageNet` 加「当前生效」卡片；**板端 `eth0 192.168.2.120/24`、网关 `192.168.2.1`、MAC 与 `ip -4 addr` 逐项一致**） | 2026-10-17 11:02 | 详见本文件文末 2026-10-17 11:02 节。 |
 | 断网录像判据改为「只看主网」＋ 录像启动失败原因可读 | 已实现（VM 单测 47/47、反向证伪 2/2 抓出、ARM 0 告警；**板端实测**：主网断 10 s 自动开录、3 s 确认成功、坏地址逐行报因；`record.status` 带 `reason`） | 2026-10-28 10:38 | 详见本文件文末 2026-10-28 10:38 节。 |
+| Web 手动录像入口 ＋ 媒体进程自启 ＋ 静态资源 413 闭环 | 已实现（VM 单测 48/48、集成 16 passed＋1 SKIP、前端 9 用例全绿、反向证伪 5 条；**板端实测**：整机重启后媒体进程自起并自动开录、`/app.js` 由 413 转 200、手动开关录像双向 `changed`） | 2026-10-28 11:32 | 上一节「未做」的两条（Web 手动入口、媒体自启）本轮闭环；另修掉加完前端后暴露的静态资源硬顶 413（整页白屏）。详见本文件文末 2026-10-28 11:32 节。 |
 |===
 
 
@@ -8419,4 +8420,164 @@ static int ipc_brand_code(iv_dev_brand_t b);   /* hik 0 / dahua 1 / unv 2 / 其�
   now 可传，退避基准变成 0 ⇒ **11 s 就重试**（10:35:14 → 10:35:25，每拍吃一次
   500 ms 预检）。改为传 `a->now_ms` 后单测加 `c08 ⑥` 钉死。
 * 换版后复测（md5 `7f94308f`）：10:37:52 自动开录、10:37:55 确认成功、文件继续增长。
+
+== 2026-10-28 11:32 Web 手动录像入口 ＋ 媒体进程自启 ＋ 静态资源 413 闭环
+
+=== 干了什么事
+
+三件事，前两件正是上一节（10:38）「未做」清单里剩下的那两条。
+
+**一、手动（强制）录像。** `iv_recctl_t` 增两个标志 `force` / `manual_off`，
+对外三个口子 `iv_recctl_manual()` / `iv_recctl_forced()` / `iv_recctl_held_off()`
+（装配层对应 `iv_agent_record_manual/forced/held_off`）：
+
+[cols="1,3"]
+|===
+| 状态 | 语义
+
+| `force = 1`
+| **不看主网判据**：主网恢复、4G 通断、平台连接一概不影响。只有三种事能让它停 ——
+  `on=0`、存储水位闸门（`iv_recctl_gate()`，闸门一到连 `force` 一起清）、
+  配置热更新（`iv_recctl_set_cfg()` 重开时丢掉 `force`，因为地址可能已经换了）。
+
+| `manual_off = 1`
+| **人工停止必须压得住自动开录**：`on=0` 之后如果只清 `force`，主网还是断的 ⇒
+  下一拍的 hold 到点又把它拉起来（板端实测 10 s 后就重开了）。所以停止时另置
+  此标志，`iv_recctl_step()` 里"主网断 ⇒ 开录"那一支先看它。**解除条件只有一条：
+  主网恢复一拍**（`if (main_up) { r->manual_off = 0; … }`）—— 即"这次断网我不录，
+  下次断网照常自动录"。
+
+| `force` 但没在录
+| 仍按 30 s 退避重试（`next_try_ms`），闸门挡住时直接返回。所以"强制录像"不等于
+  "必定成功"：摄像机不通就一直在退避里试，失败原因留在 `ch_why[]`。
+|===
+
+拉流地址**只从配置**（`cfg.url[]`，即 `camera.ch.N.url` ＋ `.record` 同时配好）
+取，**不接受请求里带来的 URL** —— 否则等于给 Web 开了一个"让设备去拉任意地址"
+的口子。失败原因与自动路径**同一套措辞**（`iv_media_record_start()` 的预检给的
+原文），所以"摄像机端口未开放：192.168.1.64:554 拒绝连接"这种话在页面和日志里
+是同一句。
+
+**二、ctl 两个方法 ＋ Web 一个路由。**
+
+* `record.page`：一次快照 8 路，
+  `{recording,forced,held_off,count,ch:[{id,url,want,on,failed[,why]}]}`。
+  `url` 只回**布尔**（有没有配地址），RTSP 地址与 `admin:` 这类凭据**一律不下发**；
+  不列文件、不逐路去问媒体进程（那会把一次页面刷新变成 8 次往返）。
+* `record.manual {on:bool}`：失败把原因**原样**放 `msg` 透出去（操作员要看到的是
+  "为什么没录上"，不是 `-22`）；成功回 `{on,changed}`，`changed=0` ＝ 本来就没在录，
+  页面据此不要说"已停止"这种废话。
+* `web/src/iv_web_api.c`：`/api/media/record`（POST＝动作、GET＝页面数据，与
+  `relay.set` / `device.identity.set` 同一口径：动作只给 POST）。
+* `web/static/app.js` 的媒体页从占位（"属 M6，尚未启用"）改成真页面：三态结论
+  （自动＝主网断开触发 / 手动＝需点「停止录像」才停 / 已人工停止＝压制了自动开录、
+  主网恢复一次后解除）＋ 5 列只读表（通道 / 录像开关 / 是否有拉流地址 / 状态 /
+  未启动原因）＋ 开、停两个按钮。失败原因单独占一行，**不被 5 s 轮询刷掉**。
+
+**三、媒体进程自启 —— 是部署缺口，不是代码缺口。** 仓库里
+`scripts/init.d/S67ivsboxmedia` 本来就对：`start-stop-daemon --start --background
+--make-pidfile` 拉 `monitor-media.sh`，而后者是 `ivsbox-media` 的**唯一**拉起方
+（`restart` 还会删 `.monitor-media.state` 解熔断），`Makefile` 的 `package-copy`
+也早就把它列进 `packaging/init.d/`。板端 `/etc/init.d/` 里**没有这个文件**才是
+上一节「重启后媒体进程消失」的全部原因。本轮把它装上并验证（见验证段），代码零改动。
+
+**四、静态资源 413。** `iv_web_static.c` 改成两条路：
+
+[source,c]
+----
+if (st_size <= IV_WEB_STATIC_MAX && st_size < cap)   /* 快路径：一次 read 进 wbuf，一次 send */
+        …
+/* 大文件：文件体分流（S6.4 既有通道） */
+rsp->file_path   = s_static_path;   /* 静态缓冲；本函数到 build_response 之间没有让出点 */
+rsp->file_off    = 0;
+rsp->file_len    = st.st_size;
+rsp->no_throttle = 1;               /* 静态资源免 --media-bps 限速 */
+----
+
+`build_response()` 里那条 `rsp->file_path` 的路早就有了（`open(O_NOFOLLOW)` ＋
+`c->send_fd/send_off/send_left` ＋ `on_writable()` 里 `pread`→`send`），媒体下载
+一直走它，静态资源只是过去没用。同时 `iv_web_resp_t` 增 `no_throttle`：限速
+（`--media-bps`，默认 256 KiB/s）是给**录像下载**的，拿它卡页面资源没收益 ——
+13 万字节要白等 0.5 s，而 `test_web_http` 的 fd 用例连发 200 次要 100 s。
+
+=== 解决什么问题
+
+* **现场没有"现在就录"的手段**：上一节修好的是"主网断自动录"，而排障、验机、
+  临时取证都需要人工开一段。现在浏览器点两下就行，且**停止这件事真的停得住**
+  （`manual_off`），不会 10 s 后自己又起来。
+* **重启后录像能力整体消失**：`ivsboxd`/Web 都有自启，媒体没有 ⇒ 箱子断电恢复
+  后没人 ssh 进去拉起就永远不录。装上 `S67` 后与其它三个进程同生共死。
+* **Web UI 白屏**：`/app.js` 顶穿静态硬顶回 413。这条是**加完前端才暴露**的
+  （页面变大是正常的、必然的），修法按 `iv_web.h` 里当时写下的办法办 ——
+  文件体分流，**没有再抬 `IV_WEB_RSP_MAX`**（抬它等于每连接多占 32 KiB BSS，
+  8 连接 ≈ +256 KiB，且下次页面再长几 KB 又顶）。
+
+=== 影响范围
+
+* **接口变更**（调用点已全部同步）：`iv_recctl_t` 两个字段；
+  `iv_ctl_media_ops_t` ＋2 个成员（`record_state` / `record_manual`，`main.c` 与
+  单测的初始化都补了）；`iv_agent.h` ＋3 个函数；`iv_web_resp_t` ＋`no_throttle`。
+* **`IV_WEB_STATIC_MAX` 语义变了**：从"单文件硬顶（超了就 413）"变成"小文件快路径
+  的分界线"。**任何静态文件都不再 413**（只要它是普通文件），代价是大文件会占用
+  一个连接 fd 直到发完 —— 与媒体下载同一条路，已有 fd 泄漏用例守着。
+* **静态资源不再受 `--media-bps` 约束**（`no_throttle=1`）。媒体/日志下载行为不变
+  （该字段是 `memset` 的 0 默认值）。
+* **`record.page` 不下发 RTSP 地址**是刻意的：地址里常带账密。要看地址请去配置页
+  （那里本来就有，且需要登录＋改密闸门）。前端用例钉了"页面里不出现 `rtsp://`
+  与 `admin:`"。
+* **未做**（登记，不冒充）：`record.page` 的 `why` 只在"启动过又失败"的通道上有值，
+  从未尝试过的通道不给原因（"没配"与"配了没开"由 `url`/`want` 区分）；
+  面板上的录像文件列表仍归媒体下载页（`/media/...`）；`0xD1` 之类与录像无关的
+  动作没有改成走 `record.manual` 的必要，故未动。
+
+=== 验证方式与结果
+
+* VM 全量：`make host` 零告警、`make test` **48/48**、`make asan` / `make tsan`
+  （`setarch -R`）各 **48/48** 零 sanitizer、`make analyze` rc=0 零报告（先
+  `rm -rf build/analyze`，防增量假绿）、`make arm` 零告警
+  （`ivsboxd` md5 `fc0b48c12bb9bf1a7bcc9863a94f1300`、`ivsbox-web`
+  `3c90b52dd2988ac07d561ba6651cbbdb`）、`make itest` **16 passed ＋ 1 SKIP**
+  （`test_tunnel_e2e` 无设备身份，基线同）。
+* 前端：9 个 jsdom 用例全绿，含新增 `tests/web/ui_media_record.mjs`（25 条断言：
+  三态措辞、9 行表格、四种状态标签、失败原因原样出现、页面不出现 `rtsp://` /
+  `admin:`、POST 体是 `{on:true}/{on:false}`、媒体链未装配时的提示）。
+* **反向证伪 5 条**（都是"真编译通过后"跑，避开"编译失败照跑旧二进制"的假绿）：
+  ① `if (0 && r->force)` ⇒ `test_recctl` 5 红；② `record.page` 里 `on` 恒置 1 ⇒
+  `c28c` 红；③ 丢弃 ops 回的 `why` ⇒ `c28d` 红；④ `on` 退回 `(rec && !failed)` ⇒
+  `c28b2` 红（这条是板端 bug 的回归守卫）；⑤ `manual_off` 恒 0 ⇒ 3 红
+  （含 `c12: the auto path cannot restart it while suppressed (f14)`）；
+  另把静态层改回"超阈值即 413" ⇒ `test_web_http` `w09a/w09b/w09d/w09e/w10b/w10c`
+  **6 红**。全部还原后复绿（`iv_web_static.c` md5 复原一致）。
+* **板端实测**（`192.168.1.120`，主网 eth0 仍不通、4G 在线）：
+
+[source,text]
+----
+# ① 媒体自启：装上 /etc/init.d/S67ivsboxmedia（520183a4…，755）
+10:55:08 kill -9 ivsbox-media        -> 10:55:17 monitor 拉起（pid 25170）
+11:11:45 reboot                       -> 11:12:21 自动开录 channel0_111222.mp4（2.6 MB 且在长）
+ps: monitor-media.sh(1778) ivsbox-media(1815) ivsboxd(1782) ivsbox-web(1806)
+
+# ② Web 手动录像（GET 页面数据 / POST 开关）
+GET  /api/media/record -> {"recording":true,"forced":false,"held_off":false,"count":8,
+                           "ch":[{"id":0,"url":true,"want":true,"on":true},…其余 7 路 on:false]}
+POST {on:true}         -> {"on":true,"changed":true}   日志 manual recording: already recording, forced on
+POST {on:false}        -> {"on":false,"changed":true}  日志 recording stopped (1/1 ch ok)
+POST {on:false} 再来   -> {"on":false,"changed":false} 日志 manual recording: already stopped
+
+# ③ 静态资源（换 ivsbox-web 3918f9c7 -> 3c90b52d 之前 / 之后）
+wget -S http://127.0.0.1/app.js  ->  HTTP/1.1 413 Payload Too Large     （修前，浏览器白屏）
+wget -S http://127.0.0.1/app.js  ->  HTTP/1.1 200 OK, Content-Length: 134114（修后）
+落地 md5 24a9b505a1e64cb607c05e3d10441d29 == 盘上 /opt/ivsbox/web/static/app.js
+GET / 200；GET /style.css 200（6158 B）
+----
+
+* **板端抓出并修掉的两个真缺陷**（都是"看着能用、其实不对"，单测与前端用例都
+  发现不了，只有真机才露）：
+  ① `record.page` 的 `on` 初版取的是整机 `recording` ⇒ **8 路全 `on:true`**。
+  板端真帧：`{"recording":true,…{"id":1,"url":false,"want":false,"on":true}}`。
+  改为 `rec && has_url && want && !failed`，并补 `c28b2` 钉死。
+  ② 点「停止」后 **10 s 又被自动开录** —— 只清了 `force`，hold 到点就起。新增
+  `manual_off` 压制，主网恢复一拍才解除；板端实测「停止 → `held_off:true` →
+  等 25 s 仍 `recording:false`」。
+
 

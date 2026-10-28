@@ -50,7 +50,10 @@
                                 * 否则内核可能把两次 write 合并成一段，
                                 * "分段"这个前提就不成立了 */
 #define FD_LEAK_REQS    200    /* fd 泄漏检查的请求次数（ab -c 50 的本机等价替代） */
-#define RSP_CAP         (128u * 1024u)
+/* 收响应缓冲。**必须大于 `web/static` 里最大的文件**（app.js 13 万字节量级）：
+ * 缓冲比文件小的话 `http_exchange` 会在 RSP_CAP 处截断，w09c/w09e 变成"读数不够"
+ * 的假红，看起来像服务端少发了字节。128 KiB（2026-10-28 之前）已经不够了。 */
+#define RSP_CAP         (256u * 1024u)
 
 static int   g_fail;
 static pid_t g_child = -1;
@@ -512,7 +515,14 @@ int main(int argc, char *argv[])
         chk(status == 400, "w08: Content-Length over the cap -> 400 (no hang, no OOM)");
     }
 
-    /* ---------------- w09 静态资源 MIME ---------------- */
+    /* ---------------- w09 静态资源 MIME ＋ 大文件必须走文件体分流 ----------------
+     * `web/static/app.js` 已经长到 13 万字节量级，**大于静态层"整体读入"的阈值**
+     * （`IV_WEB_STATIC_MAX` = 128 KiB - 2 KiB）⇒ 走的就是 S6.4 的文件体分流。
+     * 2026-10-28 那天它顶穿了阈值而服务端还按"读进 wbuf"处理 ⇒ 板端 `/app.js`
+     * 回 `413 Payload Too Large`、整个 Web UI 白屏（板端 wget 实证）。w09d/w09e
+     * 把"声明长度"与"实际字节数"都钉在磁盘文件的真实大小上，回 413 或截断都会红。
+     * ⚠ 若哪天 app.js 缩回阈值以内，本组仍然全绿，但**分流分支就没覆盖了** ——
+     *   到那时需要另造一个超阈值文件，别以为这几条还守着它。 */
     {
         int len = snprintf(g_req, sizeof(g_req),
                            "GET /app.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
@@ -523,6 +533,20 @@ int main(int argc, char *argv[])
         cl = rsp_content_length((size_t)total);
         bl = rsp_body_len((size_t)total);
         chk(cl > 0 && cl == bl, "w09c: static body length consistent");
+
+        {
+            char        fp[600];
+            struct stat st;
+
+            (void)snprintf(fp, sizeof(fp), "%.560s/app.js", root);
+            if (stat(fp, &st) != 0) {
+                chk(0, "w09d: cannot stat app.js under the static root");
+            } else {
+                chk(cl == (long)st.st_size,
+                    "w09d: Content-Length equals the on-disk size (no 413, no truncation)");
+                chk(bl == (long)st.st_size, "w09e: body bytes equal the on-disk size");
+            }
+        }
     }
 
     /* ---------------- w10 fd 不泄漏（ab -c N 的本机等价替代） ---------------- */

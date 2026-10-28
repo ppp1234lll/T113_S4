@@ -18,6 +18,10 @@
  *       recording 归 0、原因写明"已受理但未进入录像"；status 说在录 ⇒ 保持
  *   c11 判据只看主网（2026-10-28）：`main_up=1` 就停、`main_up=0` 就录，
  *       **没有任何其它入参**能改变这个结论（旧口径的 4G/平台参数已删除）
+ *   c12 手动（强制）录像（2026-10-28）：on=1 立即开录且**不受主网状态影响**、
+ *       自动态下按"立即录像"只升格不重发、总失败时回原因并**退出强制态**、
+ *       闸门/热更新照样能停它；on=0 还要**压住自动开录**（否则 10 s 后自己又录，
+ *       按钮看起来是坏的），且主网恢复一次即解除压制
  *
  * 反向证伪（本用例内建）：
  *   f1 若把"保持"判据去掉（到达 hold 前就开录），c02 的保持段会提前动作；
@@ -33,6 +37,11 @@
  *   f9 若把原因记录去掉，c09 的 `fail_reason` 会返回 0；
  *   f11 若 `iv_recctl_set_cfg()` 不拿调用方给的 now 设退避（改用 0），c08 的
  *       ⑥ 会红 —— 现场形态是"热更新后 11 s 就重试"，每拍吃一次 500 ms 预检。
+ *   f12 若把 force 分支从 `iv_recctl_step()` 里去掉（手动录像照样受主网管），
+ *       c12 ③/⑤ 会在主网恢复 60 s 后被停；
+ *   f13 若启动总失败后不清 force，c12 ⑥ 那句"后台没有静默重试"会红。
+ *   f14 若手动停止不置压制位（只清 force），c12 ⑨ 会在 10 s 后被自动路径重新
+ *       拉起来 —— 板端现象就是"按了停止，过一会儿又自己录了"。
  * 以上都由对应的 chk 钉死：动作次数与时间是精确断言，多一次/少一次都红。
  */
 #include <stdio.h>
@@ -470,6 +479,137 @@ int main(void)
         chk(iv_recctl_step(&r, 0, 211000, &ops) == 1,
             "c11: main link down => starts after hold, with no other condition");
         chk(iv_recctl_recording(&r) == 1, "c11: recording driven by the main link alone");
+    }
+
+    /* ---------------- c12 手动（强制）录像（f12 / f13） ---------------- */
+    {
+        char why[IV_RECCTL_WHY_MAX];
+
+        /* ① 没有可录的通道：这不是"按错了"，是**该去配置页** —— why 必须说清 */
+        iv_recctl_cfg_default(&cfg); /* n_url = 0 */
+        fake_reset(&f);
+        chk(iv_recctl_init(&r, &cfg) == IV_OK, "c12: init with an empty table");
+        why[0] = '\0';
+        chk(iv_recctl_manual(&r, 1, 5000, &ops, why, sizeof(why)) == IV_ESTATE,
+            "c12: manual start without any source -> ESTATE");
+        chk(why[0] != '\0', "c12: an empty table still explains itself");
+        chk(f.n_start == 0, "c12: nothing attempted on an empty table");
+        chk(iv_recctl_forced(&r) == 0, "c12: not left in force mode");
+
+        /* ② on=1 立刻开录：**不等 hold**（hold 是"等主网稳定"，人工不该等） */
+        cfg_two_urls(&cfg);
+        fake_reset(&f);
+        chk(iv_recctl_init(&r, &cfg) == IV_OK, "c12: init ok");
+        why[0] = '\0';
+        chk(iv_recctl_manual(&r, 1, 5000, &ops, why, sizeof(why)) == 1,
+            "c12: manual start reports a transition");
+        chk(f.n_start == 2, "c12: both channels started immediately");
+        chk(iv_recctl_recording(&r) == 1, "c12: recording flag set");
+        chk(iv_recctl_forced(&r) == 1, "c12: force flag set");
+
+        /* ③ 主网**通着**，且远超 debounce(60 s)：手动录像不许被停（f12） */
+        (void)iv_recctl_step(&r, 1, 10000, &ops);
+        (void)iv_recctl_step(&r, 1, 200000, &ops);
+        chk(f.n_stop == 0, "c12: manual recording survives main-link recovery (f12)");
+        chk(iv_recctl_recording(&r) == 1, "c12: still recording with force on (f12)");
+
+        /* ④ on=0 ⇒ 停 + 退出强制态 */
+        fake_reset(&f);
+        chk(iv_recctl_manual(&r, 0, 201000, &ops, why, sizeof(why)) == 1,
+            "c12: manual stop reports a transition");
+        chk(f.n_stop == 2, "c12: both channels stopped");
+        chk(iv_recctl_recording(&r) == 0, "c12: recording cleared");
+        chk(iv_recctl_forced(&r) == 0, "c12: force cleared");
+        chk(iv_recctl_manual(&r, 0, 202000, &ops, why, sizeof(why)) == 0,
+            "c12: stopping an idle machine is a no-op");
+
+        /* ⑤ 自动态（主网断）下按"立即录像"：只升格成强制，不重发 start */
+        fake_reset(&f);
+        chk(iv_recctl_init(&r, &cfg) == IV_OK, "c12: init for the upgrade case");
+        (void)iv_recctl_step(&r, 0, 300000, &ops);
+        (void)iv_recctl_step(&r, 0, 310000, &ops);
+        chk(iv_recctl_recording(&r) == 1, "c12: auto recording first");
+        {
+            int ns = f.n_start;
+
+            chk(iv_recctl_manual(&r, 1, 311000, &ops, why, sizeof(why)) == 1,
+                "c12: manual start while already recording -> ok");
+            chk(f.n_start == ns, "c12: no redundant start when already recording");
+            chk(f.n_stop == 0, "c12: and no stop either");
+            chk(iv_recctl_forced(&r) == 1, "c12: upgraded to the forced state");
+        }
+        /* 升格之后主网恢复同样停不下来（f12 的第二个侧面） */
+        (void)iv_recctl_step(&r, 1, 400000, &ops);
+        (void)iv_recctl_step(&r, 1, 600000, &ops);
+        chk(f.n_stop == 0, "c12: an upgraded forced recording ignores recovery too (f12)");
+
+        /* ⑥ 一路都起不来：ESTATE + 原因透传 + **不残留强制态**（f13） */
+        fake_reset(&f);
+        f.start_fail = 1;
+        f.fail_why   = "摄像机网络不可达：10.0.0.11:554 连接超时（500ms）";
+        chk(iv_recctl_init(&r, &cfg) == IV_OK, "c12: init for the reject case");
+        why[0] = '\0';
+        chk(iv_recctl_manual(&r, 1, 700000, &ops, why, sizeof(why)) == IV_ESTATE,
+            "c12: all channels refused -> ESTATE");
+        chk(strcmp(why, "摄像机网络不可达：10.0.0.11:554 连接超时（500ms）") == 0,
+            "c12: the first channel's reason is handed back verbatim");
+        chk(iv_recctl_recording(&r) == 0, "c12: not recording after a total failure");
+        chk(iv_recctl_forced(&r) == 0, "c12: force is NOT left on after a total failure (f13)");
+        {
+            int att = f.n_start_att;
+
+            (void)iv_recctl_step(&r, 1, 731000, &ops);
+            (void)iv_recctl_step(&r, 1, 800000, &ops);
+            chk(f.n_start_att == att,
+                "c12: no silent retry loop behind the user's back (f13)");
+        }
+        f.start_fail = 0;
+
+        /* ⑦ 存储闸门要停就停，并顺手清掉强制态 */
+        fake_reset(&f);
+        chk(iv_recctl_init(&r, &cfg) == IV_OK, "c12: init for the gate case");
+        chk(iv_recctl_manual(&r, 1, 900000, &ops, why, sizeof(why)) == 1,
+            "c12: manual start before the gate");
+        chk(iv_recctl_forced(&r) == 1, "c12: forced");
+        chk(iv_recctl_gate(&r, 0, 1, &ops) == 2, "c12: the storage gate stops it anyway");
+        chk(iv_recctl_recording(&r) == 0, "c12: recording cleared by the gate");
+        chk(iv_recctl_forced(&r) == 0, "c12: force cleared by the gate");
+        chk(iv_recctl_gate(&r, 1, 0, &ops) == 0, "c12: gate reset");
+
+        /* ⑧ 人工停止必须压得住自动开录（f14）：主网断着也不能"10 s 后自己又开始录"，
+         * 但**主网恢复一次即解除**（一次点击不该把断网录像这条安全功能永久关掉）。 */
+        fake_reset(&f);
+        chk(iv_recctl_init(&r, &cfg) == IV_OK, "c12: init for the suppress case");
+        (void)iv_recctl_step(&r, 0, 1000000, &ops); /* 主网断：起计时 */
+        (void)iv_recctl_step(&r, 0, 1010000, &ops); /* 到 hold：自动开录 */
+        chk(iv_recctl_recording(&r) == 1, "c12: auto recording before the manual stop");
+        chk(iv_recctl_manual(&r, 0, 1011000, &ops, why, sizeof(why)) == 1,
+            "c12: manual stop while the main link is still down");
+        chk(iv_recctl_held_off(&r) == 1, "c12: auto start is suppressed (f14)");
+        {
+            int att = f.n_start_att;
+
+            (void)iv_recctl_step(&r, 0, 1020000, &ops);
+            (void)iv_recctl_step(&r, 0, 2000000, &ops);
+            chk(f.n_start_att == att,
+                "c12: the auto path cannot restart it while suppressed (f14)");
+            chk(iv_recctl_recording(&r) == 0, "c12: still stopped while suppressed");
+        }
+        /* 主网恢复一拍 ⇒ 压制解除；再断网仍按 hold 自动录（回到安全功能的常态） */
+        (void)iv_recctl_step(&r, 1, 2001000, &ops);
+        chk(iv_recctl_held_off(&r) == 0, "c12: a recovery clears the suppression");
+        (void)iv_recctl_step(&r, 0, 2002000, &ops);
+        (void)iv_recctl_step(&r, 0, 2012000, &ops);
+        chk(iv_recctl_recording(&r) == 1,
+            "c12: the next outage records again on the auto path");
+        chk(iv_recctl_forced(&r) == 0, "c12: and that one is auto, not forced");
+        (void)iv_recctl_stop_all(&r, &ops); /* 收尾，别把状态带进后面的用例 */
+
+        /* ⑨ 入参守卫 */
+        chk(iv_recctl_manual(NULL, 1, 0, &ops, NULL, 0) == IV_EINVAL,
+            "c12: NULL state -> EINVAL");
+        chk(iv_recctl_manual(&r, 1, 0, NULL, NULL, 0) == IV_EINVAL,
+            "c12: NULL ops -> EINVAL");
     }
 
     if (g_fail != 0) {

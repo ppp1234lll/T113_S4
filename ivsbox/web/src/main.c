@@ -404,7 +404,10 @@ static void build_response(iv_web_conn_t *c, const iv_web_resp_t *rsp, size_t bo
     c->send_left = (ffd >= 0) ? rsp->file_len : 0u;
     c->flen      = 0u;
     c->fsent     = 0u;
-    c->rl_bps           = g_ctx.media_bps;
+    /* 限速只给"录像/日志下载"这类大流量；静态资源走 `no_throttle` 免限速
+     * （否则 13 万字节的 app.js 在默认 256 KiB/s 下要多等 0.5 s，
+     *  而它本来就不值得限）。0 是 memset 默认值 ⇒ 媒体路径行为不变。 */
+    c->rl_bps           = (rsp->no_throttle != 0) ? 0u : g_ctx.media_bps;
     c->rl_win_start_ms  = iv_web_now_ms();
     c->rl_sent          = 0u;
     c->rl_wait_until_ms = 0u;

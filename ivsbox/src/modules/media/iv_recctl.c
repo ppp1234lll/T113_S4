@@ -3,6 +3,7 @@
  *
  * 判据：只看主网（有线 WAN）。4G 与平台链路不参与。
  * 失败：start 带原因，status 复查真实状态，原因留成人能看懂的中文。
+ * 手动：force 标记绕过主网判据（见 iv_recctl_manual）。
  */
 #include "ivsbox/iv_recctl.h"
 
@@ -50,7 +51,28 @@ static void clear_why(iv_recctl_t *r, int id)
     r->ch_why[id][0]  = '\0';
 }
 
-static int start_all(iv_recctl_t *r, uint64_t now_ms, const iv_recctl_ops_t *ops)
+/* 把**第一路**失败原因抄出去（手动启动失败时给页面一句话）。
+ * 没有失败原因时写兜底文案 —— 调用方拿到的永远不是空串。 */
+static void copy_first_why(const iv_recctl_t *r, char *why, size_t cap)
+{
+    int i;
+
+    if (why == NULL || cap == 0u)
+        return;
+    for (i = 0; i < r->cfg.n_url && i < IV_RECCTL_CH_N; i++) {
+        if (!r->ch_failed[i])
+            continue;
+        (void)snprintf(why, cap, "%s",
+                       (r->ch_why[i][0] != '\0') ? r->ch_why[i] : WHY_FALLBACK);
+        return;
+    }
+    (void)snprintf(why, cap, "%s", WHY_FALLBACK);
+}
+
+/* `manual` 只影响日志措辞：自动路径的日志读作"main link down"，
+ * 手动路径要是也这么说，现场看日志会以为主网又断了。 */
+static int start_all(iv_recctl_t *r, uint64_t now_ms, const iv_recctl_ops_t *ops,
+                     int manual)
 {
     int i;
     int ok = 0;
@@ -82,8 +104,8 @@ static int start_all(iv_recctl_t *r, uint64_t now_ms, const iv_recctl_ops_t *ops
         /* 受理 ≠ 在录：3 s 后由 confirm_pending() 复查真实状态 */
         r->pending    = 1;
         r->pending_ms = now_ms;
-        IV_LOG_I(RC_MOD, "main link down: recording started (%d/%d ch), "
-                         "confirming in %ums", ok, r->cfg.n_url,
+        IV_LOG_I(RC_MOD, "%s: recording started (%d/%d ch), confirming in %ums",
+                 manual ? "manual" : "main link down", ok, r->cfg.n_url,
                  (unsigned)IV_RECCTL_CONFIRM_MS);
         return 1;
     }
@@ -91,7 +113,8 @@ static int start_all(iv_recctl_t *r, uint64_t now_ms, const iv_recctl_ops_t *ops
     /* 一路都没受理 ⇒ 不置位 recording，按退避重试（预检要连 TCP，
      * 每拍重来会拖住 Reactor 单线程）。down_since 保留，"主网断"计时连续。 */
     r->next_try_ms = now_ms + IV_RECCTL_RETRY_MS;
-    IV_LOG_W(RC_MOD, "main link down but no channel could start; retry in %us",
+    IV_LOG_W(RC_MOD, "%s but no channel could start; retry in %us",
+             manual ? "manual start" : "main link down",
              (unsigned)(IV_RECCTL_RETRY_MS / 1000u));
     return 0;
 }
@@ -150,6 +173,8 @@ static void confirm_pending(iv_recctl_t *r, uint64_t now_ms,
     }
 }
 
+/* 逐路停 + 清全部状态。**强制态在这里一并清掉**：stop_all 是"整机停录"的唯一
+ * 出口（人工停 / 闸门停 / 换配置停都走它），停了就没人再强制。 */
 static int stop_all(iv_recctl_t *r, const iv_recctl_ops_t *ops)
 {
     int i;
@@ -168,6 +193,7 @@ static int stop_all(iv_recctl_t *r, const iv_recctl_ops_t *ops)
     r->up_since_ms   = 0;
     r->pending       = 0;
     r->next_try_ms   = 0;
+    r->force         = 0;
     IV_LOG_I(RC_MOD, "recording stopped (%d/%d ch ok)", ok, r->cfg.n_url);
     return 1;
 }
@@ -190,6 +216,13 @@ int iv_recctl_step(iv_recctl_t *r, int main_up, uint64_t now_ms,
     confirm_pending(r, now_ms, ops);
 
     if (r->recording) {
+        /* 手动态：主网通不通都不影响（用户口径"按下按钮就得一直录"）。
+         * 只把 up_since 清零，免得将来退出强制态时拿着一个陈旧的"恢复时刻"
+         * 立刻触发防抖停录。 */
+        if (r->force) {
+            r->up_since_ms = 0;
+            return 0;
+        }
         if (!main_up) {
             r->up_since_ms = 0; /* 主网还断着：恢复计时清零 */
             return 0;
@@ -204,11 +237,31 @@ int iv_recctl_step(iv_recctl_t *r, int main_up, uint64_t now_ms,
         return 0;
     }
 
-    /* 未在录 */
+    /* 手动态但没在录（启动全失败、或确认后判死）：按退避重试，**不看主网**。
+     * 少了这一段，"主网正常时点开始录像"会变成点一次亮一下、再也不动 ——
+     * 因为下面的自动路径一判 main_up 就直接 return 了。 */
+    if (r->force) {
+        if (r->gate_block)
+            return 0;
+        if (r->next_try_ms != 0 && now_ms < r->next_try_ms)
+            return 0;
+        return start_all(r, now_ms, ops, 1);
+    }
+
+    /* 未在录（自动路径） */
     if (main_up) {
+        /* 主网回来了 ⇒ 人工"停止录像"的压制到此解除（"这次故障过去了"）。
+         * 不解除的话，一次点击会把"断网录像"这条安全功能永久关掉 —— 那与产品
+         * 口径冲突（见头文件）。 */
+        r->manual_off    = 0;
         r->down_since_ms = 0;
         return 0;
     }
+    /* 人工压制：主网断着，但用户按过"停止录像" ⇒ 不起自动录像。
+     * 2026-10-28 板端实测过不压的情形：点停止后 10 s（hold）又自己录起来，
+     * 现场只会认为按钮坏了。 */
+    if (r->manual_off)
+        return 0;
     if (r->down_since_ms == 0) {
         r->down_since_ms = now_ms;
         return 0;
@@ -222,7 +275,7 @@ int iv_recctl_step(iv_recctl_t *r, int main_up, uint64_t now_ms,
     /* 失败退避：刚试过一轮且全失败，等退避到期再来 */
     if (r->next_try_ms != 0 && now_ms < r->next_try_ms)
         return 0;
-    return start_all(r, now_ms, ops);
+    return start_all(r, now_ms, ops, 0);
 }
 
 int iv_recctl_gate(iv_recctl_t *r, int allow_new, int stop_rec,
@@ -252,6 +305,7 @@ int iv_recctl_gate(iv_recctl_t *r, int allow_new, int stop_rec,
     r->up_since_ms   = 0;
     r->pending       = 0;
     r->next_try_ms   = 0;
+    r->force         = 0;
     IV_LOG_W(RC_MOD, "storage gate: recording stopped immediately (%d ch)", n);
     return n;
 }
@@ -262,6 +316,7 @@ int iv_recctl_stop_all(iv_recctl_t *r, const iv_recctl_ops_t *ops)
         return IV_EINVAL;
     if (!r->recording) {
         r->pending = 0;
+        r->force   = 0; /* 没在录也要退出强制态，否则下一拍又会自己开录 */
         return 0;
     }
     (void)stop_all(r, ops);
@@ -271,6 +326,92 @@ int iv_recctl_stop_all(iv_recctl_t *r, const iv_recctl_ops_t *ops)
 int iv_recctl_recording(const iv_recctl_t *r)
 {
     return (r != NULL) ? (int)r->recording : 0;
+}
+
+int iv_recctl_forced(const iv_recctl_t *r)
+{
+    return (r != NULL) ? (int)r->force : 0;
+}
+
+int iv_recctl_held_off(const iv_recctl_t *r)
+{
+    return (r != NULL) ? (int)r->manual_off : 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * 手动（强制）录像 —— 语义见头文件"手动（强制）录像"一节
+ *
+ * 与自动路径**共用** start_all / stop_all：走的仍是同一条预检＋两级确认，
+ * 所以手动启动失败给出的原因与自动路径逐字相同（现场不用记两套说法）。
+ * 唯一的差别是 `force` 标记 —— 它让 step 的自动判据绕开这一轮录像。
+ * -------------------------------------------------------------------------- */
+int iv_recctl_manual(iv_recctl_t *r, int on, uint64_t now_ms,
+                     const iv_recctl_ops_t *ops, char *why, size_t whycap)
+{
+    int n;
+
+    if (why != NULL && whycap > 0u)
+        why[0] = '\0';
+    if (r == NULL || ops == NULL || ops->start == NULL || ops->stop == NULL)
+        return IV_EINVAL;
+    /* 表空 ＝ 配置上没有任何一路"既配了地址又打开了录像开关"。
+     * 这不是"按错了"，是**该去配置页**：把这句话原样给到页面。 */
+    if (r->cfg.n_url <= 0) {
+        if (why != NULL && whycap > 0u)
+            (void)snprintf(why, whycap,
+                           "没有可录的通道：需同时配好 camera.ch.N.url 与 "
+                           "camera.ch.N.record");
+        return IV_ESTATE;
+    }
+
+    if (on) {
+        r->manual_off = 0; /* 人工"开始"当然要撤掉上一次的压制 */
+        if (r->recording) {
+            /* 已经在录（自动态）⇒ 升格成强制态，不重发 start：
+             * 桥接层对"已在录"的那一路本就回 OK，但重发会多一轮无谓的
+             * HTTP + 预检，而结果完全相同。 */
+            r->force       = 1;
+            r->up_since_ms = 0;
+            r->next_try_ms = 0;
+            IV_LOG_I(RC_MOD, "manual recording: already recording, forced on");
+            return 1;
+        }
+        r->force         = 1;
+        r->down_since_ms = 0; /* 手动态与"主网断"计时无关 */
+        r->next_try_ms   = 0;
+        n = start_all(r, now_ms, ops, 1);
+        if (n == 0) {
+            /* 一路都没受理：**立刻退出强制态**。留着的话 step 每 30 s 空转
+             * 一轮预检，而页面已经明确告诉用户"没起来"，不需要后台偷偷重试。 */
+            r->force = 0;
+            copy_first_why(r, why, whycap);
+            return IV_ESTATE;
+        }
+        return 1;
+    }
+
+    r->force = 0;
+    if (!r->recording) {
+        r->pending     = 0;
+        r->next_try_ms = 0;
+        /* 本来没在录也要置压制位：主网断着的话，不置它 10 s 后自动判据就会开录，
+         * 用户看到的现象就是"按了停止，过一会儿又自己录了"。 */
+        if (r->manual_off) {
+            IV_LOG_I(RC_MOD, "manual recording: already stopped");
+            return 0;
+        }
+        r->manual_off = 1;
+        IV_LOG_I(RC_MOD, "manual recording: auto start suppressed until the "
+                         "main link comes back");
+        return 1;
+    }
+    (void)stop_all(r, ops);
+    /* stop_all 只清 force；压制位在这里补上（顺序不能反：stop_all 之后置，
+     * 免得将来有人给它加一句"顺手清 manual_off"） */
+    r->manual_off = 1;
+    IV_LOG_I(RC_MOD, "manual recording: stopped, auto start suppressed until the "
+                     "main link comes back");
+    return 1;
 }
 
 int iv_recctl_fail_reason(const iv_recctl_t *r, int id, char *buf, size_t cap)
@@ -319,11 +460,14 @@ int iv_recctl_set_cfg(iv_recctl_t *r, const iv_recctl_cfg_t *cfg,
     if (was && (ops == NULL || ops->start == NULL || ops->stop == NULL))
         return IV_EINVAL;
 
+    /* 热更新会丢掉强制态（`stop_all` 清 force，`init` 也清）：新表重开是一次
+     * 全新的开始，人工那份"强制"不该跨过配置变更继续生效 —— 否则用户改了地址
+     * 之后录像行为"改不回来"，还得再点一次停止才能回到自动。 */
     if (was)
         (void)iv_recctl_stop_all(r, ops);
     if (iv_recctl_init(r, cfg) != IV_OK)
         return IV_EINVAL;
     if (was)
-        (void)start_all(r, now_ms, ops); /* 新表重开；一路都没起来时 recording 保持 0 */
+        (void)start_all(r, now_ms, ops, 0); /* 新表重开；一路都没起来时 recording 保持 0 */
     return IV_OK;
 }

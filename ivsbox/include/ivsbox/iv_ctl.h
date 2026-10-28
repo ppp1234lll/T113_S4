@@ -76,6 +76,18 @@
  *                                          `{id,recording,known[,reason]}` ——
  *                                          `known:false` 表示"桥查不到，不知道"，
  *                                          见 iv_ctl.c 的 D-10 说明）
+ *   record.page        —                   录像页**一次读全**（2026-10-28）：
+ *                                          `{recording,forced,held_off,count,ch:[
+ *                                          {id,url,want,on,failed[,why]}]}`。
+ *                                          `url`＝该路有没有配拉流地址（**只回布尔，
+ *                                          绝不回含账密的地址**）；`want`＝
+ *                                          `camera.ch.N.record`；`on`＝状态机认为这一路
+ *                                          在录（该路进了表 ＋ 整机在录 ＋ 未判失败）；
+ *                                          `held_off`＝人工停止后压制着自动开录。
+ *   record.manual      {"on":true|false}   手动录像开关（Web「立即录像 / 停止」）：
+ *                                          on=1 **强制**开始，不受主网状态影响；
+ *                                          on=0 停止并退出强制态。失败回可读原因
+ *                                          （`{"ok":false,"msg":"摄像机端口未开放：…"}`）。
  *   ota.status         —                   升级状态（pending/版本/bootcount/回滚次数；M7-S7.2）
  *   ota.request        {"path":"/...","restart":true}
  *                                          落一个"请装这个包"请求（M7-S7.2）。
@@ -145,6 +157,21 @@ typedef struct {
      * 目的是让现场**照着这句话就能修**，不是一个错误码。
      */
     int (*record_reason)(int id, char *buf, size_t cap, void *arg);
+    /*
+     * 整机录像状态（2026-10-28，`record.page` 用）：
+     * 返回 1 = 在录 / 0 = 未在录 / <0 = 不可用；`forced` 写入 1 表示"人工强制"
+     * （不受主网状态影响），`held_off` 写入 1 表示"人工停止后压制了自动开录"
+     * （主网恢复一次即解除）。两个出参都可为 NULL。
+     * 可空 —— 为空时 `record.page` 只给通道表，不给整机态。
+     */
+    int (*record_state)(int *forced, int *held_off, void *arg);
+    /*
+     * 整机手动录像（`record.manual` 用）：on=1 强制开始 / on=0 停止。
+     * 失败时把**人能照着修**的原因写进 why（配置错 / 摄像机不可达 / 媒体进程没起）；
+     * 返回 `IV_OK`/`IV_ESTATE`（一路都没起来，原因在 why）/`IV_EINVAL`。
+     * **可空** ⇒ `record.manual` 返回 `IV_ENOTSUP`（"能调但没接"，同一口径）。
+     */
+    int (*record_manual)(int on, char *why, size_t cap, void *arg);
     void *arg;
 } iv_ctl_media_ops_t;
 

@@ -79,6 +79,8 @@ static const char *const k_methods[] = {
     "record.start",
     "record.stop",
     "record.status",
+    "record.page",
+    "record.manual",
     "ota.status",
     "ota.request",
     "tunnel.status",
@@ -2801,6 +2803,143 @@ static int m_media_record_status(const iv_ctl_ctx_t *ctx, json_object *p,
     return rsp_data(d, out, cap, out_len);
 }
 
+/* ---------------------------------------------------------------------------
+ * record.page / record.manual（2026-10-28，Web 录像页）
+ *
+ * ============================ 为什么要有 page ============================
+ * 页面要把 8 个通道的"配了没 / 开了没 / 在不在录 / 为什么没录上"一次画出来。
+ * 让前端循环 8 次 `record.status` 会有两个坏处：
+ *   1. 每次都要过一遍回环 HTTP（media 慢的时候 8 次叠加）；
+ *   2. 状态可能跨了两次轮询，表里出现"第 1 路在录、汇总说没录"的自相矛盾。
+ * 一次读完即一份快照，页面只认这一份。
+ *
+ * ============================ 有三个隐瞒 ============================
+ *   · **不回 `camera.ch.N.url` 的值**（含账密），只回 `url:true/false`。页面需要
+ *     知道的只是"这一路配没配"，把口令串送到浏览器没有任何好处。
+ *   · 不含录像文件列表：那属于 `/media/...` 下载通道（`iv_web_media.c`），
+ *     本方法一个字节都不读 SD 卡。
+ *   · 不主动去问 media 进程（不逐个调 `record_status`）：状态全取状态机的镜像。
+ *     镜像在启动 3 s 后的 `confirm_pending()` 里已经和 media 核对过一遍，
+ *     再逐个查一遍只会让页面在媒体进程卡死时一起卡住。
+ *     副作用是"页面看到的是状态机的认为"，所以 `on` 字段的措辞是"认为在录"。
+ * -------------------------------------------------------------------------- */
+static int m_media_record_page(const iv_ctl_ctx_t *ctx, char *out, size_t cap,
+                               size_t *out_len)
+{
+    json_object *d;
+    json_object *arr;
+    int          rec  = 0;
+    int          forced = 0;
+    int          held_off = 0;
+    int          i;
+
+    if (ctx->media == NULL)
+        return rsp_err(IV_ENOTSUP, "media not wired", out, cap, out_len);
+    if (ctx->media->record_state != NULL) {
+        int st = ctx->media->record_state(&forced, &held_off, ctx->media_arg);
+
+        if (st >= 0)
+            rec = st;
+    }
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    arr = json_object_new_array();
+    if (arr == NULL) {
+        json_object_put(d);
+        return IV_ENOMEM;
+    }
+
+    for (i = 0; i < IV_RECCTL_CH_N; i++) {
+        char        key[48];
+        const char *url = NULL;
+        int         has_url = 0;
+        int         want = 0;
+        int         failed = 0;
+        char        why[IV_RECCTL_WHY_MAX];
+        json_object *o;
+
+        (void)snprintf(key, sizeof(key), "camera.ch.%d.url", i);
+        if (ctx->cfg != NULL &&
+            iv_config_get_str(ctx->cfg, key, &url) == IV_OK && url != NULL &&
+            url[0] != '\0')
+            has_url = 1;
+        (void)snprintf(key, sizeof(key), "camera.ch.%d.record", i);
+        if (ctx->cfg != NULL)
+            (void)iv_config_get_bool(ctx->cfg, key, &want);
+
+        why[0] = '\0';
+        failed = (ctx->media->record_reason != NULL &&
+                  ctx->media->record_reason(i, why, sizeof(why), ctx->media_arg) == 1);
+
+        o = json_object_new_object();
+        if (o == NULL)
+            continue;
+        json_object_object_add(o, "id", json_object_new_int(i));
+        /* `url` 只给布尔：地址里有账密，页面不需要也不该拿到（见上面"三个隐瞒"） */
+        json_object_object_add(o, "url", json_object_new_boolean(has_url ? 1 : 0));
+        json_object_object_add(o, "want", json_object_new_boolean(want ? 1 : 0));
+        /* `on`＝状态机认为这一路在录。三个条件缺一不可：**这一路本来就进了录像表**
+         * （配了地址 且 `camera.ch.N.record` 为真）、整机在录、这一路没被判失败。
+         * ⚠ 少了"这一路在不在表里"这一条，8 路会全部报"在录" —— 2026-10-28 板端
+         * 实测就是这样（第 2~8 路既没地址也没开开关，却全显示 on:true），
+         * 因为整机这一个位被当成了每路的位。 */
+        json_object_object_add(
+            o, "on",
+            json_object_new_boolean((rec && has_url && want && !failed) ? 1 : 0));
+        json_object_object_add(o, "failed", json_object_new_boolean(failed ? 1 : 0));
+        if (failed && why[0] != '\0')
+            json_object_object_add(o, "why", json_object_new_string(why));
+        json_object_array_add(arr, o);
+    }
+
+    json_object_object_add(d, "recording", json_object_new_boolean(rec ? 1 : 0));
+    json_object_object_add(d, "forced", json_object_new_boolean(forced ? 1 : 0));
+    /* `held_off`：人工按过"停止录像"、正在压制自动开录。没有它，页面只能显示
+     * "未录像"，而主网明明断着 —— 看起来像功能坏了（2026-10-28 板端就是这个形态）。 */
+    json_object_object_add(d, "held_off", json_object_new_boolean(held_off ? 1 : 0));
+    json_object_object_add(d, "count", json_object_new_int(IV_RECCTL_CH_N));
+    json_object_object_add(d, "ch", arr);
+    return rsp_data(d, out, cap, out_len);
+}
+
+/* 手动启停。**失败原因原样当 msg 回**（"摄像机端口未开放：192.168.1.64:554 拒绝
+ * 连接"比 "record manual failed" 有用一万倍）—— 这正是用户 2026-10-28 的要求：
+ * 起不来就要说清是什么原因。 */
+static int m_media_record_manual(const iv_ctl_ctx_t *ctx, json_object *p,
+                                 char *out, size_t cap, size_t *out_len)
+{
+    json_object *v = NULL;
+    char         why[IV_RECCTL_WHY_MAX];
+    int          on;
+    int          rc;
+    json_object *d;
+
+    if (ctx->media == NULL || ctx->media->record_manual == NULL)
+        return rsp_err(IV_ENOTSUP, "media not wired", out, cap, out_len);
+    if (!json_object_object_get_ex(p, "on", &v) || v == NULL)
+        return rsp_err(IV_EINVAL, "missing on", out, cap, out_len);
+    on = json_object_get_boolean(v) ? 1 : 0;
+
+    why[0] = '\0';
+    rc = ctx->media->record_manual(on, why, sizeof(why), ctx->media_arg);
+    if (rc < 0) {
+        if (why[0] != '\0')
+            return rsp_err(rc, why, out, cap, out_len);
+        return rsp_err(rc, on ? "record start failed" : "record stop failed",
+                       out, cap, out_len);
+    }
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "on", json_object_new_boolean(on));
+    /* 1 = 真的开始/停掉了；0 = 无须动作（停的时候本来就没在录）。
+     * 页面据此决定提示"已开始"还是"本来就没在录"，不自己猜。 */
+    json_object_object_add(d, "changed", json_object_new_boolean(rc ? 1 : 0));
+    return rsp_data(d, out, cap, out_len);
+}
+
 /* ============================ ota.status / ota.request（M7-S7.2） ============================ */
 
 /* OTA 落点：本模块不持有配置，只在调用瞬间借用（与 cfg/agent 同一口径）。 */
@@ -3179,6 +3318,10 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_media_record_stop(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "record.status") == 0)
         rc = m_media_record_status(ctx, params, out, out_cap, out_len);
+    else if (strcmp(method, "record.page") == 0)
+        rc = m_media_record_page(ctx, out, out_cap, out_len);
+    else if (strcmp(method, "record.manual") == 0)
+        rc = m_media_record_manual(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "ota.status") == 0)
         rc = m_ota_status(ctx, out, out_cap, out_len);
     else if (strcmp(method, "ota.request") == 0)

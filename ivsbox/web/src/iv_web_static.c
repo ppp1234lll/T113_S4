@@ -12,6 +12,11 @@
  * 而不是"黑名单查 `..`"：路径只允许 `[A-Za-z0-9._-/]`，`..` 自然被拦下，
  * 且不会漏掉 `%2e%2e` 之外的变体（本层不做 URL 解码，百分号本身就不在白名单里）。
  * 这是**第二道**——第一道是 static_root 本就不该包含敏感目录。
+ *
+ * ============================ 大文件（2026-10-28） ============================
+ * 静态资源不再有"单个文件上限"：超 `IV_WEB_STATIC_MAX` 的文件走 S6.4 的文件体
+ * 分流（`rsp->file_path`，正文 pread 分块发），只有小文件才整体读进 wbuf 快路径。
+ * 起因是 `/app.js` 长到 133673 B 顶穿 129024 B 的硬顶 ⇒ 板端整个 Web UI 白屏。
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -22,6 +27,9 @@
 
 #include "ivsbox/iv_ret.h"
 #include "iv_web.h"
+
+/* 文件体分流的路径存放点（见 .c 末尾"大文件"分支的注释：只在一次调用栈内有效）。 */
+static char s_static_path[IV_WEB_PATH_MAX * 2u];
 
 /* 路径字符白名单。注意空格、`%`、`\` 都不在内 —— 静态资源文件名一律用
  * 简单 ASCII，不需要给浏览器留转义口子。 */
@@ -119,22 +127,49 @@ int iv_web_static_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
         set_simple(out, cap, out_len, rsp, 404, "not a file");
         return IV_OK;
     }
-    if ((size_t)st.st_size > (size_t)IV_WEB_STATIC_MAX || (size_t)st.st_size >= cap) {
+    /* ---- 快路径：放得进 wbuf 正文区的文件，一次读入、一次 send 发完 ----
+     * 页面里绝大多数资源（index.html / style.css / 图标）都走这里。
+     * `st_size < cap` 是硬条件：真放不下就绝不能读进来（会写穿 wbuf）。 */
+    if ((size_t)st.st_size <= (size_t)IV_WEB_STATIC_MAX && (size_t)st.st_size < cap) {
+        n = read(fd, out, (size_t)st.st_size);
         (void)close(fd);
-        set_simple(out, cap, out_len, rsp, 413, "file too large");
+        if (n < 0) {
+            set_simple(out, cap, out_len, rsp, 500, "read error");
+            return IV_OK;
+        }
+
+        rsp->status = 200;
+        (void)snprintf(rsp->ctype, sizeof(rsp->ctype), "%s", ctype_of(path));
+        *out_len = (size_t)n;
+        rsp->len = (size_t)n;
         return IV_OK;
     }
 
-    n = read(fd, out, (size_t)st.st_size);
+    /* ---- 大文件：走 S6.4 的文件体分流（2026-10-28）----
+     * 头进 wbuf、正文由 `build_response()` 打开后一块块 `pread`→`send`
+     * （`c->send_fd/send_off/send_left`），**静态资源从此不受 wbuf 容量约束**。
+     *
+     * 为什么必须这样：`IV_WEB_STATIC_MAX` 是硬顶，撞上是 `/app.js` 回 413 ——
+     * 浏览器表现为**白屏**（2026-10-28 实测：app.js 长到 133673 B，板端
+     * `wget -S /app.js` 回 `413 Payload Too Large`，整个 Web UI 打不开）。
+     * 抬 wbuf 只能再撑几 KB，且每连接多占几十 KiB BSS；分流则一次到位。
+     *
+     * ⚠ `rsp->file_path` 要活到 `build_response()` 打开文件为止。本函数返回到
+     * 那一步之间**没有让出点**（单线程事件循环，且 send_fd>=0 的连接不再进
+     * `on_readable`），故用静态缓冲 —— 与 `iv_web_media.c` / `iv_web_logs.c`
+     * 同一口径。若将来把响应改成异线程投递，这里必须换成随连接走的存储。 */
     (void)close(fd);
-    if (n < 0) {
-        set_simple(out, cap, out_len, rsp, 500, "read error");
-        return IV_OK;
-    }
+    (void)snprintf(s_static_path, sizeof(s_static_path), "%s", full);
 
-    rsp->status = 200;
+    rsp->status    = 200;
     (void)snprintf(rsp->ctype, sizeof(rsp->ctype), "%s", ctype_of(path));
-    *out_len = (size_t)n;
-    rsp->len = (size_t)n;
+    rsp->file_path = s_static_path;
+    rsp->file_off  = 0u;
+    rsp->file_len  = (uint64_t)st.st_size;
+    /* 静态资源免限速：`--media-bps` 是给**录像下载**的（4G 下不让一个大文件
+     * 把上行占满），拿它卡页面资源只会让页面白等几秒，收益为零。 */
+    rsp->no_throttle = 1;
+    *out_len = 0u;
+    rsp->len = 0u;
     return IV_OK;
 }

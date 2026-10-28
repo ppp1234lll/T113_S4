@@ -460,12 +460,38 @@ static int media_op_record_reason(int id, char *buf, size_t cap, void *arg)
     return iv_recctl_fail_reason(iv_agent_recctl((iv_agent_t *)arg), id, buf, cap);
 }
 
+/* 2026-10-28：整机录像状态（`record.page`）。取状态机的镜像，**不去问 media 进程**
+ * —— 逐个通道查一遍回环 HTTP 会让页面在媒体进程卡死时一起卡住，而镜像在启动
+ * 3 s 后已经和 media 核对过（`confirm_pending`）。 */
+static int media_op_record_state(int *forced, int *held_off, void *arg)
+{
+    iv_agent_t  *a  = arg;
+    iv_recctl_t *rc = iv_agent_recctl(a);
+
+    if (rc == NULL)
+        return -1;
+    if (forced != NULL)
+        *forced = iv_agent_record_forced(a);
+    if (held_off != NULL)
+        *held_off = iv_agent_record_held_off(a);
+    return iv_recctl_recording(rc);
+}
+
+/* 手动录像（`record.manual`）：整段语义在 iv_recctl.h 文件头，这里只转一手。
+ * why 一路透传到 ctl 的 msg，页面直接显示"为什么没录上"。 */
+static int media_op_record_manual(int on, char *why, size_t cap, void *arg)
+{
+    return iv_agent_record_manual((iv_agent_t *)arg, on, why, cap);
+}
+
 static const iv_ctl_media_ops_t s_media_ops = {
     media_op_capture,
     media_op_record_start,
     media_op_record_stop,
     media_op_record_status,
     media_op_record_reason,
+    media_op_record_state,
+    media_op_record_manual,
     NULL /* arg 在 app_init 里回填为 &g_agent（agent 此时才存在） */
 };
 

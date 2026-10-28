@@ -180,6 +180,55 @@ static int media_fake_status(int id, int *recording, void *arg)
     return IV_OK;
 }
 
+/* ---- c28 手动录像（2026-10-28，record.page / record.manual） ----------------
+ * 三个假钩子合起来能造出页面要显示的四种状态：配了/没配、开着/关着、
+ * 在录/没在录、失败带原因。第 0 路**永久**带一条失败原因 —— 页面把"原因"
+ * 抄错（比如抄成上一路的）就会在 c28 里露馅。 */
+static int         g_n_manual;
+static int         g_manual_on;
+static int         g_manual_rc = IV_OK;      /* 设成 IV_ESTATE 可测"失败原因透传" */
+static int         g_rec_state = 1;          /* 1 在录 / 0 未在录 / -1 不可用 */
+static int         g_rec_forced;             /* 强制态标记 */
+static int         g_rec_held_off;           /* 人工停止后压制自动开录 */
+static const char *g_manual_why = "摄像机端口未开放：192.168.1.64:554 拒绝连接";
+
+static int media_fake_reason(int id, char *buf, size_t cap, void *arg)
+{
+    (void)arg;
+    if (buf != NULL && cap > 0u)
+        buf[0] = '\0';
+    if (id != 0)
+        return 0;
+    if (buf != NULL)
+        (void)snprintf(buf, cap, "配置错误：拉流地址必须以 rtsp:// 开头");
+    return 1;
+}
+
+static int media_fake_rstate(int *forced, int *held_off, void *arg)
+{
+    (void)arg;
+    if (forced != NULL)
+        *forced = g_rec_forced;
+    if (held_off != NULL)
+        *held_off = g_rec_held_off;
+    return g_rec_state;
+}
+
+static int media_fake_rmanual(int on, char *why, size_t cap, void *arg)
+{
+    (void)arg;
+    g_n_manual++;
+    g_manual_on = on;
+    if (why != NULL && cap > 0u)
+        why[0] = '\0';
+    if (g_manual_rc != IV_OK) {
+        if (on && why != NULL && cap > 0u)
+            (void)snprintf(why, cap, "%s", g_manual_why);
+        return g_manual_rc;
+    }
+    return IV_OK;
+}
+
 int main(void)
 {
     iv_ctl_ctx_t ctx;
@@ -615,7 +664,8 @@ int main(void)
     {
         static const iv_ctl_media_ops_t ops = {
             media_fake_capture, media_fake_start, media_fake_stop,
-            media_fake_status,  NULL /* record_reason（2026-10-28 新增，本用例不测） */,
+            media_fake_status,  media_fake_reason,
+            media_fake_rstate,  media_fake_rmanual,
             NULL
         };
 
@@ -699,6 +749,127 @@ int main(void)
         if (j != NULL)
             json_object_put(j);
         chk(g_n_status == 1, "c16d: fake status called");
+    }
+
+    /* ==================== c28 手动录像（2026-10-28：record.page / record.manual） ====================
+     * 这一页存在的理由只有一条：**起不来要能看出为什么**（用户 2026-10-28 原话）。
+     * 因此钉四件事：
+     *   · c28a/c28b `record.page` 一次给全 8 路，且**绝不回 RTSP 地址**（含账密）；
+     *   · c28c    `record.manual` 的 on 真的传到了 ops；
+     *   · c28d    失败时后端那句 why **原样**当 msg 回 —— 被改写成
+     *             "record start failed" 就失去意义，现场得照着这句话修；
+     *   · c28e    缺 on 参数 ⇒ EINVAL 且不调 ops。
+     *
+     * 全程只用假 ops 与假配置，不碰媒体进程；用完不残留任何配置改动。 */
+    {
+        json_object *j;
+        int          n0;
+
+        /* c28a 外形：recording/forced/ch 齐全，ch 恰好 8 条 */
+        j = call(&ctx, "{\"m\":\"record.page\"}", &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c28a: record.page answered");
+        chk(strstr(raw, "rtsp://") == NULL, "c28a: no rtsp url leaks into the page (f7)");
+        {
+            json_object *d   = jodata(j);
+            json_object *v   = NULL;
+            json_object *arr = NULL;
+
+            chk(d != NULL && json_object_object_get_ex(d, "ch", &arr) &&
+                    json_object_is_type(arr, json_type_array),
+                "c28a: ch array present");
+            if (arr != NULL)
+                chk(json_object_array_length(arr) == (size_t)IV_RECCTL_CH_N,
+                    "c28a: one entry per recctl channel");
+            if (d != NULL && json_object_object_get_ex(d, "recording", &v))
+                chk(json_object_get_boolean(v) == 1, "c28a: recording mirrors ops");
+            else
+                chk(0, "c28a: recording field missing");
+            v = NULL;
+            if (d != NULL && json_object_object_get_ex(d, "forced", &v))
+                chk(json_object_get_boolean(v) == 0, "c28a: forced false by default");
+            else
+                chk(0, "c28a: forced field missing");
+            /* held_off 必须出现：它是"人工停过、正在压制自动开录"的唯一证据，
+             * 少了它页面只能干巴巴说"未录像"（2026-10-28 板端踩过）。 */
+            v = NULL;
+            if (d != NULL && json_object_object_get_ex(d, "held_off", &v))
+                chk(json_object_get_boolean(v) == 0, "c28a: held_off false by default");
+            else
+                chk(0, "c28a: held_off field missing");
+            /* 第 0 路：假 reason 报它失败 ⇒ on 必须是 false，且 why 得是**那一路**的原因 */
+            if (arr != NULL && json_object_array_length(arr) > 0) {
+                json_object *e0 = json_object_array_get_idx(arr, 0);
+                json_object *w  = NULL;
+                json_object *on = NULL;
+
+                if (e0 != NULL && json_object_object_get_ex(e0, "on", &on))
+                    chk(json_object_get_boolean(on) == 0,
+                        "c28b: a failed channel is never reported as recording");
+                else
+                    chk(0, "c28b: on field missing");
+                if (e0 != NULL && json_object_object_get_ex(e0, "why", &w))
+                    chk(strcmp(json_object_get_string(w),
+                               "配置错误：拉流地址必须以 rtsp:// 开头") == 0,
+                        "c28b: per-channel reason belongs to that channel (f8)");
+                else
+                    chk(0, "c28b: failed channel carries no reason");
+            }
+            /* c28b2 最后一个通道没配地址、开关也是关的 ⇒ 整机在录也**不许**报它在录。
+             * 2026-10-28 板端实测踩到过：把"整机在录"当成每路都在录，8 路全显示
+             * "录制中"，页面直接骗人。 */
+            if (arr != NULL && json_object_array_length(arr) > 1) {
+                json_object *e7 = json_object_array_get_idx(
+                    arr, json_object_array_length(arr) - 1);
+                json_object *on = NULL;
+
+                if (e7 != NULL && json_object_object_get_ex(e7, "on", &on))
+                    chk(json_object_get_boolean(on) == 0,
+                        "c28b2: an unconfigured channel is never reported as recording");
+                else
+                    chk(0, "c28b2: on field missing on an unconfigured channel");
+            }
+        }
+        if (j != NULL)
+            json_object_put(j);
+
+        /* c28c on 真的传到底 */
+        j = call(&ctx, "{\"m\":\"record.manual\",\"p\":{\"on\":true}}", &rc, raw,
+                 sizeof(raw));
+        chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c28c: manual start accepted");
+        chk(g_n_manual == 1 && g_manual_on == 1, "c28c: on=1 reached the ops (f9)");
+        if (j != NULL)
+            json_object_put(j);
+        j = call(&ctx, "{\"m\":\"record.manual\",\"p\":{\"on\":false}}", &rc, raw,
+                 sizeof(raw));
+        chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c28c: manual stop accepted");
+        chk(g_n_manual == 2 && g_manual_on == 0, "c28c: on=0 reached the ops");
+        if (j != NULL)
+            json_object_put(j);
+
+        /* c28d 失败原因原样当 msg（f10） */
+        g_manual_rc = IV_ESTATE;
+        j = call(&ctx, "{\"m\":\"record.manual\",\"p\":{\"on\":true}}", &rc, raw,
+                 sizeof(raw));
+        chk(rc == IV_OK && j != NULL && joerr(j) == IV_ESTATE,
+            "c28d: failure surfaces as an error code");
+        {
+            json_object *m = NULL;
+
+            chk(j != NULL && json_object_object_get_ex(j, "msg", &m) && m != NULL &&
+                    strcmp(json_object_get_string(m), g_manual_why) == 0,
+                "c28d: the ops' why is passed through verbatim (f10)");
+        }
+        if (j != NULL)
+            json_object_put(j);
+        g_manual_rc = IV_OK;
+
+        /* c28e 缺 on ⇒ EINVAL 且不调 ops */
+        n0 = g_n_manual;
+        j = call(&ctx, "{\"m\":\"record.manual\",\"p\":{}}", &rc, raw, sizeof(raw));
+        chk(rc == IV_OK && j != NULL && joerr(j) == IV_EINVAL, "c28e: missing on rejected");
+        chk(g_n_manual == n0, "c28e: ops NOT called when on is missing");
+        if (j != NULL)
+            json_object_put(j);
     }
 
     /* ==================== c26 D-08：system.snapshot 必须带真快照内容 ====================

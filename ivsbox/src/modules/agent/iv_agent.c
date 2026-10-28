@@ -65,6 +65,7 @@ static int  rec_media_start(int id, const char *url, char *why, size_t whycap,
                             void *arg);
 static int  rec_media_stop(int id, void *arg);
 static int  rec_media_status(int id, void *arg);
+static void rec_ops_init(iv_agent_t *a, iv_recctl_ops_t *ops);
 
 /* 接口名 → 内核 ifindex；未解析到返回 0（该 WAN 视为未绑定） */
 static int wan_ifindex_of(const char *name)
@@ -992,10 +993,7 @@ void iv_agent_close(iv_agent_t *a)
     if (a->media.inited) {
         iv_recctl_ops_t ops;
 
-        ops.start  = rec_media_start;
-        ops.stop   = rec_media_stop;
-        ops.status = rec_media_status;
-        ops.arg    = a;
+        rec_ops_init(a, &ops);
         (void)iv_recctl_stop_all(&a->recm, &ops);
         iv_media_fini(&a->media);
     }
@@ -1093,6 +1091,16 @@ static int rec_media_status(int id, void *arg)
     return rec;
 }
 
+/* 录像回调表的**唯一**装配点。原先四个调用点各抄一遍同样的五行，改一处漏三处
+ * 是迟早的事（2026-10-28 手动录像就是第四个调用点）。 */
+static void rec_ops_init(iv_agent_t *a, iv_recctl_ops_t *ops)
+{
+    ops->start  = rec_media_start;
+    ops->stop   = rec_media_stop;
+    ops->status = rec_media_status;
+    ops->arg    = a;
+}
+
 static void rec_drive(iv_agent_t *a, uint64_t now)
 {
     iv_recctl_ops_t ops;
@@ -1106,10 +1114,7 @@ static void rec_drive(iv_agent_t *a, uint64_t now)
      * 走 4G 照常 ESTABLISHED ⇒ 双断永不成立 ⇒ 主网故障期间一段都不录，
      * 而那时正是最需要留证据的时候。 */
     main_up    = iv_netmgr_wan_is_up(&a->nm, IV_WAN_WIRED);
-    ops.start  = rec_media_start;
-    ops.stop   = rec_media_stop;
-    ops.status = rec_media_status;
-    ops.arg    = a;
+    rec_ops_init(a, &ops);
     (void)iv_recctl_step(&a->recm, main_up, now, &ops);
 }
 
@@ -1127,10 +1132,7 @@ static void storage_drive(iv_agent_t *a, uint64_t now)
     (void)iv_storage_step(&a->stg, now);
     if (!a->media.inited)
         return; /* 无媒体链 ⇒ recctl 未装配（open 里 gate 过），闸门无处可喂 */
-    ops.start  = rec_media_start;
-    ops.stop   = rec_media_stop;
-    ops.status = rec_media_status;
-    ops.arg    = a;
+    rec_ops_init(a, &ops);
     (void)iv_recctl_gate(&a->recm, iv_storage_allow_new(&a->stg),
                          iv_storage_stop_rec(&a->stg), &ops);
 }
@@ -2173,10 +2175,7 @@ int iv_agent_reload_rec(iv_agent_t *a, const char *const *urls, int n,
         if (rcfg.url[i][0] != '\0')
             n_eff++;
 
-    ops.start  = rec_media_start;
-    ops.stop   = rec_media_stop;
-    ops.status = rec_media_status;
-    ops.arg    = a;
+    rec_ops_init(a, &ops);
     if (iv_recctl_set_cfg(&a->recm, &rcfg, &ops, a->now_ms) != IV_OK) {
         IV_LOG_W(AG_MOD, "rec sources not applied");
         return IV_EFAIL;
@@ -2280,6 +2279,38 @@ iv_recctl_t *iv_agent_recctl(iv_agent_t *a)
 iv_storage_t *iv_agent_storage(iv_agent_t *a)
 {
     return (a != NULL) ? &a->stg : NULL;
+}
+
+/* 手动录像（Web 按钮）：装配层把 ops 与时钟一次给全，ctl 只管调一个函数。
+ * 语义（强制态、能停它的三种东西）全在 iv_recctl.h 文件头，本函数不重新解释。 */
+int iv_agent_record_manual(iv_agent_t *a, int on, char *why, size_t whycap)
+{
+    iv_recctl_ops_t ops;
+
+    if (why != NULL && whycap > 0u)
+        why[0] = '\0';
+    if (a == NULL)
+        return IV_EINVAL;
+    if (!a->media.inited) {
+        /* 媒体桥没起来 ＝ 媒体进程不在 / 没装。这与"摄像机连不上"是两件事，
+         * 必须分开说，否则现场会去改摄像机。 */
+        if (why != NULL && whycap > 0u)
+            (void)snprintf(why, whycap,
+                           "媒体进程未就绪（ivsbox-media 未运行或桥接未装配）");
+        return IV_ESTATE;
+    }
+    rec_ops_init(a, &ops);
+    return iv_recctl_manual(&a->recm, on, a->now_ms, &ops, why, whycap);
+}
+
+int iv_agent_record_forced(const iv_agent_t *a)
+{
+    return (a != NULL) ? iv_recctl_forced(&a->recm) : 0;
+}
+
+int iv_agent_record_held_off(const iv_agent_t *a)
+{
+    return (a != NULL) ? iv_recctl_held_off(&a->recm) : 0;
 }
 
 uint64_t iv_agent_door_events(const iv_agent_t *a)

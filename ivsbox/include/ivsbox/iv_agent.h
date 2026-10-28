@@ -830,6 +830,29 @@ iv_media_t  *iv_agent_media(iv_agent_t *a);
 iv_recctl_t *iv_agent_recctl(iv_agent_t *a);
 iv_storage_t *iv_agent_storage(iv_agent_t *a);
 
+/* ---------------------------------------------------------------------------
+ * M6 手动录像（2026-10-28，Web「立即录像 / 停止录像」按钮）
+ *
+ * 装配层替 ctl 把"取 ops + 传时钟"这两件事做完，ctl 只管调一个函数：
+ *   `on=1` 强制开始（**不受主网状态影响**，一直录到人工停 / SD 闸门 / 换配置）；
+ *   `on=0` 停止并退出强制态。
+ * 失败原因写进 `why`（可空，`whycap` 为容量），文案与自动路径逐字相同
+ * （都出自 `iv_recctl`）——现场只需记一套说法。
+ *
+ * 返回：1 = 已开始/已停止；0 = 无须动作；`IV_EINVAL` 入参错；
+ *       `IV_ESTATE` 未 open（媒体桥没起来）或一路都没起来（原因在 why）。
+ *
+ * ⚠ 这是**同步**动作：内部最多逐路发一次回环 HTTP（含 ≤500 ms TCP 预检）。
+ *   与 `rec_drive()` 同一代价，仍在架构 §4.2 的单拍预算内。
+ * ------------------------------------------------------------------------- */
+int iv_agent_record_manual(iv_agent_t *a, int on, char *why, size_t whycap);
+
+/* 当前是否处于手动强制态（1/0）。0 = 未 open 或非强制。 */
+int iv_agent_record_forced(const iv_agent_t *a);
+
+/* 是否处于"人工停止后压制自动开录"的状态（1/0）。页面据此解释"主网断着却没在录"。 */
+int iv_agent_record_held_off(const iv_agent_t *a);
+
 /* S4.4 主网第 w 路（0/1）的 MN 状态：1=正常 / 2=断开（迟滞判定后；0=尚未判定）。
  * 就是上报数据段 `MN=` 字段的生产者（见 iv_report.h 的 env.mn[]）。 */
 uint8_t           iv_agent_mn(const iv_agent_t *a, int w);

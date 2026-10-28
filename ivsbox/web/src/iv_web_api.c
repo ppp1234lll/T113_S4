@@ -763,6 +763,18 @@ int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
         return api_p_call(ctx, "camera.test",
                           (req->body != NULL) ? req->body : "{}",
                           out, cap, out_len, rsp);
+    /* 媒体录像页（2026-10-28）。GET = 一次读全 8 路状态（`record.page`），
+     * POST = 手动启停（`record.manual`）。**启停只收 POST**：按钮动作不能让浏览器
+     * 的预取/刷新重放一次 —— 与 relay.set / device.identity.set 同一条口径。
+     * 注意路径在 `/api/` 前缀下，与录像下载的 `/media/...`（iv_web_media.c）不是
+     * 一回事，两处互不影响。 */
+    if (strcmp(req->path, "/api/media/record") == 0) {
+        if (strcmp(req->method, "POST") == 0)
+            return api_p_call(ctx, "record.manual",
+                              (req->body != NULL) ? req->body : "{}",
+                              out, cap, out_len, rsp);
+        return api_simple_call(ctx, "record.page", out, cap, out_len, rsp);
+    }
     if (strcmp(req->path, "/api/system/time") == 0)
         return api_p_call(ctx, "system.time",
                           (req->body != NULL) ? req->body : "{}",

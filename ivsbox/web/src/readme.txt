@@ -29,6 +29,11 @@ web/src  ——  ivsbox-web 进程源码目录（自研最小 HTTP/1.1 服务）
                    2026-10-16 起含账号/口令登录（POST /api/login）、改密
                    （POST /api/passwd）与 must_change 闸门。
   iv_web_static.c  静态资源（直接从 web/static 读盘 —— 改页面不必重编固件）。
+                   2026-10-28 起**不再有单文件上限**：≤ `IV_WEB_STATIC_MAX` 走
+                   "一次 read 进 wbuf"快路径，更大的走 `rsp->file_path` 文件体分流
+                   （`no_throttle=1`，免得页面资源被 `--media-bps` 卡住）。
+                   起因：app.js 长到 133673 B 顶穿 129024 B 硬顶 ⇒ 板端 /app.js 回
+                   413、整个 Web UI 白屏。
   iv_web_media.c   S6.4 媒体下载：`/media/...` → media_root 下的普通文件。路径围栏
                    三道（逐段拒 `.`/`..` → realpath 前缀复核 → open(O_NOFOLLOW)）；
                    Range（含后缀区间）/ETag/If-Range；`?sha=1` 时附 X-SHA256。

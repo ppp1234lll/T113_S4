@@ -2208,12 +2208,155 @@
     return root;
   }
 
+  /* 媒体（M6）：录像状态 + 手动启停。
+   * 数据来自 `GET /api/media/record`（ctl 的 `record.page`，**一次读全 8 路**），
+   * 启停走 `POST /api/media/record {"on":true|false}`（ctl 的 `record.manual`）。
+   *
+   * 两条不写在页面上的约定（写在这儿免得以后有人"顺手加一下"）：
+   *   1. **不显示 RTSP 地址**：后端只回一个布尔（`url:true/false`），地址里有
+   *      摄像机账密，页面没有理由拿到它；
+   *   2. **失败原因照抄后端**：后端给的是"摄像机端口未开放：1.64:554 拒绝连接"
+   *      这种能照着修的句子，页面一旦改写成"操作失败"就白做了（用户 2026-10-28
+   *      明确要求：起不来要能看出是什么原因，方便排查）。 */
   function pageMedia() {
     var root = document.createDocumentFragment();
     root.appendChild(el('h2', 'page-title', '媒体'));
+
     var card = el('div', 'card');
-    card.appendChild(el('p', 'hint', '媒体功能（抓图 / 录像 / 视频读取）属 M6，尚未启用。'));
+    card.appendChild(el('h3', null, '录像'));
+    var note = el('p', 'hint', '读取中…');
+    card.appendChild(note);
+
+    var bar = el('div', 'actions');
+    var bOn = el('button', 'ghost', '立即录像');
+    var bOff = el('button', 'ghost', '停止录像');
+    bOn.type = 'button';
+    bOff.type = 'button';
+    bar.appendChild(bOn);
+    bar.appendChild(bOff);
+    card.appendChild(bar);
+
+    /* 失败原因单独一行：**不能写进上面那句结论里** —— `load()` 每次都会重写
+     * 结论，写在那儿会被 5 s 一次的自动刷新抹掉，用户恰好在这一刻抬头就什么
+     * 都看不到。这一行只由动作结果写、由下一次动作清。 */
+    var failLine = el('p', 'msg');
+    card.appendChild(failLine);
+
+    var box = el('div');
+    card.appendChild(box);
     root.appendChild(card);
+
+    var tip = el('div', 'card');
+    tip.appendChild(el('h3', null, '录像文件'));
+    tip.appendChild(el('p', 'hint',
+      '每路一个文件，按日期分目录：SD 卡 /mnt/sdcard/video/<yyyymmdd>/channel<路号>_<时分秒>.mp4，' +
+      '每段 15 分钟自动切分。SD 卡未挂载或写保护时不会开新录像（水位 ≥90% 不新开、≥95% 立即停）。'));
+    root.appendChild(tip);
+
+    var busy = false;
+
+    function act(on) {
+      if (busy) return;
+      busy = true;
+      bOn.disabled = true;
+      bOff.disabled = true;
+      failLine.textContent = '';
+      note.textContent = on ? '正在启动录像…' : '正在停止录像…';
+      api('/api/media/record', { method: 'POST', body: { on: on } })
+        .then(function (r) {
+          busy = false;
+          bOn.disabled = false;
+          bOff.disabled = false;
+          if (!r.ok) {
+            var why = r.msg || ('错误 ' + r.e);
+            toast((on ? '启动失败：' : '停止失败：') + why, 'err');
+            failLine.textContent = (on ? '启动失败：' : '停止失败：') + why;
+            load();
+            return;
+          }
+          var changed = !!(r.d && r.d.changed);
+          toast(on ? (changed ? '已开始录像' : '本来就在录')
+                   : (changed ? '已停止录像' : '本来就没在录'), 'ok');
+          load();
+        })
+        .catch(function () {
+          busy = false;
+          bOn.disabled = false;
+          bOff.disabled = false;
+          failLine.textContent = '无法连接服务';
+          note.textContent = '';
+        });
+    }
+    bOn.addEventListener('click', function () { act(true); });
+    bOff.addEventListener('click', function () { act(false); });
+
+    /* 一路的"状态"三态：配了才能录、开了才会录、在录才算录。
+     * 三者的文字要能区分 —— 都写成"未录"的话，现场分不清该去改哪一处。 */
+    function chState(ch) {
+      if (!ch.url) return ['未配置地址', 'badge'];
+      if (!ch.want) return ['录像开关关闭', 'badge'];
+      if (ch.failed) return ['无法启动', 'badge err'];
+      if (ch.on) return ['录制中', 'badge ok'];
+      return ['未录', 'badge'];
+    }
+
+    function load() {
+      api('/api/media/record').then(function (r) {
+        box.innerHTML = '';
+        if (!r.ok) {
+          note.textContent = '';
+          var why = (r.msg === 'media not wired')
+            ? '本机固件未装配媒体链（ivsboxd 未打开媒体桥接）'
+            : (r.msg || '读取失败');
+          box.appendChild(kv('状态', why, 'err'));
+          return;
+        }
+        var d = r.d || {}, chs = d.ch || [];
+
+        /* 一句话结论：**自动** / **手动** / **人工停过** 三种必须分开说 ——
+         * 手动态主网恢复也不会停；而"人工停过"时主网断着却不录，不说清楚
+         * 现场只会当成功能坏了（2026-10-28 板端就是这个形态）。 */
+        if (d.recording) {
+          note.textContent = d.forced
+            ? '正在录像（手动启动：不受主网状态影响，需点「停止录像」才会停）'
+            : '正在录像（主网断开触发：主网恢复一段时间后会自动停止）';
+        } else if (d.held_off) {
+          note.textContent = '已人工停止录像：暂时压制了「主网断开自动录像」，' +
+            '主网恢复一次后自动解除。要马上录请点「立即录像」。';
+        } else {
+          note.textContent = '当前未录像 —— 主网断开并保持一段时间后自动开始；' +
+            '也可以点「立即录像」马上开始（不受主网状态限制）。';
+        }
+
+        var t = el('table');
+        var head = el('tr');
+        ['通道', '录像开关', '拉流地址', '状态', '未启动原因'].forEach(function (h) {
+          head.appendChild(el('th', null, h));
+        });
+        t.appendChild(head);
+        chs.forEach(function (ch) {
+          var tr = el('tr');
+          tr.appendChild(el('td', null, '第 ' + (ch.id + 1) + ' 路'));
+          /* 开关与地址都只读：改它们去「摄像机」页（一处写者，改完即时热生效） */
+          tr.appendChild(el('td', null, ch.want ? '开' : '关'));
+          tr.appendChild(el('td', null, ch.url ? '已配置' : '未配置'));
+          var st = chState(ch);
+          var td = el('td');
+          td.appendChild(el('span', st[1], st[0]));
+          tr.appendChild(td);
+          tr.appendChild(el('td', null, ch.why || '—'));
+          t.appendChild(tr);
+        });
+        box.appendChild(t);
+      }).catch(function () {
+        box.innerHTML = '';
+        note.textContent = '';
+        box.appendChild(kv('状态', '无法连接服务', 'err'));
+      });
+    }
+
+    load();
+    st.timer = setInterval(load, 5000);  /* 5 s 自动刷新；切页时由 go() 收掉 */
     return root;
   }
 

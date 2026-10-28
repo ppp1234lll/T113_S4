@@ -55,6 +55,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | Web 手动录像入口 ＋ 媒体进程自启 ＋ 静态资源 413 闭环 | 已实现（VM 单测 48/48、集成 16 passed＋1 SKIP、前端 9 用例全绿、反向证伪 5 条；**板端实测**：整机重启后媒体进程自起并自动开录、`/app.js` 由 413 转 200、手动开关录像双向 `changed`） | 2026-10-28 11:32 | 上一节「未做」的两条（Web 手动入口、媒体自启）本轮闭环；另修掉加完前端后暴露的静态资源硬顶 413（整页白屏）。详见本文件文末 2026-10-28 11:32 节。 |
 | 采集板 0xE1 应答补 `ERR` 键 ＋ `Error_Get_Codesbuf()` 数量回填 | 已实现（**仓库外**采集板固件 `General_Version - 无SADP`；Keil 真实构建 0 Error 0 Warning、axf/hex 已产出；逻辑单测 9 例全通过含 ASan/UBSan；**未烧录实测、未提交采集板仓库**） | 2026-10-28 11:50 | 详见本文件文末 2026-10-28 11:50 节。 |
 | 采集板 `ERR` 扩容到 32 码（绕开 mycJSON 的 `pbuff[128]`） | 已实现（**仓库外**采集板固件；改 3 次 `strcat` 直拼 `pdata` ＋ 384 B 取值缓冲 ＋ 2048 溢出闸门；Keil 真实构建 0 Error 0 Warning；单测 10 例含 ASan/UBSan 全通过，32 码全带上） | 2026-10-28 15:55 | 解除 11:50 那条的"单帧最多 9 个码"限制。详见本文件文末 2026-10-28 15:55 节。 |
+| 采集板 0xE1 应答缺逗号（主板镜像冻结）修复 | 已实现（**真正的现场工程** `F:\debug_2026\嵌入式\采集板\main`，STM32F103RC＋UCOS-II；`ELEC3` 补逗号、`ERR` 改直拼且自身无尾逗号；Keil 构建 0/0；端到端实证"修前整串被拒 / 修后 RELAY=2,2,2 可解析"；**未烧录**） | 2026-10-28 16:29 | 现场「断开继电器后平台状态不更新」的直接原因。同时更正前两条登记的现场固件路径有误。详见本文件文末 2026-10-28 16:29 节。 |
 |===
 
 
@@ -8868,5 +8869,97 @@ Code 比上一版多 44 字节（384 B 缓冲 + 闸门）。
 * **采集板仓库仍未提交**：`F:\debug\General_Version - 无SADP` 常驻 200+ 未提交改动
   （含 bootloader 二进制），`com.c` 的 diff 里夹着本次之外的既有改动，`git add` 会连别人的
   一起带上（规则 3），故只改文件，登记写到 T113 仓库。
+
+== 2026-10-28 16:29 采集板 0xE1 应答缺逗号 —— 主板镜像被整体冻结
+
+=== 干了什么事
+
+**这次改的是真正的现场工程**：`F:\debug_2026\嵌入式\采集板\main`（STM32F103RC ＋ UCOS-II，
+工程 `USER/dc_base.uvprojx`，烧录 `main\烧录.bat` = pyocd + ST-Link `--target stm32f103rc`）。
+11:50 / 15:55 两次改的 `F:\debug\General_Version - 无SADP\main` 是另一套 GD32F460 代码，
+不是现场跑的固件（判别见「影响范围」）。
+
+只动 `APP/USER/src/com.c` 的 `com_query_configuration_function()`（0xE1 应答）两处：
+
+[source,c]
+----
+/* ① ELEC3 后面还有 ERR ⇒ next 从 0 改 1 */
+my_cjson_join_float_function(pdata, (uint8_t *)"ELEC3", ..., 1);
+
+/* ② ERR 是最后一个键：直拼、自身不带逗号、去 ERR= 前缀与结尾 ';' */
+char errbuf[384];
+Error_Get_Codesbuf((uint8_t *)errbuf, sizeof(errbuf));
+if (strncmp(perr,"ERR=",4) == 0) perr += 4;
+if (perr[strlen(perr)-1] == ';') perr[strlen(perr)-1] = '\0';
+if ((strlen((char *)pdata) + elen + 12u) < 1024u) {
+    strcat((char *)pdata, "\"ERR\":\""); strcat((char *)pdata, perr); strcat((char *)pdata, "\"");
+}
+----
+
+=== 解决什么问题
+
+现场：平台点「通道X 断电」，继电器动作了（能听到吸合、面板灯变），但平台「通道信息」
+一直显示**通电**、电压停在 **234.08 V**，之后设备也不再更新数据。
+
+根因是采集板 0xE1 应答**不是合法 JSON**：
+
+[source]
+----
+..."ELEC3":0.00"ERR":"2,30500000,30700000;",}
+              ↑ 缺逗号（ELEC3 的 next 还是 0）   ↑ 尾逗号多余（ERR 传了 next=1）
+----
+
+`ELEC3` 原本是这个 JSON 的最后一个键（`next=0`，尾部不带逗号），后来有人在它后面加了 `ERR`，
+**没把 `ELEC3` 的 `next` 改成 1**，而 `ERR` 自己又传了 `next=1` —— 两头都错。
+
+主板 `iv_status_handle_query()` 对坏应答的处理是「没有任何已识别字段 ⇒ 保留上次有效镜像」，
+于是：整串被拒 → 镜像冻结 → `relay_moved` 恒假（`prev == new`）→ 每帧内容不变 →
+平台界面停在旧值。板端日志里三帧 `report #103/104/105` 的 `m=` 全是 `aa52534b`，正是这个冻结的指纹。
+
+=== 影响范围
+
+* 只影响 0xE1 应答的 `ERR` 键与前一个键的逗号；其它键、`com_report_normally_function()`
+  的周期上报段、0xE2/0xE4/0xE7 等应答都不动。
+* `ERR` 值长度：384 B 缓冲（32 码 295 B），`pdata` 是 `app.c` 的 `sg_send_buff[1024]`，
+  0xE1 全帧约 400 B —— 有余量；闸门按 1024 挡，不越界。
+* 采集板自己也判网络码（`alarm_net_collection_param()`），会随 `ERR` 一并发上去；主板
+  `iv_fault_apply_board()` 只采信 `0x1`/`0x3` 类，`0x2xxxxxxx` 直接剔除 ⇒ 不会重复报。
+* 该工程 `error.c` 的 `Error_Get_Codesbuf()` **没有**"截断时回填数量"的修复（15:55 只改在
+  GD32F460 那套里）。这里是 384 B 缓冲、32 码最多 295 B ⇒ 不会触发截断，数量天然正确；
+  若将来把 `fault_index` 扩到 32 以上，需要同步搬那条修复。
+* **烧录未做**：必须重烧 `USER/HEXBIN/dc_base.hex` 才生效。
+
+=== 验证方式与结果
+
+**1. Keil 真实构建**
+
+----
+UV4.exe -b USER/dc_base.uvprojx -j0
+  compiling com.c...  linking...
+  Program Size: Code=40352 RO-data=4836 RW-data=248 ZI-data=39624
+  ".\Objects\dc_base.axf" - 0 Error(s), 0 Warning(s).
+----
+
+**2. 端到端实证**（直接用主板真代码，VM 上编译链接 `libivmodules`，没有模拟）
+
+[cols="1,6,2",options="header"]
+|===
+| 输入 | 断言 | 结果
+
+| 修前那一串（缺逗号 + 尾逗号） | `valid.V=0 valid.RELAY=0 valid.ERR=0` —— 整串被拒 | 通过（这正是镜像冻结的机制）
+| 修后那一串 | `valid.V=1 valid.RELAY=1 RELAY=2,2,2`、`valid.ERR=1` | 通过（`relay_moved` 具备触发条件）
+| 修后的 `ERR` 值 | `iv_fault_apply_board()` → `nb=2`（`30500000`/`30700000`）、`board_rejected=0` | 通过
+|===
+
+**3. Python 反例对照**：修前串 `json.loads` 报 `Expecting ',' delimiter: column 25`；
+修后串解析出 3 个键、`ERR=2,30500000,30700000`。
+
+=== 未做 / 待办
+
+* **烧录**（需现场 ST-Link ＋ 断电 3 s 窗口）：`main\烧录.bat` 一键烧录。烧完平台应能立刻
+  看到「通道信息」随继电器动作刷新（电压列跟着变 0 / 恢复）。
+* 烧录后建议同时确认主板日志：`relay changed 2,1,1 -> 2,2,1, report` 这行 INFO 出现，
+  说明 `relay_moved` 判据恢复工作（这行以前一次都没出现过）。
+
 
 

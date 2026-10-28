@@ -173,6 +173,81 @@ static void confirm_pending(iv_recctl_t *r, uint64_t now_ms,
     }
 }
 
+/* 运行期复检：把"在录"从"发起过 start"换回"真的还在录"。
+ *
+ * 板端实证（2026-10-28）：断流是对端**随时**能给的事件，而启动确认只做一次。
+ * 断流之后媒体层的 worker 只是把该路标志清掉就回去等 `is_recording`，本模块
+ * 却仍认为在录 ⇒ 录像永久停、页面照旧显示"录制中"，直到进程重启。
+ * 见头文件"在录 ≠ 一直在录"。
+ *
+ * 返回本拍是否已处理掉线（1 = 有动作）。`ops->status` 为空时什么都不做（保持
+ * "受理即成功"的降级口径，与 confirm_pending 一致）。
+ */
+static int recheck_channels(iv_recctl_t *r, int main_up, uint64_t now_ms,
+                            const iv_recctl_ops_t *ops)
+{
+    int i;
+    int want = 0;
+    int alive = 0;
+
+    if (ops->status == NULL)
+        return 0;
+    /* 刚发起、还没确认的那一轮不参与复检：此刻 ffmpeg 可能正在建流，
+     * 查了也必然是"未在录"，会把正常启动误判成掉线。 */
+    if (r->pending)
+        return 0;
+    if (r->recheck_ms != 0u && now_ms - r->recheck_ms < IV_RECCTL_RECHECK_MS)
+        return 0;
+    r->recheck_ms = now_ms;
+
+    for (i = 0; i < r->cfg.n_url && i < IV_RECCTL_CH_N; i++) {
+        int st;
+
+        if (r->cfg.url[i][0] == '\0')
+            continue;
+        want++;
+        st = ops->status(i, ops->arg);
+        if (st > 0) {
+            clear_why(r, i);
+            alive++;
+            continue;
+        }
+        if (st < 0)
+            continue; /* 查不到（媒体桥/进程没了）：不判死，与 confirm 同口径 */
+        set_why(r, i, "录像已中断：拉流被对端关闭或网络中断，正在重连");
+        IV_LOG_W(RC_MOD, "record ch%d lost while recording: %s", i, r->ch_why[i]);
+    }
+
+    if (want == 0 || alive == want)
+        return 0;
+
+    if (alive == 0) {
+        /* 整批掉线：明确退出"在录"，退避一轮再按原路径重开。
+         * 摄像机整机重启要几十秒，此时每拍都打一轮 TCP 预检没人受得了。 */
+        r->recording  = 0;
+        r->recheck_ms = 0;
+        r->next_try_ms = now_ms + IV_RECCTL_RECHECK_MS;
+        /* 主网一直断着 ⇒ 不必重走 hold 保持期（"断网"这件事从没中断过），
+         * 把保持计时拉到"已满"，退避一到就开录。主网已恢复（正在防抖停录途中）
+         * 就不动它：那一路由下面的恢复分支收口。 */
+        if (!main_up)
+            r->down_since_ms = (now_ms > (uint64_t)r->cfg.hold_ms)
+                                   ? (now_ms - (uint64_t)r->cfg.hold_ms)
+                                   : 1u;
+        IV_LOG_W(RC_MOD, "all %d ch dropped while recording; retry in %us",
+                 want, (unsigned)(IV_RECCTL_RECHECK_MS / 1000u));
+        return 1;
+    }
+
+    /* 部分掉线：立刻重开整批。对仍在录的路重发 start 是**幂等**的（桥接只置
+     * 标志与地址，不会切当前文件），所以不必为了"只补缺的那几路"多写一条路径；
+     * 3 s 后的启动确认会把仍起不来的路连同原因留下。 */
+    IV_LOG_W(RC_MOD, "%d/%d ch dropped while recording; restarting the batch",
+             want - alive, want);
+    (void)start_all(r, now_ms, ops, r->force ? 1 : 0);
+    return 1;
+}
+
 /* 逐路停 + 清全部状态。**强制态在这里一并清掉**：stop_all 是"整机停录"的唯一
  * 出口（人工停 / 闸门停 / 换配置停都走它），停了就没人再强制。 */
 static int stop_all(iv_recctl_t *r, const iv_recctl_ops_t *ops)
@@ -193,6 +268,7 @@ static int stop_all(iv_recctl_t *r, const iv_recctl_ops_t *ops)
     r->up_since_ms   = 0;
     r->pending       = 0;
     r->next_try_ms   = 0;
+    r->recheck_ms    = 0;
     r->force         = 0;
     IV_LOG_I(RC_MOD, "recording stopped (%d/%d ch ok)", ok, r->cfg.n_url);
     return 1;
@@ -216,25 +292,32 @@ int iv_recctl_step(iv_recctl_t *r, int main_up, uint64_t now_ms,
     confirm_pending(r, now_ms, ops);
 
     if (r->recording) {
-        /* 手动态：主网通不通都不影响（用户口径"按下按钮就得一直录"）。
-         * 只把 up_since 清零，免得将来退出强制态时拿着一个陈旧的"恢复时刻"
-         * 立刻触发防抖停录。 */
-        if (r->force) {
-            r->up_since_ms = 0;
+        /* 运行期复检（2026-10-28 板端）：先问一句"真的还在录吗"。放在 force
+         * 判断**之前** —— 手动录像同样会因 RTSP 断流而停，不能因为它是人工
+         * 开的就不管。复检若判定整批掉线会把 recording 归 0，本拍继续往下走
+         * "未在录"路径（退避已由复检设好）。 */
+        (void)recheck_channels(r, main_up, now_ms, ops);
+        if (r->recording) {
+            /* 手动态：主网通不通都不影响（用户口径"按下按钮就得一直录"）。
+             * 只把 up_since 清零，免得将来退出强制态时拿着一个陈旧的"恢复时刻"
+             * 立刻触发防抖停录。 */
+            if (r->force) {
+                r->up_since_ms = 0;
+                return 0;
+            }
+            if (!main_up) {
+                r->up_since_ms = 0; /* 主网还断着：恢复计时清零 */
+                return 0;
+            }
+            /* 主网恢复：防抖 */
+            if (r->up_since_ms == 0) {
+                r->up_since_ms = now_ms;
+                return 0;
+            }
+            if (now_ms - r->up_since_ms >= r->cfg.debounce_ms)
+                return stop_all(r, ops);
             return 0;
         }
-        if (!main_up) {
-            r->up_since_ms = 0; /* 主网还断着：恢复计时清零 */
-            return 0;
-        }
-        /* 主网恢复：防抖 */
-        if (r->up_since_ms == 0) {
-            r->up_since_ms = now_ms;
-            return 0;
-        }
-        if (now_ms - r->up_since_ms >= r->cfg.debounce_ms)
-            return stop_all(r, ops);
-        return 0;
     }
 
     /* 手动态但没在录（启动全失败、或确认后判死）：按退避重试，**不看主网**。
@@ -305,6 +388,7 @@ int iv_recctl_gate(iv_recctl_t *r, int allow_new, int stop_rec,
     r->up_since_ms   = 0;
     r->pending       = 0;
     r->next_try_ms   = 0;
+    r->recheck_ms    = 0;
     r->force         = 0;
     IV_LOG_W(RC_MOD, "storage gate: recording stopped immediately (%d ch)", n);
     return n;
@@ -315,8 +399,9 @@ int iv_recctl_stop_all(iv_recctl_t *r, const iv_recctl_ops_t *ops)
     if (r == NULL || ops == NULL || ops->stop == NULL)
         return IV_EINVAL;
     if (!r->recording) {
-        r->pending = 0;
-        r->force   = 0; /* 没在录也要退出强制态，否则下一拍又会自己开录 */
+        r->pending    = 0;
+        r->recheck_ms = 0;
+        r->force      = 0; /* 没在录也要退出强制态，否则下一拍又会自己开录 */
         return 0;
     }
     (void)stop_all(r, ops);

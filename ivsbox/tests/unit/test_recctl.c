@@ -22,6 +22,11 @@
  *       自动态下按"立即录像"只升格不重发、总失败时回原因并**退出强制态**、
  *       闸门/热更新照样能停它；on=0 还要**压住自动开录**（否则 10 s 后自己又录，
  *       按钮看起来是坏的），且主网恢复一次即解除压制
+ *   c13 运行期复检（2026-10-28 板端）：启动确认只做一次，断流之后没人再看 ⇒
+ *       录像永久停、页面还显示"录制中"。这里钉三件事：全部路掉线 ⇒ recording
+ *       归 0、退避一轮后按原路径重开（且**不重走 hold 保持期**）；部分路掉线 ⇒
+ *       立刻重开整批且 recording 保持；复检**节流**（10 s 内不重复查）并且
+ *       在启动确认未完成（pending）时不参与
  *
  * 反向证伪（本用例内建）：
  *   f1 若把"保持"判据去掉（到达 hold 前就开录），c02 的保持段会提前动作；
@@ -42,6 +47,10 @@
  *   f13 若启动总失败后不清 force，c12 ⑥ 那句"后台没有静默重试"会红。
  *   f14 若手动停止不置压制位（只清 force），c12 ⑨ 会在 10 s 后被自动路径重新
  *       拉起来 —— 板端现象就是"按了停止，过一会儿又自己录了"。
+ *   f15 若把运行期复检去掉（`if (r->recording)` 里不调 `recheck_channels()`），
+ *       c13 ①②③ 全红：`recording` 永远停在 1，`n_start` 不再增长 —— 板端现象
+ *       就是"摄像机重启过一次，之后再也不录，界面却说在录"。
+ *   f16 若复检不节流（每拍都查），c13 ④ 的 `status_calls` 增量会远超预期。
  * 以上都由对应的 chk 钉死：动作次数与时间是精确断言，多一次/少一次都红。
  */
 #include <stdio.h>
@@ -82,6 +91,10 @@ typedef struct {
     const char *fail_why; /* 拒绝时写进 why 的文案（NULL ⇒ 不写，验兜底） */
     int  status_val;      /* status 回调的返回值：1 在录 / 0 未录 / -1 查不到 */
     int  status_calls;
+    /* 逐路状态（c13 用）：`status_ch_set=1` 时按路返回 `status_ch[id]`，
+     * 否则一律返回 `status_val`。用来复现"两路里只掉了一路"。 */
+    int  status_ch_set;
+    int  status_ch[IV_RECCTL_CH_N];
 } fake_ops_t;
 
 static int fake_start(int id, const char *url, char *why, size_t whycap,
@@ -117,8 +130,9 @@ static int fake_status(int id, void *arg)
 {
     fake_ops_t *f = arg;
 
-    (void)id;
     f->status_calls++;
+    if (f->status_ch_set && id >= 0 && id < IV_RECCTL_CH_N)
+        return f->status_ch[id];
     return f->status_val;
 }
 
@@ -612,11 +626,109 @@ int main(void)
             "c12: NULL ops -> EINVAL");
     }
 
+    /* ---------------- c13 运行期复检（f15 / f16） ----------------
+     * 板端形态：12:16:46 两路开录 → 12:23:09 与 13:04:09 各被对端关掉一次
+     * （`peer reports stopped`）→ 之后录像永久停，`record.page` 仍报每路
+     * `on:true`。根因就是"启动确认只做一次"，见头文件"在录 ≠ 一直在录"。 */
+    {
+        char why[IV_RECCTL_WHY_MAX];
+
+        /* ① 正常开录并确认（两路都在录） */
+        cfg_two_urls(&cfg); /* hold=10s debounce=60s */
+        chk(iv_recctl_init(&r, &cfg) == IV_OK, "c13: init ok");
+        fake_reset(&f);
+        (void)iv_recctl_step(&r, 0, 1000, &ops);    /* 起计时 */
+        (void)iv_recctl_step(&r, 0, 11000, &ops);   /* 到 hold：2 路开录 */
+        (void)iv_recctl_step(&r, 0, 14000, &ops);   /* 3 s 后确认：都真在录 */
+        chk(f.n_start == 2, "c13: two channels started");
+        chk(iv_recctl_recording(&r) == 1, "c13: recording after confirm");
+
+        /* ② 两路都断流。复检节流：距上次（14000 那拍）不到 10 s 不许再查 */
+        f.status_val = 0;
+        {
+            int calls = f.status_calls;
+
+            (void)iv_recctl_step(&r, 0, 20000, &ops);
+            chk(f.status_calls == calls, "c13: recheck is throttled (f16)");
+            chk(iv_recctl_recording(&r) == 1, "c13: still believes it records (f16)");
+
+            /* 到点：复检发现两路都不在录 ⇒ recording 归 0、退避一轮 */
+            (void)iv_recctl_step(&r, 0, 24000, &ops);
+            chk(iv_recctl_recording(&r) == 0,
+                "c13: all channels dropped -> recording cleared (f15)");
+            chk(f.n_start == 2, "c13: no immediate restart, backoff first");
+            chk(iv_recctl_fail_reason(&r, 0, why, sizeof(why)) == 1 && why[0] != '\0',
+                "c13: the dropped channel explains itself");
+            /* 退避窗口内不许重开（摄像机整机重启期间每拍打预检没人受得了） */
+            (void)iv_recctl_step(&r, 0, 25000, &ops);
+            chk(f.n_start == 2, "c13: no retry inside the backoff window");
+        }
+
+        /* ③ 摄像机回来了：退避到期即开录，且**不必重走 hold 保持期**
+         *    （"主网断"这件事从没中断过 —— 谁要是让 down_since 归零，
+         *     这里会再等 10 s，n_start 就停在 2） */
+        f.status_val = 1;
+        (void)iv_recctl_step(&r, 0, 34000, &ops);
+        chk(f.n_start == 4, "c13: restart once the backoff expires (f15)");
+        chk(iv_recctl_recording(&r) == 1, "c13: recording again");
+        (void)iv_recctl_step(&r, 0, 37000, &ops); /* 确认这一批 */
+        chk(iv_recctl_recording(&r) == 1, "c13: confirmed again");
+
+        /* ④ 部分掉线：只有第 2 路断流 ⇒ 立刻重开整批，recording 保持 1。
+         *    注意"原因"的生命周期：重开被受理后原因先被清掉（不留陈旧结论），
+         *    3 s 后的启动确认发现它还是没在录，才写下真正的那句原因 —— 这条
+         *    链路正是页面 `failed`/`why` 的来源。 */
+        f.status_ch_set = 1;
+        f.status_ch[0]   = 1; /* ch0 还在录 */
+        f.status_ch[1]   = 0; /* ch1 断了 */
+        (void)iv_recctl_step(&r, 0, 48000, &ops);
+        chk(f.n_start == 6, "c13: a partial drop restarts the batch (f15)");
+        chk(iv_recctl_recording(&r) == 1, "c13: still recording (one channel alive)");
+        chk(iv_recctl_fail_reason(&r, 0, why, sizeof(why)) == 0,
+            "c13: the live channel has no stale reason");
+        (void)iv_recctl_step(&r, 0, 51000, &ops); /* 3 s 后确认：ch1 还是没起来 */
+        chk(iv_recctl_fail_reason(&r, 1, why, sizeof(why)) == 1,
+            "c13: the dropped channel carries a reason after confirm");
+        chk(strstr(why, "未进入录像") != NULL,
+            "c13: reason explains it never got into recording");
+        chk(iv_recctl_recording(&r) == 1, "c13: a partial drop never stops the batch");
+
+        /* ⑤ 启动确认未完成时（pending）不参与复检：此刻 ffmpeg 可能正在建流，
+         *    查了必然"未在录"，会把正常启动误判成掉线 */
+        fake_reset(&f);
+        chk(iv_recctl_init(&r, &cfg) == IV_OK, "c13: init for the pending case");
+        (void)iv_recctl_step(&r, 0, 1000, &ops);
+        (void)iv_recctl_step(&r, 0, 11000, &ops); /* 刚发起，pending=1 */
+        {
+            int calls = f.status_calls;
+
+            (void)iv_recctl_step(&r, 0, 12000, &ops);
+            chk(f.status_calls == calls,
+                "c13: no recheck while the start confirmation is pending");
+            chk(iv_recctl_recording(&r) == 1,
+                "c13: a fresh start is not mistaken for a drop");
+        }
+
+        /* ⑥ 没有 status 回调时复检静默跳过（保持"受理即成功"的降级口径） */
+        fake_reset(&f);
+        ops.status = NULL;
+        chk(iv_recctl_init(&r, &cfg) == IV_OK, "c13: init without a status hook");
+        (void)iv_recctl_step(&r, 0, 1000, &ops);
+        (void)iv_recctl_step(&r, 0, 11000, &ops);
+        (void)iv_recctl_step(&r, 0, 30000, &ops);
+        (void)iv_recctl_step(&r, 0, 90000, &ops);
+        chk(iv_recctl_recording(&r) == 1, "c13: no hook -> nothing to recheck");
+        chk(f.n_stop == 0, "c13: and no spurious stop");
+        ops.status = fake_status; /* 还给后面的用例 */
+        (void)iv_recctl_stop_all(&r, &ops);
+    }
+
     if (g_fail != 0) {
         fprintf(stderr, "test_recctl FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_recctl passed (main-link criterion, hold/debounce, backoff retry, "
-           "start confirm, failure reason, manual stop, storage gate, config swap)\n");
+           "start confirm, running recheck, failure reason, manual stop, "
+           "storage gate, config swap)\n");
     return 0;
 }

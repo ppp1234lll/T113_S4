@@ -232,54 +232,86 @@ static int rep_poll(iv_report_t *rp)
     return rc;
 }
 
+/* 把下一拍 0xE1 提前到 `IV_REPORT_POLL_RETRY_MS` 之后（**只改时刻表，不直接发帧**）。
+ * 只给"有一帧补报在等全量"的场合用；常规 30 s 轮询节拍不受影响。 */
+static void rep_poll_soon(iv_report_t *rp)
+{
+    rp->next_poll = rp->now_ms + IV_REPORT_POLL_RETRY_MS;
+}
+
+/* 一份 0xE1 全量应答落地：刷新镜像 → 继电器变化 / 待补报 → 立刻入队一帧。
+ *
+ * **两个入口共用**（2026-10-28 板端实测后合并）：
+ *   - `on_link_done()`：应答与本层发出的 0xE1 配对成功（正常路径）；
+ *   - `on_link_upstream()`：**迟到的应答** —— 超过 2 s ×3 的应答窗口才回来，事务
+ *     早已摘槽，`iv_link` 只能当"无配对上行帧"交上来。改前这种迟到帧被**整帧丢掉**，
+ *     而"事件即报"恰恰在等这份全量：实测 18:12:25 箱门/水浸事件，采集板 18:12:44
+ *     才把 0xE1 吐出来（比窗口晚 13 s）⇒ 这帧被扔 ⇒ 补报一直等到 30 s 后的下一拍
+ *     轮询才发（18:13:07，事件后 42 s）。迟到帧本身是**完整合法**的全量，没理由丢。 */
+static void rep_apply_query(iv_report_t *rp, const uint8_t *data, uint16_t len)
+{
+    int32_t prev[3];
+    uint8_t had_relay = rp->st.valid.RELAY;
+    int     relay_moved;
+
+    prev[0] = rp->st.data.RELAY[0];
+    prev[1] = rp->st.data.RELAY[1];
+    prev[2] = rp->st.data.RELAY[2];
+
+    iv_status_handle_query(&rp->st, data, len);
+    /* 把采集板回的原样打一份（DEBUG，正常 30 s 一条）：
+     * "平台不显示通道电压/电流"这种问题，第一件事就是看采集板到底回没回
+     * `CHV1..3`/`CHA1..3` —— 镜像里 `valid.CHV` 要求**三项齐全**，
+     * 少一项就整组当 0，光看镜像分不清"没测到"还是"没回这个键"。 */
+    if (data != NULL && len > 0u) {
+        char jb[512];
+        uint16_t n = (uint16_t)((len < sizeof(jb)) ? len : sizeof(jb) - 1u);
+
+        memcpy(jb, data, n);
+        jb[n] = '\0';
+        IV_LOG_D(REP_MOD, "E1 from board (%u B): %s", (unsigned)len, jb);
+    }
+    /* **继电器一变就上报**：不区分是谁改的（我们下发的 `0xD1`、网页、
+     * 采集板自己的动作）。2026-10-27 实测：平台点「通道3 重启」后采集板
+     * 把 `RELAY3` 从 1 改成 2（断电），十几秒后**自己**又改回 1（上电）；
+     * 回来这一下没有任何命令触发它，`want_report` 早被消费掉了 ⇒ 平台
+     * 界面一直停在"断电"，用户看到的就是"点重启没反应"。
+     * 判据只看 0xE1 里 `RELAY1..3` 的值，与 `want_report` 去重
+     * （两者都成立也只报一帧，上报本来就是全量状态）。 */
+    relay_moved = (had_relay != 0u && rp->st.valid.RELAY != 0u &&
+                   (prev[0] != rp->st.data.RELAY[0] ||
+                    prev[1] != rp->st.data.RELAY[1] ||
+                    prev[2] != rp->st.data.RELAY[2]));
+    if (relay_moved || rp->want_report) {
+        rp->want_report = 0;
+        if (relay_moved)
+            IV_LOG_I(REP_MOD, "relay changed %ld,%ld,%ld -> %ld,%ld,%ld, report",
+                     (long)prev[0], (long)prev[1], (long)prev[2],
+                     (long)rp->st.data.RELAY[0], (long)rp->st.data.RELAY[1],
+                     (long)rp->st.data.RELAY[2]);
+        (void)iv_report_trigger(rp, rp->now_ms);
+    }
+}
+
 static void on_link_done(int rc, uint8_t cmd, const uint8_t *data, uint16_t len,
                          void *arg)
 {
     iv_report_t *rp = arg;
 
-    /* 只消费 0xE1 应答 → 全量刷新镜像（0xF1/0xD1/0xD2 应答本步不用） */
-    if (rc == IV_OK && cmd == IV_FRAME_CMD_QUERY) {
-        int32_t prev[3];
-        uint8_t had_relay = rp->st.valid.RELAY;
-        int     relay_moved;
-
-        prev[0] = rp->st.data.RELAY[0];
-        prev[1] = rp->st.data.RELAY[1];
-        prev[2] = rp->st.data.RELAY[2];
-
-        iv_status_handle_query(&rp->st, data, len);
-        /* 把采集板回的原样打一份（DEBUG，正常 30 s 一条）：
-         * "平台不显示通道电压/电流"这种问题，第一件事就是看采集板到底回没回
-         * `CHV1..3`/`CHA1..3` —— 镜像里 `valid.CHV` 要求**三项齐全**，
-         * 少一项就整组当 0，光看镜像分不清"没测到"还是"没回这个键"。 */
-        if (data != NULL && len > 0u) {
-            char jb[512];
-            uint16_t n = (uint16_t)((len < sizeof(jb)) ? len : sizeof(jb) - 1u);
-
-            memcpy(jb, data, n);
-            jb[n] = '\0';
-            IV_LOG_D(REP_MOD, "E1 from board (%u B): %s", (unsigned)len, jb);
-        }
-        /* **继电器一变就上报**：不区分是谁改的（我们下发的 `0xD1`、网页、
-         * 采集板自己的动作）。2026-10-27 实测：平台点「通道3 重启」后采集板
-         * 把 `RELAY3` 从 1 改成 2（断电），十几秒后**自己**又改回 1（上电）；
-         * 回来这一下没有任何命令触发它，`want_report` 早被消费掉了 ⇒ 平台
-         * 界面一直停在"断电"，用户看到的就是"点重启没反应"。
-         * 判据只看 0xE1 里 `RELAY1..3` 的值，与 `want_report` 去重
-         * （两者都成立也只报一帧，上报本来就是全量状态）。 */
-        relay_moved = (had_relay != 0u && rp->st.valid.RELAY != 0u &&
-                       (prev[0] != rp->st.data.RELAY[0] ||
-                        prev[1] != rp->st.data.RELAY[1] ||
-                        prev[2] != rp->st.data.RELAY[2]));
-        if (relay_moved || rp->want_report) {
-            rp->want_report = 0;
-            if (relay_moved)
-                IV_LOG_I(REP_MOD, "relay changed %ld,%ld,%ld -> %ld,%ld,%ld, report",
-                         (long)prev[0], (long)prev[1], (long)prev[2],
-                         (long)rp->st.data.RELAY[0], (long)rp->st.data.RELAY[1],
-                         (long)rp->st.data.RELAY[2]);
-            (void)iv_report_trigger(rp, rp->now_ms);
-        }
+    /* 只消费 0xE1 事务（0xF1/0xD1/0xD2 应答本层不用） */
+    if (cmd != IV_FRAME_CMD_QUERY)
+        return;
+    if (rc == IV_OK) {
+        rep_apply_query(rp, data, len);
+        return;
+    }
+    /* **超时 / 取消 = 催出去的那一拍没人应答**。若有一帧补报正在等全量，绝不能
+     * 等下一个 30 s 轮询周期（现场实测＝事件后 42 s 才上平台）。这里立刻再催一次，
+     * 一直催到采集板答复为止；采集板真的不回时也就每 ~6 s（3 发窗口）重试一次。 */
+    if (rp->want_report) {
+        rep_poll_soon(rp);
+        IV_LOG_D(REP_MOD,
+                 "0xE1 no answer (rc=%d), re-poll for the pending report", rc);
     }
 }
 
@@ -412,6 +444,13 @@ static void on_link_upstream(uint8_t cmd, const uint8_t *data, uint16_t len,
         IV_LOG_D(REP_MOD, "board up cmd 0x%02X (%u B): %s", (unsigned)cmd,
                  (unsigned)len, nb);
     }
+    /* **迟到的 0xE1 应答**（事务已超时摘槽，只能走上行帧）：它是一份完整合法的
+     * 全量镜像，照常落地；若正等着补报就立刻上报。见 `rep_apply_query()` 抬头。 */
+    if (cmd == IV_FRAME_CMD_QUERY) {
+        rep_apply_query(rp, data, len);
+        return;
+    }
+
     iv_status_handle_upstream(cmd, data, len, &rp->st);
 
     /* ============================ 采集板一上报，就立刻取全量 + 上平台 ============================

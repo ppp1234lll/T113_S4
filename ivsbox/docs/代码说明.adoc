@@ -59,6 +59,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | 控制命令 `0xD1/0xD2` 独立短应答窗口（`ctrl_timeout_ms`） | 已实现（`iv_link_cfg_t` 追加字段、默认 300 ms、0＝沿用 `timeout_ms`；`make test`/`asan` 全绿、`analyze` 0 报告、`arm` 0 告警；新增 3b 用例钉住"短窗口只给控制命令"；**板端未换版**） | 2026-10-28 17:19 | 平台「下发后设备反应慢」的真因：采集板从不回 0xD1 ⇒ 槽白占 2 s ⇒ 连点第二个通道撞 `IV_EBUSY(-3)` 回 `0x74`。详见本文件文末 2026-10-28 17:19 节。 |
 | 采集板 `0xC2`/`0xC1` 主动上报 → 立刻取全量 → 走正常上报报文 | 已实现（`iv_report.c:on_link_upstream()` 只认命令字、不解析事件内容；`rep_poll()` 回传返回码 ＋ `IV_REPORT_POLL_RETRY_MS` 200 ms 兜底重试；`test_e2e_report` 新增 c04d/c04e、扩展 c02c，c05 计数 6→9；`make test`/`asan`/`tsan` 49 passed、`arm` 0 告警、`analyze` 0 报告；反向证伪 14 条 ＋ 1 条；**板端未换版**） | 2026-10-28 17:45 | 事件（单 TAG 增量）不能直接当上报内容；改前平台要等 300 s 周期，箱门开启完全不上报。详见本文件文末 2026-10-28 17:45 节。 |
 | 抓拍可用性（目录自动创建 ＋ 摄像头热插拔）＋ Web 抓拍与图片显示 | 已实现（`capture.c` 写前 `mkdir -p` ＋ 按能力扫 `/dev/video0..31` ＋ 掉线后重开；`/capture` 失败改回 **500**；`iv_media` 侧同样建目录；新增 `POST /api/snapshot` 与 `/media/<目录>/` 列表 JSON；`app.js` 新增「抓拍（USB 摄像头）」卡；`test_web_media_e2e` 新增 m14a~m14n ＋ 新增 `tests/web/ui_media_snap.mjs` 18 条；`make test`/`asan`/`tsan` 49 passed、`make itest` 16 passed＋1 SKIP、`analyze` 0、`arm` 0 告警；反向证伪 2 条；**板端实测**：删目录后抓拍自建目录、拔插视频节点无需重启进程即可用、`/media/snap/` 列表与取图全通） | 2026-10-28 18:10 | 用户口径：没有目录就创建 / 摄像头插入没有先后顺序 / Web 要能抓拍和看图。详见本文件文末 2026-10-28 18:10 节。 |
+| 0xE1 **超时无应答 → 迟到应答**仍落地补报（现场 42 s 延迟的真因） | 已实现（`rep_apply_query()` 由 `on_link_done()` 与 `on_link_upstream()` 共用；超时且 `want_report` 挂着 → `rep_poll_soon()` 立刻再催；`test_e2e_report` 新增 c04f，c05 计数 9→10；`make test`/`asan`/`tsan` 49 passed、itest 16 passed＋1 SKIP、`platcmd_e2e.py` 全通过、`arm` 0 告警、`analyze` 0 报告；反向证伪 5 条 ＋ 1 条；**待再次换版上板**） | 2026-10-28 18:29 | 17:45 那条换版后现场实测暴露：采集板 13 s 后才回 0xE1 ⇒ 事务已摘槽 ⇒ 整帧被丢 ＋ 超时后无人再催 ⇒ 事件后 42 s 才上平台。详见本文件文末 2026-10-28 18:29 节。 |
 |===
 
 
@@ -9127,7 +9128,6 @@ if (cmd == IV_FRAME_CMD_DOOR || cmd == IV_FRAME_CMD_EVENT) {   /* 0xC1 / 0xC2 */
   直接 `usart3_send_str()`，不登记 `send_cmd`、不等 ACK）⇒ 主板不回应答不影响对端。
 * 事件语义化（哪个告警、持续多久、要不要另出一类事件报文）未做 —— 按用户口径不解析内容。
 
-
 == 2026-10-28 18:10 抓拍三件事：目录自动创建、摄像头后插即用、Web 抓拍与图片显示
 
 === 用户口径（2026-10-28 18:00）
@@ -9212,3 +9212,96 @@ if (cmd == IV_FRAME_CMD_DOOR || cmd == IV_FRAME_CMD_EVENT) {   /* 0xC1 / 0xC2 */
   的响应体里带码值——当前用一句 `capture failed` 就够定位到 `media.log`。
 * 抓拍目录固定 `IV_MEDIA_SNAP_DIR_DEFAULT`（`/mnt/sdcard/snap`）；`media_snap_dir` 仍是
   死配置（装配层从不填），改它需要同时改 `ctx->media_root` 的映射，本轮不动。
+
+== 2026-10-28 18:29 0xE1 超时无应答 → 迟到应答仍落地补报（现场 42 s 延迟的真因）
+
+=== 干了什么事
+
+`iv_report.c` 里做了三件事，全部是为了让"事件即报"在采集板**慢回**时仍然成立：
+
+. **抽出 `rep_apply_query()`**：原先写在 `on_link_done()` 里的"镜像刷新 ＋ 继电器变化检测 ＋
+补报入队"整段抽成一个函数，给两个入口共用 —— 正常配对应答（`on_link_done`）和**迟到应答**
+（`on_link_upstream`）。行为逐字不变，只是搬了位置。
+. **`on_link_done()` 超时分支补动作**：`cmd != 0xE1` 直接返回；`rc == IV_OK` 走
+`rep_apply_query()`；`rc != IV_OK`（超时/取消）且 `want_report` 还挂着 → `rep_poll_soon()`
+把下一拍 `0xE1` 拨到 `now + IV_REPORT_POLL_RETRY_MS`，一直催到采集板答复为止。
+. **`on_link_upstream()` 拦下 `0xE1`**：放在 `iv_status_handle_upstream()` **之前**，
+走 `rep_apply_query()` 后 `return`。
++
+[source,c]
+----
+if (cmd == IV_FRAME_CMD_QUERY) {      /* 迟到的全量：事务已摘槽，只能从上行帧来 */
+    rep_apply_query(rp, data, len);   /* 与正常应答完全同一条落地路径 */
+    return;                           /* 0xE1 不是 0xC1/0xC2，不必再进镜像增量分支 */
+}
+iv_status_handle_upstream(cmd, data, len, &rp->st);
+----
+
+两个入口**互斥**：`iv_link` 在 `on_framed()` 里先找同 cmd 的在飞事务，找到就只回调
+`on_done()`，找不到才回调 `on_upstream()` ⇒ 同一份应答不可能被处理两次。
+
+=== 解决什么问题
+
+`2026-10-28 17:45` 那条改完换版上板，用户现场触发箱门/水浸，**上报要 42 s 才到平台**。
+板端日志（`/mnt/UDISK/log/2026-10-28/18.log`）的台阶很清楚：
+
+[source,text]
+----
+18:12:25 board up cmd 0xC2 (35 B): {"key":"mcuEvent","value":{"DS":2}}
+18:12:25 board event 0xC2 -> poll 0xE1 + report after poll
+18:12:44 board up cmd 0xE1 (393 B): {"V":237.28,...}   <- 采集板晚 13 s 才回
+18:13:07 report #1 DT=20261028181307 ...                <- 事件后 42 s
+----
+
+两处漏洞叠加：
+
+* **催出去的那笔没人管**：`0xE1` 应答窗口 2 s ×3 发（最长 6 s），超时后 `iv_link` 摘槽并回调
+  `on_link_done(IV_ETIMEDOUT)`，而改前的 `on_link_done()` 只处理 `rc == IV_OK` ⇒
+  `want_report` 一直挂着，只能等下一个 30 s 轮询；
+* **迟到应答被整帧丢**：13 s 后才回来的全量，因为事务早已摘槽，只能当"无配对上行帧"交给
+  `on_link_upstream()`，而那里只认 `0xC1`/`0xC2` ⇒ 一份**完整合法**的全量镜像被扔掉。
+
+采集板为什么慢 13 s：它当时正在执行事件本身的动作（箱门/水浸处理），`0xE1` 应答排在后面。
+这不是主板能控的，只能容错。
+
+=== 影响范围
+
+* 只在上报装配层内部：不新增 API、不改协议、不改配置键、不动 `iv_agent`/`main.c` 装配；
+* 迟到帧的处理**复用**正常路径 ⇒ 继电器变化检测、`want_report` 去重、`##` 全量帧格式全部不变；
+* 采集板长期不回（掉电/排线断）时，最坏退化成"每 ~6 s 催一次 `0xE1`"，
+  `want_report` 被消费或镜像稳定后自动回到 30 s 常规节拍 —— 不会有人为的额外上报；
+* `on_link_upstream()` 对 `0xE1` 提前 return 不改变既有语义：`iv_status_handle_upstream()`
+  本来就只处理 `0xC1`/`0xC2`。
+
+=== 验证方式与结果
+
+[cols="3,4,1"]
+|===
+| 项 | 内容 | 结果
+
+| 端到端（新增 c04f） | 先清场跑完遗留事务 → 喂 `0xC2`（不认识的 TAG `zz`）→ 同拍催 `0xE1`
+  且**故意不应答**，推 40 拍把三发窗口跑完 → 断言 `want_report == 1` 且
+  `next_poll == now + IV_REPORT_POLL_RETRY_MS`（超时再催生效）→ 喂迟到全量
+  （`T=52.50`）→ 断言镜像落地、`want_report` 被消费、恰好一帧、平台收到 `T=52.50;`
+  的标准 `##` 帧 | 通过
+| 反向证伪 ① | 关掉 `on_link_upstream()` 的 `0xE1` 分支（`if (cmd == 0xFFu)`）：
+  **5 条** FAIL（c04f 的 mirror / consumed / exactly-one / platform-got 与 c05 计数），
+  其余用例全绿，还原后复绿 | 通过
+| 反向证伪 ② | 只把超时后的 `rep_poll_soon()` 换成 `if (0)`：**恰好 1 条** FAIL
+  （`c04f poll timeout re-arms within IV_REPORT_POLL_RETRY_MS`），还原后复绿 | 通过
+| 集成 | `make itest` 16 passed ＋ 1 SKIP（SKIP＝device identity 未 provisioned，与基线同因） | 通过
+| 平台命令 e2e | `sudo python3 tests/integration/platcmd_e2e.py` 全部通过（Z4/Z5 还原核对一致） | 通过
+| 全量 | `make test` 49 passed / RC=0；`make asan` 49 passed / RC=0；`setarch -R make tsan`
+  49 passed / RC=0；`make analyze`（先 `rm -rf build/analyze`）0 warning / 0 error | 通过
+| 交叉编译 | `make arm` 0 告警 / RC=0，`build/arm/ivsboxd` md5 见修改记录对应条目 | 通过
+| 同步对账 | 源码 `tar` 到 VM 后 `md5sum` 两文件两端一致 | 通过
+|===
+
+=== 未做 / 待办
+
+* **待再次换版上板实测**：期望 `board up cmd 0xC2` → 同秒/数秒内 `E1 from board` →
+  `report #N`，不再出现 40 s 级延迟；本次未动真实继电器/断电。
+* 现场 `0xC2` 载荷是**嵌套**的 `{"key":"mcuEvent","value":{"DS":2}}`，而
+  `iv_status_handle_upstream()` 按扁平结构解析，把 `value` 当成 TAG ⇒ 该事件对镜像无影响。
+  **当前无害**（触发只看命令字）；若将来要按 TAG 增量刷新单值，需要先支持嵌套结构。
+

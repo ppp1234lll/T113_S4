@@ -15,6 +15,7 @@
  *   c04c 采集板自己改继电器也要报；同值不重复报；
  *   c04d 采集板 0xC2 事件 → **同一拍**催 0xE1 → 全量回来后才组包，走正常上报报文；
  *   c04e 事件撞上"0xE1 还在飞" → 补报按 IV_REPORT_POLL_RETRY_MS 重试，不退回 30 s；
+ *   c04f 事件催的 0xE1 **超窗无应答 → 迟到应答**（现场实测晚 13 s）仍要落地补报；
  *   c02c 采集板 0xC1 箱门开启 → 同上（顺带验门开钩子经 cfg 装配链挂上）；
  *   c05 平台断开 → 上报入队积压（不丢）；
  *   c06 平台恢复 → 欠包按序补发（CSQ 11/12/13 的到达顺序即序号顺序）、队列清空；
@@ -884,6 +885,98 @@ int main(void)
                 "c04e report carries the post-poll value");
     }
 
+    /* ---- c04f 0xE1 超窗无应答 → 迟到应答仍须落地并补一帧（现场实测的真 bug） ----
+     * 2026-10-28 18:12 板端实录：
+     *   18:12:25 board up cmd 0xC2 {"key":"mcuEvent","value":{"DS":2}}
+     *   18:12:25 board event 0xC2 -> poll 0xE1 + report after poll
+     *   18:12:44 board up cmd 0xE1 (393 B)      ← 晚 13 s，早超 2 s×3 窗口
+     *   18:13:07 report #1 ...                   ← 事件后 42 s 才上平台
+     * 成因：催出去的那笔 0xE1 三发（最长 6 s）打完就摘槽，`on_link_done()`
+     * 收到 `IV_ETIMEDOUT` 后**没人再催**；13 s 后才回来的全量因为事务已摘槽，
+     * 只能当"无配对上行帧"走 `on_link_upstream()`，而改前的上行分支只认
+     * 0xC1/0xC2 ⇒ 这帧完整合法的全量被**整帧丢掉**，补报一直挂到下一个 30 s
+     * 轮询。两处都修：①超时且 `want_report` 挂着 → `rep_poll_soon()` 立刻再催；
+     * ②上行分支收 0xE1 → 走同一个 `rep_apply_query()` 落地。
+     * 本块只钉 ② 的独立存在性（事务摘槽后、无人再催时，迟到帧照样变成一帧上报）。 */
+    {
+        static const char ev[]   = "{\"key\":\"mcuEvent\",\"zz\":9}";
+        static const char full[] =
+            "{\"V\":240.10,\"A\":0.50,\"H\":50.01,\"T\":52.50,\"DS\":2,"
+            "\"P\":0,\"SPD\":1,\"PA\":1,\"PV\":1,\"APOWER\":\"0.00\","
+            "\"AKW\":\"0.00\",\"RELAY1\":1,\"RELAY2\":1,\"RELAY3\":1,"
+            "\"CHV1\":240.10,\"CHV2\":240.10,\"CHV3\":240.10,"
+            "\"CHA1\":0.0,\"CHA2\":0.0,\"CHA3\":0.0,"
+            "\"POWER1\":0.0,\"POWER2\":0.0,\"POWER3\":0.0,"
+            "\"ELEC1\":0.0,\"ELEC2\":0.0,\"ELEC3\":0.0}";
+        uint8_t     up[IV_FRAME_MAX];
+        char        rx[4096];
+        char        scratch[512];
+        const char *seg  = NULL;
+        size_t      sl   = 0u;
+        size_t      rn   = 0u;
+        size_t      used = 0u;
+        uint64_t    reps0;
+        int         un;
+        int         j;
+        int         aged = 0;
+
+        /* 清场：把上一块可能遗留的在飞事务跑完（每个在飞窗口最长 6 s） */
+        for (j = 0; j < 60; j++) {
+            g_now += STEP_MS;
+            (void)iv_report_step(&rp, g_now);
+            (void)drain(master, scratch, sizeof scratch, 30);
+        }
+        reps0 = iv_report_reports(&rp);
+
+        /* 事件到达 → 同拍催 0xE1，然后**故意不应答**，让三发窗口跑完 */
+        un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_EVENT, ev,
+                            (uint16_t)(sizeof ev - 1u), up, sizeof up);
+        chk(un > 0 && write(master, up, (size_t)un) == un, "c04f feed 0xC2 event");
+        g_now += STEP_MS;
+        (void)iv_report_step(&rp, g_now);
+        (void)drain(master, scratch, sizeof scratch, 100);
+        chk(rp.want_report == 1u, "c04f report armed by the event");
+
+        /* 推进到超时那一刻：`on_link_done(IV_ETIMEDOUT)` 必须把下一拍 0xE1 提前到
+         * `IV_REPORT_POLL_RETRY_MS` 之内（否则只能等 30 s 周期）。 */
+        for (j = 0; j < 40; j++) {
+            g_now += STEP_MS;
+            (void)iv_report_step(&rp, g_now);
+            (void)drain(master, scratch, sizeof scratch, 30);
+            if (rp.want_report == 1u &&
+                rp.next_poll == g_now + (uint64_t)IV_REPORT_POLL_RETRY_MS) {
+                aged = 1;
+                break;
+            }
+        }
+        chk(aged, "c04f poll timeout re-arms within IV_REPORT_POLL_RETRY_MS");
+        chk(iv_report_reports(&rp) == reps0, "c04f nothing reported without a mirror");
+
+        /* 迟到 13 s 的全量到了：事务早已摘槽 ⇒ 只能走 `on_link_upstream()`。
+         * 改前这里整帧丢弃；改后照常刷新镜像并补一帧。 */
+        un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_QUERY, full,
+                            (uint16_t)(sizeof full - 1u), up, sizeof up);
+        chk(un > 0 && write(master, up, (size_t)un) == un, "c04f feed the LATE 0xE1 answer");
+        pump(&rp, master, 2);
+        chk(rp.st.valid.T != 0u && rp.st.data.T > 52.49f && rp.st.data.T < 52.51f,
+            "c04f late answer still lands in the mirror");
+        chk(rp.want_report == 0u, "c04f late answer consumed the pending report");
+        chk(iv_report_reports(&rp) == reps0 + 1u,
+            "c04f late answer produced exactly one report");
+
+        for (j = 0; j < 50 && iv_report_queue_count(&rp) > 0u; j++)
+            pump(&rp, master, 1);
+        rn   = drain(cs, rx, sizeof rx, 1000);
+        used = next_report_frame(rx, rn, 0u, &seg, &sl);
+        chk(used > 0u, "c04f platform got the report after the late answer");
+        if (used > 0u) {
+            chk(strncmp(seg, want_hdr, sizeof want_hdr - 1u) == 0,
+                "c04f the late-answer report is the standard state frame");
+            chk(strstr(seg, "T=52.50;") != NULL,
+                "c04f report carries the value from the late answer");
+        }
+    }
+
     /* ---- c05 平台断开 → 上报入队积压（不丢） ---- */
     {
         int j;
@@ -907,10 +1000,10 @@ int main(void)
             pump(&rp, master, 1);
         }
         chk(iv_report_queue_count(&rp) == 3u, "c05 3 items queued while down");
-        /* 9：c04 1 + c02c 1（门开事件补报）+ c04b 1（动作后补报）
+        /* 10：c04 1 + c02c 1（门开事件补报）+ c04b 1（动作后补报）
          *    + c04c 1（采集板自己改继电器）+ c04d 1（0xC2 事件补报）
-         *    + c04e 1（撞在飞后仍补报）+ 这里 3 */
-        chk(iv_report_reports(&rp) == 9u, "c05 total reports=9");
+         *    + c04e 1（撞在飞后仍补报）+ c04f 1（迟到应答补报）+ 这里 3 */
+        chk(iv_report_reports(&rp) == 10u, "c05 total reports=10");
         chk(iv_report_queue_full(&rp) == 0u, "c05 nothing dropped");
     }
 

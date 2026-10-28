@@ -68,14 +68,22 @@ static void handleMessage(struct mg_connection *c, int ev, void *ev_data)
         {
             char path[256] = {0};
             ret = mg_http_get_var(&msg->query, API_QUERY_PATH, path, sizeof(path));
-            if (ret < 0)
+            if (ret < 0 || path[0] == '\0')
             {
-                mg_http_reply(c, 400, "", "Invalid path");
+                mg_http_reply(c, 400, "", "invalid path");
                 return;
             }
 
-            // 异步处理，不用判断返回值
-            media_capture(path);
+            /* 抓图在服务端是**同步**的（V4L2 DQBUF 阻塞等帧），所以返回值必须
+             * 回给调用方。原实现一律回 200，主板侧只能靠 stat() 猜"到底写没
+             * 写下来"，日志长成 `capture: peer 200 but /mnt/sdcard/snap/…
+             * missing` —— 看不出是没目录、没摄像头，还是摄像头刚被拔。
+             * 现在失败回 500（原因在 media.log 里，那是唯一知道细节的地方）。 */
+            if (media_capture(path) != 0)
+            {
+                mg_http_reply(c, 500, "", "capture failed");
+                return;
+            }
             mg_http_reply(c, 200, "", "OK");
         }
         // 开启录制

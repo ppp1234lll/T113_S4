@@ -291,7 +291,9 @@ uint64_t iv_web_now_ms(void);
 uint32_t iv_web_rand(iv_web_ctx_t *ctx);
 
 /* 从 `a=1&b=2` 里取 `key` 的值（不做 percent-decode：本工程的参数都是短标识符）。
- * 实现在 api.c；logs.c 复用同一份 —— 两处各写一遍迟早只有一处支持新语法。 */
+ * 实现在 api.c；logs.c 复用同一份 —— 两处各写一遍迟早只有一处支持新语法。
+ * ⚠ 返回 **1 = 取到 / 0 = 没取到**，不是 IV_OK/IV_ENOENT（`IV_OK` 恰好是 0，
+ *   写成 `== IV_OK` 会变成"永远取不到"；2026-10-28 在目录列表的 `?n=` 上踩过）。 */
 int iv_web_query_get(const char *q, const char *key, char *out, size_t cap);
 
 /* --------------------------------------------------------------------------
@@ -324,6 +326,11 @@ void iv_web_sess_new(iv_web_ctx_t *ctx, char *out_token, size_t cap);
  * 与 api.c 同口径：IV_OK = 已填好响应；IV_ENOTSUP = 这个路径不归我。
  * 命中 /media/... 但**未登录** ⇒ 401；**待改密（must_change）** ⇒ 403；
  * 路径非法/越界 ⇒ 403；不存在 ⇒ 404。
+ *
+ * 2026-10-28 起**路径是目录时返回列表 JSON**（`{ok,d:{dir,n,items:[{n,s,t}]}}`，
+ * 按 mtime 降序、最多 48 条）：Web 的「抓拍图片」要用 `GET /media/snap/` 列出刚抓
+ * 的几张。目录与文件走同一套路径围栏与鉴权闸门，没有扩大可读面（文件名另有
+ * 字符白名单，见 iv_web_media.c 的说明）。
  * -------------------------------------------------------------------------- */
 int iv_web_media_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
                         char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp);

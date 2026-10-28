@@ -33,10 +33,13 @@ static void *monitor_worker(void *arg);
 // 初始化
 int media_init()
 {
-    // 初始化 V4L2
+    /* 初始化 V4L2。**允许失败**：摄像头是可选外设，而且可以后插 ——
+     * `capture_process()` 每次抓拍前会重新找节点（2026-10-28 用户口径：
+     * "禁止有先后顺序，摄像头不一定什么时候插入，需要插入后就能用"）。
+     * 因此这里失败只降级抓拍能力，录像（走网络 RTSP）不受影响。 */
     if (capture_init(&g_capture_ctx, PATH_VIDEO_DEVICE) != 0) {
-        log_err("capture init failed!");
-        // 即使失败也继续，防止录制业务受影响
+        log_warn("capture not ready at startup; will retry on each snapshot "
+                 "(record unaffected)");
     }
 
     pthread_t tid;

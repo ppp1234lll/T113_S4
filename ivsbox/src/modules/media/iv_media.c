@@ -71,6 +71,56 @@ static int url_encode(const char *in, char *out, size_t cap)
 }
 
 /* ---------------------------------------------------------------------------
+ * 抓拍落地目录
+ *
+ * 2026-10-28 板端实测：`/mnt/sdcard/snap` 不存在时抓拍**一定失败** ——
+ * media 进程的 `fopen()` 拿到 ENOENT，主板侧只看到 `peer 200 but … missing`。
+ * 用户口径："没有目录就创建，不要因为没有目录导致存储失败"。
+ *
+ * **两处都要建**（不是重复劳动，各挡一类现场）：
+ *   1. 这里（ivsboxd，Reactor 线程，开机时建）：SD 卡开机就挂着 ⇒ 一次建好，
+ *      之后门开抓拍不必每次 syscall；
+ *   2. media 进程的 `capture_process()`（见 media/src/media/capture.c）：SD 卡
+ *      **重插**、人手工删了目录、工厂复位之后，ivsboxd 这边并不知道，只有真正
+ *      写文件的那一刻建目录才拦得住。
+ * 只建不删：目录留着不影响任何判据。
+ * ------------------------------------------------------------------------- */
+
+/* mkdir -p 语义（与 src/core/iv_db.c 的同名实现同语义：逐段建、EEXIST 不算错）。 */
+static int mkdir_p(const char *path)
+{
+    char   buf[IV_MEDIA_URL_MAX * 2];
+    size_t i;
+    size_t n;
+
+    if (path == NULL || path[0] == '\0')
+        return IV_EINVAL;
+    n = strlen(path);
+    if (n + 1u > sizeof(buf))
+        return IV_ERANGE;
+    memcpy(buf, path, n + 1u);
+    while (n > 1u && buf[n - 1u] == '/')
+        buf[--n] = '\0';
+    for (i = 1u; i < n; i++) {
+        if (buf[i] != '/')
+            continue;
+        buf[i] = '\0';
+        if (mkdir(buf, 0755) != 0 && errno != EEXIST)
+            return IV_EIO;
+        buf[i] = '/';
+    }
+    if (mkdir(buf, 0755) != 0 && errno != EEXIST)
+        return IV_EIO;
+    return IV_OK;
+}
+
+/* 生效的抓拍目录（配置空 ⇒ 默认）。 */
+static const char *snap_dir_of(const iv_media_t *m)
+{
+    return (m->cfg.snap_dir != NULL) ? m->cfg.snap_dir : IV_MEDIA_SNAP_DIR_DEFAULT;
+}
+
+/* ---------------------------------------------------------------------------
  * 极小回环 HTTP 客户端（GET，只认状态行与 body）
  * ------------------------------------------------------------------------- */
 
@@ -269,7 +319,7 @@ static void *worker_main(void *arg)
         if (have) {
             char enc[IV_MEDIA_URL_MAX * 3];
             char req[IV_MEDIA_URL_MAX * 3 + 32];
-            char resp[256];
+            char resp[256] = {0};   /* url_encode 失败时不会填，绝不能读未初始化 */
             int  status = 0;
 
             if (url_encode(path, enc, sizeof(enc)) == IV_OK)
@@ -294,7 +344,11 @@ static void *worker_main(void *arg)
                 pthread_mutex_lock(&m->lock);
                 m->st.snap_fail++;
                 pthread_mutex_unlock(&m->lock);
-                IV_LOG_W(MD_MOD, "capture failed: %s (http %d)", path, status);
+                /* 带上对端给的一句话原因（media 进程 500 时说 `capture failed`，
+                 * 细节在它自己的日志里；连不上时这里是空串，不回显垃圾字节）。
+                 * 现场要能一眼分开"没摄像头 / 没目录 / 媒体进程不在"。 */
+                IV_LOG_W(MD_MOD, "capture failed: %s (http %d: %s)", path, status,
+                         (resp[0] != '\0') ? resp : "-");
             }
             continue; /* 干完一个立刻看队列里还有没有 */
         }
@@ -386,10 +440,16 @@ int iv_media_init(iv_media_t *m, const iv_media_cfg_t *cfg)
     }
 
     m->inited = 1;
+    /* 抓拍目录先建好：见 mkdir_p 上方的说明（不建就一定抓拍失败）。
+     * 失败只告警不阻断 —— SD 卡后插的场景由 media 进程写入前那一遍兜住。 */
+    if (mkdir_p(snap_dir_of(m)) != IV_OK)
+        IV_LOG_W(MD_MOD, "snap dir %s not usable yet (%s); "
+                         "the media process will retry before writing",
+                 snap_dir_of(m), strerror(errno));
     IV_LOG_I(MD_MOD, "media bridge up: %s:%d snap_dir=%s ka=%us",
              host_of(m),
              (m->cfg.port != 0) ? m->cfg.port : IV_MEDIA_PORT_DEFAULT,
-             (m->cfg.snap_dir != NULL) ? m->cfg.snap_dir : IV_MEDIA_SNAP_DIR_DEFAULT,
+             snap_dir_of(m),
              (unsigned)((m->cfg.ka_period_ms != 0u) ? m->cfg.ka_period_ms : 0u));
     return IV_OK;
 }
@@ -426,8 +486,12 @@ int iv_media_capture_async(iv_media_t *m, const char *path,
         return IV_ESTATE;
 
     if (path == NULL) {
-        const char *dir = (m->cfg.snap_dir != NULL) ? m->cfg.snap_dir
-                                                    : IV_MEDIA_SNAP_DIR_DEFAULT;
+        const char *dir = snap_dir_of(m);
+
+        /* 自动命名这条路才建目录：显式 path 由调用方自己保证（门开抓拍与 ctl
+         * 都走自动命名）。成本是每拍 1~2 次 mkdir，只在"目录已被删/SD 刚插回"
+         * 时才真的落到 syscall 上。 */
+        (void)mkdir_p(dir);
         sec = wall_sec();
         (void)snprintf(auto_path, sizeof(auto_path), "%s/snap_%lld.jpg", dir,
                        (long long)sec);

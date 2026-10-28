@@ -58,6 +58,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | 采集板 0xE1 应答缺逗号（主板镜像冻结）修复 | 已实现（**真正的现场工程** `F:\debug_2026\嵌入式\采集板\main`，STM32F103RC＋UCOS-II；`ELEC3` 补逗号、`ERR` 改直拼且自身无尾逗号；Keil 构建 0/0；端到端实证"修前整串被拒 / 修后 RELAY=2,2,2 可解析"；**未烧录**） | 2026-10-28 16:29 | 现场「断开继电器后平台状态不更新」的直接原因。同时更正前两条登记的现场固件路径有误。详见本文件文末 2026-10-28 16:29 节。 |
 | 控制命令 `0xD1/0xD2` 独立短应答窗口（`ctrl_timeout_ms`） | 已实现（`iv_link_cfg_t` 追加字段、默认 300 ms、0＝沿用 `timeout_ms`；`make test`/`asan` 全绿、`analyze` 0 报告、`arm` 0 告警；新增 3b 用例钉住"短窗口只给控制命令"；**板端未换版**） | 2026-10-28 17:19 | 平台「下发后设备反应慢」的真因：采集板从不回 0xD1 ⇒ 槽白占 2 s ⇒ 连点第二个通道撞 `IV_EBUSY(-3)` 回 `0x74`。详见本文件文末 2026-10-28 17:19 节。 |
 | 采集板 `0xC2`/`0xC1` 主动上报 → 立刻取全量 → 走正常上报报文 | 已实现（`iv_report.c:on_link_upstream()` 只认命令字、不解析事件内容；`rep_poll()` 回传返回码 ＋ `IV_REPORT_POLL_RETRY_MS` 200 ms 兜底重试；`test_e2e_report` 新增 c04d/c04e、扩展 c02c，c05 计数 6→9；`make test`/`asan`/`tsan` 49 passed、`arm` 0 告警、`analyze` 0 报告；反向证伪 14 条 ＋ 1 条；**板端未换版**） | 2026-10-28 17:45 | 事件（单 TAG 增量）不能直接当上报内容；改前平台要等 300 s 周期，箱门开启完全不上报。详见本文件文末 2026-10-28 17:45 节。 |
+| 抓拍可用性（目录自动创建 ＋ 摄像头热插拔）＋ Web 抓拍与图片显示 | 已实现（`capture.c` 写前 `mkdir -p` ＋ 按能力扫 `/dev/video0..31` ＋ 掉线后重开；`/capture` 失败改回 **500**；`iv_media` 侧同样建目录；新增 `POST /api/snapshot` 与 `/media/<目录>/` 列表 JSON；`app.js` 新增「抓拍（USB 摄像头）」卡；`test_web_media_e2e` 新增 m14a~m14n ＋ 新增 `tests/web/ui_media_snap.mjs` 18 条；`make test`/`asan`/`tsan` 49 passed、`make itest` 16 passed＋1 SKIP、`analyze` 0、`arm` 0 告警；反向证伪 2 条；**板端实测**：删目录后抓拍自建目录、拔插视频节点无需重启进程即可用、`/media/snap/` 列表与取图全通） | 2026-10-28 18:10 | 用户口径：没有目录就创建 / 摄像头插入没有先后顺序 / Web 要能抓拍和看图。详见本文件文末 2026-10-28 18:10 节。 |
 |===
 
 
@@ -9125,3 +9126,89 @@ if (cmd == IV_FRAME_CMD_DOOR || cmd == IV_FRAME_CMD_EVENT) {   /* 0xC1 / 0xC2 */
 * 采集板侧**无需改动**：`0xC2` 是 fire-and-forget（`app_report_information_immediately()`
   直接 `usart3_send_str()`，不登记 `send_cmd`、不等 ACK）⇒ 主板不回应答不影响对端。
 * 事件语义化（哪个告警、持续多久、要不要另出一类事件报文）未做 —— 按用户口径不解析内容。
+
+
+== 2026-10-28 18:10 抓拍三件事：目录自动创建、摄像头后插即用、Web 抓拍与图片显示
+
+=== 用户口径（2026-10-28 18:00）
+
+* "没有目录就创建，不要因为没有目录导致存储失败"；
+* "禁止有先后顺序，摄像头不一定什么时候插入，需要插入后就能用"；
+* "在 web 上增加抓拍功能和图片显示功能"。
+
+=== 现场实况（改前，192.168.1.120）
+
+`snapshot.take` 回 `{"queued":true,"path":"/mnt/sdcard/snap/snap_1793180675.jpg"}`，但**文件不存在**，
+主板侧只有一句 `WARN [media] capture: peer 200 but /mnt/sdcard/snap/snap_1793180675.jpg missing`。
+两个独立原因，都不是"参数没配对"：
+
+. `/mnt/sdcard/snap` **不存在** ⇒ `capture.c` 的 `fopen()` 直接 `ENOENT`；而 media 的 `/capture`
+  无论成败都回 200 ⇒ 调用方只能靠 `stat()` 猜"到底写没写下来"。
+. 摄像头 **17:43** 插上、`ivsbox-media` **11:11** 启动 ⇒ `capture_init()` 早已失败，`fd` 永远 -1
+  ⇒ **必须重启媒体进程**才能抓拍（`/opt/log/media.log` 11:12:09 两条 error 就是这一形态）。
+
+=== 做法
+
+* **目录两处都建**（各挡一类现场，不是重复劳动）：
+  **①** `ivsboxd` 的 `iv_media_init()` 里 `mkdir -p <snap_dir>`（开机 SD 已挂载的正常路径）；
+  **②** media 进程在**真正写文件前**再建一次父目录（SD 重插、人手工删目录、工厂复位之后，
+  只有写的那一刻才拦得住）。`mkdir -p` 逐段建、`EEXIST` 不算错，与 `iv_db`/`iv_config`
+  里的同名静态实现同语义。
+* **热插拔：抓拍前若 `fd < 0` 就重新找设备**。判据是**能力**不是名字：
+  `VIDIOC_QUERYCAP`（`VIDEO_CAPTURE` ＋ `STREAMING`）＋ `VIDIOC_ENUM_FMT` 含 `MJPEG`
+  ＋ `S_FMT` 回报的 `pixelformat` 必须**真变成** MJPEG（有的驱动会"尽力而为"换格式，
+  存出来是废文件）。顺序＝"先上次那个节点，再扫 `/dev/video0..31`" —— 后插的 UVC 会被
+  排到空出来的号上（板端 `tvd_0` 就占过 `video4`），不能写死 `/dev/video0`。
+  抓拍中途拔掉 ⇒ `QBUF/DQBUF` 失败 ⇒ `capture_fini()` 释放，下一次抓拍重新找。
+  探测是**静默**的（扫 32 个节点每个都打日志会把控制台淹没），只在"全部失败"与
+  "命中哪个节点"两处各打一句；同一个失败状态只打一次（`no_cam` 标志去重）。
+* **可诊断**：media 的 `/capture` 失败改成 **500**（细节留在它自己的 `/opt/log/media.log`）；
+  桥接侧日志变成 `capture failed: <path> (http 500: capture failed)` ⇒ 现场能一眼分开
+  "没摄像头 / 没目录 / 媒体进程不在"。
+* **Web**：
+  **①** `POST /api/snapshot` → ctl `snapshot.take`（**只收 POST**，抓拍会写 SD 卡，不能被
+  浏览器预取重放）⇒ 返回 `queued/name/path/url`，`url` 由本层把绝对路径换算成 `/media/…`
+  （媒体根只有 Web 进程知道）；
+  **②** `GET /media/snap/` 走 `iv_web_media.c` 的**目录分支**（新增）⇒ 返回列表 JSON
+  （mtime 降序、最多 48 条、文件名白名单、只列普通文件）；图片本身仍走原来的 Range 下载，
+  鉴权闸门与三道路径围栏完全复用；
+  **③** `app.js` 新增「抓拍（USB 摄像头）」卡：进页列出现有图片并把最新一张上大图，
+  点「立即抓拍」只显示"等待图片落盘"，**图片真的 load 出来**才 toast 成功，load 不到就带
+  `&r=` 重试 8 次（约 5 s）再报"图片没有落盘"。
+
+=== 验证
+
+[cols="3,4,1"]
+|===
+| 项 | 内容 | 结果
+
+| VM 单测 | `make test` 49 passed / RC=0；`make asan` 49 passed / RC=0（无 sanitizer 报告）；
+  `setarch -R make tsan` 49 passed / RC=0；`make analyze`（先 `rm -rf build/analyze`）0 报告 | 通过
+| 交叉编译 | `make arm` 0 告警 / RC=0（`ivsboxd` `d70dc4c8` / `ivsbox-web` `2c2d97fd` /
+  `ivsbox-media` `2005ae98`；`app.js` `56b3eaa2`） | 通过
+| 集成 | `make itest` 16 passed ＋ 1 SKIP（`test_tunnel_e2e` 缺设备身份，与基线同） | 通过
+| 目录列表（新增 m14a~m14n） | 结构 `ok/dir/n/items`、新的在前、`?n=1` 只回一条、
+  名字带空格的跳过、同一路径取文件仍是 `image/jpeg` | 通过
+| 前端（新增 `ui_media_snap.mjs`） | 18 条：无顺序要求的文案、进页列表与缩略图、
+  "受理≠成功"、load 后才报成功、失败原话、媒体根外如实说、重试与放弃 | 通过
+| 反向证伪 ① | 目录列表恒回 404 ⇒ m14 组 **10 条** FAIL，还原复绿 | 通过
+| 反向证伪 ② | POST 回来就 `toast('抓拍成功')` ⇒ **恰好 1 条** FAIL（s03c），还原复绿 | 通过
+| 板端·目录 | `rm -rf /mnt/sdcard/snap` 后抓拍 ⇒ 目录被重建、`141648 B`、`capture ok` | 通过
+| 板端·热插拔 | 移走 `/dev/video0`、`/dev/video1` 后重启媒体进程 ⇒
+  `capture init: no MJPEG capture device yet`，抓拍回 500；节点放回后**不重启进程**
+  再抓 ⇒ `capture: camera appeared, using /dev/video0` ＋ `snapshot saved` ＋ `capture ok` | 通过
+| 板端·Web | `POST /api/snapshot` 回 `queued/name/path/url`；`GET /media/snap/?n=5` 回 3 条
+  新的在前；`GET /media/snap/<name>` 200 / `140536 B` / `ffd8ff`；`GET /api/snapshot` 405；
+  `index.html`/`app.js`(141675 B)/`style.css` 全 200 | 通过
+| 板端·目视 | 取回图片是 1280×720 真实画面（桌面与网线），非黑帧/残帧 | 通过
+|===
+
+=== 未做 / 待办
+
+* 媒体进程的日志只在 `/opt/log/media.log`（`start-stop-daemon --background` ⇒ stdout 丢弃），
+  板端 Web 页签看不到它；"抓拍失败原因"目前靠主板日志里那句 `http 500` 指路。
+* 摄像头**不在**时的抓拍失败不会写进主板日志的"原因"字段（只有 `snap_fail` 计数与
+  `capture failed` 一行）；若要更细（no device / write error 分开），需要在 `/capture`
+  的响应体里带码值——当前用一句 `capture failed` 就够定位到 `media.log`。
+* 抓拍目录固定 `IV_MEDIA_SNAP_DIR_DEFAULT`（`/mnt/sdcard/snap`）；`media_snap_dir` 仍是
+  死配置（装配层从不填），改它需要同时改 `ctx->media_root` 的映射，本轮不动。

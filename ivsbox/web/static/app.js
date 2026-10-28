@@ -2208,6 +2208,188 @@
     return root;
   }
 
+  /* 抓拍卡（USB 摄像头，2026-10-28）：`POST /api/snapshot` ＋ `/media/snap/`。
+   *
+   * 三条界面上的约定（都不显眼，但错一条现场就会误判功能坏了）：
+   *   1. **"已受理"不等于"拍好了"**：后端 `snapshot.take` 是异步的（V4L2 出帧
+   *      要几百毫秒），`queued:true` 只代表排上队了。所以点完按钮先显示"等待落盘"，
+   *      **图片真的 load 出来**才说成功；load 不到就重试几次再报失败 ——
+   *      板端踩过的正是"日志说 200、文件其实没写下来"。
+   *   2. **列表来自 `GET /media/snap/`**（目录列表 JSON），刷新页面也能看到之前
+   *      抓的图；否则用户会以为"抓完就丢了"。
+   *   3. **不自动轮询列表**：T113 上一次轮询就是一次 SD 卡目录扫描 + 一串图片
+   *      请求，何况也没人在盯着看。进页读一次、抓完刷一次、外加一个「刷新列表」。
+   */
+  function snapCard() {
+    var card = el('div', 'card');
+    card.appendChild(el('h3', null, '抓拍（USB 摄像头）'));
+    card.appendChild(el('p', 'hint',
+      '摄像头插上 USB 口就能用，没有先后顺序（服务先起、摄像头后插也行；拔了再插也认）。' +
+      '图片存 SD 卡 /mnt/sdcard/snap/（目录不存在会自动创建）。'));
+
+    var bar = el('div', 'actions');
+    var bShot = el('button', 'ghost', '立即抓拍');
+    var bReload = el('button', 'ghost', '刷新列表');
+    bShot.type = 'button';
+    bReload.type = 'button';
+    bar.appendChild(bShot);
+    bar.appendChild(bReload);
+    card.appendChild(bar);
+
+    var msg = el('p', 'msg');
+    card.appendChild(msg);
+
+    /* 大图：只由 `loadBig()` 驱动。`pending` 是"正在等落盘的那张图"，
+     * 为空串表示当前没有等待中的请求（onerror 里据此决定要不要重试）。 */
+    var fig = el('div', 'snapfig hidden');
+    var big = el('img', 'snapimg');
+    var figCap = el('p', 'hint');
+    big.alt = '抓拍图片';
+    fig.appendChild(big);
+    fig.appendChild(figCap);
+    card.appendChild(fig);
+
+    var grid = el('div', 'snapgrid');
+    card.appendChild(grid);
+
+    var base = '/media/snap/';   /* 列表返回 `d.dir` 后会被改写成本次真实目录 */
+    var pending = '';
+    var retry = 0;
+    var afterShot = false;
+
+    function fmtEpoch(t) {
+      var d = new Date((t || 0) * 1000);
+      function p2(n) { return (n < 10 ? '0' : '') + n; }
+      return p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' +
+             p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+    }
+
+    big.onload = function () {
+      if (pending === '') return;
+      pending = '';
+      retry = 0;
+      fig.className = 'snapfig';
+      bShot.disabled = false;
+      msg.textContent = '';
+      if (afterShot) {
+        afterShot = false;
+        toast('抓拍成功', 'ok');
+        loadList();       /* 新图立刻进列表 */
+      }
+    };
+    big.onerror = function () {
+      if (pending === '') return;
+      if (retry >= 8) {   /* 8 次 × 600 ms ≈ 5 s：够 V4L2 出帧 + 写 SD 卡了 */
+        pending = '';
+        afterShot = false;
+        bShot.disabled = false;
+        fig.className = 'snapfig hidden';
+        msg.textContent = '抓拍失败：图片没有落盘 —— 摄像头没插好/被别的程序占用，' +
+                          '或 SD 卡不可写（板端日志里能查到具体原因）。';
+        toast('抓拍失败：图片没有落盘', 'err');
+        return;
+      }
+      retry++;
+      setTimeout(function () {
+        if (pending === '') return;
+        /* 加 ?t= 破缓存：同一秒重抓会命中同一个文件名 */
+        big.src = pending + '?t=' + Date.now() + '&r=' + retry;
+      }, 600);
+    };
+
+    function loadBig(url, isShot) {
+      pending = url;
+      retry = 0;
+      afterShot = !!isShot;
+      big.src = url + '?t=' + Date.now();
+      fig.className = 'snapfig';
+    }
+
+    function loadList() {
+      api('/media/snap/?n=24').then(function (r) {
+        grid.innerHTML = '';
+        if (!r.ok) {
+          var why = (r.msg === 'not found' || r.msg === 'media root not available')
+            ? '还没有抓拍图片（抓一张就会出现在这里）。'
+            : ('图片列表读取失败：' + (r.msg || ('错误 ' + r.e)));
+          grid.appendChild(el('p', 'hint', why));
+          return;
+        }
+        var d = r.d || {};
+        if (d.dir) {
+          base = '/media' + d.dir;
+          if (base.charAt(base.length - 1) !== '/') base += '/';
+        }
+        var items = (d.items || []).filter(function (it) {
+          return /\.(jpg|jpeg|png)$/i.test(it.n || '');
+        });
+        if (items.length === 0) {
+          grid.appendChild(el('p', 'hint', '还没有抓拍图片（抓一张就会出现在这里）。'));
+          return;
+        }
+        /* 进页时把最新一张直接显示出来：不显示的话，"上次抓的那张在哪"没人答得上 */
+        if (pending === '' && fig.className.indexOf('hidden') >= 0)
+          loadBig(base + items[0].n, false);
+        items.forEach(function (it) {
+          var b = el('button', 'snapthumb');
+          var im = el('img');
+          b.type = 'button';
+          im.src = base + it.n;
+          im.alt = it.n;
+          b.appendChild(im);
+          b.appendChild(el('span', null, fmtEpoch(it.t)));
+          b.addEventListener('click', function () {
+            figCap.textContent = it.n + '（' + Math.round((it.s || 0) / 1024) + ' KB）';
+            loadBig(base + it.n, false);
+          });
+          grid.appendChild(b);
+        });
+      }).catch(function () {
+        grid.innerHTML = '';
+        grid.appendChild(el('p', 'hint', '无法连接服务'));
+      });
+    }
+
+    function shoot() {
+      if (bShot.disabled) return;
+      bShot.disabled = true;
+      msg.textContent = '已提交抓拍，等待图片落盘…';
+      api('/api/snapshot', { method: 'POST' }).then(function (r) {
+        if (!r.ok) {
+          bShot.disabled = false;
+          /* `media not wired` 与录像卡同一句人话（两处各写一句迟早只改一处） */
+          var why = (r.msg === 'media not wired')
+            ? '本机固件未装配媒体链（ivsboxd 未打开媒体桥接）'
+            : (r.msg || ('错误 ' + r.e));
+          msg.textContent = '抓拍失败：' + why;
+          toast('抓拍失败：' + why, 'err');
+          return;
+        }
+        var d = r.d || {};
+        if (!d.url) {
+          /* 抓拍目录不在媒体根下（`--media-root` 与 snap_dir 不一致）：
+           * 文件是写下来了，但本页面没法显示它 —— 如实说，别装成功。 */
+          bShot.disabled = false;
+          figCap.textContent = d.path || '';
+          msg.textContent = '已抓拍，但图片不在媒体根下，页面无法显示：' + (d.path || '');
+          loadList();
+          return;
+        }
+        figCap.textContent = (d.name || '') + '（板端路径 ' + (d.path || '') + '）';
+        loadBig(d.url, true);
+      }).catch(function () {
+        bShot.disabled = false;
+        msg.textContent = '无法连接服务';
+      });
+    }
+
+    bShot.addEventListener('click', shoot);
+    bReload.addEventListener('click', loadList);
+    loadList();
+
+    return card;
+  }
+
   /* 媒体（M6）：录像状态 + 手动启停。
    * 数据来自 `GET /api/media/record`（ctl 的 `record.page`，**一次读全 8 路**），
    * 启停走 `POST /api/media/record {"on":true|false}`（ctl 的 `record.manual`）。
@@ -2245,6 +2427,10 @@
     var box = el('div');
     card.appendChild(box);
     root.appendChild(card);
+
+    /* 抓拍卡（USB 摄像头）：与录像卡是两条独立的路 —— 录像走网络 RTSP，
+     * 抓拍走本机 V4L2，摄像头不在也不影响录像（反之亦然）。 */
+    root.appendChild(snapCard());
 
     var tip = el('div', 'card');
     tip.appendChild(el('h3', null, '录像文件'));

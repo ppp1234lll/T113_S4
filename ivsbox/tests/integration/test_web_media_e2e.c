@@ -44,6 +44,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <utime.h>
 
 #include "ivsbox/iv_sha256.h"
 
@@ -62,6 +63,11 @@ static char  g_rsp[RSP_CAP];
 static char  g_req[4096];
 static char  g_media[256];   /* 临时媒体根 */
 static char  g_file[512];    /* 测试文件全路径 */
+/* 目录列表（m14）用的快照夹具：两张 jpg ＋ 一个"白名单外"的文件名 */
+static char  g_snap_dir[300];
+static char  g_snap_a[400];
+static char  g_snap_b[400];
+static char  g_snap_bad[400];
 static unsigned char g_payload[PAYLOAD_LEN];
 
 static void chk(int cond, const char *what)
@@ -356,6 +362,68 @@ static int make_media_file(void)
     return 0;
 }
 
+/* 造 `<media>/snap/` 夹具（m14 用）：两张 jpg，mtime 差 1 秒、大小 100/200 B，
+ * 外加一个**名字带空格**的文件 —— 列表只认 `[A-Za-z0-9._-]`（拼 JSON 前不做转义，
+ * 用白名单代替），这种名字必须被跳过。 */
+static int make_snap_fixture(void)
+{
+    char *paths[2];
+    long  times[2];
+    int   sizes[2];
+    int   i;
+
+    (void)snprintf(g_snap_dir, sizeof(g_snap_dir), "%s/snap", g_media);
+    (void)snprintf(g_snap_a, sizeof(g_snap_a), "%s/snap_1700000001.jpg", g_snap_dir);
+    (void)snprintf(g_snap_b, sizeof(g_snap_b), "%s/snap_1700000002.jpg", g_snap_dir);
+    (void)snprintf(g_snap_bad, sizeof(g_snap_bad), "%s/we ird.jpg", g_snap_dir);
+
+    if (mkdir(g_snap_dir, 0700) != 0)
+        return -1;
+
+    paths[0] = g_snap_a;
+    paths[1] = g_snap_b;
+    times[0] = 1700000001L;
+    times[1] = 1700000002L;
+    sizes[0] = 100;
+    sizes[1] = 200;
+
+    for (i = 0; i < 2; i++) {
+        char    blob[200];
+        int     fd;
+        ssize_t n;
+
+        memset(blob, 'J', sizeof(blob));
+        fd = open(paths[i], O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0)
+            return -1;
+        n = write(fd, blob, (size_t)sizes[i]);
+        (void)close(fd);
+        if (n != (ssize_t)sizes[i])
+            return -1;
+        {
+            struct utimbuf ut;
+
+            ut.actime  = (time_t)times[i];
+            ut.modtime = (time_t)times[i];
+            if (utime(paths[i], &ut) != 0)
+                return -1;
+        }
+    }
+
+    {
+        int fd = open(g_snap_bad, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+        if (fd < 0)
+            return -1;
+        if (write(fd, "X", 1) != 1) {
+            (void)close(fd);
+            return -1;
+        }
+        (void)close(fd);
+    }
+    return 0;
+}
+
 static void clean_media(void)
 {
     char d1[300];
@@ -367,6 +435,14 @@ static void clean_media(void)
         (void)unlink(g_file);
     (void)rmdir(d2);
     (void)rmdir(d1);
+    if (g_snap_a[0] != '\0')
+        (void)unlink(g_snap_a);
+    if (g_snap_b[0] != '\0')
+        (void)unlink(g_snap_b);
+    if (g_snap_bad[0] != '\0')
+        (void)unlink(g_snap_bad);
+    if (g_snap_dir[0] != '\0')
+        (void)rmdir(g_snap_dir);
     (void)rmdir(g_media);
 }
 
@@ -406,6 +482,11 @@ int main(int argc, char *argv[])
     }
     if (make_media_file() != 0) {
         fprintf(stderr, "FAIL: cannot create media fixture\n");
+        clean_media();
+        return 1;
+    }
+    if (make_snap_fixture() != 0) {
+        fprintf(stderr, "FAIL: cannot create snapshot listing fixture\n");
         clean_media();
         return 1;
     }
@@ -700,6 +781,63 @@ int main(int argc, char *argv[])
             chk(after == before, "m12b: no fd leak across media downloads");
     }
 
+    /* ---------------- m14 目录列表（2026-10-28：Web 抓拍图片列表用） ----------------
+     * 前端「抓拍」卡要列出 `/media/snap/` 里的图，所以 `/media/<目录>/` 必须回
+     * JSON 而不是 403。这里钉住四件事：结构（ok/dir/n/items）、顺序（新的在前，
+     * 前端拿第一条当大图）、白名单（名字带空格的跳过，绝不把需要转义的字节拼进
+     * JSON）、以及"列目录不影响取文件"（同一个路径换成文件还得是 image/jpeg）。 */
+    {
+        const char *b;
+        const char *p_old;
+        const char *p_new;
+        char        ct[64];
+        int         len;
+
+        len = snprintf(g_req, sizeof(g_req),
+                       "GET /media/snap/ HTTP/1.1\r\nHost: x\r\n"
+                       "Cookie: ivs_sid=%s\r\nConnection: close\r\n\r\n", cookie);
+        total = exchange(port, g_req, (size_t)len, NULL);
+        chk(total > 0 && rsp_status() == 200, "m14a: directory listing -> 200");
+        chk(hdr_val((size_t)total, "Content-Type:", ct, sizeof(ct)) &&
+            strstr(ct, "application/json") != NULL,
+            "m14b: listing is JSON (not octet-stream)");
+        b = rsp_body((size_t)total);
+        chk(b != NULL && strstr(b, "\"ok\":true") != NULL, "m14c: listing body is ok:true");
+        chk(b != NULL && strstr(b, "\"dir\":\"/snap/\"") != NULL,
+            "m14d: echoes the requested directory");
+        chk(b != NULL && strstr(b, "\"n\":2") != NULL,
+            "m14e: n counts the two jpgs only (space name skipped)");
+        chk(b != NULL && strstr(b, "snap_1700000001.jpg") != NULL, "m14f: older jpg listed");
+        chk(b != NULL && strstr(b, "snap_1700000002.jpg") != NULL, "m14g: newer jpg listed");
+        chk(b != NULL && strstr(b, "we ird.jpg") == NULL,
+            "m14h: names outside [A-Za-z0-9._-] are skipped");
+        chk(b != NULL && strstr(b, "\"s\":200") != NULL, "m14i: size is included");
+        chk(b != NULL && strstr(b, "\"t\":1700000002") != NULL, "m14j: mtime is included");
+        p_old = (b != NULL) ? strstr(b, "snap_1700000001.jpg") : NULL;
+        p_new = (b != NULL) ? strstr(b, "snap_1700000002.jpg") : NULL;
+        chk(p_old != NULL && p_new != NULL && p_new < p_old,
+            "m14k: newest first (the UI uses items[0] as the big picture)");
+
+        /* ?n=1 只回一条（前端可以按需少取） */
+        len = snprintf(g_req, sizeof(g_req),
+                       "GET /media/snap/?n=1 HTTP/1.1\r\nHost: x\r\n"
+                       "Cookie: ivs_sid=%s\r\nConnection: close\r\n\r\n", cookie);
+        total = exchange(port, g_req, (size_t)len, NULL);
+        b = rsp_body((size_t)total);
+        chk(total > 0 && rsp_status() == 200 && b != NULL && strstr(b, "\"n\":1") != NULL,
+            "m14l: ?n=1 returns exactly one item");
+
+        /* 同一路径换成文件：还是原来的图片下载（列目录没有抢走这条路） */
+        len = snprintf(g_req, sizeof(g_req),
+                       "GET /media/snap/snap_1700000002.jpg HTTP/1.1\r\nHost: x\r\n"
+                       "Cookie: ivs_sid=%s\r\nConnection: close\r\n\r\n", cookie);
+        total = exchange(port, g_req, (size_t)len, NULL);
+        chk(total > 0 && rsp_status() == 200 && rsp_body_len((size_t)total) == 200,
+            "m14m: the jpg under the listed dir still downloads (200 bytes)");
+        chk(hdr_val((size_t)total, "Content-Type:", ct, sizeof(ct)) &&
+            strcmp(ct, "image/jpeg") == 0, "m14n: jpg keeps image/jpeg");
+    }
+
     /* ---------------- 收尾 ---------------- */
     (void)kill(g_child, SIGTERM);
     {
@@ -723,6 +861,6 @@ int main(int argc, char *argv[])
         return 1;
     }
     printf("test_web_media_e2e passed (auth, range 206/416, if-range, path fence, "
-           "sha256, throttle, cancel, fd stability)\n");
+           "sha256, throttle, cancel, fd stability, dir listing)\n");
     return 0;
 }

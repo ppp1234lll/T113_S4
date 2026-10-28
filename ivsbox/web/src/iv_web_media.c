@@ -32,6 +32,7 @@
  * `s_media_path` 是**静态**的：本函数返回后 http 层才 `open()` 它。这是安全的，
  * 因为事件循环是单线程、一次只处理一条请求，本函数返回前不会插进第二个请求。
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -157,6 +158,162 @@ static const char *media_ctype(const char *path)
     if (strcmp(dot, ".txt") == 0)
         return "text/plain; charset=utf-8";
     return "application/octet-stream";
+}
+
+/* --------------------------------------------------------------------------
+ * 目录列表（2026-10-28，为 Web「抓拍图片」而加）
+ *
+ * `GET /media/<目录>/` 返回 JSON（`{ok,d:{dir,n,items:[{n,s,t}]}}`）而不是 403：
+ * 抓拍的 jpg 就落在 `media_root/snap/` 下，浏览器要能"列出刚抓的那几张"。
+ * 这是**读**能力，与下载录像同一道鉴权闸门、同一套路径围栏（进来之前已经过了
+ * `rel_path_ok` + `realpath` 前缀复核），没有扩大可读面。
+ *
+ * 三个刻意的限制：
+ *   1. **只认白名单字符的文件名**（`[A-Za-z0-9._-]`）：JSON 是拼字符串拼出来的，
+ *      不符合白名单的名字直接跳过 —— 这比写一套 JSON 转义更不容易出错，而本机
+ *      自己产的文件名（`snap_<秒>.jpg` / `channelN_HHMMSS.mp4`）全在白名单里；
+ *   2. **只列普通文件**（`lstat` + `S_ISREG`）：不跟随符号链接、不递归子目录；
+ *   3. **按 mtime 降序、最多 48 条**：录像目录一天几百个文件，前端只要"最近的"。
+ *      满了以后用"比最旧的更新就替换"的取舍，而不是"先扫到的前 N 条"——后者在
+ *      大目录上返回的是最旧的文件，正是这个功能最不该给的。
+ * ------------------------------------------------------------------------- */
+#define MEDIA_LIST_MAX  48     /* 一次最多返回/保留的条目数 */
+#define MEDIA_NAME_MAX  64     /* 单个文件名上限（含 NUL） */
+#define MEDIA_NUM_MAX   16
+
+typedef struct {
+    char     name[MEDIA_NAME_MAX];
+    uint64_t size;
+    uint64_t mtime;
+} media_ent_t;
+
+/* 静态：48×80 ≈ 3.8 KB。**不放栈上** —— 这个函数在事件循环里被调用，
+ * 栈帧越小越不容易在 8 连接极限下出意外。单线程，无并发问题。 */
+static media_ent_t s_list[MEDIA_LIST_MAX];
+
+static int ent_newer(const void *a, const void *b)
+{
+    const media_ent_t *x = (const media_ent_t *)a;
+    const media_ent_t *y = (const media_ent_t *)b;
+
+    if (x->mtime != y->mtime)
+        return (x->mtime > y->mtime) ? -1 : 1;
+    return strcmp(x->name, y->name);   /* 同一秒内按名字定序，结果稳定可断言 */
+}
+
+static int name_json_safe(const char *n)
+{
+    size_t i;
+
+    for (i = 0; n[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)n[i];
+
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')
+            continue;
+        return 0;
+    }
+    return (i > 0u) ? 1 : 0;
+}
+
+static int media_dir_list(const char *real, const char *rel, const char *query,
+                          char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp)
+{
+    DIR           *d;
+    struct dirent *e;
+    int            n = 0;
+    int            want = MEDIA_LIST_MAX;
+    int            n_out;
+    int            i;
+    size_t         used;
+    char           num[MEDIA_NUM_MAX];
+
+    d = opendir(real);
+    if (d == NULL) {
+        media_err(out, cap, out_len, rsp, 404, "cannot list directory");
+        return IV_OK;
+    }
+
+    while ((e = readdir(d)) != NULL) {
+        char        full[PATH_MAX];
+        struct stat st;
+        int         w;
+
+        if (e->d_name[0] == '.' || !name_json_safe(e->d_name) ||
+            strlen(e->d_name) >= MEDIA_NAME_MAX)
+            continue;
+        w = snprintf(full, sizeof(full), "%s/%s", real, e->d_name);
+        if (w < 0 || (size_t)w >= sizeof(full))
+            continue;
+        if (lstat(full, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+
+        if (n < MEDIA_LIST_MAX) {
+            i = n++;
+        } else {
+            /* 满了：找当前最旧的，比它新就顶掉（n ≤ 48，O(n) 可忽略） */
+            int oldest = 0;
+
+            for (w = 1; w < n; w++) {
+                if (s_list[w].mtime < s_list[oldest].mtime)
+                    oldest = w;
+            }
+            if ((uint64_t)st.st_mtime <= s_list[oldest].mtime)
+                continue;
+            i = oldest;
+        }
+        /* 长度已在上面的过滤里卡过（< MEDIA_NAME_MAX），故用 memcpy 而不是
+         * snprintf —— 后者在 d_name 可达 255 B 时会触发
+         * -Wformat-truncation（`-Werror` 下直接编译不过）。 */
+        memcpy(s_list[i].name, e->d_name, strlen(e->d_name) + 1u);
+        s_list[i].size  = (uint64_t)st.st_size;
+        s_list[i].mtime = (uint64_t)st.st_mtime;
+    }
+    (void)closedir(d);
+
+    qsort(s_list, (size_t)n, sizeof(s_list[0]), ent_newer);
+
+    /* `iv_web_query_get()` 的返回是 **1/0**（不是 IV_OK/IV_ENOENT —— 那边 IV_OK 就是 0，
+     * 写成 `== IV_OK` 会变成"永远取不到参数"，m14l 就是被这个卡红的）。 */
+    if (iv_web_query_get(query, "n", num, sizeof(num)) != 0) {
+        int v = atoi(num);
+
+        if (v > 0 && v < want)
+            want = v;
+    }
+    n_out = (n < want) ? n : want;
+
+    used = (size_t)snprintf(out, cap, "{\"ok\":true,\"d\":{\"dir\":\"%s\",\"n\":%d,"
+                                     "\"items\":[", rel, n_out);
+    if (used >= cap)
+        used = cap - 1u;
+    for (i = 0; i < n_out; i++) {
+        int w = snprintf(out + used, cap - used,
+                         "%s{\"n\":\"%s\",\"s\":%llu,\"t\":%llu}",
+                         (i != 0) ? "," : "", s_list[i].name,
+                         (unsigned long long)s_list[i].size,
+                         (unsigned long long)s_list[i].mtime);
+        /* 放不下：**整条不收**（写半条就是非法 JSON），后面用 ]}} 收尾 */
+        if (w < 0 || (size_t)w >= cap - used)
+            break;
+        used += (size_t)w;
+    }
+    {
+        int w = snprintf(out + used, cap - used, "]}}");
+
+        if (w < 0 || (size_t)w >= cap - used) {
+            *out_len = cap - 1u;
+        } else {
+            used += (size_t)w;
+            *out_len = used;
+        }
+    }
+
+    rsp->status = 200;
+    (void)snprintf(rsp->ctype, sizeof(rsp->ctype), "application/json");
+    rsp->file_path = NULL;
+    rsp->len = *out_len;
+    return IV_OK;
 }
 
 /* 解析 `Range: bytes=a-b` / `a-` / `-n`（单区间）。见文件头说明。 */
@@ -363,6 +520,10 @@ int iv_web_media_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
         media_err(out, cap, out_len, rsp, 404, "not found");
         return IV_OK;
     }
+    /* 目录 ⇒ 返回列表 JSON（2026-10-28：Web 抓拍图片列表要用）。
+     * 文件 ⇒ 走下面的 Range 下载。两条路都在同一套路径围栏之后。 */
+    if (S_ISDIR(st.st_mode))
+        return media_dir_list(real, rel, req->query, out, cap, out_len, rsp);
     if (!S_ISREG(st.st_mode)) {
         media_err(out, cap, out_len, rsp, 404, "not a file");
         return IV_OK;

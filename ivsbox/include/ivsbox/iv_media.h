@@ -31,6 +31,19 @@
  *      每 `ka_period_ms` 对活跃会话补一次 status 查询，**顺带同步对端的真实
  *      状态**（对端 RTSP 断流自动停录后，status 返回 0，桥接把会话表清掉）。
  *
+ * ============================ 抓拍的落地前提（2026-10-28 板端定案） ============================
+ * 板端实测两个"看起来像功能坏了"的失败，都不是参数问题：
+ *   - **没有目录**：`/mnt/sdcard/snap` 不存在 ⇒ media 写入 ENOENT ⇒ 日志只有
+ *     `peer 200 but … missing`。现在 ivsboxd 在 `iv_media_init()` 里 `mkdir -p`
+ *     一次，media 进程在真正写文件前再建一次（SD 重插/目录被删/工厂复位后
+ *     只有后者拦得住）。用户口径："没有目录就创建，不要因为没有目录导致存储失败"。
+ *   - **必须先插摄像头再起进程**：`ivsbox-media` 只在启动时打开 `/dev/video0`。
+ *     现在 media 侧每次抓拍前若设备不可用就**重新找节点**（优先上次那个，再扫
+ *     `/dev/video0..31`，只认"能出 MJPEG 的采集设备"），抓拍中途掉线也会释放后
+ *     重开。用户口径："禁止有先后顺序，摄像头不一定什么时候插入，需要插入后就能用"。
+ * 桥接层因此**不需要**感知设备是否在场：`snap_fail` 涨了就是失败，原因在
+ * media 进程日志（它对 `/capture` 返回 500 而不是原来的恒 200）。
+ *
  * ============================ 依赖与生命周期 ============================
  *   - 纯 libc（socket/pthread），不引 Reactor/不碰 iv_chan；worker 线程与
  *     调用方以互斥锁＋条件变量同步，队列操作只持锁刹那。
@@ -60,8 +73,10 @@ extern "C" {
 #define IV_MEDIA_URL_MAX     256 /* RTSP URL 与抓拍路径长度上限（含 NUL） */
 #define IV_MEDIA_QUEUE_DEPTH 2   /* 抓拍有界队列深度；满丢最旧 */
 #define IV_MEDIA_PORT_DEFAULT 18000
-#define IV_MEDIA_SNAP_DIR_DEFAULT "/mnt/sdcard/snap" /* 板端 SD 挂载点确认前先按
-                                          bird_media 的 /mnt/sdcard 根系走（登记） */
+#define IV_MEDIA_SNAP_DIR_DEFAULT "/mnt/sdcard/snap" /* 板端实测（2026-10-28）：
+                                          SD 卡挂在 /mnt/sdcard，抓拍写这里；
+                                          **目录不存在会自动创建**（ivsboxd 侧与
+                                          media 进程侧各建一遍，见下） */
 
 /* 单次回环 HTTP 的收发超时（ms）。media 进程死了是立即拒连，这里只防"活着但卡死"。 */
 #define IV_MEDIA_HTTP_TIMEOUT_MS 2000u

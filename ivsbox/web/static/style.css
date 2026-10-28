@@ -211,3 +211,39 @@ button[disabled] { opacity: .5; cursor: not-allowed; }
 }
 /* 服务端回的错误/提示里带换行（例如规则原文），别把它挤成一行 */
 .login-box .msg { white-space: pre-line; }
+
+/* ---------------- 抓拍（USB 摄像头，2026-10-28） ---------------- */
+/* 抓拍图是 1280×720 的 JPEG。大图用 object-fit: contain —— 拉伸会让人以为
+ * "画面变形了"，而这是现场判断"摄像头是不是装歪了"的唯一依据。 */
+.snapfig { margin-top: 12px; }
+.snapimg {
+  display: block;
+  width: 100%;
+  max-height: 360px;
+  object-fit: contain;
+  background: #0b0f14;
+  border-radius: 4px;
+}
+/* 缩略图条：flex 换行，点一张在上面的 .snapfig 里放大 */
+.snapgrid { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.snapthumb {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: center;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fff;
+  color: var(--dim);
+  font-size: 11px;
+  cursor: pointer;
+}
+.snapthumb:hover { border-color: var(--pri); background: #eaf1fd; }
+.snapthumb img {
+  width: 96px;
+  height: 54px;
+  object-fit: cover;
+  border-radius: 2px;
+  background: #0b0f14;
+}

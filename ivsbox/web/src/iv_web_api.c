@@ -366,6 +366,103 @@ int iv_web_api_call(iv_web_ctx_t *ctx, const char *method, const char *p_json,
     return api_p_call(ctx, method, p_json, out, cap, out_len, rsp);
 }
 
+/* --------------------------------------------------------------------------
+ * 抓拍（2026-10-28，Web「抓拍」按钮）
+ *
+ * `POST /api/snapshot` → ctl `snapshot.take`，自动命名落 `<snap_dir>/snap_<秒>.jpg`。
+ *
+ * **入队 ≠ 已落盘**：ctl 侧是异步的（V4L2 出帧可达数百毫秒），所以响应里的
+ * `queued:true` 只代表"已受理"。前端必须拿 `url` 去取图，取不到就是失败
+ * （`<img onerror>` 重试几次后报错），不能把 queued 当成"拍好了"弹成功 ——
+ * 这正是 2026-10-28 板端 `peer 200 but … missing` 那条日志在界面上的对应物。
+ *
+ * `url` 由本层**现算**：绝对路径换算成 `/media/...`。只有落在媒体根之下才算得
+ * 出来（否则 `url` 缺省，前端退化成只显示文件名）。不让前端自己拼，是因为
+ * `media_root` 只有本进程知道（`--media-root`）。
+ * -------------------------------------------------------------------------- */
+static int api_media_url(const iv_web_ctx_t *ctx, const char *abs, char *out, size_t cap)
+{
+    const char *root = (ctx->media_root[0] != '\0') ? ctx->media_root
+                                                    : IV_WEB_MEDIA_ROOT_DEFAULT;
+    size_t      rl   = strlen(root);
+    int         n;
+
+    if (abs == NULL || abs[0] != '/')
+        return 0;
+    if (rl == 0u || strncmp(abs, root, rl) != 0 || abs[rl] != '/')
+        return 0;
+    n = snprintf(out, cap, "/media%s", abs + rl);
+    return (n > 0 && (size_t)n < cap) ? 1 : 0;
+}
+
+/* 路径只允许这些字符（本机命名全是 ASCII 安全字符）。不合格就整条拒 ——
+ * 不许把任意字节拼进 JSON 字符串（拼串比转义容易出错，索性不给机会）。 */
+static int api_path_json_safe(const char *p)
+{
+    size_t i;
+
+    for (i = 0; p[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)p[i];
+
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' || c == '/')
+            continue;
+        return 0;
+    }
+    return (i > 0u) ? 1 : 0;
+}
+
+static int api_snapshot(iv_web_ctx_t *ctx, char *out, size_t cap, size_t *out_len,
+                        iv_web_resp_t *rsp)
+{
+    static const char *k_req = "{\"m\":\"snapshot.take\",\"p\":{}}";
+    json_object *resp;
+    json_object *d;
+    json_object *v;
+    const char  *path = NULL;
+    const char  *name;
+    char         url[IV_WEB_PATH_MAX + 32u];
+    int          has_url;
+    int          n;
+
+    (void)chan_json(ctx, k_req, strlen(k_req), out, cap);
+
+    resp = json_tokener_parse(out);
+    if (resp == NULL || !json_object_is_type(resp, json_type_object) ||
+        !json_object_object_get_ex(resp, "ok", &v) || v == NULL ||
+        !json_object_get_boolean(v)) {
+        if (resp != NULL)
+            json_object_put(resp);
+        return to_rsp(out, cap, out_len, rsp); /* 失败原样透传（-95 未装配等） */
+    }
+    d = json_object_object_get(resp, "d");
+    if (d != NULL && json_object_object_get_ex(d, "path", &v) && v != NULL)
+        path = json_object_get_string(v);
+    if (path == NULL || !api_path_json_safe(path)) {
+        json_object_put(resp);
+        *out_len = api_err(out, cap, IV_EPROTO, "bad path from daemon");
+        return to_rsp(out, cap, out_len, rsp);
+    }
+
+    name = strrchr(path, '/');
+    name = (name != NULL) ? (name + 1) : path;
+    has_url = api_media_url(ctx, path, url, sizeof(url));
+    n = snprintf(out, cap,
+                 "{\"ok\":true,\"d\":{\"queued\":true,\"path\":\"%s\",\"name\":\"%s\"%s%s%s}}",
+                 path, name, (has_url != 0) ? ",\"url\":\"" : "",
+                 (has_url != 0) ? url : "", (has_url != 0) ? "\"" : "");
+    json_object_put(resp);
+    if (n < 0 || (size_t)n >= cap) {
+        *out_len = api_err(out, cap, IV_ERANGE, "path too long");
+        return to_rsp(out, cap, out_len, rsp);
+    }
+    *out_len     = (size_t)n;
+    rsp->status  = 200;
+    (void)snprintf(rsp->ctype, sizeof(rsp->ctype), "application/json");
+    rsp->len     = *out_len;
+    return IV_OK;
+}
+
 static int api_config_get(iv_web_ctx_t *ctx, const iv_web_req_t *req,
                           char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp)
 {
@@ -774,6 +871,19 @@ int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
                               (req->body != NULL) ? req->body : "{}",
                               out, cap, out_len, rsp);
         return api_simple_call(ctx, "record.page", out, cap, out_len, rsp);
+    }
+    /* 抓拍（USB 摄像头，2026-10-28）：**只收 POST** —— 抓拍会往 SD 卡写文件，
+     * 不能被浏览器的预取/刷新重放一次（与 relay.set 同一条口径）。
+     * 取图不在这里：图片走 `/media/snap/<文件名>`（iv_web_media.c 的 Range 下载），
+     * 列表走 `GET /media/snap/`（同一文件的目录分支）。 */
+    if (strcmp(req->path, "/api/snapshot") == 0) {
+        if (strcmp(req->method, "POST") != 0) {
+            *out_len = api_err(out, cap, IV_EINVAL, "POST required");
+            rsp->status = 405;
+            rsp->len = *out_len;
+            return IV_OK;
+        }
+        return api_snapshot(ctx, out, cap, out_len, rsp);
     }
     if (strcmp(req->path, "/api/system/time") == 0)
         return api_p_call(ctx, "system.time",

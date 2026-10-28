@@ -83,12 +83,20 @@ typedef struct {
     uint8_t  max_retries;  /* E1/F1 等非控制命令重传上限；D1/D2 始终不重传 */
     uint8_t  fail_threshold; /* 连续失败多少次判链路 DOWN */
     uint32_t gap_ms;       /* 成帧帧超时（0＝关闭）；半截帧复位，见文件头"帧超时" */
+    /* 控制命令（0xD1/0xD2）的应答等待，0＝沿用 timeout_ms。
+     * 这两条只发一次、不重传，等待窗口的唯一作用就是"什么时候把事务槽
+     * 放出来"；现场采集板**从不回 0xD1**（0xE1/0xC1 一条不缺，0xD1 一条
+     * 没有）⇒ 沿用 2 s 会把槽占满 2 s，期间到达的第二条控制命令直接撞
+     * IV_EBUSY（平台上就是"点第二个通道没反应/特别慢"）。
+     * 见 iv_link_send() 里 deadline 那行。 */
+    uint32_t ctrl_timeout_ms;
 } iv_link_cfg_t;
 
 /* 默认：2 s 应答窗口、重传 2 次（共 3 发）、连续 3 次失败判 DOWN。
  * 串口 115200、帧均几十字节，线上传输毫秒级；2 s 窗口是给单片机组装
- * JSON 应答的余量。 */
-#define IV_LINK_CFG_DEFAULT { 2000u, 2u, 3u, IV_LINK_GAP_MS_DEFAULT }
+ * JSON 应答的余量。
+ * 控制命令的窗口压到 300 ms：只影响"槽什么时候释放"，见上面字段注释。 */
+#define IV_LINK_CFG_DEFAULT { 2000u, 2u, 3u, IV_LINK_GAP_MS_DEFAULT, 300u }
 
 /* 帧超时默认值。**必须 > iv_link_tick() 的调用周期**（装配层 200 ms），
  * 否则"被节拍切开的正常帧"会被误判成半截帧；依据见文件头"帧超时"段。 */

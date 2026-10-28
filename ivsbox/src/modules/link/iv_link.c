@@ -203,7 +203,17 @@ int iv_link_send(iv_link_t *lk, uint8_t cmd, const void *data, uint16_t len,
     lk->txn[slot].cmd = cmd;
     lk->txn[slot].retries = 0;
     lk->txn[slot].len = len;
-    lk->txn[slot].deadline_ms = now_ms + lk->cfg.timeout_ms;
+    /* 控制命令（0xD1 电源 / 0xD2 重启）用单独的、更短的应答窗口：
+     * 它们**不发重传**（见 iv_link_tick），窗口到期只是把槽放出来 ——
+     * 而槽是按 cmd 判并发的（同 cmd 在飞再发就 IV_EBUSY），沿用 timeout_ms
+     * 等于"上一条控制命令占住 2 s"。现场采集板从不回 0xD1，所以每点一下
+     * 通道就锁 2 s：连点第二个通道直接 `send failed (-3)` → 平台回 0x74，
+     * 界面上就是"反应慢、有的干脆没反应"。 */
+    lk->txn[slot].deadline_ms =
+        now_ms + (((cmd == IV_FRAME_CMD_POWER || cmd == IV_FRAME_CMD_REBOOT) &&
+                   lk->cfg.ctrl_timeout_ms != 0u)
+                      ? lk->cfg.ctrl_timeout_ms
+                      : lk->cfg.timeout_ms);
     lk->txn[slot].on_done = on_done;
     lk->txn[slot].cb_arg = cb_arg;
     if (len != 0)

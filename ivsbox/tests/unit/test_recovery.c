@@ -519,8 +519,12 @@ static void r12_link_bytes(void)
 
     memset(&g_link_tx, 0, sizeof(g_link_tx));
 
-    /* 短超时：单测里让在飞事务尽快过期，便于逐条推进 */
-    lc.timeout_ms = 10u;
+    /* 短超时：单测里让在飞事务尽快过期，便于逐条推进。
+     * `0xD1` 走的是**控制命令专用窗口** `ctrl_timeout_ms`（默认 300 ms），
+     * 不跟着 `timeout_ms` 走 ⇒ 这里两处都要压短，否则槽一直占着、
+     * 队列推进不了（本用例验的正是"槽释放后队列继续发"）。 */
+    lc.timeout_ms      = 10u;
+    lc.ctrl_timeout_ms = 10u;
     chk(iv_link_init(&lk, &lc, link_tx, NULL, NULL, NULL) == IV_OK,
         "r12 link init");
 

@@ -57,6 +57,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | 采集板 `ERR` 扩容到 32 码（绕开 mycJSON 的 `pbuff[128]`） | 已实现（**仓库外**采集板固件；改 3 次 `strcat` 直拼 `pdata` ＋ 384 B 取值缓冲 ＋ 2048 溢出闸门；Keil 真实构建 0 Error 0 Warning；单测 10 例含 ASan/UBSan 全通过，32 码全带上） | 2026-10-28 15:55 | 解除 11:50 那条的"单帧最多 9 个码"限制。详见本文件文末 2026-10-28 15:55 节。 |
 | 采集板 0xE1 应答缺逗号（主板镜像冻结）修复 | 已实现（**真正的现场工程** `F:\debug_2026\嵌入式\采集板\main`，STM32F103RC＋UCOS-II；`ELEC3` 补逗号、`ERR` 改直拼且自身无尾逗号；Keil 构建 0/0；端到端实证"修前整串被拒 / 修后 RELAY=2,2,2 可解析"；**未烧录**） | 2026-10-28 16:29 | 现场「断开继电器后平台状态不更新」的直接原因。同时更正前两条登记的现场固件路径有误。详见本文件文末 2026-10-28 16:29 节。 |
 | 控制命令 `0xD1/0xD2` 独立短应答窗口（`ctrl_timeout_ms`） | 已实现（`iv_link_cfg_t` 追加字段、默认 300 ms、0＝沿用 `timeout_ms`；`make test`/`asan` 全绿、`analyze` 0 报告、`arm` 0 告警；新增 3b 用例钉住"短窗口只给控制命令"；**板端未换版**） | 2026-10-28 17:19 | 平台「下发后设备反应慢」的真因：采集板从不回 0xD1 ⇒ 槽白占 2 s ⇒ 连点第二个通道撞 `IV_EBUSY(-3)` 回 `0x74`。详见本文件文末 2026-10-28 17:19 节。 |
+| 采集板 `0xC2`/`0xC1` 主动上报 → 立刻取全量 → 走正常上报报文 | 已实现（`iv_report.c:on_link_upstream()` 只认命令字、不解析事件内容；`rep_poll()` 回传返回码 ＋ `IV_REPORT_POLL_RETRY_MS` 200 ms 兜底重试；`test_e2e_report` 新增 c04d/c04e、扩展 c02c，c05 计数 6→9；`make test`/`asan`/`tsan` 49 passed、`arm` 0 告警、`analyze` 0 报告；反向证伪 14 条 ＋ 1 条；**板端未换版**） | 2026-10-28 17:45 | 事件（单 TAG 增量）不能直接当上报内容；改前平台要等 300 s 周期，箱门开启完全不上报。详见本文件文末 2026-10-28 17:45 节。 |
 |===
 
 
@@ -9035,3 +9036,92 @@ UV4.exe -b USER/dc_base.uvprojx -j0
   主板这一改只是把"第二条命令被拒"变成"300 ms 后可发"，让连点不再失败。
 * 板端尚未换版验证：换版后连点两个通道应都能成功，且日志里不再出现
   `send failed (-3)`。
+
+== 2026-10-28 17:45 采集板 `0xC2`/`0xC1` 主动上报 → 立刻取全量 → 走正常上报报文
+
+=== 干了什么事
+
+改动集中在上报装配层 `src/modules/report/iv_report.c`（三个点）：
+
+. **`on_link_upstream()`：只认命令字**
++
+[source,c]
+----
+iv_status_handle_upstream(cmd, data, len, &rp->st);   /* 镜像：按 TAG 增量（原有） */
+if (cmd == IV_FRAME_CMD_DOOR || cmd == IV_FRAME_CMD_EVENT) {   /* 0xC1 / 0xC2 */
+    iv_report_request_poll(rp);               /* next_poll = now ⇒ 本拍就发 0xE1 */
+    iv_report_request_report_after_poll(rp);  /* 镜像刷新完在 on_link_done 里补报 */
+}
+----
++
+**不解析 JSON**：TAG 不认识、没有 `mcuEvent`、甚至 body 是垃圾，只要命令字是 `0xC2`
+（或箱门 `0xC1`）就动作 —— 用户 2026-10-28 明确"不需要解析具体事件，检测到 C2 指令就执行操作"。
+镜像增量那一步仍是 `iv_status` 的既有职责，与本分支互不依赖。
+
+. **`rep_poll()` 改为返回 `iv_link_send()` 的返回码**（`IV_OK` 才 `polls++`），
+让 `iv_report_step()` 知道"这一拍到底发出去没有"。
+. **`iv_report_step()` 增加兜底重试**：`rep_poll()` 失败且 `want_report` 置位时，
+`next_poll = now_ms + IV_REPORT_POLL_RETRY_MS`（200 ms，= 总线一拍），
+而不是退回 `poll_ms`（30 s）。常规轮询路径（`want_report == 0`）行为逐字不变。
+
+上报侧**一行未改**：仍然走 `rep_send_report()` 的 `##` 全量状态帧（正常上报报文），
+不新增事件帧格式，平台侧无需任何解析分支。
+
+=== 解决什么问题
+
+* **平台看不到告警**：采集板在告警翻转那一刻就推 `0xC2`（`com.c` 的 `mcuEvent` 单 TAG 帧）、
+  箱门开推 `0xC1`；改前主板只写镜像 ＋ 打一行 DEBUG，**不上报** ⇒ 平台要等下一个周期上报
+  （`IV_REPORT_REPORT_MS` 默认 **300 s**）才知道告警发生/消失；箱门开启更是完全不上报
+  （`iv_agent` 的门开钩子只记日志，抓图属 M6）。
+* **为什么不能"收到就报"**：`0xC2` 是**单 TAG 增量**（`{"key":"mcuEvent","T":48.5}`），
+  直接拿来组包，其余字段还是旧值/空值 —— 平台上就是"告警响了，电压电流还是上一条"。
+  必须先用 `0xE1` 取全量，再组帧。这条链路与继电器动作后补报是**同一条**（`want_report`），
+  已有用例（c04b/c04c）证明可用。
+* **"立刻"的时间尺度**：`0xE1` 的在飞窗口 2 s ×3 发（最长 6 s），按 30 s 轮询算，
+  事件约 20% 概率撞在"同 cmd 在飞"上并吃 `IV_EBUSY`。不兜底的话这一帧就要等 30 s，
+  现场表现是"有时候立刻、有时候半分钟" ⇒ 用 200 ms 重试消掉这个长尾。
+
+=== 影响范围
+
+* `iv_report` 内部：新增"事件触发"这一条置 `want_report` 的路径（原来只有装配层
+  动作路径 `iv_report_request_report_after_poll()` 与 `on_link_done()` 的继电器变化检测）；
+* 上报频率：只有**采集板状态翻转**时才会多出**最多一帧**（事件突发也只是一帧，
+  `want_report` 只能置位不能叠加，`0xE1` 受"同 cmd 在飞唯一"约束）；
+* 不改协议、不改配置键、不改 `iv_agent`/`main.c` 装配（触发点在 `iv_report` 内部），
+  对 `0xE1` 轮询节拍、心跳、周期上报、队列/补传、门开钩子（`on_door`）均无影响；
+* **风险**：采集板若把 `0xC2` 当心跳/周期帧高频推送，会带来同样高频的 `0xE1` ＋ 上报。
+  现网固件不是这样（`app_report_information_immediately()` 只在告警状态翻转时调用），
+  登记为已知前提；真出现时按"每 N 秒最多一帧"加闸即可，不必改协议。
+
+=== 验证方式与结果
+
+[cols="3,4,1"]
+|===
+| 项 | 内容 | 结果
+
+| 端到端（新增 c04d） | pty 假采集板喂 `{"key":"mcuEvent","zz":7}`（**不认识的 TAG**）：
+  同一拍抓到下行的 `0xE1`（字节级黄金比对）、镜像 `T` 不变（证明不解析内容）、
+  `0xE1` 应答回来前零上报；应答（`T=49.75`）到达后恰好一帧，平台收到的 `##` 帧里
+  `T=49.75;`/`V=240.10;` | 通过
+| 端到端（扩展 c02c） | `0xC1` 箱门：同拍 `0xE1` ＋ 镜像 `DS=2` ＋ 门开钩子各一次；
+  应答回来补一帧，平台收到 `DS=2;` 的正常上报帧 | 通过
+| 端到端（新增 c04e） | 先欠一笔 `0xE1` 在飞，再喂 `0xC2`：这一拍 `polls` 不涨
+  （撞 `IV_EBUSY`）、`next_poll - now <= IV_REPORT_POLL_RETRY_MS`、仍不上报；
+  在飞那笔的应答到达后恰好一帧 | 通过
+| 反向证伪 ① | 触发条件改 `if (0 && ...)`：14 条断言 FAIL（c02c 4、c04d 5、c04e 3、
+  c05 计数 1 等），还原后复绿 | 通过
+| 反向证伪 ② | 只去掉 `IV_REPORT_POLL_RETRY_MS` 重试：**恰好 1 条** FAIL
+  （`c04e poll re-armed within IV_REPORT_POLL_RETRY_MS`），还原后复绿 | 通过
+| 全量 | `make test` 49 passed / RC=0；`make asan` 49 passed / RC=0；`setarch -R make tsan`
+  49 passed / RC=0；`make analyze`（先 `rm -rf build/analyze`）0 warning / 0 error | 通过
+| 交叉编译 | `make arm` 0 告警 / RC=0，`build/arm/ivsboxd` md5 见修改记录对应条目 | 通过
+| 同步对账 | 源码 `tar` 到 VM 后 `md5sum` 三文件两端一致 | 通过
+|===
+
+=== 未做 / 待办
+
+* **板端换版实测**：期望日志顺序为 `board up cmd 0xC2` → 同秒 `E1 from board (...)` →
+  `report #N DT=... m=...`；本次未动真实继电器/断电，也未换版。
+* 采集板侧**无需改动**：`0xC2` 是 fire-and-forget（`app_report_information_immediately()`
+  直接 `usart3_send_str()`，不登记 `send_cmd`、不等 ACK）⇒ 主板不回应答不影响对端。
+* 事件语义化（哪个告警、持续多久、要不要另出一类事件报文）未做 —— 按用户口径不解析内容。

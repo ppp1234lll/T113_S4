@@ -13,6 +13,9 @@
  *   c04 立即上报 → 经「队列 → 取件泵 → TCP」到平台，字段值/顺序/壳/CRC 正确；
  *   c04b 继电器动作后：催 0xE1 → 镜像刷新 → **立刻补一帧上报**（不等周期）；
  *   c04c 采集板自己改继电器也要报；同值不重复报；
+ *   c04d 采集板 0xC2 事件 → **同一拍**催 0xE1 → 全量回来后才组包，走正常上报报文；
+ *   c04e 事件撞上"0xE1 还在飞" → 补报按 IV_REPORT_POLL_RETRY_MS 重试，不退回 30 s；
+ *   c02c 采集板 0xC1 箱门开启 → 同上（顺带验门开钩子经 cfg 装配链挂上）；
  *   c05 平台断开 → 上报入队积压（不丢）；
  *   c06 平台恢复 → 欠包按序补发（CSQ 11/12/13 的到达顺序即序号顺序）、队列清空；
  *   c07 平台下发 E3 查询 → `##`+JSON+`##` 应答、**QN 按平台原值回填**、crc=06；
@@ -512,27 +515,87 @@ int main(void)
         }
     }
 
-    /* ---- c02c M4-S4.5：0xC1 箱门开启 → 镜像 DS=2 ＋ 门开钩子触发（端到端） ----
+    /* ---- c02c M4-S4.5：0xC1 箱门开启 → DS=2 ＋ 门开钩子 ＋「立刻取全量再上报」 ----
      * 覆盖 plan §S4.5「怎么验证」单元项在**装配链**上的等价物：这里的钩子不是测试
      * 直接调 `iv_status` 挂的，而是经 `iv_report_cfg_t` 在 `iv_report_open()` 时落下的。
      * 帧字节也顺带验一次：0xC1 的 data = 0x01（**非 JSON**，架构 §18.2）。
-     * ⚠ **故意放在 c04 之后**：本块会把镜像 DS 从 1 改成 2，而 c04 的数据段黄金里
-     * 写死了 （不能为了让新用例方便就去改旁边已有的黄金断言）。 */
+     * 2026-10-28 追加：箱门/事件这类**采集板主动上报**到达后，本层现在会自动
+     * 「①本拍催 0xE1 取全量 → ②镜像刷新完立刻补一帧正常上报」（用户原话见 c04d
+     * 抬头），本块把这条链在装配层走通 —— 门开是安全事故，不能等 300 s 周期上报。
+     * ⚠ 两点：①本块会把镜像 DS 从 1 改成 2；②本块产生的那帧上报必须从平台 socket
+     * 里**收干净** —— c04b 断言"平台收到的第一帧是继电器补报"，留一帧在这里会让
+     * 它错位。（不为了让新用例方便就去改旁边已有的黄金断言。） */
     {
-        uint8_t up[IV_FRAME_MAX];
-        int     un;
+        static const char json_ds2[] =
+            "{\"V\":234.17,\"A\":0.50,\"H\":50.01,\"T\":31.33,\"DS\":2,"
+            "\"P\":0,\"SPD\":1,\"PA\":1,\"PV\":1,\"APOWER\":\"0.00\","
+            "\"AKW\":\"0.00\",\"RELAY1\":1,\"RELAY2\":1,\"RELAY3\":1,"
+            "\"CHV1\":234.17,\"CHV2\":234.17,\"CHV3\":234.17,"
+            "\"CHA1\":0.0,\"CHA2\":0.0,\"CHA3\":0.0,"
+            "\"POWER1\":0.0,\"POWER2\":0.0,\"POWER3\":0.0,"
+            "\"ELEC1\":0.0,\"ELEC2\":0.0,\"ELEC3\":0.0}";
+        uint8_t     up[IV_FRAME_MAX];
+        uint8_t     want[IV_FRAME_MAX];
+        char        got[512];
+        char        rx[4096];
+        char        scratch[512];
+        const char *seg  = NULL;
+        size_t      sl   = 0u;
+        size_t      rn   = 0u;
+        size_t      used = 0u;
+        size_t      wn;
+        size_t      gn;
+        uint64_t    reps0;
+        int         un;
+        int         j;
 
         g_door_hits = 0;
         g_door_last = -1;
+        reps0 = iv_report_reports(&rp);
         un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_DOOR, "\x01", 1u,
                             up, sizeof up);
         chk(un > 0, "c02c upstream 0xC1 frame built");
         chk(write(master, up, (size_t)un) == un, "c02c feed 0xC1 door-open event");
-        pump(&rp, master, 2);
-        chk(rp.st.valid.DS == 1u && rp.st.data.DS == 2,
-            "c02c mirror DS=2 after 0xC1");
+
+        /* ① 事件到达的**这一拍**就得把 0xE1 发出去（不是等 30 s 轮询）。
+         * 这里手动推进一格而不走 pump()：pump() 会先把 master 上的下行字节抽掉，
+         * 那样就抓不到这一帧了。 */
+        (void)drain(master, scratch, sizeof scratch, 0);
+        g_now += STEP_MS;
+        (void)iv_report_step(&rp, g_now);
+        gn = drain(master, got, sizeof got, 200);
+        wn = (size_t)iv_frame_build(IV_FRAME_HEAD_DOWN, IV_FRAME_CMD_QUERY,
+                                    "\x00", 1u, want, sizeof want);
+        chk(wn > 0u, "c02c expected 0xE1 frame built");
+        chk(gn == wn && memcmp(got, want, wn) == 0,
+            "c02c door event -> immediate 0xE1 in the same step");
+        chk(rp.st.valid.DS == 1u && rp.st.data.DS == 2, "c02c mirror DS=2 after 0xC1");
         chk(g_door_hits == 1, "c02c door hook fired once via cfg wiring");
         chk(g_door_last == 2, "c02c door hook got DS=2");
+        chk(rp.want_report == 1u, "c02c report armed, waiting for the full mirror");
+        chk(iv_report_reports(&rp) == reps0,
+            "c02c nothing reported before the poll answer");
+
+        /* ② 采集板回全量（门开 DS=2）→ 镜像刷新 → 立刻补一帧**正常上报** */
+        un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_QUERY, json_ds2,
+                            (uint16_t)(sizeof json_ds2 - 1u), up, sizeof up);
+        chk(un > 0, "c02c upstream 0xE1 (door open) built");
+        chk(write(master, up, (size_t)un) == un, "c02c feed 0xE1 door-open answer");
+        pump(&rp, master, 2);
+        chk(rp.want_report == 0u, "c02c want_report consumed by the poll answer");
+        chk(iv_report_reports(&rp) == reps0 + 1u,
+            "c02c door event produced exactly one report");
+
+        for (j = 0; j < 50 && iv_report_queue_count(&rp) > 0u; j++)
+            pump(&rp, master, 1);
+        rn   = drain(cs, rx, sizeof rx, 1000);
+        used = next_report_frame(rx, rn, 0u, &seg, &sl);
+        chk(used > 0u, "c02c platform got the door report");
+        if (used > 0u) {
+            chk(strncmp(seg, want_hdr, sizeof want_hdr - 1u) == 0,
+                "c02c door report is the normal state frame");
+            chk(strstr(seg, "DS=2;") != NULL, "c02c door report carries DS=2");
+        }
     }
 
     /* ---- c04b 继电器动作后「催 0xE1 → 镜像刷新 → 立刻补报」 ----
@@ -668,6 +731,159 @@ int main(void)
         chk(iv_report_reports(&rp) == reps0, "c04c same state => no extra report");
     }
 
+    /* ---- c04d 采集板 0xC2 事件（告警发生）→ 立刻取全量 → 组包走正常上报 ----
+     * 用户原话（2026-10-28）：「参考采集板的事件上报，当接收到采集板事件后，主板
+     * 需要立刻获取采集板信息，然后组包上报，走正常上报报文」。三点必须同时成立：
+     *   ① 事件到达的**同一拍**就下发 0xE1（不是等 30 s 轮询）；
+     *   ② 0xE1 应答回来**之前不许**上报 —— 事件帧只有一个 TAG，拿它组包就是半张
+     *      状态（平台上表现为"告警响了，但电压电流还是上一条"）；
+     *   ③ 上报走**正常上报报文**（`##` 全量状态帧），字段来自刚刷新完的镜像。
+     * 另加一条用户 2026-10-28 的口径：**不解析具体事件**，检测到 0xC2 就动作
+     * ⇒ 本块的事件载荷带一个不认识的 TAG（`zz`），镜像不许因此变化，但催查询与
+     * 补报照样发生。③ 的判据是"上报里 T=49.75"（事件里根本没有 T），证明这一帧
+     * 是**取完全量之后**组的，而不是拿事件增量凑的。 */
+    {
+        /* ⚠ 事件载荷故意用**不认识的 TAG**（`zz`）：判据只有命令字 0xC2，
+         * 不解析事件内容（用户 2026-10-28 明确口径）。见下面那条"mirror 不变"断言。 */
+        static const char ev[]   = "{\"key\":\"mcuEvent\",\"zz\":7}";
+        static const char full[] =
+            "{\"V\":240.10,\"A\":0.50,\"H\":50.01,\"T\":49.75,\"DS\":2,"
+            "\"P\":0,\"SPD\":1,\"PA\":1,\"PV\":1,\"APOWER\":\"0.00\","
+            "\"AKW\":\"0.00\",\"RELAY1\":1,\"RELAY2\":1,\"RELAY3\":1,"
+            "\"CHV1\":240.10,\"CHV2\":240.10,\"CHV3\":240.10,"
+            "\"CHA1\":0.0,\"CHA2\":0.0,\"CHA3\":0.0,"
+            "\"POWER1\":0.0,\"POWER2\":0.0,\"POWER3\":0.0,"
+            "\"ELEC1\":0.0,\"ELEC2\":0.0,\"ELEC3\":0.0}";
+        uint8_t     up[IV_FRAME_MAX];
+        uint8_t     want[IV_FRAME_MAX];
+        char        got[512];
+        char        rx[4096];
+        char        scratch[512];
+        const char *seg  = NULL;
+        size_t      sl   = 0u;
+        size_t      rn   = 0u;
+        size_t      used = 0u;
+        size_t      wn;
+        size_t      gn;
+        uint64_t    reps0;
+        uint64_t    polls0;
+        int         un;
+        int         j;
+
+        reps0  = iv_report_reports(&rp);
+        polls0 = rp.polls;
+        un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_EVENT, ev,
+                            (uint16_t)(sizeof ev - 1u), up, sizeof up);
+        chk(un > 0, "c04d upstream 0xC2 event built");
+        chk(write(master, up, (size_t)un) == un, "c04d feed 0xC2 mcuEvent");
+
+        (void)drain(master, scratch, sizeof scratch, 0);
+        g_now += STEP_MS;
+        (void)iv_report_step(&rp, g_now);
+        gn = drain(master, got, sizeof got, 200);
+        wn = (size_t)iv_frame_build(IV_FRAME_HEAD_DOWN, IV_FRAME_CMD_QUERY,
+                                    "\x00", 1u, want, sizeof want);
+        chk(rp.polls == polls0 + 1u, "c04d event triggered one 0xE1 request");
+        chk(wn > 0u && gn == wn && memcmp(got, want, wn) == 0,
+            "c04d 0xE1 goes out in the same step as the event");
+        chk(rp.st.data.T > 31.32f && rp.st.data.T < 31.34f,
+            "c04d unknown event TAG ignored by the mirror (content not parsed)");
+        chk(iv_report_reports(&rp) == reps0,
+            "c04d no report until the full mirror is back");
+        chk(rp.want_report == 1u, "c04d report pending the 0xE1 answer");
+
+        /* 采集板回全量（T=49.75）→ 镜像刷新 → 一帧正常上报 */
+        un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_QUERY, full,
+                            (uint16_t)(sizeof full - 1u), up, sizeof up);
+        chk(un > 0, "c04d upstream 0xE1 answer built");
+        chk(write(master, up, (size_t)un) == un, "c04d feed the 0xE1 answer");
+        pump(&rp, master, 2);
+        chk(rp.want_report == 0u, "c04d want_report consumed");
+        chk(iv_report_reports(&rp) == reps0 + 1u,
+            "c04d event produced exactly one report");
+
+        for (j = 0; j < 50 && iv_report_queue_count(&rp) > 0u; j++)
+            pump(&rp, master, 1);
+        rn   = drain(cs, rx, sizeof rx, 1000);
+        used = next_report_frame(rx, rn, 0u, &seg, &sl);
+        chk(used > 0u, "c04d platform got a normal ## report");
+        if (used > 0u) {
+            chk(strncmp(seg, want_hdr, sizeof want_hdr - 1u) == 0,
+                "c04d the report is the standard state frame (no new format)");
+            chk(strstr(seg, "T=49.75;") != NULL,
+                "c04d report carries the post-poll value (not the event TAG)");
+            chk(strstr(seg, "V=240.10;") != NULL,
+                "c04d report carries the full snapshot");
+        }
+    }
+
+    /* ---- c04e 事件撞上"0xE1 还在飞" → 催报不许退回 30 s 轮询 ----
+     * 现场最容易踩的时序：轮询 30 s 一拍，而 `0xE1` 的在飞窗口是 2 s ×3 发
+     * （最长 6 s）⇒ 事件有约 20% 的概率撞在"同 cmd 在飞"上（IV_EBUSY）。
+     * 若这时按常规把 `next_poll` 推进 30 s，这帧补报就变成"有时立刻、有时半分钟"。
+     * 本块钉住兜底：撞 IV_EBUSY 时 `next_poll` 只推到 `IV_REPORT_POLL_RETRY_MS`。 */
+    {
+        static const char ev[]   = "{\"key\":\"mcuEvent\",\"T\":50.5}";
+        static const char full[] =
+            "{\"V\":240.10,\"A\":0.50,\"H\":50.01,\"T\":51.25,\"DS\":2,"
+            "\"P\":0,\"SPD\":1,\"PA\":1,\"PV\":1,\"APOWER\":\"0.00\","
+            "\"AKW\":\"0.00\",\"RELAY1\":1,\"RELAY2\":1,\"RELAY3\":1,"
+            "\"CHV1\":240.10,\"CHV2\":240.10,\"CHV3\":240.10,"
+            "\"CHA1\":0.0,\"CHA2\":0.0,\"CHA3\":0.0,"
+            "\"POWER1\":0.0,\"POWER2\":0.0,\"POWER3\":0.0,"
+            "\"ELEC1\":0.0,\"ELEC2\":0.0,\"ELEC3\":0.0}";
+        uint8_t     up[IV_FRAME_MAX];
+        char        rx[4096];
+        char        scratch[512];
+        const char *seg  = NULL;
+        size_t      sl   = 0u;
+        size_t      rn   = 0u;
+        size_t      used = 0u;
+        uint64_t    reps0;
+        uint64_t    polls0;
+        int         un;
+        int         j;
+
+        /* 先欠一笔 0xE1 在飞（**不**喂应答） */
+        iv_report_request_poll(&rp);
+        (void)drain(master, scratch, sizeof scratch, 0);
+        g_now += STEP_MS;
+        (void)iv_report_step(&rp, g_now);
+        (void)drain(master, scratch, sizeof scratch, 200);
+        polls0 = rp.polls;
+        reps0  = iv_report_reports(&rp);
+
+        /* 事件到达：这一拍必然发不出 0xE1（同 cmd 在飞） */
+        un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_EVENT, ev,
+                            (uint16_t)(sizeof ev - 1u), up, sizeof up);
+        chk(un > 0 && write(master, up, (size_t)un) == un, "c04e feed 0xC2 while E1 in flight");
+        g_now += STEP_MS;
+        (void)iv_report_step(&rp, g_now);
+        chk(rp.polls == polls0, "c04e collision: no new 0xE1 this step (IV_EBUSY)");
+        chk(rp.want_report == 1u, "c04e report still pending after the collision");
+        chk(rp.next_poll > g_now &&
+            rp.next_poll - g_now <= (uint64_t)IV_REPORT_POLL_RETRY_MS,
+            "c04e poll re-armed within IV_REPORT_POLL_RETRY_MS (not the 30 s period)");
+        chk(iv_report_reports(&rp) == reps0, "c04e still no report (no fresh mirror)");
+
+        /* 在飞那一笔的应答到达 → 镜像刷新 → 这一帧补报落地（只一帧） */
+        un = iv_frame_build(IV_FRAME_HEAD_UP, IV_FRAME_CMD_QUERY, full,
+                            (uint16_t)(sizeof full - 1u), up, sizeof up);
+        chk(un > 0 && write(master, up, (size_t)un) == un, "c04e feed the in-flight answer");
+        pump(&rp, master, 2);
+        chk(rp.want_report == 0u, "c04e want_report consumed by the in-flight answer");
+        chk(iv_report_reports(&rp) == reps0 + 1u, "c04e exactly one report");
+
+        for (j = 0; j < 50 && iv_report_queue_count(&rp) > 0u; j++)
+            pump(&rp, master, 1);
+        rn   = drain(cs, rx, sizeof rx, 1000);
+        used = next_report_frame(rx, rn, 0u, &seg, &sl);
+        chk(used > 0u, "c04e platform got the report after the collision");
+        if (used > 0u)
+            chk(strstr(seg, "T=51.25;") != NULL,
+                "c04e report carries the post-poll value");
+    }
+
     /* ---- c05 平台断开 → 上报入队积压（不丢） ---- */
     {
         int j;
@@ -691,8 +907,10 @@ int main(void)
             pump(&rp, master, 1);
         }
         chk(iv_report_queue_count(&rp) == 3u, "c05 3 items queued while down");
-        /* 6：c04 1 + c04b 1（动作后补报）+ c04c 1（采集板自己改继电器）+ 这里 3 */
-        chk(iv_report_reports(&rp) == 6u, "c05 total reports=6");
+        /* 9：c04 1 + c02c 1（门开事件补报）+ c04b 1（动作后补报）
+         *    + c04c 1（采集板自己改继电器）+ c04d 1（0xC2 事件补报）
+         *    + c04e 1（撞在飞后仍补报）+ 这里 3 */
+        chk(iv_report_reports(&rp) == 9u, "c05 total reports=9");
         chk(iv_report_queue_full(&rp) == 0u, "c05 nothing dropped");
     }
 
@@ -852,7 +1070,8 @@ int main(void)
     if (g_fail == 0)
         printf("test_e2e_report passed "
                "(poll/mirror/power-0xD1/door-event/report/queue/replay/query/ack/"
-               "relay-forced-report/relay-change-report/serial-reconnect)\n");
+               "relay-forced-report/relay-change-report/board-event-forced-report/"
+               "serial-reconnect)\n");
     else
         printf("test_e2e_report FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

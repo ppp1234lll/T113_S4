@@ -215,16 +215,21 @@ static void serial_drain(iv_report_t *rp, uint64_t now_ms)
 static void on_link_done(int rc, uint8_t cmd, const uint8_t *data, uint16_t len,
                          void *arg);
 
-static void rep_poll(iv_report_t *rp)
+/* 返回值＝`iv_link_send` 的返回码（IV_OK 已入队 / IV_EBUSY 同 cmd 在飞 / ...）：
+ * 调用方（`iv_report_step`）要靠它判"这一拍到底发出去没有"。 */
+static int rep_poll(iv_report_t *rp)
 {
     static const uint8_t zero = 0x00;
+    int rc;
 
     /* 0xE1 查询：请求 data = 0x00（架构 §18.2）。
      * 注意 on_done 是**逐笔**登记的（iv_link_init 不收它）——传 NULL 会让该
      * 槽的应答被静默丢弃、状态镜像永不刷新（iv_link.c: `if (done != NULL)`）。 */
-    if (iv_link_send(&rp->lk, IV_FRAME_CMD_QUERY, &zero, 1u,
-                     (uint32_t)rp->now_ms, on_link_done, rp) == IV_OK)
+    rc = iv_link_send(&rp->lk, IV_FRAME_CMD_QUERY, &zero, 1u,
+                      (uint32_t)rp->now_ms, on_link_done, rp);
+    if (rc == IV_OK)
         rp->polls++;
+    return rc;
 }
 
 static void on_link_done(int rc, uint8_t cmd, const uint8_t *data, uint16_t len,
@@ -408,6 +413,34 @@ static void on_link_upstream(uint8_t cmd, const uint8_t *data, uint16_t len,
                  (unsigned)len, nb);
     }
     iv_status_handle_upstream(cmd, data, len, &rp->st);
+
+    /* ============================ 采集板一上报，就立刻取全量 + 上平台 ============================
+     * 采集板**主动**上报两类帧（架构 §18.2）：
+     *   0xC1 箱门开启（data=0x01，非 JSON） —— 安全事故，必须秒级可见；
+     *   0xC2 事件（`{"key":"mcuEvent","<TAG>":<v>}`）—— 过压/欠压/过流/漏水/门磁/
+     *        姿态/温湿度超限等告警的发生**与消失**，采集板在状态翻转那一刻就推。
+     *
+     * **判据只有命令字**（用户 2026-10-28 明确：不需要解析具体事件）：见到 0xC2
+     * 就动作，不去看 JSON 里是哪个 TAG、值是多少 —— 事件内容对我们没有用处，
+     * 有用的只有"此刻设备状态变了"这个事实，而全量状态要靠 0xE1 取回来。
+     * 因此 `iv_status_handle_upstream()` 上面那次"按 TAG 增量写镜像"即使解析不出
+     * 东西（无 `mcuEvent`、字段不认识），本分支照样会触发。
+     *
+     * 为什么不能"收到事件就直接上报"：事件帧只带**一个 TAG**，是增量；直接拿来
+     * 组包会让其余字段还是旧值/空值（平台上就是"告警响了，但电压电流还是上一条"）。
+     * 正确顺序与继电器动作那条通路完全一致（见 `iv_report.h` 的 `want_report`）：
+     *   ① 把 `next_poll` 拨到当前时刻 ⇒ 本拍就发 0xE1 取全量；
+     *   ② 打"镜像刷新完立刻补一帧"的标记 ⇒ 在 `on_link_done()` 里入队；
+     *   ③ 上报走**正常上报报文**（`rep_send_report()` 的 `##` 全量状态帧），
+     *      不另造事件帧格式 —— 平台侧无需新增解析分支。
+     * 突发多帧事件不会放大：`want_report` 只能置位不能叠加，0xE1 又受
+     * "同 cmd 在飞唯一"约束，最终最多一帧上报（上报本来就是全量状态）。 */
+    if (cmd == IV_FRAME_CMD_DOOR || cmd == IV_FRAME_CMD_EVENT) {
+        iv_report_request_poll(rp);
+        iv_report_request_report_after_poll(rp);
+        IV_LOG_D(REP_MOD, "board event 0x%02X -> poll 0xE1 + report after poll",
+                 (unsigned)cmd);
+    }
 }
 
 static void on_link_change(int up, void *arg)
@@ -712,7 +745,15 @@ int iv_report_step(iv_report_t *rp, uint64_t now_ms)
         rp->next_poll += rp->cfg.poll_ms;
         if (rp->next_poll <= now_ms)
             rp->next_poll = now_ms + rp->cfg.poll_ms;
-        rep_poll(rp);
+        if (rep_poll(rp) != IV_OK && rp->want_report) {
+            /* 有一帧"等全量镜像后立刻补报"在等，这一拍却没把 0xE1 发出去
+             * （典型＝上一笔 0xE1 还在飞 ⇒ `IV_EBUSY`；应答窗口 2 s ×3 发，
+             * 最多能占 6 s）。此时**不能**等下一个轮询周期（默认 30 s），
+             * 否则"采集板一上报就立刻上平台"会变成"有时立刻、有时 30 s 后"。
+             * 几拍后重试即可：真正在飞的那一笔回来时会在 `on_link_done()`
+             * 里自己把 `want_report` 消化掉，这里只是兜底，不会多报。 */
+            rp->next_poll = now_ms + IV_REPORT_POLL_RETRY_MS;
+        }
     }
     if (now_ms >= rp->next_hb) {
         rp->next_hb += rp->cfg.heartbeat_ms;

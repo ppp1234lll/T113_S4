@@ -53,6 +53,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | 断网录像判据改为「只看主网」＋ 录像启动失败原因可读 | 已实现（VM 单测 47/47、反向证伪 2/2 抓出、ARM 0 告警；**板端实测**：主网断 10 s 自动开录、3 s 确认成功、坏地址逐行报因；`record.status` 带 `reason`） | 2026-10-28 10:38 | 详见本文件文末 2026-10-28 10:38 节。 |
 | 故障码（`ERR`）上报：采集板 JSON `ERR` ＋ 主板网络码合并 | 已实现（新增 `iv_fault` 模块；`iv_status` 落 `ERR`、`iv_agent` 合流；VM 单测 49/49、ASan 49/49、analyze 0、ARM 0 告警、反向证伪 4/4；**板端未换版**） | 2026-10-28 11:10 | 详见本文件文末 2026-10-28 11:10 节。 |
 | Web 手动录像入口 ＋ 媒体进程自启 ＋ 静态资源 413 闭环 | 已实现（VM 单测 48/48、集成 16 passed＋1 SKIP、前端 9 用例全绿、反向证伪 5 条；**板端实测**：整机重启后媒体进程自起并自动开录、`/app.js` 由 413 转 200、手动开关录像双向 `changed`） | 2026-10-28 11:32 | 上一节「未做」的两条（Web 手动入口、媒体自启）本轮闭环；另修掉加完前端后暴露的静态资源硬顶 413（整页白屏）。详见本文件文末 2026-10-28 11:32 节。 |
+| 采集板 0xE1 应答补 `ERR` 键 ＋ `Error_Get_Codesbuf()` 数量回填 | 已实现（**仓库外**采集板固件 `General_Version - 无SADP`；Keil 真实构建 0 Error 0 Warning、axf/hex 已产出；逻辑单测 9 例全通过含 ASan/UBSan；**未烧录实测、未提交采集板仓库**） | 2026-10-28 11:50 | 详见本文件文末 2026-10-28 11:50 节。 |
 |===
 
 
@@ -8678,3 +8679,102 @@ GET / 200；GET /style.css 200（6158 B）
   ② 点「停止」后 **10 s 又被自动开录** —— 只清了 `force`，hold 到点就起。新增
   `manual_off` 压制，主网恢复一拍才解除；板端实测「停止 → `held_off:true` →
   等 25 s 仍 `recording:false`」。
+
+== 2026-10-28 11:50 采集板 0xE1 应答补 ERR 键（故障码上行闭环）
+
+=== 干了什么事
+
+改的是**仓库外**的采集板固件 `F:\debug\General_Version - 无SADP\main`（GD32F460 + ARMCC5），
+两个文件、两处改动：
+
+. `APP/USER/src/com.c` → `com_query_configuration_function()`（0xE1「查询配置」应答，
+  由 `app.c:271` 在 `COM_FLAG_DEVICE_INFO` 分支组帧）。在 `/* 签名校验 */` 之前插一段独立块：
++
+[source,c]
+----
+memset(temp,0,sizeof(temp));
+if (Error_Get_Codesbuf((uint8_t*)temp,96) >= 0) {
+    if (strncmp(perr,"ERR=",4) == 0) perr += 4;          // 去掉文本协议前缀
+    elen = strlen(perr);
+    if ((elen > 0) && (perr[elen-1] == ';')) perr[elen-1] = '\0';  // 去掉尾分号
+    my_cjson_join_string_function(pdata,(uint8_t*)"ERR",(uint8_t*)perr,1);
+}
+----
++
+产出 `"ERR":"3,10300000,30500000,"`。**不带** `ERR=` 前缀（JSON 键名已表达语义），
+健康态也发 `"ERR":"0"` —— 主板据此清空上一轮故障，不需要额外的清除命令。
+
+. `APP/USER/src/error.c` → `Error_Get_Codesbuf()`：循环里数 `out_count`，截断时用
+  `memmove` 把前缀重写成 `ERR=<out_count>`，并删掉不再需要的 `finish` 标签。
+
+=== 解决什么问题
+
+* 主板在 2026-10-28 11:10 那一版已经能解析 `0xE1` 的 `ERR` 键，但采集板**从不发这个键**
+  ⇒ 平台上只会出现主板判的网络码（`0x20100000` 之类），电量/传感器故障码永远缺失。
+* `Error_Get_Codesbuf()` 的原有缺陷：数量前缀在**进循环之前**就写死了，缓冲不够 `goto finish`
+  时数字不跟着变。96 字节只放得下 9 个码时它会输出 `ERR=16,9 个码` —— **采信数量的解析方
+  会去读 7 个不存在的码**。文本协议（参考工程 512 字节缓冲）碰不到，JSON 这条 96 字节的路径
+  一测就中（主机侧 `t5` 抓出）。
+
+=== 影响范围
+
+* `Error_Get_Codesbuf()` 是**文本协议与 JSON 共用**的：返回值语义从"真实故障数"变成
+  "实际输出的码数"（与函数注释「成功读取的个数」一致）。现有调用方只判 `>= 0` 与读字符串
+  （`com.c` 的 0xE1 文本应答、参考工程 `com_report_normally_function()`），不受影响。
+* 长度上限：`mycJSON` 的 `my_cjson_join_string_function()` 内部是 `pbuff[128]` + `sprintf`
+  ⇒ 值不能超过约 118 字节。这里按 96 取值，值最长 92、JSON 片段 101（实测 91），
+  **单帧最多 9 个码**；超出按码序截断且数量同步。要全量 32 码需把 `pbuff` 提到 384
+  并把 `com.c` 改成直接 `strcat`，本轮不做（改中间件影响全部 JSON 构造，风险大于收益）。
+* 采集板自己也判了网络码（`alarm_net_collection_param()` 里的 `NET_LAN_PORT`），
+  它会随 `ERR` 一并发上去，但主板 `iv_fault_apply_board()` **只采信 `0x1`/`0x3` 类**，
+  `0x2xxxxxxx` 直接剔除并计入 `board_rejected` ⇒ 不会与主板网络码重复。
+* 未覆盖：烧录真机实测（需现场设备窗口）；采集板仓库未提交（见下）。
+
+=== 验证方式与结果
+
+**1. Keil 真实构建（最权威）**
+
+----
+UV4.exe -b atk_f460.uvprojx -j0
+  compiling error.c...  compiling com.c...  linking...
+  Program Size: Code=276172 RO-data=47796 RW-data=20896 ZI-data=439888
+  FromELF: creating hex file...
+  "..\..\Output\atk_f460.axf" - 0 Error(s), 0 Warning(s).
+Build Time Elapsed: 00:00:07     Output/atk_f460.hex 913460 B (11:49)
+----
+构建尾部 `HexBin.bat` 报 `'-' 不是内部或外部命令` 是**既有环境问题**：`After Build` 里的
+用户命令参数多了一个空项，与本次改动无关，axf/hex 均已正常产出。
+
+**2. 全工程 armcc 单文件体检**（`keil-armcc-compile-check`）
+`com.c e=0 w=0`、`error.c e=0 w=0`；全工程唯一 `Error:` 是
+`FreeRTOS/portable/RVDS/ARM_CM4F/port.c:32` 的 `#error`（脚本未传 FPU 参数）。
+补 `--fpu=FPv4-SP` 后该文件 `rc=0` ⇒ 证实是**脚本参数**问题而不是代码问题
+（注意 ARMCC5 的取值是 `FPv4-SP`，写 `FPv4-SP-D16` 会报 `C3903U`）。
+
+**3. 逻辑单测 9 例**（直接编**真** `error.c`，只把 `SYSTEM/sys/sys.h` 换成 stdint 桩；
+主机 gcc 与 VM `-fsanitize=address,undefined` 两侧结果一致、无 sanitizer 报告）
+
+[cols="1,6,4",options="header"]
+|===
+| 用例 | 输入 / 断言 | 结果
+
+| t1 | 空表 → `"0"` | 通过
+| t2 | 过压 + 门开 → `2,10300000,30500000` | 通过
+| t3 | 断电专有路径（表塌缩成单码）→ `1,10100000` | 通过
+| t4 | 清除后回 `"0"` | 通过
+| t5 | 16 码 / 96 B → 截断为 9 个且**数量同步回填 9**（修前是 16） | 通过
+| t6 | 文本协议形状 `ERR=6,...;` 不变 | 通过
+| t7 | JSON 片段 91 B < `pbuff[128]` | 通过
+| t8 | 16 B 小缓冲 → `ERR=0;`，不越界 | 通过
+| t9 | 56 B 恰好装 5 码 | 通过
+|===
+
+=== 未做 / 待办
+
+* **未烧录实测**：改的是采集板固件，验证只到"编译 + 链接 + 主机逻辑单测"。
+* **采集板仓库未提交**：`F:\debug\General_Version - 无SADP` 当前有 241 个未提交改动，
+  且 `com.c` 的 diff（99+/24-）里夹着本次之外的既有改动 ⇒ 单独提交会把别人的改动一起带上
+  （违反规则 3「只提交本次修改」），故只改文件不提交。
+* 与主板联调时看两处日志：采集板侧 `ERR` 是否随 0xE1 应答发出；主板侧
+  `iv_fault` 的 `board_rejected` / `board_mismatch` 计数是否保持 0。
+

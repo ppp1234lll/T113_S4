@@ -59,6 +59,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | 控制命令 `0xD1/0xD2` 独立短应答窗口（`ctrl_timeout_ms`） | 已实现（`iv_link_cfg_t` 追加字段、默认 300 ms、0＝沿用 `timeout_ms`；`make test`/`asan` 全绿、`analyze` 0 报告、`arm` 0 告警；新增 3b 用例钉住"短窗口只给控制命令"；**板端未换版**） | 2026-10-28 17:19 | 平台「下发后设备反应慢」的真因：采集板从不回 0xD1 ⇒ 槽白占 2 s ⇒ 连点第二个通道撞 `IV_EBUSY(-3)` 回 `0x74`。详见本文件文末 2026-10-28 17:19 节。 |
 | 采集板 `0xC2`/`0xC1` 主动上报 → 立刻取全量 → 走正常上报报文 | 已实现（`iv_report.c:on_link_upstream()` 只认命令字、不解析事件内容；`rep_poll()` 回传返回码 ＋ `IV_REPORT_POLL_RETRY_MS` 200 ms 兜底重试；`test_e2e_report` 新增 c04d/c04e、扩展 c02c，c05 计数 6→9；`make test`/`asan`/`tsan` 49 passed、`arm` 0 告警、`analyze` 0 报告；反向证伪 14 条 ＋ 1 条；**板端未换版**） | 2026-10-28 17:45 | 事件（单 TAG 增量）不能直接当上报内容；改前平台要等 300 s 周期，箱门开启完全不上报。详见本文件文末 2026-10-28 17:45 节。 |
 | 抓拍可用性（目录自动创建 ＋ 摄像头热插拔）＋ Web 抓拍与图片显示 | 已实现（`capture.c` 写前 `mkdir -p` ＋ 按能力扫 `/dev/video0..31` ＋ 掉线后重开；`/capture` 失败改回 **500**；`iv_media` 侧同样建目录；新增 `POST /api/snapshot` 与 `/media/<目录>/` 列表 JSON；`app.js` 新增「抓拍（USB 摄像头）」卡；`test_web_media_e2e` 新增 m14a~m14n ＋ 新增 `tests/web/ui_media_snap.mjs` 18 条；`make test`/`asan`/`tsan` 49 passed、`make itest` 16 passed＋1 SKIP、`analyze` 0、`arm` 0 告警；反向证伪 2 条；**板端实测**：删目录后抓拍自建目录、拔插视频节点无需重启进程即可用、`/media/snap/` 列表与取图全通） | 2026-10-28 18:10 | 用户口径：没有目录就创建 / 摄像头插入没有先后顺序 / Web 要能抓拍和看图。详见本文件文末 2026-10-28 18:10 节。 |
+| 录像**运行期复检**（断流 10 s 内发现并重开，不再"UI 显示在录、其实没录"） | 已实现（`iv_recctl` 新增 `IV_RECCTL_RECHECK_MS`=10 s ＋ `recheck_ms` ＋ `recheck_channels()`，放在 `force` 判断之前；全掉线 ⇒ `recording` 归 0 ＋ 退避 10 s 且不重走 hold；部分掉线 ⇒ 立刻整批重开；`pending` 期间不参与、`ops->status` 为空静默跳过；`test_recctl` 新增 c13 六段；`make test`/`asan`/`tsan` 49 passed、`make itest` 16 passed＋1 SKIP、`analyze` 0 报告、`arm` 0 告警、jsdom 10 用例全绿；反向证伪 6 条 c13 FAIL；**板端实测通过**：媒体侧清会话后 10 s 内 `record ch0 lost while recording` → 重开 → `record confirm: 2 ch actually recording`） | 2026-10-28 18:53 | 启动确认只在开录后做一次；对端随后关掉拉流时没人再看 ⇒ 录像永久停、`record.page` 仍报每路 `on:true`（现场形态："摄像机重启过一次，之后再也不录，界面却说在录"）。详见本文件文末 2026-10-28 18:53 节。 |
 | 0xE1 **超时无应答 → 迟到应答**仍落地补报（现场 42 s 延迟的真因） | 已实现（`rep_apply_query()` 由 `on_link_done()` 与 `on_link_upstream()` 共用；超时且 `want_report` 挂着 → `rep_poll_soon()` 立刻再催；`test_e2e_report` 新增 c04f，c05 计数 9→10；`make test`/`asan`/`tsan` 49 passed、itest 16 passed＋1 SKIP、`platcmd_e2e.py` 全通过、`arm` 0 告警、`analyze` 0 报告；反向证伪 5 条 ＋ 1 条；**已换版上板（`b825a4a1`）待现场触发确认**） | 2026-10-28 18:29 | 17:45 那条换版后现场实测暴露：采集板 13 s 后才回 0xE1 ⇒ 事务已摘槽 ⇒ 整帧被丢 ＋ 超时后无人再催 ⇒ 事件后 42 s 才上平台。详见本文件文末 2026-10-28 18:29 节。 |
 |===
 
@@ -9317,4 +9318,94 @@ iv_status_handle_upstream(cmd, data, len, &rp->st);
   **当前无害**（触发只看命令字）；若将来要按 TAG 增量刷新单值，需要先支持嵌套结构。
 * 采集板每 10 s 推一帧 `0xE2`（载荷 1 B `0xFF`），`iv_frame.h` 无此定义、无人消费
   （只打 DEBUG 一行）。判为采集板侧心跳，与本次触发链路无关。
+
+== 2026-10-28 18:53 录像运行期复检：断流 10 s 内发现并重开
+
+=== 现场形态（2026-10-28 板端实测）
+
+两路 RTSP 在 12:16:46 开录后，分别于 **12:23:09**（第 6 分钟）与 **13:04:09**（第 47 分钟）
+被对端关掉。媒体层日志只有一句：
+
+[source,text]
+----
+[media] record[0]: peer reports stopped (rtsp ended?), session cleared
+----
+
+之后该路 worker 只是把标志清掉就回去等 `is_recording` —— 而 `iv_recctl` 这边
+`recording` 一直是 1、`ch_failed[]` 全是 0，于是：
+
+* 录像**永久停**，直到进程重启或配置热更新；
+* `record.page` 仍对每一路报 `on:true`（"状态机认为在录"），Web 页面照旧显示"录制中"。
+
+即"摄像机重启过一次，之后再也不录，界面却说在录"。
+
+=== 根因
+
+`iv_recctl` 的两级确认（受理 → 3 s 后 `ops->status` 复查）**只在启动时做一次**。
+断流是运行期的常态事件（摄像机重启、码流超时、交换机抖一下），确认过之后再没有人看一眼。
+
+=== 做法
+
+`src/modules/media/iv_recctl.c`：
+
+* 新增 `IV_RECCTL_RECHECK_MS`（10 s）与 `iv_recctl_t.recheck_ms`；
+* 新增 `static int recheck_channels()`：`pending` 期间直接返回（此刻 ffmpeg 正在建流，
+  查了必然"未在录"，会把正常启动误判成掉线）；按 `recheck_ms` 节流；逐路调
+  `ops->status`，`st < 0` 不判死（媒体桥/进程没了，与 `confirm_pending()` 同口径）；
+* 全部路掉线 ⇒ `recording` 归 0、`recheck_ms` 清 0、`next_try_ms = now + 10 s`；
+  主网仍断着时把 `down_since_ms` 拉到"保持期已满"，**不重走 hold**（"主网断"这件事
+  从没中断过）；主网已恢复（正在防抖停录途中）则不动它，交给恢复分支收口；
+* 部分掉线 ⇒ 立刻 `start_all()` 重开整批。对仍在录的路重发 start 是**幂等**的
+  （桥接只置标志与地址，不切当前文件），所以不必写"只补缺的那几路"的第二条路径；
+  3 s 后的启动确认会把仍起不来的路连同原因留下；
+* 调用点在 `iv_recctl_step()` 里 `if (r->recording)` 的**第一句**，即在 `force`
+  判断之前 —— 手动录像同样会因断流而停，不能因为它是人工开的就不管；
+* `stop_all()` / `iv_recctl_gate()` / `iv_recctl_stop_all()` 一并清 `recheck_ms`。
+
+**为什么不在媒体层自己重连**：媒体层是执行层，它不知道"现在该不该录"（主网恢复、
+容量闸门、人工停止都可能要求停）。重连放在状态机里，才能保证"页面显示的状态"与
+"真的在录"用的是同一个判据。
+
+`tests/unit/test_recctl.c` 新增 c13 六段：① 全掉线 ⇒ `recording` 归 0 且退避一轮
+不立刻重开；② 退避到期即重开且**不重走 hold**（`n_start` 从 2 直接到 4）；③ 部分
+掉线 ⇒ 立刻整批重开、`recording` 保持；④ 复检**节流**（10 s 内不重复查）；⑤ `pending`
+未完成时不参与；⑥ 无 `status` 回调时静默跳过。内建 f15/f16 反向证伪说明。
+
+=== 验证结果
+
+* VM：`make test` **49 passed**、`make asan` **49 passed**、`setarch -R make tsan`
+  **49 passed**、`make itest` **16 passed ＋ 1 SKIP**、`make analyze`
+  **0 warning / 0 error**、`make arm` **0 告警**（`ivsboxd` md5
+  `b825a4a1b7f06ee63e839560fc473295`，`ivsbox-web`/`ivsbox-media` 未变）；
+  `tests/web/*.mjs` **10 个用例全绿**；`platcmd_e2e.py` **全部通过**（Z1~Z5 还原核对一致）；
+* 反向证伪：把调用点改成 `if (0) (void)recheck_channels(...)` 重编 ⇒ `test_recctl`
+  **6 条 c13 全红**（`recording` 停在 1、`n_start` 不再增长），还原后复绿；
+* **板端实测**（192.168.1.120，`ivsboxd` md5 `b825a4a1…`）：
+  +
+[source,text]
+----
+18:52:23 INFO [recctl] manual: recording started (2/2 ch), confirming in 3000ms
+18:52:26 INFO [recctl] record confirm: 2 ch actually recording
+18:52:36 WARN [recctl] record ch0 lost while recording: 录像已中断：拉流被对端关闭或网络中断，正在重连
+18:52:36 WARN [recctl] 1/2 ch dropped while recording; restarting the batch
+18:52:39 INFO [recctl] record confirm: 2 ch actually recording
+18:52:56 WARN [recctl] record ch0 lost while recording: 录像已中断：拉流被对端关闭或网络中断，正在重连
+18:52:56 WARN [recctl] record ch1 lost while recording: 录像已中断：拉流被对端关闭或网络中断，正在重连
+18:52:56 WARN [recctl] all 2 ch dropped while recording; retry in 10s
+18:53:06 INFO [recctl] manual: recording started (2/2 ch), confirming in 3000ms
+----
+  +
+断流是**在媒体层直接把会话清掉**模拟的（`/record/stop?id=N`，与现场"对端关掉"的
+  落地状态一致），没有改代码、没有重启进程。观测：`record.page` 在 12 s 内由
+  `recording=true` 翻成 `false` 且每路带出 `why`，再过 10 s 自动恢复为 `true`；
+  两条分支（`1/2 ch dropped … restarting the batch` 与 `all 2 ch dropped … retry in 10s`）
+  都真实跑到。
+
+=== 未做
+
+* 复检测的是"媒体层还有没有这个会话"，**不是"码流还在不在动"**：ffmpeg 卡死不退
+  出时复检仍认为在录。要做需媒体层上报每路的码流字节增量。
+* 每次复检都是 8 路以内的环回 HTTP ＋ 一次 `urllib` 级请求（毫秒级），满配 8 路
+  也只有 0.8 次/秒，未做批量接口。
+
 

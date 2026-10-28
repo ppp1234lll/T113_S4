@@ -1165,8 +1165,51 @@ static int mn_state_of(const iv_agent_t *a, int w)
     return iv_netmgr_wan_is_up(&a->nm, (iv_wan_t)w) ? 1 : 2;
 }
 
-/* 把本层掌握的"非采集板事实"注入上报层：CNS（六路摄像机网络状态）＋ MN（主网两路）。
- * 只改这两个字段，其余外部事实（CSQ/定位/故障码）原样保留。
+/* 故障码（上报帧 `ERR=` 段）的两半合并，详见 iv_fault.h 的分工表：
+ *
+ *   电量 / 传感器 ← 采集板 `0xE1` 应答的 `ERR` 键（镜像原文，已由 iv_status 清洗）
+ *   网络         ← 本层掌握的四个事实：主网1/主网2 状态、六路摄像机状态、有线载波
+ *
+ * 为什么在这里而不是在 iv_report 里：`iv_report` 只有镜像与 env，看不到
+ * `mn_state_of()` 的判定过程（它连 `iv_probe`/`iv_netmgr` 都不认识），也算不出
+ * "载波是否已知"。装配层是唯一同时握着这两边事实的地方。
+ *
+ * `mnv[]` 按 `iv_wan_t` 下标（0=usb0/4G、1=eth0/有线），与 `mn_state_of()` 同序；
+ * 故障码里"主网1"给有线、"主网2"给 4G —— **按角色分，不按 MN 槽位顺序分**
+ * （`env.mn[0]` 是 4G、`mn[1]` 是有线，那个顺序是历史实现，见 test_agent_mn）。
+ * 即：4G 是备份链路，它断了报主网2，别把 4G 的故障写成"主网1 故障"。
+ */
+static void fault_feed(iv_agent_t *a, const int *mnv, uint64_t now_ms,
+                       iv_report_env_t *env)
+{
+    int lan = -1;
+    int cns[IV_CAMDET_CH_N];
+    int cns_n = 0;
+
+    if (iv_camdet_is_open(&a->cd) && iv_camdet_cns(&a->cd, cns) == IV_OK)
+        cns_n = (int)IV_CAMDET_CH_N;
+
+    /* 载波三态：接口都没绑上 ⇒ 未知（-1）⇒ 不置 `NET_LAN_PORT`。
+     * 开机头几拍 netlink 还没回事件时若按 0 判"载波掉"，会凭空多一条
+     * "LAN 口故障"，平台侧就成了开机误报。 */
+    if (a->wan_ifindex[IV_WAN_WIRED] != 0)
+        lan = (a->wan_link_up[IV_WAN_WIRED] != 0u) ? 1 : 0;
+
+    /* 采集板没送 `ERR` 键（老固件）时传 NULL ⇒ 表清空 ⇒ 只报网络码，不猜。 */
+    (void)iv_fault_apply_board(&a->flt,
+                               (a->rp.st.valid.ERR != 0u) ? a->rp.st.data.ERR
+                                                          : NULL,
+                               now_ms);
+    iv_fault_apply_net(&a->flt, mnv[IV_WAN_WIRED], mnv[IV_WAN_WIRELESS], cns,
+                       cns_n, lan);
+    env->err = (iv_fault_format(&a->flt, a->err_buf, sizeof(a->err_buf)) == IV_OK)
+                   ? a->err_buf
+                   : NULL;
+}
+
+/* 把本层掌握的"非采集板事实"注入上报层：CNS（六路摄像机网络状态）＋ MN（主网两路）
+ * ＋ ERR（故障码，见 `fault_feed()`）。前两个只改自己的字段，其余外部事实
+ * （CSQ/定位）原样保留；ERR 是本层**整体重算**的（每次都由当前事实推出，不累加）。
  *
  * MN **同时带出 S4.4 的主网故障沿**：判据用 `iv_netmgr_wan_is_up()` 的**迟滞结论**
  * （连续 fail_n 次失败才判死），**不是**裸 `iv_probe_state()` —— 后者单次探测超时
@@ -1175,9 +1218,12 @@ static int mn_state_of(const iv_agent_t *a, int w)
 static void env_feed(iv_agent_t *a, uint64_t now_ms)
 {
     iv_report_env_t env;
+    int             mnv[IV_WAN_N];
     int             i;
 
     env = a->rp.env;
+    for (i = 0; i < (int)IV_WAN_N; i++)
+        mnv[i] = 0;
 
     if (iv_camdet_is_open(&a->cd)) {
         int cns[IV_CAMDET_CH_N];
@@ -1201,6 +1247,7 @@ static void env_feed(iv_agent_t *a, uint64_t now_ms)
         int st = mn_state_of(a, i);
 
         env.mn[i] = st;
+        mnv[i] = st;
         /* 故障沿：只有"原来能上网 → 现在不能"才算故障。
          *   3（网线断开）**算** —— 那是真的上不了网，该断继电器重启现场设备；
          *   4（延时严重）**不算** —— 延时只是慢，链路还在，重启只会把现场
@@ -1211,6 +1258,8 @@ static void env_feed(iv_agent_t *a, uint64_t now_ms)
                                          IV_RECOVERY_FAULT, now_ms);
         a->mn_last[i] = (uint8_t)st;
     }
+
+    fault_feed(a, mnv, now_ms, &env);
 
     iv_report_set_env(&a->rp, &env);
 }

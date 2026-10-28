@@ -91,6 +91,29 @@ static int json_get_string(const char *json, const char *key, char *out, size_t 
     return 1;
 }
 
+/* 故障码串（`ERR`）的字符白名单清洗：只留数字、A-F/a-f、`,`、`;`、`=`、空格与
+ * `x/X`（`0x` 前缀）。为什么要在镜像这一层洗：
+ *   ① 这串会被 `iv_status_snapshot_json()` 原样写进 JSON（Web/ctl 都读它），
+ *      一旦里面出现引号或反斜杠就把整份 JSON 弄坏；
+ *   ② 采集板那边是 `sprintf("%08X")` 拼出来的，正常只会是这几个字符 ——
+ *      出现别的字符本身就是它拼错了，丢掉比透传安全。
+ * `json_flat_complete()` 已经拒掉带转义的应答，这里是第二道闸。 */
+static void err_sanitize(char *s)
+{
+    size_t r = 0, w = 0;
+
+    if (s == NULL) return;
+    while (s[r] != '\0') {
+        char c = s[r++];
+
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+            (c >= 'A' && c <= 'F') || c == ',' || c == ';' || c == '=' ||
+            c == ' ' || c == 'x' || c == 'X')
+            s[w++] = c;
+    }
+    s[w] = '\0';
+}
+
 /* 本协议应答仅有扁平键值：先验完整结构，再做固定键提取。 */
 static const char *json_skip_ws(const char *p)
 {
@@ -192,6 +215,12 @@ void iv_status_handle_query(iv_status_t *st, const uint8_t *json, uint16_t len)
     if (json_get_string(buf, "AKW",    next.data.AKW,    sizeof(next.data.AKW))) {
         /* 同上 */
     }
+    /* 故障码（2026-10-28）：采集板把电量/传感器故障码放在这个键里，原样存
+     * （只清洗字符）；解析与合并见 `iv_fault`。老固件没有这个键 ⇒ valid 位留 0。 */
+    if (json_get_string(buf, "ERR", next.data.ERR, sizeof(next.data.ERR))) {
+        err_sanitize(next.data.ERR);
+        next.valid.ERR = 1;
+    }
 
     if (json_get_long(buf, "hv", &l)) { next.data.hv = (int32_t)l; next.valid.hv = 1; }
     if (json_get_long(buf, "lv", &l)) { next.data.lv = (int32_t)l; next.valid.lv = 1; }
@@ -229,7 +258,7 @@ void iv_status_handle_query(iv_status_t *st, const uint8_t *json, uint16_t len)
           next.valid.tu || next.valid.tl || next.valid.hu || next.valid.hl ||
           next.valid.sl || next.valid.ld || next.data.APOWER[0] ||
           next.data.AKW[0] || relay_seen || chv_seen || cha_seen ||
-          power_seen || elec_seen))
+          power_seen || elec_seen || next.valid.ERR))
         return;
     /* 只把镜像本体换上去，不碰 `on_door`/`on_door_arg`。 */
     st->data  = next.data;
@@ -261,7 +290,7 @@ void iv_status_handle_upstream(uint8_t cmd, const uint8_t *data, uint16_t len, v
     if (strstr(buf, "\"mcuEvent\"") == NULL) return;
     {
         char tag[8] = {0};
-        char val[32] = {0};
+        char val[IV_STATUS_ERR_MAX] = {0};
         const char *p = strstr(buf, "\"mcuEvent\"");
         if (p == NULL) return;
         p += strlen("\"mcuEvent\"");
@@ -308,6 +337,16 @@ void iv_status_handle_upstream(uint8_t cmd, const uint8_t *data, uint16_t len, v
             else if (strcmp(tag, "H") == 0)    { st->data.H   = (float)atof(val);  st->valid.H   = 1; }
             else if (strcmp(tag, "PA") == 0)   { st->data.PA  = (int32_t)atol(val); st->valid.PA  = 1; }
             else if (strcmp(tag, "PV") == 0)   { st->data.PV  = (int32_t)atol(val); st->valid.PV  = 1; }
+            /* 故障码也能从事件上报进来（`{"key":"mcuEvent","ERR":"1,10100000"}`）：
+             * 采集板若在故障发生/消失的那一刻推 0xC2，主板就不用等下一次 0xE1
+             * 轮询（默认 30 s）才看得到。值同样是 `Error_Get_Codesbuf()` 的原文。
+             * 原样覆盖 —— 与 0xE1 是同一份事实，后者下一拍会把它刷新成一样的内容。 */
+            else if (strcmp(tag, "ERR") == 0) {
+                memcpy(st->data.ERR, val, sizeof(st->data.ERR));
+                st->data.ERR[sizeof(st->data.ERR) - 1] = '\0';
+                err_sanitize(st->data.ERR);
+                st->valid.ERR = 1;
+            }
             /* 其余 TAG（OV/OCPS/MIU/WATER/TS）由应用层按需映射，参见架构 §18.2 */
             (void)val;
             (void)n;
@@ -364,6 +403,8 @@ int iv_status_format(const iv_status_t *st, char *buf, size_t buf_size)
         appendf(&p, end, "APOWER=%s ", st->data.APOWER);
     if (st->data.AKW[0])
         appendf(&p, end, "AKW=%s ",    st->data.AKW);
+    if (st->valid.ERR)
+        appendf(&p, end, "ERR=%s ",    st->data.ERR);
     if (st->valid.hv)   appendf(&p, end, "hv=%ld ", (long)st->data.hv);
     if (st->valid.lv)   appendf(&p, end, "lv=%ld ", (long)st->data.lv);
     if (st->valid.ov)   appendf(&p, end, "ov=%ld ", (long)st->data.ov);
@@ -434,6 +475,8 @@ int iv_status_snapshot_json(const iv_status_t *st, char *buf, size_t buf_size)
         { appendf(&p, end, "%s\"APOWER\":\"%s\"", first?"":",", st->data.APOWER); first = 0; }
     if (st->data.AKW[0])
         { appendf(&p, end, "%s\"AKW\":\"%s\"",    first?"":",", st->data.AKW);    first = 0; }
+    if (st->valid.ERR)
+        { appendf(&p, end, "%s\"ERR\":\"%s\"",    first?"":",", st->data.ERR);    first = 0; }
     if (st->valid.hv) { appendf(&p, end, "%s\"hv\":%ld",    first?"":",", (long)st->data.hv); first = 0; }
     if (st->valid.lv) { appendf(&p, end, "%s\"lv\":%ld",    first?"":",", (long)st->data.lv); first = 0; }
     if (st->valid.ov) { appendf(&p, end, "%s\"ov\":%ld",    first?"":",", (long)st->data.ov); first = 0; }

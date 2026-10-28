@@ -299,8 +299,57 @@ int main(void)
         chk(st.valid.DS && st.data.DS == 2, "S4.5 no cb -> mirror still updated");
     }
 
+    /* ---- 14) 采集板故障码 `ERR`（2026-10-28） ---- */
+    {
+        const char *json   = "{\"V\":220.0,\"ERR\":\"2,10100000,30100000\"}";
+        const char *no_err = "{\"V\":221.0}";
+
+        iv_status_init(&st);
+        iv_status_handle_query(&st, (const uint8_t *)json, (uint16_t)strlen(json));
+        chk(st.valid.ERR, "ERR: valid bit set when the key is present");
+        chk(strcmp(st.data.ERR, "2,10100000,30100000") == 0,
+            "ERR: reference wording kept verbatim (ERR=<n>,<code>,...)");
+
+        /* 全量刷新缺该键（老固件 / 采集板改口）⇒ 失效并清值，不留旧码冒充现状 */
+        iv_status_handle_query(&st, (const uint8_t *)no_err,
+                              (uint16_t)strlen(no_err));
+        chk(!st.valid.ERR, "ERR: dropped when the key is absent");
+        chk(st.data.ERR[0] == '\0', "ERR: value cleared together with the bit");
+
+        /* 白名单清洗：非契约字符被吃掉（这串会原样写进 snapshot JSON） */
+        {
+            const char *dirty = "{\"ERR\":\"1,10100000,30100000%\"}";
+            iv_status_handle_query(&st, (const uint8_t *)dirty,
+                                   (uint16_t)strlen(dirty));
+            chk(st.valid.ERR, "ERR: dirty value still accepted");
+            chk(strcmp(st.data.ERR, "1,10100000,30100000") == 0,
+                "ERR: sanitize drops non-whitelisted chars");
+        }
+
+        /* snapshot 里带出（Web / ctl 读的就是它） */
+        {
+            char sj[512];
+            int  m = iv_status_snapshot_json(&st, sj, sizeof sj);
+            chk(m > 0, "ERR: snapshot built");
+            chk(strstr(sj, "\"ERR\":\"1,10100000,30100000\"") != NULL,
+                "ERR: snapshot carries the raw string");
+        }
+
+        /* 0xC2 事件也能推（故障发生/消失那一刻，不必等下一次 0xE1 轮询） */
+        {
+            const char *ev = "{\"key\":\"mcuEvent\",\"T\":25.5,"
+                             "\"ERR\":\"1,10100000\"}";
+            iv_status_init(&st);
+            iv_status_handle_upstream(IV_FRAME_CMD_EVENT, (const uint8_t *)ev,
+                                      (uint16_t)strlen(ev), &st);
+            chk(st.valid.ERR, "ERR: 0xC2 event tag accepted");
+            chk(strcmp(st.data.ERR, "1,10100000") == 0, "ERR: 0xC2 value kept");
+            chk(st.valid.T && st.data.T == 25.5f, "ERR: other tags still mapped");
+        }
+    }
+
     if (g_fail == 0)
         printf("test_status passed (query/partial/robust/badjson/door/event/nomcuEvent/"
-               "snapshot/format/init/null/done_adapter/door_cb)\n");
+               "snapshot/format/init/null/done_adapter/door_cb/err)\n");
     return g_fail == 0 ? 0 : 1;
 }

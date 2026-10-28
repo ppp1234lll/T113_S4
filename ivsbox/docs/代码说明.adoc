@@ -51,6 +51,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M8-S8.5 摄像机 Web 受控代理（专用环回监听 ＋ `/cam/<N>` 反代 ＋ URL/Location/Cookie 重写） | 已实现（`iv_web_cam.c` ＋ main.c 第二监听接线 ＋ 集成 test_web_cam_e2e 自包含 14 组 ＋ 反向证伪 6/6（含装配层 1 条）；**真机浏览器兼容性不承诺、端到端待 frps 就位**） | 2026-10-15 11:30 | 新增 `web/src/iv_web_cam.c`：只绑 `127.0.0.1` 的专用监听口（`--cam-port`，默认 8081 与 `sys.tunnel.cam.port` 同源），只认 `/cam/<N>/...`（N 0..7、禁前导零），目标 IP 只经本地通道查 `camera.ch.<N>.ip`、上游端口只有 `--cam-upstream` 一个 ⇒ "禁止任意 ip:port"是物理事实；环回护栏拒自指；凭据零下发（SM4 密文 Web 读都不读）。**集成用例当场抓出 2 个真缺陷**（绝对 URL 重写吞掉路径分隔符 `/`；纯 Set-Cookie 响应因 `has_extra` 未置位被整段丢弃）。详见本文件 2026-10-15 11:30 节。 |
 | M5-S5.5 Web 网络页：配置项中文化 ＋ 「当前生效」只读网口状态 | 已实现（新增 `iv_config_default_desc()`；`config.defaults` 每项加可选 `d`；`sys.overview` 加 `net.link`；前端标签改用键说明 ＋ `pageNet` 加「当前生效」卡片；**板端 `eth0 192.168.2.120/24`、网关 `192.168.2.1`、MAC 与 `ip -4 addr` 逐项一致**） | 2026-10-17 11:02 | 详见本文件文末 2026-10-17 11:02 节。 |
 | 断网录像判据改为「只看主网」＋ 录像启动失败原因可读 | 已实现（VM 单测 47/47、反向证伪 2/2 抓出、ARM 0 告警；**板端实测**：主网断 10 s 自动开录、3 s 确认成功、坏地址逐行报因；`record.status` 带 `reason`） | 2026-10-28 10:38 | 详见本文件文末 2026-10-28 10:38 节。 |
+| 故障码（`ERR`）上报：采集板 JSON `ERR` ＋ 主板网络码合并 | 已实现（新增 `iv_fault` 模块；`iv_status` 落 `ERR`、`iv_agent` 合流；VM 单测 49/49、ASan 49/49、analyze 0、ARM 0 告警、反向证伪 4/4；**板端未换版**） | 2026-10-28 11:10 | 详见本文件文末 2026-10-28 11:10 节。 |
 | Web 手动录像入口 ＋ 媒体进程自启 ＋ 静态资源 413 闭环 | 已实现（VM 单测 48/48、集成 16 passed＋1 SKIP、前端 9 用例全绿、反向证伪 5 条；**板端实测**：整机重启后媒体进程自起并自动开录、`/app.js` 由 413 转 200、手动开关录像双向 `changed`） | 2026-10-28 11:32 | 上一节「未做」的两条（Web 手动入口、媒体自启）本轮闭环；另修掉加完前端后暴露的静态资源硬顶 413（整页白屏）。详见本文件文末 2026-10-28 11:32 节。 |
 |===
 
@@ -8421,6 +8422,104 @@ static int ipc_brand_code(iv_dev_brand_t b);   /* hik 0 / dahua 1 / unv 2 / 其�
   500 ms 预检）。改为传 `a->now_ms` 后单测加 `c08 ⑥` 钉死。
 * 换版后复测（md5 `7f94308f`）：10:37:52 自动开录、10:37:55 确认成功、文件继续增长。
 
+== 2026-10-28 11:10 故障码（`ERR`）上报：采集板 JSON ＋ 主板网络码合并
+
+=== 干了什么事
+
+* **新增模块 `iv_fault`**（`include/ivsbox/iv_fault.h` ＋ `src/modules/fault/iv_fault.c`，进 `libivmodules`）：
+  故障码表（`IV_FAULT_*`）、合并表（`iv_fault_t`）与四个接口 `iv_fault_init / apply_board /
+  apply_net / format`（另加 `count` / `has` 两个只读）。
+  - 码表**照抄**参考实现「雅下市电 GD32F460 版」`main/APP/User/inc/error.h`（2026-10-28 逐条核对）：
+    `0x1XXXXXXX` 电量 9 种、`0x2XXXXXXX` 网络（LAN/主网1/2/摄像机1..6 × 故障·延时·丢包 ＋ 主网 IP 未配置）、
+    `0x3XXXXXXX` 传感器 7 种。第 20..23 位＝项、第 16..19 位＝序号（摄像机逐路 `1<<16`）。
+  - `apply_board()`：解析采集板 `ERR` **原文**（`ERR=<数量>,<码>,<码>;`），容忍四个变体 ——
+    带不带 `ERR=` 前缀、带不带尾分号、带不带 `0x` 前缀、数量字段与真码数不符（不采信数量，
+    只记 `board_mismatch`）。**只采信 0x1/0x3 类**，网络码（0x2）剔除并计入 `board_rejected`；
+    **每轮整体替换**（不是累加）⇒ 采集板故障消失后下一帧就没有那条，不需要"清除"命令。
+  - `apply_net()`：把主网两路状态码、六路摄像机状态码、有线载波**纯映射**成网络码，
+    同样整体重算。判定表（与参考实现 `det.c` / `alarm.c` 对齐）：
+    * 主网1（有线）`2⇒NET_MAIN_FAULT`、`4⇒NET_MAIN_DELAY`、**`3`（网线断开）不置主网码**——
+      同一条物理事实由 `NET_LAN_PORT` 表达，报两个码只会让平台多一条不相干条目；
+    * 主网2（4G）`2/3⇒NET_MAIN2_FAULT`、`4⇒NET_MAIN2_DELAY`；
+    * LAN 口（运维网口 = eth0）载波 down ⇒ `NET_LAN_PORT`；**载波未知（未绑接口）不置码**，
+      否则开机头几拍就凭空多一条"LAN 口故障"；
+    * 摄像机 1..6：`2⇒CAM_FAULT(n)`、`4⇒CAM_DELAY(n)`、`5`（丢包）不置码（参考实现 2026-09 起的口径）、
+      `0/1` 不置码。
+  - `format()`：`n,C1,C2,...`（8 位**大写**十六进制、**升序去重**），空表 `0` ——
+    直接对接 `iv_report_build_seg()` 的 `ERR=%s;`（健康态 `ERR=0;` 与参考实现逐字一致）。
+* **`iv_status` 成为 `ERR` 的落点**（`iv_status.h` / `iv_status.c`）：
+  - 新增 `IV_STATUS_ERR_MAX 128`（**放在结构体之前**，第一版放后面导致编译不过）、`data.ERR[]`、`valid.ERR`；
+  - 0xE1 全量应答里解析 `"ERR"` 键 → `err_sanitize()` 字符白名单（只留 `0-9A-Fa-f,;=`, 空格与 `x/X`）后入镜像。
+    为什么要洗：这串会被 `snapshot_json()` **原样**写进 JSON（Web/ctl 都读），一个引号就能把整份 JSON 弄坏；
+    采集板那边是 `sprintf("%08X")` 拼出来的，出现别的字符本身就是它拼错了。缺该键 ⇒ `valid.ERR=0`（失效，不拿旧值冒充）；
+  - 0xC2 事件也认 `ERR` TAG（`{"key":"mcuEvent","ERR":"1,10100000"}`）：采集板若在故障发生/消失那一刻推事件，
+    平台不必等下一次 0xE1 轮询；`val[]` 缓冲同时由 32 加宽到 `IV_STATUS_ERR_MAX`；
+  - `iv_status_format()` / `iv_status_snapshot_json()` 带出 `ERR`（`board.status` / `sys.overview` 白拿）。
+* **`iv_agent` 是两半的唯一合流点**（`iv_agent.h` / `iv_agent.c`）：
+  - `iv_agent_t` 增 `iv_fault_t flt` ＋ `char err_buf[IV_FAULT_STR_MAX]`
+    （`iv_report_set_env()` **只存指针**，到出报那一刻才读 ⇒ 缓冲必须跟着 agent 活，不能是栈上临时量）；
+  - 新增 `fault_feed()`，在 `env_feed()` 里 `mn_state_of()` 算完两路之后调用：采集板码取
+    `rp.st.data.ERR`（`valid.ERR` 为 0 时传 NULL ⇒ 只报网络码）、摄像机取 `iv_camdet_cns()`、
+    有线载波取 `wan_ifindex/wan_link_up`（未绑接口 = 未知），组串后填 `env.err`；
+  - 角色分配：**有线 ⇒ 主网1、4G ⇒ 主网2**，不按 `env.mn[]` 的槽位顺序（那里 0 是 usb0、1 是 eth0，
+    历史实现如此）—— 4G 是备份链路，它断了不该写成"主网1 故障"。
+* **`iv_report` 一行未改**：`build_seg()` 早在 2026-10-2x 就有 `ERR=%s;` 与 `iv_report_env_t::err`，
+  缺的是生产者（`env.err` 全仓零赋值 ⇒ 恒 `ERR=0;`）。本轮只补生产者。
+
+=== 解决什么问题
+
+* 平台「故障」一栏永远是空的：`ERR=0;` 恒发，故障码功能等于是个空壳。
+* **分工不清会导致两套结论**：电量/传感器只有采集板有传感器（分压、互感器、AHT20、水浸、门磁、防雷），
+  主板只有网络视角（LAN 口载波、主网探活、摄像机 PING）。谁判谁报，写死在模块注释与码表分类里。
+* **数量字段不可信**：参考实现 `Error_Get_Codesbuf()` 在缓冲不够时会截断码、但数量字段仍是完整值 ⇒
+  以数量为准会少报故障。本实现以解析出的码为准。
+* **载波未知 ≠ 载波掉**：开机头几拍 netlink 还没回事件，按 0 判就会凭空多一条"LAN 口故障"。
+  三态（1/0/负数）把这条坑堵住。
+* **串味事故**：编译 VM 上 `~/wbnet/ivsbox` 是多个会话共用的，本轮开工时那份树的 `test_recctl.c`
+  已被另一会话改成引用新函数、头文件却还是本树的 ⇒ `implicit declaration` 编不过。本轮验证改在
+  `~/wbnet/wb-fault/ivsbox` 独立目录进行（另：`git worktree` 新建的工作副本**不含被 git 忽略的**
+  `media/third_party/ffmpeg/lib_x86/*.a`，需从既有树拷一份）。
+
+=== 影响范围
+
+* 新增文件：`iv_fault.h` / `iv_fault.c` / `test_fault.c` / `test_agent_fault.c`。
+  构建脚本**无需改动**（`MODULES_SRCS` / `TEST_SRCS` 都是通配）。
+* 改动的结构体：`iv_status_data_t`（＋128 B）、`iv_status_valid_t`（＋1 bit）、`iv_agent_t`（＋`flt`、`err_buf`）。
+  `iv_report_t` 内嵌 `iv_status_t` ⇒ 句柄整体约 +128 B（原约 15 KB，可忽略）。
+* 上报帧：`ERR=` 段内容由 `0` 变为"合并表"；**字段名、位置、结尾分号都没变**，字段表仍恒长。
+  健康时仍是 `ERR=0;`（与现场老平台兼容）。
+* 平台 E1 查询应答、状态镜像 JSON 多了一个 `"ERR"` 键（可选项，老前端忽略即可）。
+* **跨端依赖（重要）**：采集板固件必须在 `0xE1` 应答里**增加 `"ERR"` 键**，本功能才有电量/传感器码。
+  2026-10-28 的现场固件（`General_Version 无SADP` 与雅下 GD32F460 版）都只在**自己的上报报文**里拼
+  `ERR=`，0xE1 应答里没有该键 ⇒ 换版当天平台上只会看到主板的网络码，这是预期行为（不猜不编）。
+* 未覆盖 / 待办：
+  - **板端未换版**（本轮只做 VM 四层：host / test / asan / analyze / arm）；真机"拔网线看平台是否出现
+    `20100000`／`20200000`"未做；
+  - `NET_MAIN_IP_UNCONFIG`（0x20B0/0x20C0）与三条丢包码**故意不置码**（参考实现同期也不报），码表里留值备查；
+  - 采集板若把 `ERR` 写成 JSON number（而非字符串）不会被识别（`json_get_string` 只认引号）——
+    协议上它是 `ERR=<n>,<码>` 这种带逗号的串，只能是字符串；
+  - 断电码 `ELEC_MAIN_AC` 的"独占"语义（参考实现 `Error_Set()` 里一旦置它就清空其它）由**采集板**保证，
+    主板只做透传 + 网络码合并，不重算。
+
+=== 验证方式与结果
+
+* 编译（VM `~/wbnet/wb-fault/ivsbox`，独立目录）：`make host` / `make arm` **0 告警 0 错误**；
+  `build/arm/ivsboxd` md5 `0a9f3bd3e60c7fc146a74ec259b8fd24`。
+* 单测：`make test` **49/49 passed、0 FAIL**（原 47 ＋ `test_fault` 15 组 ＋ `test_agent_fault` 5 组；
+  `test_status` 新增第 14 组）。`make asan` 49/49 无 sanitizer 报告；
+  `make analyze`（先 `rm -rf build/analyze`，否则增量 0 行是假绿）**0 报告**。
+* **反向证伪 4 条**（改函数体 → 重编 → 判红 → 还原 → md5 与本地逐字节一致 → 复绿）：
+  |===
+  | 变异 | 命中用例 | 红
+  | 采信条件放开成"1/2/3 全收" | `test_fault f04` | 4
+  | 主网 3（网线断开）也置 `NET_MAIN_FAULT` | `test_fault f10` | 1
+  | `fault_feed()` 不再喂采集板 `ERR` | `test_agent_fault k01/k02/k05` | 4
+  | 去掉 `err_sanitize()` 白名单 | `test_status` 清洗 ＋ snapshot | 2
+  |===
+* 端到端（本层能测到的最远处）：`k05` 直接用 `iv_report_build_seg()` 组段，断言
+  `ERR=3,10100000,20100000,20300000;` —— 覆盖"指针不悬空 + 合并 + 升序 + 段格式"四件事。
+* 未验证：板端真机与平台界面（缺采集板 `ERR` 键，见"影响范围"）。
+
 == 2026-10-28 11:32 Web 手动录像入口 ＋ 媒体进程自启 ＋ 静态资源 413 闭环
 
 === 干了什么事
@@ -8579,5 +8678,3 @@ GET / 200；GET /style.css 200（6158 B）
   ② 点「停止」后 **10 s 又被自动开录** —— 只清了 `force`，hold 到点就起。新增
   `manual_off` 压制，主网恢复一拍才解除；板端实测「停止 → `held_off:true` →
   等 25 s 仍 `recording:false`」。
-
-

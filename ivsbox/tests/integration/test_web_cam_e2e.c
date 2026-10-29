@@ -449,16 +449,56 @@ static void fake_camera_main(void)
                                "METHOD=%s PATH=%s CT=%s CK=%s AUTH=%s BODY=%s",
                                method, path, cts, cks, aus, bcopy);
                 body = ebuf;
+            } else if (strcmp(path, "/keepalive") == 0) {
+                /* 摄像机"发完 body 不关连接"的现场行为（2026-10-29 大华 192.168.1.108
+                 * 实证）：即使请求写了 Connection: close，它发完 Content-Length 指定
+                 * 的字节后仍然把连接开着。代理若只等 EOF 就会挂死，进而把单线程 Web
+                 * 主循环冻住 ⇒ 心跳过期 ⇒ monitor-web.sh 杀掉重启。 */
+                static const char kv[] = "<html>keepalive</html>";
+                int w = snprintf(rsp, sizeof rsp,
+                                 "HTTP/1.1 200 X\r\nContent-Type: text/html\r\n"
+                                 "Content-Length: %zu\r\n\r\n%s",
+                                 strlen(kv), kv);
+
+                (void)send(cfd, rsp, (size_t)w, MSG_NOSIGNAL);
+                {
+                    char           drain[256];
+                    struct timeval tv2;
+
+                    tv2.tv_sec  = 5; /* 兜底：代理不关也最多等 5 s，免得整轮测试挂住 */
+                    tv2.tv_usec = 0;
+                    (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof tv2);
+                    while (recv(cfd, drain, sizeof drain, 0) > 0) {
+                    }
+                }
+                (void)close(cfd);
+                continue;
+            } else if (strcmp(path, "/bin") == 0) {
+                /* 二进制体（含 0 字节）：代理若拿 strlen() 量长度会截成 0 字节。 */
+                static const char bin[6] = { 0x00, 0x01, 0x02, 0x00, 0x03, 0x04 };
+                int w = snprintf(rsp, sizeof rsp,
+                                 "HTTP/1.1 200 X\r\n"
+                                 "Content-Type: application/octet-stream\r\n"
+                                 "Content-Length: 6\r\nConnection: close\r\n\r\n");
+
+                (void)send(cfd, rsp, (size_t)w, MSG_NOSIGNAL);
+                (void)send(cfd, bin, sizeof bin, MSG_NOSIGNAL);
+                (void)close(cfd);
+                continue;
             } else {
                 status = 404;
                 body = "nope";
             }
 
             {
+                /* ⚠ Content-Type 故意放**最后一行**：大华等现场摄像机就是这么发的
+                 * （2026-10-29 板端实证）。代理按行解析头区，最后一行没有后续 CRLF
+                 * 时极易被整行漏掉 —— 放了它这条用例才能钉住"类型透传"。 */
                 int w = snprintf(rsp, sizeof rsp,
-                                 "HTTP/1.1 %d X\r\nContent-Type: %s\r\n"
-                                 "Content-Length: %zu\r\n%sConnection: close\r\n\r\n",
-                                 status, ctype, strlen(body), extra);
+                                 "HTTP/1.1 %d X\r\n"
+                                 "Content-Length: %zu\r\n%sConnection: close\r\n"
+                                 "Content-Type: %s\r\n\r\n",
+                                 status, strlen(body), extra, ctype);
                 size_t blen = strlen(body);
 
                 (void)send(cfd, rsp, (size_t)w, MSG_NOSIGNAL);
@@ -660,6 +700,16 @@ int main(int argc, char *argv[])
             "c03c: relative link passes through verbatim (documented scope)");
         chk(strstr(g_rsp, "http://127.0.0.1") == NULL,
             "c03d: no absolute upstream URL leaks to the client");
+        /* 上游把 Content-Type 放在**最后一行**（大华就是这么发的）—— 头区最后一行
+         * 若因缺少行尾被漏掉，这里会退回 application/octet-stream，浏览器就把整个
+         * 摄像机页面当文件下载。反向证伪点。 */
+        {
+            char ct[64];
+
+            chk(hdr_val((size_t)total, "Content-Type:", ct, sizeof ct) != 0 &&
+                strcmp(ct, "text/html") == 0,
+                "c03e: response Content-Type passed through (last header line)");
+        }
     }
 
     /* ---------------- c04 302 Location 重写 ---------------- */
@@ -802,12 +852,48 @@ int main(int argc, char *argv[])
             chk(after == before, "c13b: no fd leak across cam proxy requests");
     }
 
+    /* ---------------- c14 上游发完 body 不关连接：收满 Content-Length 就必须收工 ---------------- */
+    {
+        struct timespec t0;
+        struct timespec t1;
+        long            ms;
+        int             len = snprintf(g_req, sizeof g_req,
+                                       "GET /cam/0/keepalive HTTP/1.1\r\nHost: x\r\n"
+                                       "Connection: close\r\n\r\n");
+        int             total;
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        total = exchange(g_cam_lport, g_req, (size_t)len);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        ms = (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+
+        chk(total > 0 && rsp_status() == 200, "c14a: keep-alive upstream answered 200");
+        chk(strstr(g_rsp, "keepalive") != NULL, "c14b: full body delivered");
+        /* 反向证伪点：只等 EOF 的写法这里会是 ~5000 ms（假摄像机 5 s 兜底才关） */
+        chk(ms < 3000L, "c14c: returns once Content-Length is satisfied (<3s)");
+    }
+
+    /* ---------------- c15 二进制体按长度搬运（含 0 字节） ---------------- */
+    {
+        int  len = snprintf(g_req, sizeof g_req,
+                            "GET /cam/0/bin HTTP/1.1\r\nHost: x\r\n"
+                            "Connection: close\r\n\r\n");
+        int  total = exchange(g_cam_lport, g_req, (size_t)len);
+        long off = hdr_end_off((size_t)total);
+
+        chk(total > 0 && rsp_status() == 200, "c15a: binary body answered 200");
+        chk(off > 0 && (size_t)total - (size_t)off == 6u, "c15b: 6 bytes passed through");
+        chk(off > 0 && memcmp(g_rsp + off, "\x00\x01\x02\x00\x03\x04", 6u) == 0,
+            "c15c: binary content intact (no strlen truncation)");
+    }
+
     cleanup();
     if (g_fail != 0) {
         fprintf(stderr, "test_web_cam_e2e FAILED (%d checks)\n", g_fail);
         return 1;
     }
     printf("test_web_cam_e2e passed (route isolation, proxy+rewrites, header/body "
-           "passthrough, 502 paths, loopback guard, fd stability)\n");
+           "passthrough, 502 paths, loopback guard, fd stability, no-EOF upstream, "
+           "binary body)\n");
     return 0;
 }

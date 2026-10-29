@@ -392,6 +392,66 @@ static int resp_is_chunked(const char *head)
 }
 
 /* ---------------------------------------------------------------------------
+ * 收包期间用到的**长度受限**小工具（此时 out 还没 NUL 终止，不能用 strstr）
+ * ------------------------------------------------------------------------- */
+
+/* 头区结束偏移（"\r\n\r\n" 之后那一个字节）；没收到完整头区返回 0。 */
+static size_t find_head_end(const char *buf, size_t len)
+{
+    size_t i;
+
+    for (i = 0u; i + 3u < len; i++)
+        if (buf[i] == '\r' && buf[i + 1u] == '\n' && buf[i + 2u] == '\r' &&
+            buf[i + 3u] == '\n')
+            return i + 4u;
+    return 0u;
+}
+
+/* 在 [0, he) 里找下标 from 之后最近的行尾；没有则返回 he。 */
+static size_t line_end_at(const char *buf, size_t from, size_t he)
+{
+    size_t i;
+
+    for (i = from; i + 1u < he; i++)
+        if (buf[i] == '\r' && buf[i + 1u] == '\n')
+            return i;
+    return he;
+}
+
+/* 头区里的 Content-Length；没有/非法返回 -1。**必须带长度**：调用时 body 可能
+ * 是二进制且缓冲区未终止。 */
+static long hdr_clen_bounded(const char *buf, size_t he)
+{
+    size_t p = 0u;
+
+    while (p < he) {
+        size_t e = line_end_at(buf, p, he);
+
+        if (e - p >= 15u && strncasecmp(buf + p, "Content-Length:", 15u) == 0) {
+            long v = strtol(buf + p + 15u, NULL, 10);
+
+            return (v >= 0) ? v : -1;
+        }
+        p = e + 2u;
+    }
+    return -1;
+}
+
+/* 响应体是否为文本（决定要不要做 URL 改写）。二进制体**绝不能**按字符串处理：
+ * `strlen()` 会在第一个 0 字节处截断，摄像机页面里的图片/字体就是这么丢的。 */
+static int ctype_is_text(const char *ct)
+{
+    if (ct == NULL || ct[0] == '\0')
+        return 0;
+    if (strncasecmp(ct, "text/", 5u) == 0)
+        return 1;
+    if (strcasestr(ct, "javascript") != NULL || strcasestr(ct, "json") != NULL ||
+        strcasestr(ct, "xml") != NULL || strcasestr(ct, "x-www-form-urlencoded") != NULL)
+        return 1;
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
  * 主入口
  * ------------------------------------------------------------------------- */
 int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
@@ -505,6 +565,18 @@ int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
         return IV_OK;
     }
 
+    /* 收发都要有超时：**阻塞 recv 自身没有时间上限时，下面那个 8 s 总预算根本不生效**
+     * —— 摄像机发完 body 不关连接（2026-10-29 板端实证，见收包循环注释），recv 会
+     * 一直挂着，把单线程 Web 主循环冻住。1 s 一跳，让总预算能真正判到。 */
+    {
+        struct timeval tv;
+
+        tv.tv_sec  = 1;
+        tv.tv_usec = 0;
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    }
+
     {
         size_t sent = 0u;
         size_t total = strlen(upreq);
@@ -540,19 +612,46 @@ int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
     }
 
     deadline = (uint64_t)time(NULL) * 1000u + IV_WEB_CAM_TOTAL_MS;
-    while (off < cap - 1u) {
-        ssize_t r = recv(fd, out + off, cap - 1u - off, 0);
+    {
+        size_t he   = 0u;  /* 头区结束偏移；0 ＝ 还没收齐（此时整段不能当字符串用） */
+        long   clen = -1;  /* Content-Length；-1 ＝ 没有该头或非法 */
 
-        if (r < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
+        while (off < cap - 1u) {
+            ssize_t r = recv(fd, out + off, cap - 1u - off, 0);
+
+            if (r < 0) {
+                if (errno == EINTR)
+                    continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    /* SO_RCVTIMEO 1 s 一跳：判总预算，别在这儿死等（见下） */
+                    if ((uint64_t)time(NULL) * 1000u > deadline)
+                        break;
+                    continue;
+                }
+                break;
+            }
+            if (r == 0)
+                break; /* 上游按 Connection: close 收尾（部分摄像机会） */
+            off += (size_t)r;
+            if (he == 0u) {
+                size_t h = find_head_end(out, off);
+
+                if (h != 0u) {
+                    he   = h;
+                    clen = hdr_clen_bounded(out, h);
+                }
+            }
+            /* ① 有 Content-Length 且已收满 ⇒ 立刻收工。
+             * 板端实证 2026-10-29（大华 192.168.1.108）：**请求里写了
+             * `Connection: close`，它发完 Content-Length 指定的字节后仍然不关连接**
+             * ⇒ 只等 EOF 的写法会把单线程 Web 主循环冻死 8 s 以上，心跳过期后
+             * monitor-web.sh 杀掉重启（浏览器看到 `Connection reset by peer`，
+             * 现场表现就是"远程看摄像机打不开，还把整个 Web 拖挂 10 秒"）。 */
+            if (he != 0u && clen >= 0 && off >= he + (size_t)clen)
+                break;
+            if ((uint64_t)time(NULL) * 1000u > deadline)
+                break; /* 超预算：有多少算多少（下面按截断应答处理） */
         }
-        if (r == 0)
-            break; /* 上游按 Connection: close 收尾 */
-        off += (size_t)r;
-        if ((uint64_t)time(NULL) * 1000u > deadline)
-            break; /* 超预算：有多少算多少（下面按截断应答处理） */
     }
     (void)close(fd);
     out[off] = '\0';
@@ -568,11 +667,19 @@ int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
             return IV_OK;
         }
         head_end = (size_t)(body - out);
-        if (head_end >= sizeof head) {
-            head_end = sizeof head - 1u;
+        if (head_end + 2u >= sizeof head) {
+            head_end = sizeof head - 3u;
         }
         memcpy(head, out, head_end);
-        head[head_end] = '\0';
+        /* 末尾**补一个 CRLF**：`hdr_get()`/`cookies_to_extra()`/`resp_is_chunked()`
+         * 都按行匹配（先找齐本行的 "\r\n" 再比对名字），而 head_end 指向的正是
+         * "\r\n\r\n" 的第一个字节 —— 所以头区的**最后一行**在这个副本里没有行尾，
+         * 不补就会被整行漏掉。板端实证 2026-10-29：大华把 `Content-Type` 放在最后，
+         * 于是类型恒为空 ⇒ 回 `application/octet-stream` ⇒ 浏览器把摄像机页面当
+         * 文件下载（"远程查看摄像机网页"直接变成"下载一个 html"）。 */
+        head[head_end]      = '\r';
+        head[head_end + 1u] = '\n';
+        head[head_end + 2u] = '\0';
         status = atoi(out + 8);
 
         if (status < 100 || status > 599 || resp_is_chunked(head)) {
@@ -582,17 +689,24 @@ int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
             return IV_OK;
         }
 
-        /* ⑥ 重写与回填（body 就地改写后把体搬到缓冲前部） */
+        /* ⑥ 重写与回填（文本体就地改写；二进制体原样按长度搬运） */
         {
             char  *b = body + 4;
             size_t blen = off - head_end - 4u;
+            int    is_text;
 
             hdr_get(head, "Content-Type", ctype, sizeof ctype);
+            is_text = ctype_is_text(ctype);
             hdr_get(head, "Location", location, sizeof location);
             if (location[0] != '\0')
                 rewrite_location(location, sizeof location, ipstr, port, prefix);
-            rewrite_abs_urls(b, cap - (size_t)(b - out) - 1u, ipstr, port, prefix);
-            blen = strlen(b);
+            if (is_text != 0)
+                rewrite_abs_urls(b, cap - (size_t)(b - out) - 1u, ipstr, port, prefix);
+            /* 长度只对文本体重算（改写只会变短）；二进制体（图片/字体/打包 JS）
+             * **一律保持实测字节数**：拿 strlen() 量二进制会在第一个 0 字节处截断，
+             * 摄像机页面的图标、样式表就是这么丢的。 */
+            if (is_text != 0)
+                blen = strlen(b);
 
             rsp->status = status;
             (void)snprintf(rsp->ctype, sizeof rsp->ctype, "%s",

@@ -65,7 +65,7 @@ const net = { 'net.ip': '192.168.2.120', 'net.mask': '255.255.255.0',
               'net.gateway': '192.168.2.1',
               'net.server.wired.host': '47.104.250.225',
               'net.server.wired.port': 6013 };
-const probe = { 'probe.interval_ms': 5000, 'probe.timeout_ms': 2000, 'probe.max_fail': 3,
+const probe = { 'probe.interval_ms': 10000, 'probe.timeout_ms': 200, 'probe.max_fail': 3,
                 'probe.target1': '192.168.2.1', 'probe.target2': '192.168.2.2' };
 const applyCalls = [];
 const rsp = (obj) => ({ status: 200, text: () => Promise.resolve(JSON.stringify(obj)) });
@@ -193,7 +193,8 @@ const main = async () => {
 
     /* n03：两个按钮都在 */
     chk(byText(content, 'button', '配置 IP 和网关') !== null, 'n03a: 有「配置 IP 和网关」按钮');
-    chk(byText(content, 'button', '配置主网检测 IP') !== null, 'n03b: 有「配置主网检测 IP」按钮');
+    chk(byText(content, 'button', '配置检测 IP / 轮间隔') !== null,
+        'n03b: 有「配置检测 IP / 轮间隔」按钮');
 
     /* n04：同一个键只能有一个编辑器 —— 通用「网络参数」卡片必须跳过这三键，
      * 否则页面上两个表单写同一批键，后提交的带过期版本号必撞 e=-3。 */
@@ -209,22 +210,27 @@ const main = async () => {
     chk(q(content, 'net.server.wired.host') !== null,
         'n04e: 通用「网络参数」卡片仍在，平台地址还能改');
 
-    /* n05：两个按钮各自只发自己那几个键 */
-    console.log('n05 点「配置主网检测 IP」');
+    /* n05：两个按钮各自只发自己那几个键（检测 IP 按钮 2026-10-29 起还带轮间隔） */
+    console.log('n05 点「配置检测 IP / 轮间隔」');
     applyCalls.length = 0;
     t1.value = '10.1.1.1';
     t1.dispatchEvent(new window.Event('input'));
     t2.value = '10.1.1.2';
     t2.dispatchEvent(new window.Event('input'));
-    byText(content, 'button', '配置主网检测 IP').click();
+    byText(content, 'button', '配置检测 IP / 轮间隔').click();
     await sleep(60);
 
     chk(applyCalls.length === 1, 'n05a: 只发了一次 config.apply');
     if (applyCalls.length === 1) {
         const keys = Object.keys(applyCalls[0].items).sort();
-        chk(keys.length === 2 && keys[0] === 'probe.target1' && keys[1] === 'probe.target2',
-            'n05b: 只发了 probe.target1/target2 两个键');
+        chk(keys.length === 3 && keys.join(',') ===
+                'probe.interval_ms,probe.target1,probe.target2',
+            'n05b: 发的是 probe.target1/target2/interval_ms 三个键');
         chk(applyCalls[0].items['probe.target1'] === '10.1.1.1', 'n05c: 值就是输入框里的');
+        /* 数字键必须发 Number，不能发字符串 —— 后端按 int 收，字符串会被判类型错
+         * （或更糟：静默取默认值）。`submit()` 靠输入框的 `data-kind` 分流。 */
+        chk(applyCalls[0].items['probe.interval_ms'] === 10000,
+            'n05e: 轮间隔发的是数字 10000 而不是字符串');
         chk(applyCalls[0].ver === 7, 'n05d: 提交的是读到的版本号 7');
     }
 
@@ -297,7 +303,7 @@ const main = async () => {
     console.log('n09 有线网络超时时间（probe.timeout_ms）');
     const to = q(content, 'probe.timeout_ms');
     chk(to !== null, 'n09a: 「本机网络与主网检测」里有超时输入框');
-    chk(to !== null && to.value === '2000', 'n09b: 带的是真实值 2000 ms');
+    chk(to !== null && to.value === '200', 'n09b: 带的是真实值 200 ms');
     chk(content.textContent.indexOf('有线网络超时时间(ms)') >= 0,
         'n09c: 标签用的是平台的叫法，不是配置键描述');
     chk(byText(content, 'button', '配置有线超时') !== null, 'n09d: 有「配置有线超时」按钮');
@@ -319,11 +325,13 @@ const main = async () => {
     }
 
     /* 三个非法值都必须在**发请求之前**挡住：区间 100~60000、
-     * 必须**严格小于半个探测周期**（桩里 interval=5000 ⇒ 上限 2499）、整数。
-     * 「半周期」这条是 2026-10-26 语义纠正带出来的：这个键是延时门限，
-     * 等回包超时＝半周期，门限摆到半周期及以上 ⇒ 时延永远够不到它。 */
-    const bads = [['50', '低于下界 100'], ['5000', '不小于探测周期'],
-                  ['2500', '正好等于半周期（必须严格小于）'],
+     * 必须**严格小于单包间隔的一半**（桩里轮间隔=10000、每轮 4 个包 ⇒
+     * 单包间隔 2500、上限 1249）、整数。
+     * 这条是 2026-10-26 语义纠正带出来的：这个键是延时门限，等回包超时＝单包间隔
+     * 的一半，门限摆到它及以上 ⇒ 时延永远够不到它。2026-10-29 引入"轮"概念后，
+     * 单包间隔＝轮间隔/4，上限跟着从 `轮/2` 收紧到 `轮/8`。 */
+    const bads = [['50', '低于下界 100'], ['10000', '不小于轮间隔'],
+                  ['1250', '正好等于 轮间隔/8（必须严格小于）'],
                   ['2.5', '不是整数'], ['', '留空']];
     for (const [v, tag] of bads) {
         applyCalls.length = 0;
@@ -335,16 +343,50 @@ const main = async () => {
             'n09i: ' + tag + ' 被前端拦住（不发请求、有提示）');
     }
 
-    /* 边界内侧必须能过：2499 < 2500（半周期），前端不许一味拦死 */
+    /* 边界内侧必须能过：1249 < 1250（单包间隔的一半），前端不许一味拦死 */
     applyCalls.length = 0;
-    to.value = '2499';
+    to.value = '1249';
     to.dispatchEvent(new window.Event('input'));
     byText(content, 'button', '配置有线超时').click();
     await sleep(60);
-    chk(applyCalls.length === 1, 'n09j: 2499（半周期内侧）放行');
+    chk(applyCalls.length === 1, 'n09j: 1249（单包间隔一半的内侧）放行');
     if (applyCalls.length === 1) {
-        chk(applyCalls[0].items['probe.timeout_ms'] === 2499,
-            'n09j: 发的仍是数字 2499');
+        chk(applyCalls[0].items['probe.timeout_ms'] === 1249,
+            'n09j: 发的仍是数字 1249');
+    }
+
+    /* n10：「ping 轮间隔」必须有输入框且可改（2026-10-29 用户口径：
+     * "每一轮 ping 的时间间隔是 10 s，可在 web 界面配置"）。在此之前这个键
+     * 只作为"校验 timeout 时读的隐含参数"存在，页面没有任何地方能改 ——
+     * 用户看到的只有「有线网络超时时间」，问的就是"10 s 在哪儿配"。 */
+    console.log('n10 ping 轮间隔（probe.interval_ms）');
+    const itv = q(content, 'probe.interval_ms');
+    chk(itv !== null, 'n10a: 有 ping 轮间隔输入框');
+    chk(itv !== null && itv.value === '10000', 'n10b: 带的是真实值 10000 ms');
+    chk(content.querySelectorAll('[data-key="probe.interval_ms"]').length === 1,
+        'n10c: 本页只有 1 个轮间隔输入框（不和其他卡片重复）');
+
+    const badItv = [['1000', '低于下界 2000'], ['700000', '高于上界 600000'],
+                    ['1000.5', '不是整数']];
+    for (const [v, tag] of badItv) {
+        applyCalls.length = 0;
+        itv.value = v;
+        itv.dispatchEvent(new window.Event('input'));
+        byText(content, 'button', '配置检测 IP / 轮间隔').click();
+        await sleep(40);
+        chk(applyCalls.length === 0 && toastText().length > 0,
+            'n10d: 轮间隔 ' + tag + ' 被前端拦住（不发请求、有提示）');
+    }
+
+    /* 下界内侧放行：2000 ms（包间隔 500、等回包超时 250 > 门限 200）。 */
+    applyCalls.length = 0;
+    itv.value = '2000';
+    itv.dispatchEvent(new window.Event('input'));
+    byText(content, 'button', '配置检测 IP / 轮间隔').click();
+    await sleep(60);
+    chk(applyCalls.length === 1, 'n10e: 2000（下界）放行');
+    if (applyCalls.length === 1) {
+        chk(applyCalls[0].items['probe.interval_ms'] === 2000, 'n10f: 发的是数字 2000');
     }
 
     if (fail === 0) {

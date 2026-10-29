@@ -410,10 +410,11 @@ static void c02_ping_normal(void)
 /* ---------------------------------------------------------------------------
  * c03 延时判定边界：严格大于（R-02c）
  *
- * 判据从"平均 RTT >= 阈值"改成"> 阈值"：平均 RTT 只能是调用方 tick 的整数倍
- * （本层没有自己的事件循环，回包在 tick 里才被读走），默认阈值 200 恰好等于一个
- * tick ⇒ `>=` 会让"一个 tick 内就应答的局域网摄像机"恒判延时(4)。板端实测的
- * 现场症状就是 ping 0.5 ms、页面报延时。
+ * 判据是"4 包平均 RTT > 阈值"（2026-10-29 用户口径：每 ping 一次发 4 个包、
+ * 算平均响应时间判丢包/延时）。为什么必须**严格大于**：RTT 只能是调用方排空
+ * 节拍的整数倍，默认阈值 200 恰好等于一个 200 ms 的 tick ⇒ `>=` 会让"一个 tick
+ * 内就应答的局域网摄像机"恒判延时(4)。板端实测的现场症状就是 ping 0.5 ms、
+ * 页面报延时。
  * ------------------------------------------------------------------------- */
 static void c03_ping_delay_boundary(void)
 {
@@ -432,15 +433,15 @@ static void c03_ping_delay_boundary(void)
     chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL, "avg==thr -> normal (R-02c)");
     iv_camdet_close(&f.d);
 
-    /* 平均远超阈值也是正常（2026-10-29 两态口径：有应答就算通，不再判延时） */
+    /* 平均远超阈值：4 包全响应但平均超门限 ⇒ 延时(4) */
     fx_open(&f, IV_CAMDET_MODE_PING, 1u); /* 阈值 1 ms，样本 100 ms */
     one_cam(ips);
     (void)iv_camdet_set_channels(&f.d, ips, 1000u);
     t = 1000u;
     for (i = 0; i < 4; i++)
         ping_pkt(&f, &t, 1, 100);
-    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL,
-        "avg>>thr -> still normal (two-state)");
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_DELAY,
+        "4/4 ok but avg>>thr -> delay(4)");
     iv_camdet_close(&f.d);
 
     /* 现场形态原样复刻：默认阈值 200 ＋ 一个 tick 的 RTT 200 → 必须正常 */
@@ -453,10 +454,10 @@ static void c03_ping_delay_boundary(void)
     chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL,
         "rtt==one tick under default thr -> normal (board case)");
 
-    /* 两个 tick 才有回包：仍旧正常 —— 延时不再是一种状态 */
+    /* 两个 tick 才有回包：400 ms > 200 ms 门限 ⇒ 延时（不是"故障"） */
     for (i = 0; i < 4; i++)
         ping_pkt(&f, &t, 1, (int)(2u * IV_CAMDET_TICK_RESOLUTION_MS));
-    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL, "two ticks -> still normal");
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_DELAY, "two ticks > thr -> delay(4)");
     iv_camdet_close(&f.d);
 }
 
@@ -478,7 +479,7 @@ static void c04_ping_loss(void)
     ping_pkt(&f, &t, 1, 20); /* 3 成功 */
     ping_pkt(&f, &t, 1, 20); /* 4 成功 */
 
-    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL, "3/4 ok -> normal (two-state)");
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_LOSS, "3/4 ok -> loss(5)");
     iv_camdet_close(&f.d);
 }
 
@@ -717,6 +718,15 @@ static void c10_mode_switch(void)
     chk(iv_camdet_set_mode(&f.d, IV_CAMDET_MODE_PORT, 2000u) == IV_OK, "switch to port");
     chk(iv_camdet_mode(&f.d) == IV_CAMDET_MODE_PORT, "mode getter = port");
     chk(f.d.pb.started == 0, "port: engine stopped (no ICMP traffic)");
+    /* 2026-10-29 用户口径："摄像机用其他检测方式时不再参与 ping 流程" ——
+     * 不只是停引擎，项表里也不许留 ICMP 项（ch_idx 必须回到 -1，否则
+     * `sample_ping()` 会照样读一份停掉的引擎的旧统计）。 */
+    {
+        int ch;
+
+        for (ch = 0; ch < IV_CAMDET_CH_N; ch++)
+            chk(f.d.ch_idx[ch] == -1, "port: no ICMP item left for camera channels");
+    }
 
     g_conn_ret = 0;
     (void)iv_camdet_tick(&f.d, 2000u);
@@ -868,8 +878,7 @@ static void c13_probe_now_and_rtt(void)
     chk(iv_camdet_samples(&f.d, 0) == 0, "c13: ping ring cleared by probe_now");
     iv_camdet_close(&f.d);
 
-    /* ---- 延时阈值热生效：同一批 150 ms 样本，阈值 200 → 正常 / 100 → 延时 ---- */
-    fx_open(&f, IV_CAMDET_MODE_PING, 200u);
+    /* ---- 延时阈值热生效：同一批 150 ms 样本，阈值 200 → 正常 / 100 → 延时 ---- */    fx_open(&f, IV_CAMDET_MODE_PING, 200u);
     one_cam(ips);
     (void)iv_camdet_set_channels(&f.d, ips, 1000u);
     t = 1000u;
@@ -880,8 +889,8 @@ static void c13_probe_now_and_rtt(void)
     chk(iv_camdet_set_rtt_thr(&f.d, 100u) == IV_OK, "c13: lower thr to 100");
     for (i = 0; i < 4; i++)
         ping_pkt(&f, &t, 1, 150);
-    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL,
-        "c13: same rtt 150 now over thr 100 -> still normal (thr no longer judges)");
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_DELAY,
+        "c13: same rtt 150 now over thr 100 -> delay(4)");
     iv_camdet_close(&f.d);
 }
 
@@ -941,6 +950,44 @@ static void t_rebuild_no_underflow(void)
     iv_camdet_close(&f.d);
 }
 
+/* ---------------------------------------------------------------------------
+ * c15 包间隔热生效（`iv_camdet_set_ping_interval`）
+ *
+ * 装配层把配置里的**轮间隔**（`probe.interval_ms`，默认 10 s）除以 4 传进来，
+ * 一轮 4 个包。这里卡三件事：
+ *   ① `ms == 0` 必须拒（0＝"取默认"只在 init 语境成立，运行期传 0 会把节拍清掉）；
+ *   ② 同值空操作（`camera.*` 任一键变化都会无脑调到这里，不能每次都重建引擎）；
+ *   ③ 真的落地到引擎的项周期上 —— 只改 `d->cfg` 不重建引擎，就是"配了不生效"。
+ * ------------------------------------------------------------------------- */
+static void c15_ping_interval(void)
+{
+    fx_t     f;
+    uint32_t ips[6];
+
+    fx_open(&f, IV_CAMDET_MODE_PING, 0u);
+    one_cam(ips);
+    (void)iv_camdet_set_channels(&f.d, ips, 1000u);
+
+    chk(iv_camdet_set_ping_interval(&f.d, 0u) == IV_EINVAL, "c15 interval=0 -> EINVAL");
+    chk(iv_camdet_set_ping_interval(NULL, 2500u) == IV_EINVAL, "c15 NULL -> EINVAL");
+
+    /* 默认 2500（＝10 s 轮 / 4），同值必须是空操作 */
+    chk(f.d.cfg.ping_interval_ms == IV_CAMDET_PING_INTERVAL_MS, "c15 default packet interval");
+    chk(iv_camdet_set_ping_interval(&f.d, IV_CAMDET_PING_INTERVAL_MS) == IV_OK,
+        "c15 same value -> OK");
+
+    /* 改成 1 s：引擎里那一项自己的周期必须跟着变（不是只改 cfg） */
+    chk(iv_camdet_set_ping_interval(&f.d, 1000u) == IV_OK, "c15 set 1000 ms");
+    chk(f.d.cfg.ping_interval_ms == 1000u, "c15 stored in cfg");
+    chk(f.d.pb.item[f.d.ch_idx[0]].interval_ms == 1000u,
+        "c15 the probe item really carries the new interval");
+    chk(f.d.pb.cfg.timeout_ms == 500u, "c15 io timeout follows the packet interval");
+
+    /* 重建后采样游标归零，但通道表还在（项照常建回来） */
+    chk(f.d.ch_idx[0] >= 0, "c15 the channel item survives the rebuild");
+    iv_camdet_close(&f.d);
+}
+
 int main(void)
 {
     c01_args_and_guards();
@@ -956,6 +1003,7 @@ int main(void)
     c11_cns();
     c12_cns_segment();
     c13_probe_now_and_rtt();
+    c15_ping_interval();
     t_rebuild_no_underflow();
 
     if (g_fail != 0) {
@@ -964,6 +1012,6 @@ int main(void)
     }
     printf("test_camdet passed (guards, ping normal/delay/loss/fault, link-down, "
            "channel refresh, port scan, rtsp, mode switch, cns, probe-now/rtt, "
-           "rebuild-no-underflow)\n");
+           "ping-interval, rebuild-no-underflow)\n");
     return 0;
 }

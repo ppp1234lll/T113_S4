@@ -976,7 +976,10 @@
       '请按新地址重新打开。三项留空＝不在此处指定（沿用系统网络配置）。' +
       '「配置有线超时」改的是**延时门限**：设备每轮 ping 测一次平均时延，超过这个数' +
       '就在「网络状态」里把对应主网标成「延时」（链路照用、不切换、不重启），' +
-      '没超过就是「正常」。它不断链、不重启。');
+      '没超过就是「正常」。它不断链、不重启。' +
+      '每轮 ping 发 4 个包并算平均响应时间：4 个都回＝通（平均超门限则标「延时」）、' +
+      '只回一部分＝丢包、一个都不回＝不通/故障。「ping 轮间隔」是两轮之间的间隔，' +
+      '主网探活与摄像机检测共用这一个值（单包间隔＝轮间隔÷4）。');
     card.appendChild(hint);
 
     var grid = el('div', 'grid');
@@ -984,7 +987,7 @@
 
     var bar = el('div', 'actions');
     var btnNet = el('button', null, '配置 IP 和网关');
-    var btnProbe = el('button', null, '配置主网检测 IP');
+    var btnProbe = el('button', null, '配置检测 IP / 轮间隔');
     var btnTimeout = el('button', null, '配置有线超时');
     var btnReload = el('button', 'ghost', '重新载入');
     btnNet.type = 'button'; btnProbe.type = 'button'; btnTimeout.type = 'button';
@@ -995,9 +998,10 @@
 
     var ver = 0;
     var descs = {};
-    /* 最近一次载入的配置值（net + probe 合并）。点「配置有线超时」时要拿
-     * `probe.interval_ms` 做"超时必须小于探测周期"的前置校验，而那个键自己
-     * 没有输入框 —— 只能从这份快照里取。 */
+    /* 最近一次载入的配置值（net + probe 合并）。点「配置有线超时」要用
+     * `probe.interval_ms` 做"门限必须小于单包间隔的一半"的前置校验；点
+     * 「配置检测 IP / 轮间隔」要反过来用 `probe.timeout_ms` 校验轮间隔够不够大。
+     * 两个方向都靠这份快照，不必再各发一次请求。 */
     var cur = {};
 
     function load() {
@@ -1026,7 +1030,10 @@
          * 通不通"，后者说明"能不能到平台"。两者一起看才分得清是谁的问题。
          * 数据来自 `/api/overview` 的 `net.targets`：0 未知 / 1 通 / 2 不通 / 3 延时。 */
         var tgs = (ro.ok && ro.d && ro.d.net && ro.d.net.targets) ? ro.d.net.targets : [];
-        var TGT_TXT = { 0: '未检测', 1: '通', 2: '不通', 3: '延时' };
+        /* 四态 ＋「丢包」（2026-10-29）：一轮 4 个包 —— 全响应且平均 RTT 未超
+         * 「有线网络超时时间」＝通；全响应但平均超门限＝延时；只回了一部分＝丢包；
+         * 一个都没回＝不通。后端编码见 `iv_agent_target_state()`。 */
+        var TGT_TXT = { 0: '未检测', 1: '通', 2: '不通', 3: '延时', 4: '丢包' };
         var tgtNote = function (i) {
           var t = tgs[i];
           if (!t || !t.ip) return '';
@@ -1037,6 +1044,12 @@
                                   tgtNote(0)));
         grid.appendChild(fieldFor('probe.target2', it['probe.target2'], '主网检测 IP 2',
                                   tgtNote(1)));
+        /* 「每一轮 ping 的时间间隔是 10 s，可在 web 界面配置」（2026-10-29 用户口径）。
+         * 这个键**就是轮间隔**：一轮 4 个包，引擎的单包间隔 = 轮间隔/4；主网探活
+         * 与摄像机检测共用它（改一处两边一起变）。必须给输入框 —— 之前它只作为
+         * "校验 timeout 时读的隐含参数"存在，页面没有任何地方能改。 */
+        grid.appendChild(fieldFor('probe.interval_ms', it['probe.interval_ms'],
+                                  'ping 轮间隔(ms，每轮 4 个包)'));
         /* 平台「参数设置」页把这一项摆在"配置IP和网关 / 主网检测IP"同一组里，
          * 名字是「有线网络超时时间(ms)」。我们原来只在「检测与自愈」页用配置键的
          * 中文描述「单次探测超时」显示 —— 名字对不上、又换了一页，现场照着平台
@@ -1093,6 +1106,20 @@
       for (i = 0; i < keys.length; i++) {
         var k = keys[i];
         var v = pick(k);
+        var inp = grid.querySelector('[data-key="' + k + '"]');
+        var kind = inp ? inp.dataset.kind : 'string';
+
+        /* 数字键（ping 轮间隔等）**不走 IPv4 校验** —— 否则会弹出
+         * "10000 不是合法的 IPv4 地址"，把保存挡在一次误报上。类型从输入框的
+         * `data-kind` 取（`fieldFor()` 按值的 JS 类型打的），不是按键名猜。 */
+        if (kind === 'number') {
+          if (v === '' || !/^\d+$/.test(v)) {
+            bad = (descs[k] || k) + ' 必须是整数';
+            break;
+          }
+          items[k] = Number(v);
+          continue;
+        }
         if (v !== '' && !isIPv4(v)) { bad = (descs[k] || k) + ' 不是合法的 IPv4 地址'; break; }
         items[k] = v;
       }
@@ -1112,12 +1139,31 @@
              '已保存，正在切换地址…（约 1 秒后本页会断，请按新 IP 重开）');
     });
     btnProbe.addEventListener('click', function () {
-      submit(['probe.target1', 'probe.target2'], '已保存并生效（探测目标不重启、不断链）');
+      /* 轮间隔也要在这里挡一道（后端跨键校验是"门限 < 轮间隔/8"，现场只会看到
+       * 一句"保存失败"，然后以为"我明明点了保存"）。每轮 4 个包 ⇒ 单包间隔
+       * = 轮/4、等回包超时 = 轮/8；门限摆到 轮/8 及以上，那个键配了也永远不触发。 */
+      var raw = pick('probe.interval_ms');
+      var n   = Number(raw);
+      var thr = Number(cur['probe.timeout_ms']);
+      var why = '';
+
+      if (raw === '' || !/^\d+$/.test(raw)) {
+        why = 'ping 轮间隔必须是整数毫秒';
+      } else if (n < 2000 || n > 600000) {
+        why = 'ping 轮间隔必须在 2000~600000 毫秒之间';
+      } else if (isFinite(thr) && thr > 0 && thr * 8 >= n) {
+        why = '轮间隔太小：每轮 4 个包 ⇒ 等回包超时只有 ' + Math.floor(n / 8) +
+              ' ms，必须大于当前延时门限 ' + thr + ' ms';
+      }
+      if (why) { toast(why, 'err'); return; }
+
+      submit(['probe.target1', 'probe.target2', 'probe.interval_ms'],
+             '已保存并生效（探测目标不重启、不断链；ping 轮间隔即时生效）');
     });
     /* 有线网络超时（`0xFE` 落的就是这个键）：整数毫秒，区间与配置默认值表一致
-     * `100..60000`，且必须**小于探测周期的一半** —— 后端的跨键校验就是这么判的。
-     * 为什么是"一半"：等回包超时由周期推导（`interval/2`），时延超过它就不是
-     * "延时"而是"丢包"了；门限摆在半周期及以上 ⇒ 这个键配了也永远不触发。
+     * `100..60000`，且必须**小于单包间隔的一半** —— 后端的跨键校验就是这么判的。
+     * 每轮 4 个包 ⇒ 单包间隔 = 轮间隔/4、等回包超时 = 轮间隔/8；门限摆在
+     * 轮/8 及以上 ⇒ 这个键配了也永远不触发（等回包先超时，被判成丢包）。
      * 三样都在发请求前挡住：后端拒绝只会变成一句"保存失败：…"，而现场更常见的
      * 理解是"我明明点了保存"（与上面 n07/n08 同一类假成功）。 */
     btnTimeout.addEventListener('click', function () {
@@ -1131,9 +1177,10 @@
         why = '有线网络超时时间（延时门限）必须是整数毫秒';
       } else if (n < 100 || n > 60000) {
         why = '有线网络超时时间（延时门限）必须在 100~60000 毫秒之间';
-      } else if (isFinite(itv) && itv > 0 && n * 2 >= itv) {
-        why = '延时门限必须小于探测周期的一半（当前周期 ' + itv +
-              ' ms，等回包超时就是 ' + Math.floor(itv / 2) + ' ms）';
+      } else if (isFinite(itv) && itv > 0 && n * 8 >= itv) {
+        why = '延时门限必须小于单包间隔的一半（当前轮间隔 ' + itv + ' ms，每轮 4 个包 ⇒ ' +
+              '单包间隔 ' + Math.floor(itv / 4) + ' ms、等回包超时 ' +
+              Math.floor(itv / 8) + ' ms）';
       }
       if (why) { toast(why, 'err'); return; }
 

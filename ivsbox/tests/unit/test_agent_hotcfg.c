@@ -18,7 +18,7 @@
  *   h07 stale 由 `iv_agent_snmp_start()` 落地，且必须在"有没有池"这类守卫**之前**
  *       （否则池缺/开关关期间 stale 一直挂着，等就绪了第一次仍按旧表采）
  *   h08 `probe.timeout_ms` 是**延时门限**（落 `degrade_rtt_ms`），等回包超时由
- *       周期推导（`interval/2`）；只改门限也必须真的落地（2026-10-26）
+ *       单包间隔推导（包间隔/2，包间隔＝轮间隔/4）；只改门限也必须真的落地（2026-10-26）
  *
  * 为什么这一层能测：两个 reload 只依赖 `a->cfg` / `a->recm` / `a->snmp_job`，
  * 不需要 `iv_agent_open()` 的串口/netlink。**"改配置会不会走到它们"** 取决于
@@ -245,11 +245,12 @@ static void h04_snmp_targets(void)
  * 修之前 `probe_cfg_of()` 只读 interval/timeout/fail_n，**从不读** `degrade_rtt_ms`
  * ⇒ 现场把这个键设成 100，平台说的"平均时延超过 100 ms 就算延时严重"从来没生效，
  * 反倒把探测自己的等回包时间压到 100 ms（一轮 200 ms 的节拍下几乎必然判丢包）。
- * 现在：门限 → `degrade_rtt_ms`；等回包超时由周期推导（`interval/2`）。
+ * 现在：门限 → `degrade_rtt_ms`；等回包超时由**单包间隔**推导（包间隔/2），而
+ * 单包间隔 ＝ 轮间隔/4（一轮 4 个包，2026-10-29 用户口径）。
  *
  * 反向证伪：把 `probe_cfg_of()` 里那一行 `pc->degrade_rtt_ms = cfg->probe_delay_ms`
  * 去掉 ⇒ h08 的 degrade 三条全红；把 `probe_io_timeout_of()` 换成常量 1000 ⇒
- * 周期 500 那条（io 250）全红、且 retune 会因 timeout >= interval 直接回 EINVAL。 */
+ * 包间隔那两条全红、且 retune 会因 timeout >= interval 直接回 EINVAL。 */
 static void h08_probe_delay_threshold(void)
 {
     iv_agent_t     a;
@@ -266,14 +267,22 @@ static void h08_probe_delay_threshold(void)
     chk(a.pb.cfg.degrade_rtt_ms == 300u,
         "h08 delay threshold lands in iv_probe.degrade_rtt_ms");
     chk(a.cfg.probe_delay_ms == 300u, "h08 snapshot probe_delay_ms = 300");
-    chk(a.pb.cfg.timeout_ms == 2500u, "h08 io timeout = interval/2 (5000/2)");
+    /* 2026-10-29：配置值是**轮间隔**，引擎收**单包间隔** = 轮/4；
+     * 等回包超时 = 单包间隔/2。5000/4=1250 ⇒ 625。 */
+    chk(a.pb.cfg.interval_ms == 1250u, "h08 packet interval = round/4 (5000/4)");
+    chk(a.pb.cfg.timeout_ms == 625u, "h08 io timeout = packet interval/2");
     chk(a.pb.cfg.timeout_ms < a.pb.cfg.interval_ms,
         "h08 io timeout < interval (retune 的硬约束)");
 
-    /* 周期下界 500 ⇒ 半周期 250，仍必须严格小于周期，否则 retune 会拒 */
+    /* 极小轮间隔：包间隔被钳到下限 250 ⇒ 超时 250 已不小于包间隔，退到 249。
+     * 这一步卡的是 `probe_io_timeout_of()` 的兜底，别让 retune 因 timeout >= interval
+     * 回 EINVAL（那会让整次热更失败，现场表现为"改了配置没反应"）。 */
     chk(iv_agent_reload_probe(&a, 0u, 0u, 500u, 200u, 3u, 1000u) == IV_OK,
-        "h08 reload at the minimum interval -> OK");
-    chk(a.pb.cfg.timeout_ms == 250u, "h08 io timeout 250 at interval 500");
+        "h08 reload at a tiny round interval -> OK");
+    chk(a.pb.cfg.interval_ms == IV_AGENT_PROBE_PKT_MIN_MS,
+        "h08 packet interval clamped to the floor");
+    chk(a.pb.cfg.timeout_ms == IV_AGENT_PROBE_PKT_MIN_MS - 1u,
+        "h08 io timeout falls back to interval-1 at the floor");
     chk(a.pb.cfg.timeout_ms < a.pb.cfg.interval_ms, "h08 io timeout still < interval");
 
     /* 只改门限（同目标、同周期、同次数）：早返回的比对里若漏掉 degrade，

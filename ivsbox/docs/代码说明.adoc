@@ -49,6 +49,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | M8-S8.3 装配接线（身份/令牌来源 ＋ resolver 落本机代理 ＋ `sys.tunnel.*` ＋ `iv_ctl` 三方法 ＋ 到期兜底） | 已实现（配置键 7 条 ＋ `tunnel.status/enable/disable` ＋ `main.c` 装配/热更新作废/退出即关 ＋ 标记写到期时刻、脚本独立判过期 ＋ 单测新增 8 组 ＋ 集成 test_tunnel_e2e 真拉起 ivsboxd ＋ 反向证伪 5/5；`camera:N` 待 S8.5、真连通待 frps） | 2026-10-15 10:21 | SN＝身份分区 `devid`（fail-closed）；令牌＝`<secure>/tunnel.token`（**不进配置**，防 `config.all` 导出）；resolver 一律 `127.0.0.1`，`camera:N` 在 S8.5 前恒报不可达；标记文件内容＝到期时刻 ⇒ `frp.sh`/`monitor.sh` 独立判过期（有效期不依赖主控存活）。详见本文件 2026-10-15 10:21 节。 |
 | S9 延伸：control.db 表结构与落盘（iv_store 四表 ＋ 四生产者接线） | 已实现（`iv_store` 模块 ＋ `iv_db_handle()` ＋ main.c 2b 步装配 ＋ test_store 9 组 ＋ 集成 m09/k04/c11a-c11b ＋ VM 全量验证 ＋ 反向证伪 7/7 含接线层 2 条；**Web 展示方法按需后补、板端实测随板端复跑组**） | 2026-10-15 12:20 | 新增 `include/ivsbox/iv_store.h` ＋ `src/modules/store/iv_store.c`：四张表（device 主键 MAC/first_seen 保留/上限 64；snmp_latest 最近值 ok=0 不乱填；audit 上限 512 detail 不含口令；net_event 上限 512）＋ schema 版本门（user_version >1 ⇒ IV_EPROTO 不降级）＋ 全 prepared statement ＋ 表名白名单 ＋ fail-open。`iv_db` 增 `iv_db_handle()`。四生产者接线（装配层）：`on_dev_found`→device_upsert、`on_snmp_done`→逐槽位 snmp_put、`iv_ctl` 三方法成功路径→audit（绝不记键值）、`agent_reconnect`→net_event；main.c 第 2b 步 open、关停先 store 后 db。**单测当场抓出 2 个真缺陷**：trim_table 对 device 引用不存在的 id 列（⇒键列/排序列按表参数化）；audit/net_event 占位符绑定错位 ⇒ result 列落错（⇒拆成一一对应的两个 insert）。**集成断言纠偏（登记）**：m09 初版断言 device==0 被环境证伪——ifname 不存在 ⇒ if_nametoindex()==0 ⇒ AF_PACKET 不绑定 ⇒ 测试机收到宿主机真实流量（环境产物非缺陷）；未配槽位也落 ok=0 行（15=cam 9+sw 6）。改为环境无关不变量（store 行数==档案条数、行数=已配槽位总数）。详见本文件 2026-10-15 12:20 节。 |
 | M8-S8.5 摄像机 Web 受控代理（专用环回监听 ＋ `/cam/<N>` 反代 ＋ URL/Location/Cookie 重写） | 已实现（`iv_web_cam.c` ＋ main.c 第二监听接线 ＋ 集成 test_web_cam_e2e 自包含 14 组 ＋ 反向证伪 6/6（含装配层 1 条）；**真机浏览器兼容性不承诺、端到端待 frps 就位**） | 2026-10-15 11:30 | 新增 `web/src/iv_web_cam.c`：只绑 `127.0.0.1` 的专用监听口（`--cam-port`，默认 8081 与 `sys.tunnel.cam.port` 同源），只认 `/cam/<N>/...`（N 0..7、禁前导零），目标 IP 只经本地通道查 `camera.ch.<N>.ip`、上游端口只有 `--cam-upstream` 一个 ⇒ "禁止任意 ip:port"是物理事实；环回护栏拒自指；凭据零下发（SM4 密文 Web 读都不读）。**集成用例当场抓出 2 个真缺陷**（绝对 URL 重写吞掉路径分隔符 `/`；纯 Set-Cookie 响应因 `has_extra` 未置位被整段丢弃）。详见本文件 2026-10-15 11:30 节。 |
+| M8-S8.5 真机可用性修复（上游不回 EOF ＋ 头区末行漏解析 ＋ 二进制体按长度搬运） | 已实现（VM 单测/ASan 0 失败、ARM 0 告警；集成新增 8 条断言、反向证伪 3 轮 5+3+2 FAIL；**板端实测大华 192.168.1.108：同秒 200 / 41803 B / `text/html`，`ivsbox-web` 不再被守护重启**；经受控通道从另一台机器访问 web、摄像机页、SD 卡目录/Range 下载全通） | 2026-10-29 16:05 | 大华发完 `Content-Length` 后**不关连接**，只等 EOF 会冻死单线程事件循环 ⇒ 心跳过期被 `monitor-web.sh` 杀掉；`head` 副本末行缺 CRLF ⇒ 末行头（大华正是 `Content-Type`）整行漏掉 ⇒ 页面被当二进制下载。详见本文件 2026-10-29 16:05 节。 |
 | M5-S5.5 Web 网络页：配置项中文化 ＋ 「当前生效」只读网口状态 | 已实现（新增 `iv_config_default_desc()`；`config.defaults` 每项加可选 `d`；`sys.overview` 加 `net.link`；前端标签改用键说明 ＋ `pageNet` 加「当前生效」卡片；**板端 `eth0 192.168.2.120/24`、网关 `192.168.2.1`、MAC 与 `ip -4 addr` 逐项一致**） | 2026-10-17 11:02 | 详见本文件文末 2026-10-17 11:02 节。 |
 | 断网录像判据改为「只看主网」＋ 录像启动失败原因可读 | 已实现（VM 单测 47/47、反向证伪 2/2 抓出、ARM 0 告警；**板端实测**：主网断 10 s 自动开录、3 s 确认成功、坏地址逐行报因；`record.status` 带 `reason`） | 2026-10-28 10:38 | 详见本文件文末 2026-10-28 10:38 节。 |
 | 故障码（`ERR`）上报：采集板 JSON `ERR` ＋ 主板网络码合并 | 已实现（新增 `iv_fault` 模块；`iv_status` 落 `ERR`、`iv_agent` 合流；VM 单测 49/49、ASan 49/49、analyze 0、ARM 0 告警、反向证伪 4/4；**板端未换版**） | 2026-10-28 11:10 | 详见本文件文末 2026-10-28 11:10 节。 |
@@ -10134,4 +10135,167 @@ VM 全量：`make test` / `make asan` / `setarch -R make tsan` 各 **49 passed**
 * 摄像机"延时"彻底不判之后，`rtt_thr_ms` 这条链路成了纯摆设；要么删键、要么在平台
   参数页说明"保留"，需要连平台侧一起动。
 
+
+
+== 2026-10-29 16:05 摄像机反代真机可用性：三个叠在一起的缺陷
+
+=== 现场现象（先有证据再改代码）
+
+内网穿透打通后，从另一台机器访问 `http://<板>:8081/cam/2/`（经 frpc stcp）——
+浏览器约 9 s 后报 `Connection reset by peer`；与此同时板端日志出现
+`ivsbox-web listening on :80 …`（= 整套 Web 又被拉起一遍），`pidof ivsbox-web` 换号。
+即：**一次访问摄像机 = 把整台设备的 Web 界面打死一次**。
+
+=== 三个缺陷
+
+. **上游不回 EOF**。请求里写了 `Connection: close`，但大华（`192.168.1.108`）发完
+  `Content-Length: 41803` 的体之后**连接照旧开着**。用 python 直接按代理的原文发请求
+  实测：`TIMEOUT after 10.2s, got 41895 B` —— 读完体后读端一直阻塞。
+  而 `iv_web_cam_handle()` 的 8 s 总预算写在 `recv()` **返回之后**才判，`recv` 又没设
+  接收超时 ⇒ 预算形同不存在 ⇒ 单线程事件循环冻住 ⇒ 心跳文件不更新 ⇒
+  `monitor-web.sh` 判"卡死"并杀掉重启。
+. **头区最后一行漏解析**。`head` 副本按 `head_end`（指向 `\r\n\r\n` 的第一个字节）截取，
+  末行没有行尾 CRLF；而 `hdr_get()` / `cookies_to_extra()` / `resp_is_chunked()` 都以
+  "先找到本行 `\r\n`" 为前提。大华把 `Content-Type` 放在最后一行 ⇒ 类型恒空 ⇒
+  回 `application/octet-stream` ⇒ **浏览器把摄像机页面当文件下载**；`ctype_is_text()`
+  也随之误判，URL 改写整段不生效（`c03b/c03d` 同时红）。
+. **二进制体按字符串搬家**。`blen = strlen(b)` 会在第一个 `0` 字节处截断，摄像机页面的
+  图标/字体/打包 JS 全都会丢字节。
+
+=== 改法
+
+* 收包：`SO_RCVTIMEO/SO_SNDTIMEO = 1 s`；每收到一段就（用**长度受限**的
+  `find_head_end()`/`hdr_clen_bounded()`，此刻缓冲区未终止，不能用 `strstr`）取
+  `Content-Length`，**收满即停**；`EAGAIN` 一跳再判 8 s 总预算。
+* 头区：`head` 末尾补 `"\r\n"`，末行成为完整一行（上限改判 `head_end + 2 < sizeof head`）。
+* 体：只有 `text/*`、`javascript`、`json`、`xml`、`x-www-form-urlencoded` 才改写并按
+  `strlen` 重算长度；其余原样按实测字节数搬运。
+
+=== 验证
+
+* VM：`make test` / `make asan` 各 0 失败、`make arm` 0 告警；集成 `test_web_cam_e2e`
+  新增 8 条断言（c03e 类型透传、c14a~c14c 上游不回 EOF 必须在 3 s 内收工、c15a~c15c
+  二进制 6 字节含 `0x00` 原样）。假摄像机的 `Content-Type` 特意改到最后一行、并新增
+  `/keepalive`（发完体后读等对端关）与 `/bin`（含 0 字节的 6 字节体）两条路由。
+* 反向证伪 3 轮：去掉"收满即停"⇒ 5 FAIL（`c14c` 耗时 ~5000 ms）；去掉补 CRLF ⇒ 3 FAIL
+  （`c03b/c03d/c03e`）；`blen` 一律 `strlen` ⇒ 2 FAIL（`c15b/c15c`）。
+* 板端：`/cam/2/` 同秒返回 `200 / 41803 B / Content-Type: text/html`，`pidof ivsbox-web`
+  前后一致；日志 `cam/2 -> 192.168.1.108:80 / = 200 (41803 B)`。
+
+=== 未做 / 已知边界
+
+* 仍是"一次请求一次阻塞收发"：慢链路下会占住事件循环（本轮只消除"正常响应挂死"）。
+  MJPEG/HTTP 长流、WebSocket 升级、chunked 上游仍是登记不承诺项（chunked 回 502）。
+* 经受控通道（frpc stcp）的 6 MB 全量下载在本次测试链路上被中断；同一文件板端直连
+  `5993779 B / 22.2 s` 完整无误 ⇒ 判为测试跳板链路问题，需真实公网 frps 复测。
+
+== 2026-10-29 17:10 ping 采样改「一轮 4 个包」；轮间隔可配并与摄像机同源
+
+=== 用户口径（原话）
+
+. "每 ping 一次发送 4 个数据包，判断是否全部响应，计算 4 个数据包的平均响应时间，用于判断丢包、延时"
+. "每一轮 ping 的时间间隔是 10 s，可在 web 界面配置"
+. "每一轮 ping 时，都需要 ping 全部 IP 地址（主网 1、主网 2、摄像机 IP），如果摄像机使用其他检测方式，则不再参与 ping 流程"
+
+三问的答复把口径钉死：摄像机状态**恢复四态**（正常/丢包/延时/故障）；"主网 1、主网 2" 就是
+"主网检测 IP 1 / IP 2"（`probe.target1/2`，不是平台服务器地址）；轮间隔"改成一致，本来就是一个参数"。
+
+> 本节同时**推翻** 16:03 那一节的"摄像机只分通/不通"：那是同一轮对话里的中间口径，
+> 用户随后明确要求恢复四态。四态的门限仍是全工程唯一那个延时门限
+> （`probe.timeout_ms`），没有另立 `camera.detect.rtt_ms`。
+
+=== 改之前是什么样
+
+. **每个包就是一个结论**。`iv_probe::note()` 每收一个样就 `win_push()` + `recompute()`，
+  连续 `fail_n`(3) 次失败即 DOWN。于是交换机偶尔丢一个包，界面就闪一下"不通"；摄像机侧
+  更细：4 个样本里任意一个成功就报"正常"、一个不成功就报"故障"，中间的丢包/延时全被压掉。
+. **两个节拍**。`probe.interval_ms`（默认 5 s）是主网探活的单包间隔；`IV_CAMDET_PING_INTERVAL_MS`
+  （5 s）是摄像机自己的包间隔 ⇒ 摄像机一轮＝**20 s**。改一个不动另一个。
+. **`probe.interval_ms` 页面上没有输入框**。它只作为"校验 `probe.timeout_ms` 时读的隐含参数"
+  存在（`cur['probe.interval_ms']`），现场没有任何地方能改 —— 用户问的"10 s 怎么配"根子就在这。
+. **摄像机切到端口扫描/RTSP 后项表还留着 ICMP 项**。引擎 `stop()` 了，但 `ch_idx` 没清。
+. **RTT 精度只有 200 ms**。camdet 只在 `on_pb_timer`（200 ms）里被驱动，回包躺着等下一拍才被读
+  ⇒ 局域网 0.5 ms 的往返记成 200 ms（R-02 的老坑，主网侧 2026-10-26 已用 10 ms 排空节拍解决，
+  摄像机侧一直没接上）。
+
+=== 改法
+
+. **「轮」下沉到 `iv_probe`**（`IV_PROBE_ROUND_SAMPLES = 4`）。`note()` 里维护一个 4 样本小窗，
+  满 4 个就结算出 `round_ok` / `round_lost` / `round_avg_rtt_ms` / `round_seq` 写进 `iv_probe_stat_t`。
+  上层四态判定**只读这组字段**，规则因此只有一份（主网检测 IP 与摄像机共用同一套语义）。
+  `round_avg_rtt_ms` 只对成功包求平均；全失败记 0 —— 上层靠 `round_ok == 0` 判"故障"，
+  拿 0 去比门限会得出"0 ms、很快"的荒谬结论。
+. **配置值＝轮间隔**。`probe.interval_ms` 默认 **10000**、下界 2000、描述改「ping 轮间隔（毫秒，
+  每轮 4 个包）」。`probe_cfg_of()` 换算成引擎的单包间隔＝**轮/4**（下限 `IV_AGENT_PROBE_PKT_MIN_MS`
+  = 250 ms），等回包超时仍按"单包间隔/2"推导。摄像机经 `iv_camdet_cfg_t::ping_interval_ms` 拿同一个
+  换算结果 ⇒ 一轮 10 s 对两边同时成立，**一个参数**。
+. **摄像机四态**（`ping_verdict()`）：
+  +
+  |===
+  | 一轮 4 包 | 结论
+  | 全响应、平均 RTT ≤ 门限 | 正常(1)
+  | 全响应、平均 RTT > 门限 | 延时(4)
+  | 只回了一部分 | 丢包(5)
+  | 一个都没回 | 故障(2)
+  |===
+  +
+  判"延时"必须 4 包**全响应**：丢了 1 个还报延时，会把现场引去查带宽而不是查线。
+. **主网检测 IP 也四态**（`iv_agent_target_state()`）。原来直接映射 `iv_probe_state()`，那要经过
+  `fail_n/ok_n` 迟滞、DEGRADED 又用 **16 窗**平均 ⇒ 界面问的是"此刻通不通、多快"，等迟滞攒满
+  3 次失败才显示"不通"就晚了。改成读 `round_*`：全无响应＝2、部分响应＝4（新增"丢包"档）、
+  平均超门限＝3、否则 1；`round_seq == 0`（第一轮没攒满）报"未知"，别拿半轮下结论。
+  ⚠ `iv_agent_mn()`（喂 netmgr 切链路）**不动** —— 它的迟滞是有意的，两件事别混。
+. **RTT 精度**：新增 `iv_camdet_drain()`（只读回包、不发探不结算），装配层
+  `on_probe_drain_timer`（10 ms）同时驱动 camdet。`probe_drive()` 顺手改成**先读包后判超时**
+  （与 `iv_agent.c` 2026-10-26 的修法一致）—— 原来的顺序在"超时 ≤ 一个驱动节拍"时会让回包永远
+  等不到被读的那一刻，该通道稳定 100% 丢包。
+  +
+  配套加了 `iv_camdet_cfg_t::drain_ms`：`warn_rtt_thr()` 原来按硬编码的 200 ms 判「门限配得有没有
+  意义」，接上 10 ms 排空后这条判断的前提已经不成立 ⇒ 每次 open 都刷一条
+  `rtt_thr=200ms <= one tick (200ms)` 的假告警，提示的还是已无消费方的 `camera.detect.rtt_ms`。
+  现在由装配层把真实排空节拍传进来（`IV_AGENT_PROBE_DRAIN_MS`），告警随之为零。
+. **open 日志分开报两种轮间隔**：原来只打 `round=30000ms`（那是扫描/RTSP 的轮间隔），现场会把它
+  当成 ping 的轮间隔读。改成 `ping=2500ms/round(10000ms) scan_round=30000ms`。
+. **非 PING 不参与**：`pb_rebuild()` 在 `mode != PING` 时既不建 ICMP 项、也不 `start()`，
+  `ch_idx` 一律回 -1（`set_mode()` 改无条件调用它，省掉原来那半个分支）。
+. **网页可配**：「本机网络与主网检测」卡片新增「ping 轮间隔(ms，每轮 4 个包)」输入框，并入
+  「配置检测 IP / 轮间隔」按钮（原「配置主网检测 IP」）。前置校验：2000~600000、整数、
+  且必须满足「门限 < 轮/8」。`submit()` 按输入框的 `data-kind` 分流 —— 数字键不再走 IPv4 校验
+  （否则会弹"10000 不是合法的 IPv4 地址"），并且发**数字**而不是字符串。
+. **跨字段校验收紧**：`probe.timeout_ms × 2 ≥ probe.interval_ms` ⇒ `× 8 ≥ interval_ms`。
+  一轮 4 个包 ⇒ 单包间隔＝轮/4、等回包超时＝轮/8；门限摆到轮/8 及以上时，配置了也永远不触发
+  （等回包先超时，被判成丢包）。`probe.timeout_ms` 默认值同时从 2000 调到 **200**（现网
+  `DEFALUT_NETWORK_DELAY`，也是现场平台实际下发的值）—— 否则新语义下默认配置自身就冲突。
+
+=== 验证
+
+* VM：`make host` / `make arm` 0 告警；`make test` / `asan` / `tsan`（`setarch -R`）各 **49/49**；
+  `make analyze` 0 告警；`make itest` 16 passed ＋ 1 SKIP（tunnel 缺设备身份，与基线一致）。
+* jsdom 13 个用例全过。`ui_net_params` 新增 n10（轮间隔输入框、下界/上界/非整数拦截、2000 放行），
+  n05 改成断言发三个键且 `probe.interval_ms` 是**数字** 10000。
+* **反向证伪 3 轮**：
+  ** ① `probe_cfg_of()` 去掉 `/ IV_PROBE_ROUND_SAMPLES` ⇒ `test_agent_hotcfg` h08 四条红
+    （包间隔 5000 而非 1250、超时 2500 而非 625）。
+  ** ② `round_push()` 的条件改成永不成立（每包都结算一轮）⇒ `test_probe` c18 六条红
+    （没攒满 4 个就 `round_seq=1`、计数与平均全错）。
+  ** ③ `ping_verdict()` 把"部分响应"改判 NORMAL ⇒ `test_camdet` c04 红（`3/4 ok -> loss(5)`）。
+  三条都还原后复绿 49/49。
+* **板端（`192.168.1.120`）**：`ivsboxd` `6c781e2a → 94f5251d → 9883dfad`，`app.js` `05edcf20 → 3c125366`
+  （前后 `md5sum` 双核对）。`probe.interval_ms` 经 Web API 从 5000 改 10000（version 140→141），
+  热更日志 `probe reloaded: interval=2500 io_timeout=1250 fail_n=3 delay=200` ＋
+  `camdet ping packet interval -> 2500 ms (round = 10000 ms)`。
+* **节奏实测**（原始 socket 抓 22 s ICMP）：三台摄像机（`192.168.1.200/.106/.108`）每 **2.61 s**
+  一批、四批一轮 ≈ **10.4 s**；4G 出口探平台地址（`47.104.250.225`）同节拍。证明"每轮 ping 全部
+  IP"与"一轮 4 个包、轮间隔 10 s"是真的按这两个数跑的（200 ms 的 tick 粒度解释了 2.5 → 2.61）。
+* `net.targets` 两项 state=2（`192.168.2.3/.2` 现场不可达，与事实一致）；`cameras.cns` 前三路
+  normal(1)；camdet 的假 WARN 归零，剩下的 WARN 是 tunnel 缺 token 与 ICMP 回包认领（都是真实状态）。
+
+=== 未做 / 已知边界
+
+* `IV_CAMDET_PING_TIMEOUT_MS` 现在没有消费者（超时一律按包间隔推导），留作兜底值并加了注释；
+  真要清理得连 `iv_camdet.h` 里"把它们改成 1000 并在结算处改为轮起点＋4 s"那段历史说明一起改。
+* `IV_CAMDET_TICK_RESOLUTION_MS`（200 ms）仍用于 `warn_rtt_thr()` 的"阈值配得有没有意义"告警，
+  但现场路径已经由 10 ms 排空节拍驱动 ⇒ 这条告警的实际门槛偏保守，暂不动（避免误报变多）。
+* 平台 `0xF2`（ping 间隔）下发值的语义随之从"单包间隔"变成"轮间隔"。平台侧若仍按单包理解，
+  设备实际发包频率会降到 1/4 —— 需与平台确认（本次不改协议，只改解释）。
 

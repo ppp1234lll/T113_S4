@@ -218,8 +218,8 @@ static void case_defaults_startup(void)
         "c1: sys.transport.mode default 4");
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && s[0] == '\0',
         "c1: net.ip default empty (DHCP)");
-    chk(iv_config_get_int(c, "probe.interval_ms", &iv) == IV_OK && iv == 5000,
-        "c1: probe.interval_ms default 5000");
+    chk(iv_config_get_int(c, "probe.interval_ms", &iv) == IV_OK && iv == 10000,
+        "c1: probe.interval_ms default 10000 (ping round interval)");
     chk(iv_config_get_str(c, "camera.search", &s) == IV_OK && strcmp(s, "off") == 0,
         "c1: camera.search default off");
     chk(iv_config_get_bool(c, "camera.ch.0.record", &bv) == IV_ENOENT,
@@ -694,7 +694,7 @@ static void case_atomic_replace(void)
 static void case_reject_writes_nothing(void)
 {
     static const char SEED[] =
-        "{\"_meta\":{\"version\":5},\"probe\":{\"interval_ms\":5000,\"timeout_ms\":2000},\n"
+        "{\"_meta\":{\"version\":5},\"probe\":{\"interval_ms\":10000,\"timeout_ms\":200},\n"
         " \"camera\":{\"search\":\"off\"}}\n";
     char         pf[200];
     char         tmpf[200];
@@ -738,22 +738,23 @@ static void case_reject_writes_nothing(void)
     chk(contains(detail, "camera.search"), "c8: detail names the enum key");
     chk(iv_config_set_str(c, "camera.search", "onvif") == IV_OK, "c8: restore the enum");
 
-    /* ---- 跨字段：延时门限必须**严格小于半个探测周期** ----
-     * `probe.timeout_ms` 是延时门限（不是等回包超时）：等回包超时由周期推导、
-     * 取 `interval/2`，时延超过它就变成"丢包" ⇒ 门限摆在半周期及以上就永远
-     * 不触发（"配了不生效"那一类）。2026-10-26 用户明确语义后收紧。 */
-    chk(iv_config_set_int(c, "probe.interval_ms", 1000) == IV_OK, "c8: set interval=1000");
-    chk(iv_config_set_int(c, "probe.timeout_ms", 1000) == IV_OK, "c8: set delay=1000");
+    /* ---- 跨字段：延时门限必须**严格小于单包间隔的一半** ----
+     * `probe.timeout_ms` 是延时门限（不是等回包超时）：等回包超时由周期推导，
+     * 而周期＝单包间隔＝轮间隔/4（一轮 4 个包，2026-10-29 口径）⇒ 门限必须
+     * < 轮间隔/8，摆在它及以上就永远不触发（"配了不生效"那一类）。 */
+    chk(iv_config_set_int(c, "probe.interval_ms", 4000) == IV_OK, "c8: set interval=4000");
+    chk(iv_config_set_int(c, "probe.timeout_ms", 4000) == IV_OK, "c8: set delay=4000");
     detail[0] = '\0';
     chk(iv_config_save(c, detail, sizeof(detail)) == IV_EINVAL,
         "c8: save refuses delay >= interval_ms");
     chk(contains(detail, "probe.timeout_ms"), "c8: detail names the cross-field key");
 
-    /* 边界：正好等于半周期也不行（这一档的时延根本观察不到，只能是丢包） */
-    chk(iv_config_set_int(c, "probe.timeout_ms", 500) == IV_OK, "c8: set delay=500 (= half)");
+    /* 边界：正好等于 轮间隔/8（＝半个单包间隔）也不行 —— 这一档的时延根本观察
+     * 不到，只能是丢包。 */
+    chk(iv_config_set_int(c, "probe.timeout_ms", 500) == IV_OK, "c8: set delay=500 (= packet/2)");
     detail[0] = '\0';
     chk(iv_config_save(c, detail, sizeof(detail)) == IV_EINVAL,
-        "c8: save refuses delay == interval_ms/2 (strictly less required)");
+        "c8: save refuses delay == interval_ms/8 (strictly less required)");
 
     /* ---- 修好就能存（证明拒绝是"这条不变量"，不是"保存坏了"） ---- */
     chk(iv_config_set_int(c, "probe.timeout_ms", 400) == IV_OK, "c8: fix delay");
@@ -1223,11 +1224,15 @@ static void case_per_class_transaction(void)
         " \"probe\":{ \"interval_ms\":2000, \"timeout_ms\":9000 } }\n";
     /* (b) 半截文件：整份解析失败 */
     static const char BAD_SYNTAX[] = "{\"sys\":{\"report\":{\"interval_s\":12";
-    /* (c) 再来一份全合法的 */
+    /* (c) 再来一份全合法的。
+     * ⚠ 门限必须 < 轮间隔/8（一轮 4 个包，等回包超时＝半包间隔）：
+     * 8000/8 = 1000 ⇒ 900 合法、3000 不合法。2026-10-29 把 interval 从
+     * "单包间隔"改成"轮间隔"后，这行必须跟着从 3000 降到 900，否则本用例
+     * 会从"全合法"变成"probe 冲突"，(c) 段的 rl==2 直接红。 */
     static const char GOOD[] =
         "{\"_meta\":{\"version\":81},\n"
         " \"net\":{ \"ip\":\"10.8.8.8\" },\n"
-        " \"probe\":{ \"interval_ms\":8000, \"timeout_ms\":3000 } }\n";
+        " \"probe\":{ \"interval_ms\":8000, \"timeout_ms\":900 } }\n";
     struct notify_ctx n1;
     struct notify_ctx n2;
     char         pf[200];

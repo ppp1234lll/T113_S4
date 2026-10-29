@@ -259,6 +259,34 @@ static void recompute(iv_probe_t *p, iv_probe_item_t *it)
     /* 样本不足以判 UP/DOWN：保持既有状态（首次即 UNKNOWN），reason 不动。 */
 }
 
+/* 轮统计：攒满 IV_PROBE_ROUND_SAMPLES 个样本即结算一轮。
+ *
+ * 为什么放在 `note()` 里而不是另开一个入口：`note()` 是**唯一**的样本结算点
+ * （ICMP 回应、ICMP 超时、TCP 结果、APP 上报都走它），把轮攒在这里才不会有
+ * "某种结果没进轮"的漏网。上层（`iv_agent_target_state()` / `iv_camdet`）只读
+ * `round_*`，四态判定规则因此只有一份。
+ *
+ * 全失败的一轮 `round_avg_rtt_ms` 记 0 —— 此时"平均 RTT"没有定义，上层要靠
+ * `round_lost == ROUND_SAMPLES` 判"故障"而不是拿 0 去比门限（0 永远小于门限，
+ * 会得出"延时正常"的荒谬结论）。 */
+static void round_push(iv_probe_item_t *it, int ok, uint32_t rtt)
+{
+    it->rnd_n++;
+    if (ok) {
+        it->rnd_ok++;
+        it->rnd_rtt_sum += rtt;
+    }
+    if (it->rnd_n < IV_PROBE_ROUND_SAMPLES)
+        return;
+    it->round_ok         = it->rnd_ok;
+    it->round_lost       = it->rnd_n - it->rnd_ok;
+    it->round_avg_rtt_ms = (it->rnd_ok != 0u) ? (it->rnd_rtt_sum / it->rnd_ok) : 0u;
+    it->round_seq++;
+    it->rnd_n       = 0u;
+    it->rnd_ok      = 0u;
+    it->rnd_rtt_sum = 0u;
+}
+
 /* 记录一次探测结果并重判。fail_reason==NONE 时保留上一次失败原因。 */
 static void note(iv_probe_t *p, iv_probe_item_t *it, int ok, uint32_t rtt,
                  iv_probe_reason_t fail_reason, uint64_t now)
@@ -267,6 +295,7 @@ static void note(iv_probe_t *p, iv_probe_item_t *it, int ok, uint32_t rtt,
         it->sent++;
     win_push(it, ok, rtt);
     win_recalc(it);
+    round_push(it, ok, rtt);
 
     if (ok) {
         it->last_rtt_ms = rtt;
@@ -1181,6 +1210,10 @@ int iv_probe_stat_get(const iv_probe_t *p, int idx, iv_probe_stat_t *out)
     out->last_ok_ms  = it->last_ok_ms;
     out->sent        = it->sent;
     out->lost        = it->lost;
+    out->round_ok         = it->round_ok;
+    out->round_lost       = it->round_lost;
+    out->round_avg_rtt_ms = it->round_avg_rtt_ms;
+    out->round_seq        = it->round_seq;
     return IV_OK;
 }
 

@@ -104,9 +104,14 @@ extern "C" {
 /* 摄像机路数。现网 `camera[6]` / `ip[6][4]` 同为 6，CNS 字段固定 6 路。 */
 #define IV_CAMDET_CH_N 6
 
-/* PING：包间隔、单包超时、每轮样本数。4 包 / 20 s 与现网同节奏。 */
-#define IV_CAMDET_PING_INTERVAL_MS 5000u
-#define IV_CAMDET_PING_TIMEOUT_MS  5000u
+/* PING：包间隔、单包超时、每轮样本数。
+ *
+ * 节奏＝**一轮 4 个包、每轮 10 s**（2026-10-29 用户口径），于是包间隔 2.5 s。
+ * 轮间隔本身来自配置 `probe.interval_ms`（可 Web 调），装配层换算成包间隔后
+ * 经 `iv_camdet_cfg_t::ping_interval_ms` 传进来；下面这两个常量只是 cfg 为 0
+ * 时的兜底。单包超时不再单独配，一律按"包间隔 / 2"推导 —— 一个参数管一件事。 */
+#define IV_CAMDET_PING_INTERVAL_MS 2500u
+#define IV_CAMDET_PING_TIMEOUT_MS  2500u /* 兜底值；实际由包间隔推导，见 pb_rebuild() */
 #define IV_CAMDET_PING_SAMPLES     4u
 
 /* 单个 tick 允许结算的样本数上限（防"计数错乱变成死循环"的第二道防线）。
@@ -117,17 +122,15 @@ extern "C" {
  * 看门狗 16 s 后复位整机）。见 `pb_rebuild()` / `sample_ping()` 的注释。 */
 #define IV_CAMDET_PING_MAX_STEP    8u
 
-/* 延时阈值默认值：现网 `DEFALUT_NETWORK_DELAY` = 200 ms。
+/* 延时阈值兜底值：现网 `DEFALUT_NETWORK_DELAY` = 200 ms。
  *
- * ⚠ 2026-10-29 起**不参与判定**：摄像机状态已改两态（有应答＝正常、全无应答＝故障），
- * 用户口径"ping 通就正常、不通就故障，不要乱添加其他检测"。全工程的延时门限只保留
- * 一处 —— `probe.timeout_ms`（平台「有线网络超时时间(ms)」），摄像机那边也只跟随它
- * （`main.c` 用 `probe.timeout_ms` 填 `camera_detect_rtt_ms`，`camera.detect.rtt_ms`
- * 是保留键）。这里保留常量与 `rtt_thr_ms` 字段只为兼容既有调用点。
+ * 实际值由装配层从 `probe.timeout_ms`（平台「有线网络超时时间(ms)」）传进来 ——
+ * 全工程只有一个延时门限，主网探活、摄像机检测共用。`camera.detect.rtt_ms`
+ * 是保留键（无消费方），别再拿它当来源。
  *
- * 历史说明（仍然有效）：RTT 的采样分辨率＝调用方 tick（200 ms），测出来只能是
- * tick 的整数倍；当年为了不误判"延时"才把边界改成严格大于，现在判定已无阈值参与，
- * 那段坑不会复发。 */
+ * RTT 的采样分辨率＝调用方排空节拍（装配层 `IV_AGENT_PROBE_DRAIN_MS` = 10 ms），
+ * 所以要判 100 ms 量级的门限必须先保证排空足够密，否则 0.5 ms 的局域网往返
+ * 会被记成一个 tick（R-02，2026-10-22）。见 `iv_camdet_drain()`。 */
 #define IV_CAMDET_RTT_THR_MS_DEFAULT 200u
 
 /* 典型调用方 tick（agent 巡检周期 `IV_AGENT_PROBE_TICK_MS`）——只用来判"阈值配得
@@ -155,14 +158,14 @@ extern "C" {
  * ------------------------------------------------------------------------- */
 
 /* 状态编码。**数值即上报编码**，不得改动（现网 NET_STATUS_E）。
- * ⚠ 2026-10-29 用户口径：摄像机**只分通/不通**，`DELAY`/`LOSS` 保留编码但
- * **不再产生**（`ping_verdict()` 已改两态）。平台侧若仍按五态解释，4/5 永远不会出现。 */
+ * 四态判定口径（2026-10-29 用户）：一轮 4 个包 —— 全响应且平均 RTT ≤ 门限＝正常；
+ * 全响应但平均超门限＝延时；只回了一部分＝丢包；一个都没回＝故障。 */
 typedef enum {
     IV_CAMDET_NO_IP  = 0, /* 未配置该路 IP */
-    IV_CAMDET_NORMAL = 1, /* 网络正常（ping 有应答即为正常） */
-    IV_CAMDET_FAULT  = 2, /* 网络故障（含"网线断开"覆盖、四个样本全无应答） */
-    IV_CAMDET_DELAY  = 4, /* 保留编码；**不再产生** */
-    IV_CAMDET_LOSS   = 5  /* 保留编码；**不再产生** */
+    IV_CAMDET_NORMAL = 1, /* 网络正常（4 包全响应，平均 RTT 未超门限） */
+    IV_CAMDET_FAULT  = 2, /* 网络故障（含"网线断开"覆盖、4 包全无应答） */
+    IV_CAMDET_DELAY  = 4, /* 延时（4 包全响应，但平均 RTT 超门限） */
+    IV_CAMDET_LOSS   = 5  /* 丢包（4 包只回了一部分） */
 } iv_camdet_status_t;
 
 /* 检测方式。数值与现网 `search_mode` 一致（1/2/3）。 */
@@ -199,6 +202,17 @@ typedef struct {
     int      mode;        /* 1/2/3；0 → 默认 PING */
     uint32_t rtt_thr_ms;  /* 延时阈值；0 → IV_CAMDET_RTT_THR_MS_DEFAULT */
     uint32_t round_ms;    /* 扫描/RTSP 轮间隔；0 → IV_CAMDET_ROUND_MS_DEFAULT */
+    /* PING 的**单包间隔**（毫秒）。一轮 `IV_CAMDET_PING_SAMPLES` 个包，
+     * 所以包间隔 ＝ 轮间隔 / 4。装配层从 `probe.interval_ms`（轮间隔，默认
+     * 10 s）换算后传进来 ⇒ 现场改一个参数，主网探活与摄像机检测同时生效。
+     * 0 → `IV_CAMDET_PING_INTERVAL_MS`。 */
+    uint32_t ping_interval_ms;
+    /* 调用方**排空回包的节拍**（毫秒），只用于 `warn_rtt_thr()` 判"阈值配得
+     * 有没有意义"。RTT 是"发出→读到回包"的差，读得越密测得越准：装配层
+     * （`IV_AGENT_PROBE_DRAIN_MS`）已经用 10 ms 的高频排空节拍驱动
+     * `iv_camdet_drain()`，所以 200 ms 的门限在**现场路径**上完全够用。
+     * 0 → `IV_CAMDET_TICK_RESOLUTION_MS`（保守值，兼容没接排空节拍的装配方）。 */
+    uint32_t drain_ms;
 
     /* PING 方式的引擎注入点；NULL → iv_probe_default_iops()（真 socket）。
      * 配置文件模板里的 ICMP 部分由本模块固定为 5 s 间隔 / 5 s 超时，
@@ -310,6 +324,15 @@ int iv_camdet_set_link(iv_camdet_t *d, int up, uint64_t now_ms);
  *   IV_OK / IV_EINVAL / IV_ESTATE；同值空操作返回 IV_OK。 */
 int iv_camdet_set_rtt_thr(iv_camdet_t *d, uint32_t ms);
 
+/* 改 PING 的**单包间隔**（热生效；装配层从 `probe.interval_ms`（轮间隔）除以
+ * `IV_CAMDET_PING_SAMPLES` 换算后传入）。一轮 4 个包 ⇒ 一轮耗时 ≈ 4×本值。
+ *
+ *   - 只影响 PING 方式；扫描/RTSP 的轮间隔是 `round_ms`，两者互不相干。
+ *   - 会**重建** PING 引擎（引擎无改周期接口），统计随之清零 —— 结论保留到下一轮。
+ *   - `ms == 0` 返回 IV_EINVAL（0＝取默认只在 init 语境成立）。
+ *   IV_OK / IV_EINVAL / IV_ESTATE；同值空操作返回 IV_OK。 */
+int iv_camdet_set_ping_interval(iv_camdet_t *d, uint32_t ms);
+
 /* ---------------------------------------------------------------------------
  * 立即重测一路（Web 摄像机页「测」按钮；现场装完机想马上知道通不通）
  * ---------------------------------------------------------------------------
@@ -341,6 +364,15 @@ int iv_camdet_probe_now(iv_camdet_t *d, int ch, uint64_t now_ms);
  *   ③ 重算对外状态并按需回调 on_change。
  * 返回本次**对外状态变化**的通道数（>=0）；IV_EINVAL/IV_ESTATE 见文件头。 */
 int iv_camdet_tick(iv_camdet_t *d, uint64_t now_ms);
+
+/* **只读回包**，不发探、不结算（装配层的 10 ms 排空节拍调用）。
+ *
+ * 为什么必须有它：RTT 是"发出→读到回包"的差。若只跟 `iv_camdet_tick()` 的
+ * 200 ms 节拍读一次，局域网里 0.5 ms 的往返会被记成 200 ms —— 门限配 100 就
+ * 把全好的摄像机标成"延时"（R-02，2026-10-22 栽过），而这正是用户
+ * 2026-10-29 说的"网络正常检测时间肯定在 1 ms 以内"要解决的问题。
+ * 非 PING 方式直接返回 0（扫描/RTSP 用不到 ICMP）。 */
+int iv_camdet_drain(iv_camdet_t *d, uint64_t now_ms);
 
 /* ---------------------------------------------------------------------------
  * 查询

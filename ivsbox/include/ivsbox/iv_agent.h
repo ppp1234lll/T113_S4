@@ -185,6 +185,18 @@ extern "C" {
 
 /* 总线节拍：probe 驱动（发探/收结果/超时判定）与 netmgr 驱动（迟滞/回切）。 */
 #define IV_AGENT_PROBE_TICK_MS  200u
+
+/* ping 的**轮间隔**默认值（毫秒）与单包间隔下限（2026-10-29 用户口径）。
+ *
+ * 语义：`probe.interval_ms` 配的是"多久跑一轮"（默认 10 s），**不是**"两个包
+ * 隔多久"。一轮 `IV_PROBE_ROUND_SAMPLES`(4) 个包，于是引擎的单包间隔 ＝
+ * 轮间隔 / 4（默认 2.5 s）。为什么要把轮当单位：用户要的是"每 ping 一次发
+ * 4 个包、算平均响应时间"，判定与上报都以轮为粒度，配置项跟着轮走才不会让
+ * 现场以为"配 10 s 是每 10 s 发一个包、4 个包要 40 s 才出结论"。 */
+#define IV_AGENT_PROBE_ROUND_MS_DEFAULT 10000u
+/* 单包间隔下限：再小就会和 `probe.timeout_ms`（等回包超时 = 包间隔/2）打架。
+ * 轮间隔配置下界 2000 ⇒ 2000/4=500 恒 ≥ 本值，这里只是兜底。 */
+#define IV_AGENT_PROBE_PKT_MIN_MS       250u
 /* **探测回包的排空节拍**（2026-10-26 加）。
  *
  * 为什么不能只靠上面那个 200 ms 的节拍：`iv_probe` 测的 RTT 是"发出时刻 → 读到
@@ -303,7 +315,12 @@ typedef struct {
     /* ---- 双 WAN 与探活（S3.1/S3.2/S3.3）---- */
     char        wan_name[IV_WAN_N][IV_AGENT_WAN_NAME_MAX]; /* 下标＝iv_wan_t；空串跳过 */
     uint32_t    probe_target_be[IV_AGENT_TARGET_N]; /* target1/2（**网络序**）；0=未配 */
-    uint32_t    probe_interval_ms;  /* 0 → iv_probe 默认 5000 */
+    uint32_t    probe_interval_ms;  /* **轮间隔**（毫秒）；0 →
+                                     * `IV_AGENT_PROBE_ROUND_MS_DEFAULT`(10 s)。
+                                     * 引擎的单包间隔由 `probe_cfg_of()` 换算成
+                                     * `轮间隔 / IV_PROBE_ROUND_SAMPLES`，别把轮
+                                     * 间隔直接喂给 `iv_probe_cfg_t::interval_ms`
+                                     * （那样一轮要 4×10=40 s 才出结论）。 */
     /* 有线网络**延时门限**（毫秒），来自配置键 `probe.timeout_ms`
      * ＝平台 0xFE「有线网络超时时间(ms)」/ 0xE1 的 `pn`。落到
      * `iv_probe_cfg_t::degrade_rtt_ms`：每轮 ping 的平均时延超过它 ⇒ 判
@@ -325,7 +342,10 @@ typedef struct {
     /* ---- M4 摄像机网络状态检测（S4.1）---- */
     uint32_t    camera_ip_be[IV_CAMDET_CH_N]; /* 0=该路未配置 */
     uint32_t    camera_detect_mode;   /* 0 → 默认 PING(1)；对应现网 search_mode */
-    uint32_t    camera_detect_rtt_ms; /* 0 → 默认 200 ms */
+    uint32_t    camera_detect_rtt_ms; /* 摄像机 PING 延时门限；**来自
+                                       * `probe.timeout_ms`（「有线网络超时时间」），
+                                       * 2026-10-29 用户口径：全工程只有一个延时门限。
+                                       * 0 → camdet 默认 200 ms */
 
     /* ---- M4 自愈（S4.4）：故障沿 → 电源通道断电重启 ----
      * `netthr.reboot_max`：每通道最多动作次数，**0 ＝ 禁用自愈**
@@ -759,6 +779,10 @@ const iv_camdet_t *iv_agent_camdet(const iv_agent_t *a);
  *   与 `iv_agent_open()` 的口径一致（那里 `cfg->camera_detect_mode != 0` 才用），
  *   否则用户在 web 上把键清空会被读成"他选了 PING"。
  * `rtt_ms`：同上，`0` 跳过（0 是 init 期的"取默认"哨兵，不是合法阈值）。
+ *   来源是 `probe.timeout_ms`（「有线网络超时时间」）—— 全工程一个延时门限。
+ * `ping_ms`：PING 的**单包间隔**（毫秒），`0` 跳过。装配层传
+ *   `probe.interval_ms / IV_PROBE_ROUND_SAMPLES`（轮间隔 10 s ⇒ 2.5 s），
+ *   一轮 4 个包。传 0 只在"这次不想改节拍"时用。
  * `ip_be`：6 项网络序地址表（`0` = 该路未配置）；**NULL ⇒ 不动通道表**。
  *   与 `iv_camdet_set_channels()` 同口径：表没变时它是空操作，所以本函数可以在
  *   camera 分类任一键变化时无脑调用。
@@ -769,7 +793,8 @@ const iv_camdet_t *iv_agent_camdet(const iv_agent_t *a);
  * （该路没配 IP，前端据此提示"先配 IP"）。
  * ------------------------------------------------------------------------- */
 int iv_agent_reload_camdet(iv_agent_t *a, int mode, uint32_t rtt_ms,
-                          const uint32_t *ip_be, uint64_t now_ms);
+                          uint32_t ping_ms, const uint32_t *ip_be,
+                          uint64_t now_ms);
 int iv_agent_camdet_probe(iv_agent_t *a, int ch, uint64_t now_ms);
 
 /* ---------------------------------------------------------------------------
@@ -902,11 +927,19 @@ int iv_agent_record_held_off(const iv_agent_t *a);
 uint8_t           iv_agent_mn(const iv_agent_t *a, int w);
 
 /* 「主网检测 IP」（`probe.target1/2`）的探测结论，**仅供界面显示**：
- *   0 未知（没配 / 还没探 / 没建成项）· 1 通 · 2 不通 · 3 通但延时超门限
+ *   0 未知（没配 / 第一轮 4 个包还没攒满 / 没建成项）
+ *   1 通      —— 4 包全响应，平均 RTT ≤ `probe.timeout_ms`
+ *   2 不通    —— 4 包全无响应
+ *   3 延时    —— 4 包全响应，平均 RTT > `probe.timeout_ms`
+ *   4 丢包    —— 4 包里只回了部分
  * 越界或没建项一律返回 0。
  *
  * ⚠ 与 `iv_agent_mn()` 是两件事：`mn` 判的是"这条链路能不能到平台"（参与切链路
- * 与上报），这里判的是"这个检测 IP 通不通"（纯显示）。别拿它去做决策。 */
+ * 与上报），这里判的是"这个检测 IP 通不通"（纯显示）。别拿它去做决策。
+ *
+ * ⚠ 判定粒度＝**一轮 4 个包**（`IV_PROBE_ROUND_SAMPLES`），不走 `iv_probe_state()`
+ *   的 fail_n/ok_n 迟滞与 16 窗平均 —— 界面要的是"此刻通不通、多快"，等迟滞攒满
+ *   3 次失败才显示"不通"就晚了（见 `iv_agent.c` 该函数的实现注释）。 */
 uint8_t iv_agent_target_state(const iv_agent_t *a, int i);
 
 /* 第 i 个检测 IP 的点分串（网络序原样转文本）。没配返回 0，配了写进 buf 返回 1。

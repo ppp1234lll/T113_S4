@@ -234,13 +234,22 @@ static const cfg_default_t s_defaults[] = {
     /* ---- probe. 检测配置（架构 §10.2；原 net.probe.* 三项迁到本分类） ---- */
     D_STR(IV_CFG_CLS_PROBE, "probe.target1", "主网检测 IP 1", "", NULL),
     D_STR(IV_CFG_CLS_PROBE, "probe.target2", "主网检测 IP 2", "", NULL),
-    D_INT(IV_CFG_CLS_PROBE, "probe.interval_ms", "探测周期（毫秒）", 5000, 500, 600000),
+    /* **轮间隔**（不是"两个包隔多久"）。2026-10-29 用户口径："每一轮 ping 的
+     * 时间间隔是 10 s，可在 web 界面配置"，且一轮发 4 个包 ⇒ 引擎的单包间隔由
+     * 装配层换算成 `轮间隔 / 4`（`iv_agent.c:probe_cfg_of()`）。主网探活与摄像机
+     * 检测共用这一个键，改它两边一起变。
+     * 下界 2000：包间隔 ≥ 500 ms，等回包超时（包间隔/2）才不至于挤成一团。 */
+    D_INT(IV_CFG_CLS_PROBE, "probe.interval_ms", "ping 轮间隔（毫秒，每轮 4 个包）",
+          10000, 2000, 600000),
     /* ⚠ 键名带 timeout，但语义是**延时门限**（2026-10-26 用户口径，平台
      * 「有线网络超时时间(ms)」/ 0xFE / 0xE1 的 `pn`）：ping 平均时延超过它判
      * "延时严重"（上报 `MN=4`）。键名不改 —— 平台契约与已落盘的现场配置都认这个名字。
-     * 上界由跨字段校验压到"小于探测周期的一半"（等回包超时就是半个周期）。 */
+     * 默认 200 ms 对齐现网 `DEFALUT_NETWORK_DELAY`，也与现场平台下发的值一致。
+     * 上界由跨字段校验压到"小于单包间隔的一半"（等回包超时就是它），见
+     * `cross_check()`：一轮 4 个包 ⇒ 单包间隔＝轮间隔/4，所以门限必须
+     * < 轮间隔/8。 */
     D_INT(IV_CFG_CLS_PROBE, "probe.timeout_ms", "有线网络延时门限（毫秒，平均时延超过它判延时严重）",
-          2000, 100, 60000),
+          200, 100, 60000),
     D_INT(IV_CFG_CLS_PROBE, "probe.max_fail", "连续失败次数上限", 3, 1, 100),
 
     /* ---- camera. 摄像机配置（架构 §10.2；ch[] 是真数组，元素＝1 条目） ---- */
@@ -248,7 +257,11 @@ static const cfg_default_t s_defaults[] = {
     /* M4-S4.1 摄像机网络状态检测：方式与延时阈值（现网 search_mode /
      * DEFALUT_NETWORK_DELAY 口径） */
     D_INT(IV_CFG_CLS_CAMERA, "camera.detect.mode", "摄像机检测方式：1=PING 2=端口扫描 3=RTSP", 1, 1, 3),
-    D_INT(IV_CFG_CLS_CAMERA, "camera.detect.rtt_ms", "PING 方式延时判定阈值（毫秒，平均 RTT >= 此值即判延时）", 200, 10, 10000),
+    /* 保留键：**无消费方**（2026-10-29）。摄像机 PING 的延时门限改与探活同源，
+     * 统一用 `probe.timeout_ms`（平台「有线网络超时时间(ms)」）—— 用户口径：
+     * 全工程只有一个延时门限，别让人在两个地方各调一个数。键留着只为兼容已落盘的
+     * 现场配置与平台契约，改它不生效（同 `net.timeout_ms` 的处理方式）。 */
+    D_INT(IV_CFG_CLS_CAMERA, "camera.detect.rtt_ms", "保留键：无消费方（延时门限见 probe.timeout_ms）", 200, 10, 10000),
     /* M4-S4.3 SNMP 采集：目标参数 4 条 ＋ OID 槽位 9 条。
      * OID 表**唯一来源＝配置**：代码内不内置任何品牌特化表，换机型只改这里、不改固件。
      * ⚠ 槽位名必须**厂家中立**（同一槽位只能存一个 OID：海康/大华同指标 OID 不同，
@@ -1100,15 +1113,18 @@ static int cross_check(const iv_config_t *c, const char **k1, const char **k2, c
     ival = item_find(c, "probe.interval_ms");
     tval = item_find(c, "probe.timeout_ms");
     /* `probe.timeout_ms` 是**延时门限**（不是等回包超时）：要判"平均时延超过门限"，
-     * 前提是门限本身够得到 —— 等回包超时由周期推导、取 `interval/2`（见
-     * `iv_agent` 的 `probe_io_timeout_of()`），时延一旦超过它就成了"丢包"而不是
-     * "延时"。所以门限必须**严格小于**半个周期，否则这个键配了也永远不触发
-     * （正是本项目反复栽的"配了不生效、编译不报、日志不报"那一类）。 */
+     * 前提是门限本身够得到 —— 等回包超时由周期推导、取**单包间隔**的一半，而单包
+     * 间隔 ＝ 轮间隔(`probe.interval_ms`) / 4（一轮 4 个包），所以门限必须
+     * **严格小于 轮间隔/8**，否则这个键配了也永远不触发（正是本项目反复栽的
+     * "配了不生效、编译不报、日志不报"那一类）。
+     *
+     * 2026-10-29 之前这里比的是 `interval/2`（那时 interval 就是单包间隔）；
+     * 引入"轮"概念后必须跟着改成 `/8`，否则校验会放行一个永远不可能触发的门限。 */
     if (ival != NULL && tval != NULL && ival->type == IV_CFG_T_INT && tval->type == IV_CFG_T_INT &&
-        tval->v.i * 2 >= ival->v.i) {
+        (int64_t)tval->v.i * 8 >= (int64_t)ival->v.i) {
         *k1  = "probe.timeout_ms";
         *k2  = "probe.interval_ms";
-        *why = "probe delay threshold must be < interval_ms/2";
+        *why = "probe delay threshold must be < interval_ms/8 (4 packets per round)";
         return 0;
     }
 

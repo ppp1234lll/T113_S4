@@ -84,6 +84,7 @@ void iv_camdet_cfg_default(iv_camdet_cfg_t *cfg)
     cfg->mode       = IV_CAMDET_MODE_PING;
     cfg->rtt_thr_ms = IV_CAMDET_RTT_THR_MS_DEFAULT;
     cfg->round_ms   = IV_CAMDET_ROUND_MS_DEFAULT;
+    cfg->ping_interval_ms = IV_CAMDET_PING_INTERVAL_MS;
 }
 
 const char *iv_camdet_status_name(iv_camdet_status_t s)
@@ -129,16 +130,21 @@ static const iv_camdet_iops_t *iops_of(const iv_camdet_t *d)
  * 全通道红色，日志里却什么都没说 —— 所以开机和热更新时各告警一次，不静默。 */
 static void warn_rtt_thr(const iv_camdet_t *d)
 {
+    uint32_t res = (d->cfg.drain_ms != 0u) ? d->cfg.drain_ms
+                                           : IV_CAMDET_TICK_RESOLUTION_MS;
+
     if (d->cfg.rtt_thr_ms == 0u)
         return;
-    if (d->cfg.rtt_thr_ms > IV_CAMDET_TICK_RESOLUTION_MS)
+    /* 阈值必须明显大于**排空节拍**：RTT 只能是节拍的整数倍，门限比它还小，
+     * 一个节拍内就应答的局域网摄像机就会被读成"等于一个节拍 > 门限" ⇒ 恒判延时
+     * （R-02）。装配层用 10 ms 排空 ⇒ 200 ms 的门限实测足够，不再刷这条告警；
+     * 没接排空节拍的装配方（drain_ms=0）仍按 200 ms 保守告警。 */
+    if (d->cfg.rtt_thr_ms > res)
         return;
     IV_LOG_W(CD_MOD,
-             "rtt_thr=%ums <= one tick (%ums): a LAN camera answering within one "
-             "tick still reads as DELAY; raise camera.detect.rtt_ms above %ums",
-             (unsigned)d->cfg.rtt_thr_ms,
-             (unsigned)IV_CAMDET_TICK_RESOLUTION_MS,
-             (unsigned)IV_CAMDET_TICK_RESOLUTION_MS);
+             "rtt_thr=%ums <= one drain tick (%ums): a LAN camera answering within "
+             "one tick still reads as DELAY; raise probe.timeout_ms above %ums",
+             (unsigned)d->cfg.rtt_thr_ms, (unsigned)res, (unsigned)res);
 }
 
 /* ---------------------------------------------------------------------------
@@ -186,8 +192,17 @@ static void pb_rebuild(iv_camdet_t *d)
         (void)iv_probe_stop(&d->pb);
 
     iv_probe_cfg_default(&pc);
-    pc.interval_ms          = IV_CAMDET_PING_INTERVAL_MS;
-    pc.timeout_ms           = IV_CAMDET_PING_TIMEOUT_MS;
+    /* 包间隔由装配层按"轮间隔 / 4"换算后传进来（`ping_interval_ms`）；
+     * 0 则退回编译期默认。等回包超时仍按包间隔推导 —— 与 `iv_agent` 的
+     * `probe_io_timeout_of()` 同一口径，别在这里另给一个数。 */
+    pc.interval_ms          = (d->cfg.ping_interval_ms != 0u)
+                                  ? d->cfg.ping_interval_ms
+                                  : IV_CAMDET_PING_INTERVAL_MS;
+    pc.timeout_ms           = pc.interval_ms / 2u;
+    if (pc.timeout_ms < 250u)
+        pc.timeout_ms = 250u;
+    if (pc.timeout_ms >= pc.interval_ms)
+        pc.timeout_ms = (pc.interval_ms > 1u) ? (pc.interval_ms - 1u) : 1u;
     pc.fail_n               = 1u;
     pc.ok_n                 = 1u;
     pc.degrade_rtt_ms       = 0u;
@@ -218,6 +233,12 @@ static void pb_rebuild(iv_camdet_t *d)
         int  idx;
 
         d->ch_idx[ch] = -1;
+        /* **非 PING 方式不建 ICMP 项**（2026-10-29 用户口径："如果摄像机使用其他
+         * 检测方式，则不再参与 ping 流程"）。扫描/RTSP 走自己的 socket，一条
+         * ICMP 都不该发 —— 否则端口扫描模式下一轮轮扫描旁边还并行着一份 ping
+         * 流量，平台看抓包会以为设备在双重检测。 */
+        if (d->cfg.mode != IV_CAMDET_MODE_PING)
+            continue;
         if (d->ch_ip_be[ch] == 0u)
             continue;
         /* 通道名只用于诊断（"cam0"…"cam5"），手工拼，不引 snprintf */
@@ -235,6 +256,11 @@ static void pb_rebuild(iv_camdet_t *d)
         }
         d->ch_idx[ch] = idx;
     }
+    /* 非 PING 方式：**不 start**，让引擎停在"未启动"态 —— 装配层/单测都用
+     * `iv_probe_fd_count()` 是不是 0 来判"到底有没有 ICMP 流量"，start 了却
+     * 一个项都没有会让人以为还在发探。 */
+    if (d->cfg.mode != IV_CAMDET_MODE_PING)
+        return;
     (void)iv_probe_start(&d->pb, d->now_ms);
     if (iv_probe_icmp_available(&d->pb) == 0)
         IV_LOG_W(CD_MOD, "raw ICMP unavailable, ping mode will not produce verdicts");
@@ -257,6 +283,8 @@ int iv_camdet_open(iv_camdet_t *d, const iv_camdet_cfg_t *cfg, uint64_t now_ms)
             d->cfg.rtt_thr_ms = IV_CAMDET_RTT_THR_MS_DEFAULT;
         if (d->cfg.round_ms == 0u)
             d->cfg.round_ms = IV_CAMDET_ROUND_MS_DEFAULT;
+        if (d->cfg.ping_interval_ms == 0u)
+            d->cfg.ping_interval_ms = IV_CAMDET_PING_INTERVAL_MS;
     }
     d->now_ms = now_ms;
     d->fd     = -1;
@@ -281,8 +309,14 @@ int iv_camdet_open(iv_camdet_t *d, const iv_camdet_cfg_t *cfg, uint64_t now_ms)
     }
 
     pb_rebuild(d);
-    IV_LOG_I(CD_MOD, "open: mode=%s rtt_thr=%ums round=%ums",
+    /* 日志分开报两种"轮间隔"，不混成一句：
+     *   ping 轮 = 包间隔 × 每轮包数（2026-10-29 起的主判定节奏）
+     *   扫描/RTSP 轮 = `round_ms`（与 ping 无关，只在方式 2/3 生效）
+     * 之前只打 `round=30000ms`，现场会把它当成 ping 的轮间隔读。 */
+    IV_LOG_I(CD_MOD, "open: mode=%s rtt_thr=%ums ping=%ums/round(%ums) scan_round=%ums",
              iv_camdet_mode_name(d->cfg.mode), (unsigned)d->cfg.rtt_thr_ms,
+             (unsigned)d->cfg.ping_interval_ms,
+             (unsigned)(d->cfg.ping_interval_ms * IV_CAMDET_PING_SAMPLES),
              (unsigned)round_ms_of(d));
     warn_rtt_thr(d);
     return IV_OK;
@@ -411,11 +445,10 @@ int iv_camdet_set_mode(iv_camdet_t *d, int mode, uint64_t now_ms)
     close_fd(d);
     d->next_round_ms = now_ms; /* 立即开新方式的第一轮 */
 
-    if (mode == IV_CAMDET_MODE_PING) {
-        pb_rebuild(d);
-    } else if (d->pb.started) {
-        (void)iv_probe_stop(&d->pb); /* 非 PING 方式不需要 ICMP 流量 */
-    }
+    /* 无条件重建：PING ⇒ 为每路建 ICMP 项；其它方式 ⇒ **不建项**并停掉引擎
+     * （"摄像机用其他检测方式时不参与 ping 流程"），顺带把 `ch_idx` 清成 -1，
+     * 不留指向已停引擎的悬空下标。 */
+    pb_rebuild(d);
     IV_LOG_I(CD_MOD, "mode -> %s", iv_camdet_mode_name(mode));
     return 0;
 }
@@ -433,13 +466,14 @@ int iv_camdet_set_link(iv_camdet_t *d, int up, uint64_t now_ms)
 /* ---------------------------------------------------------------------------
  * PING：驱动引擎 + 采样 + 轮结算
  * ------------------------------------------------------------------------- */
-static void probe_drive(iv_camdet_t *d, uint64_t now_ms)
+/* 只读回包（不发探、不判超时）。单独拆出来是给装配层的**密排空**用的：
+ * RTT＝"发出→读到回包"，只按 200 ms 的 tick 读一次，局域网 0.5 ms 的往返就会
+ * 被记成 200 ms（R-02，2026-10-22）。见 `iv_camdet_drain()`。 */
+static void pb_drain(iv_camdet_t *d, uint64_t now_ms)
 {
-    int n;
+    int n = iv_probe_fd_count(&d->pb);
     int i;
 
-    (void)iv_probe_tick(&d->pb, now_ms);
-    n = iv_probe_fd_count(&d->pb);
     for (i = 0; i < n; i++) {
         int fd = iv_probe_fd_at(&d->pb, i);
 
@@ -448,6 +482,17 @@ static void probe_drive(iv_camdet_t *d, uint64_t now_ms)
         (void)iv_probe_on_readable(&d->pb, fd, now_ms);
         (void)iv_probe_on_writable(&d->pb, fd, now_ms);
     }
+}
+
+static void probe_drive(iv_camdet_t *d, uint64_t now_ms)
+{
+    /* ⚠ **先读回包，再判超时**（与 `iv_agent.c:probe_drive()` 同一理由，
+     * 2026-10-26 修）。`iv_probe_tick()` 第一件事就是"在飞且已超时 ⇒ 记丢包"，
+     * 原来先 tick 后 drain：超时一旦不大于一个驱动节拍，回包就永远等不到被读的
+     * 那一刻 ⇒ 该通道稳定 100% 丢包。先 drain 的语义也更对：先看已到的回包，
+     * 再判"该来的没来"。 */
+    pb_drain(d, now_ms);
+    (void)iv_probe_tick(&d->pb, now_ms);
 }
 
 static void ring_push(iv_camdet_t *d, int ch, int ok, uint32_t rtt)
@@ -468,28 +513,48 @@ static void ring_clear(iv_camdet_t *d, int ch)
 }
 
 /*
- * 本轮（4 个样本）→ **两态**（2026-10-29 用户口径）：
- *   有任何一个应答 → 正常(1)
- *   四个全没应答   → 故障(2)
+ * 本轮（4 个包）→ 四态。2026-10-29 用户口径：
  *
- * 「延时(4)」「丢包(5)」**不再产生**。用户原话："摄像机状态不区分，ping 通就正常、
- * 不通就故障，不要乱添加其他检测"。这也顺带消掉了旧判据的老毛病：RTT 是按 tick
- * （200 ms）采样出来的整数倍，0.5 ms 的局域网摄像机常被测成 200 ms，于是"ping
- * 明明很通、页面却报延时"（R-02）。两态之后不存在这个歧义。
+ *   "每 ping 一次发送 4 个数据包，判断是否全部响应，计算 4 个数据包的平均响应
+ *    时间，用于判断丢包、延时"
  *
- * `rtt_thr_ms` / `iv_camdet_set_rtt_thr()` 保留但**不再参与判定**（配置键
- * `camera.detect.rtt_ms` 早已标注"保留键：无消费方"，延时门限统一走
- * `probe.timeout_ms`），调用它们不会改变本函数的结果。
+ *   4 包全响应 且 平均 RTT ≤ 门限 → 正常(1)
+ *   4 包全响应 且 平均 RTT >  门限 → 延时(4)
+ *   部分响应                      → 丢包(5)
+ *   全无响应                      → 故障(2)
+ *
+ * 门限＝`cfg.rtt_thr_ms`，来源是 `probe.timeout_ms`（平台「有线网络超时时间
+ * (ms)」）—— 全工程只有一个延时门限，别再另立一套（`camera.detect.rtt_ms`
+ * 已标"保留键：无消费方"）。
+ *
+ * 为什么必须"全响应"才判延时：4 个包里丢了 1 个，剩下的平均 RTT 再好看，
+ * 这条链路也是"丢包"，报"延时"会把现场引到错误的方向（去查带宽而不是查线）。
+ *
+ * 关于 RTT 分辨率：本函数的样本来自 `iv_probe` 的 `last_rtt_ms`，而 RTT 是
+ * "发出→读到回包"的差，只有调用 `iv_camdet_drain()` 足够密才测得准。装配层
+ * 的 10 ms 排空节拍同时驱动本模块（见 `iv_agent.c:on_probe_drain_timer`），
+ * 否则局域网 0.5 ms 的往返会被记成一个 200 ms 的 tick（R-02，2026-10-22）。
  */
 static iv_camdet_status_t ping_verdict(const iv_camdet_t *d, int ch)
 {
-    int i;
+    int      i;
+    int      nok = 0;
+    uint32_t sum = 0u;
 
     for (i = 0; i < (int)IV_CAMDET_PING_SAMPLES; i++) {
-        if (d->pk_ok[ch][i] != 0u)
-            return IV_CAMDET_NORMAL;
+        if (d->pk_ok[ch][i] != 0u) {
+            nok++;
+            sum += d->pk_rtt[ch][i];
+        }
     }
-    return IV_CAMDET_FAULT;
+    if (nok == 0)
+        return IV_CAMDET_FAULT;
+    if (nok < (int)IV_CAMDET_PING_SAMPLES)
+        return IV_CAMDET_LOSS;
+    /* 四包全响应：平均超门限才算延时。门限 0＝不判延时（只判通/丢包）。 */
+    if (d->cfg.rtt_thr_ms != 0u && (sum / (uint32_t)nok) > d->cfg.rtt_thr_ms)
+        return IV_CAMDET_DELAY;
+    return IV_CAMDET_NORMAL;
 }
 
 /*
@@ -913,6 +978,27 @@ int iv_camdet_set_rtt_thr(iv_camdet_t *d, uint32_t ms)
     return IV_OK;
 }
 
+int iv_camdet_set_ping_interval(iv_camdet_t *d, uint32_t ms)
+{
+    if (d == NULL)
+        return IV_EINVAL;
+    if (!d->opened)
+        return IV_ESTATE;
+    if (ms == 0u)
+        return IV_EINVAL; /* 0 = 取默认只在 init 有意义，见头文件 */
+    if (d->cfg.ping_interval_ms == ms)
+        return IV_OK;
+
+    d->cfg.ping_interval_ms = ms;
+    /* `iv_probe` 没有"改某项周期"的接口，只能整份重建（项会被重新 add、统计清零）。
+     * 通道表没变 ⇒ 除周期外一切照旧；结论保留到下一轮结算。 */
+    if (d->cfg.mode == IV_CAMDET_MODE_PING)
+        pb_rebuild(d);
+    IV_LOG_I(CD_MOD, "ping packet interval -> %u ms (round = %u ms)", (unsigned)ms,
+             (unsigned)(ms * IV_CAMDET_PING_SAMPLES));
+    return IV_OK;
+}
+
 int iv_camdet_probe_now(iv_camdet_t *d, int ch, uint64_t now_ms)
 {
     if (d == NULL || ch < 0 || ch >= IV_CAMDET_CH_N)
@@ -982,6 +1068,19 @@ int iv_camdet_tick(iv_camdet_t *d, uint64_t now_ms)
         break;
     }
     return refresh(d, now_ms);
+}
+
+int iv_camdet_drain(iv_camdet_t *d, uint64_t now_ms)
+{
+    if (d == NULL)
+        return IV_EINVAL;
+    if (!d->opened)
+        return IV_ESTATE;
+    if (d->cfg.mode != IV_CAMDET_MODE_PING)
+        return 0; /* 扫描/RTSP 不用 ICMP，没什么可排空的 */
+    d->now_ms = now_ms;
+    pb_drain(d, now_ms);
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------

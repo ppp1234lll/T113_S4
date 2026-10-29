@@ -96,6 +96,21 @@ extern "C" {
 /* 统计滑窗长度（最近 N 次探测）。RTT 滑动平均与丢包率都在此窗上算。 */
 #define IV_PROBE_WIN_LEN 16
 
+/* 「一轮」＝连发几个包（2026-10-29 用户口径）。
+ *
+ * 原来的语义是"每一个包就是一个结论"：单包丢了立刻算一次失败，于是现场一个包
+ * 被交换机丢在队列里，界面就闪一下"不通"。用户要的是「每 ping 一次发 4 个包，
+ * 判断是否全部响应，算 4 个包的平均响应时间」——
+ *   4 包全响应 且 平均 ≤ 门限 → 正常
+ *   4 包全响应 且 平均 >  门限 → 延时
+ *   部分响应                  → 丢包
+ *   全无响应                  → 故障
+ *
+ * 与「轮间隔」的关系：配置键 `probe.interval_ms` 指的是**轮间隔**，引擎内部单包
+ * 间隔由装配层换算成 `轮间隔 / IV_PROBE_ROUND_SAMPLES`（见 `iv_agent` 的
+ * `probe_cfg_of()`）—— 一个参数管两件事，不让人在两个地方各调一个数。 */
+#define IV_PROBE_ROUND_SAMPLES 4u
+
 /* 项名长度（含 NUL）。仅用于日志/诊断，引擎不解析其内容。 */
 #define IV_PROBE_NAME_LEN 16
 
@@ -146,6 +161,16 @@ typedef struct {
     uint64_t          last_ok_ms;       /* 最近成功时刻（调用方时钟，0=从未） */
     uint32_t          sent;             /* 累计完成探测次数（不含 LINK） */
     uint32_t          lost;             /* 累计失败次数 */
+
+    /* ---- 轮统计（最近一个 IV_PROBE_ROUND_SAMPLES 包的结算）----
+     *
+     * 上层的四态判定（通/不通/延时/丢包）只看这四个字段，不要自己再拿滑窗去凑：
+     * `avg_rtt_ms` 是 16 窗平均，抖动被摊平了，"本轮 4 包平均超门限"在它上面
+     * 永远触发得晚一拍；而"4 包里丢了 1 个"在它上面也算不出丢包。 */
+    uint32_t          round_ok;          /* 最近一轮成功包数（0..ROUND_SAMPLES） */
+    uint32_t          round_lost;        /* 最近一轮失败包数 */
+    uint32_t          round_avg_rtt_ms;  /* 最近一轮成功包的平均 RTT；全失败为 0 */
+    uint32_t          round_seq;         /* 已结算轮数，0=还没跑完第一轮 */
 } iv_probe_stat_t;
 
 /* ---------------------------------------------------------------------------
@@ -236,6 +261,16 @@ typedef struct {
     uint64_t          last_ok_ms;
     uint32_t          sent;
     uint32_t          lost;
+
+    /* 轮统计：见 `iv_probe_stat_t` 同名字段。`rnd_*` 是进行中的一轮，
+     * `round_*` 是最近一个**已结算**的轮（上层只读这组）。 */
+    uint32_t          rnd_n;
+    uint32_t          rnd_ok;
+    uint32_t          rnd_rtt_sum;
+    uint32_t          round_ok;
+    uint32_t          round_lost;
+    uint32_t          round_avg_rtt_ms;
+    uint32_t          round_seq;
 } iv_probe_item_t;
 
 struct iv_probe {

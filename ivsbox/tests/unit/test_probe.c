@@ -1035,6 +1035,67 @@ static void c17_icmp_reply_owner_check(void)
     (void)iv_probe_stop(&p);
 }
 
+/* ---------------------------------------------------------------------------
+ * c18 轮统计：一轮 ＝ 4 个包（2026-10-29 用户口径）
+ *
+ * "每 ping 一次发 4 个数据包，判断是否全部响应，计算 4 个数据包的平均响应时间，
+ *  用于判断丢包、延时"。
+ *
+ * 上层的四态判定（通/不通/延时/丢包）只看 `round_*` 这组字段，所以它们必须：
+ *   ① 不满 4 个包时 `round_seq` 不动 —— 拿半轮数据下结论，就是"刚开机就报故障"；
+ *   ② 结算时给出成功/失败**个数**（不是只给一个布尔），否则分不清"丢包"和"故障"；
+ *   ③ 平均 RTT 只对**成功包**求平均，全失败时记 0（不是"0 ms、很快"）。
+ *
+ * 反向证伪：把 `round_push()` 里的 `if (it->rnd_n < IV_PROBE_ROUND_SAMPLES) return;`
+ * 去掉（每包都结算）⇒ ①③ 全红；把 `rnd_rtt_sum / rnd_ok` 改成 `/ rnd_n` ⇒
+ * 有丢包那一轮的平均值立刻变小（20 → 15），第 2 条断言红。
+ * ------------------------------------------------------------------------- */
+static void c18_round_stats(void)
+{
+    iv_probe_t      p;
+    iv_probe_cfg_t  c = mk_cfg();
+    iv_probe_stat_t st;
+    int             i;
+    int             k;
+
+    mock_reset();
+    (void)iv_probe_init(&p, &c);
+    i = iv_probe_add_icmp(&p, DST, 0, "round");
+    (void)iv_probe_start(&p, 5000);
+
+    /* 前 3 个包：还不算一轮 */
+    (void)iv_probe_note_result(&p, i, 1, 10, 5100);
+    (void)iv_probe_note_result(&p, i, 1, 20, 5200);
+    (void)iv_probe_note_result(&p, i, 1, 30, 5300);
+    (void)iv_probe_stat_get(&p, i, &st);
+    chk(st.round_seq == 0u, "c18 no round settled before the 4th packet");
+
+    /* 第 4 个包：3 成 1 败 ⇒ 平均只算成功的三个：(10+20+30)/3 = 20 */
+    (void)iv_probe_note_result(&p, i, 0, 0, 5400);
+    (void)iv_probe_stat_get(&p, i, &st);
+    chk(st.round_seq == 1u, "c18 round settled exactly at the 4th packet");
+    chk(st.round_ok == 3u && st.round_lost == 1u, "c18 round counts ok/lost");
+    chk(st.round_avg_rtt_ms == 20u, "c18 average uses successful packets only");
+
+    /* 全失败的一轮：平均 RTT 必须是 0，上层靠 round_ok==0 判"故障" */
+    for (k = 0; k < 4; k++)
+        (void)iv_probe_note_result(&p, i, 0, 0, 6100u + (uint64_t)k * 100u);
+    (void)iv_probe_stat_get(&p, i, &st);
+    chk(st.round_seq == 2u && st.round_ok == 0u && st.round_lost == 4u,
+        "c18 an all-lost round");
+    chk(st.round_avg_rtt_ms == 0u, "c18 all-lost round carries no average");
+
+    /* 新一轮必须把上一轮的计数清掉（否则"4 成 + 4 败"会一直显示丢包） */
+    for (k = 0; k < 4; k++)
+        (void)iv_probe_note_result(&p, i, 1, 40, 7100u + (uint64_t)k * 100u);
+    (void)iv_probe_stat_get(&p, i, &st);
+    chk(st.round_seq == 3u && st.round_ok == 4u && st.round_lost == 0u,
+        "c18 a fresh round resets the counters");
+    chk(st.round_avg_rtt_ms == 40u, "c18 fresh round average");
+
+    (void)iv_probe_stop(&p);
+}
+
 int main(void)
 {
     c01_args_and_guards();
@@ -1054,6 +1115,7 @@ int main(void)
     c15_dual_wan_shared_dst();
     c16_icmp_egress_bind();
     c17_icmp_reply_owner_check();
+    c18_round_stats();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_probe FAILED (%d)\n", g_fail);
@@ -1061,6 +1123,6 @@ int main(void)
     }
     printf("test_probe passed (args, stat window, hysteresis, degrade, link event, "
            "icmp disable/reply/packet-bytes/seq-unique/egress-bind/reply-owner, tcp result, "
-           "timeout, lifecycle, retune, dual-wan-shared-dst)\n");
+           "timeout, lifecycle, retune, dual-wan-shared-dst, round-4-packets)\n");
     return 0;
 }

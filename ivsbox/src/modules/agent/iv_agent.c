@@ -196,8 +196,11 @@ static uint32_t probe_io_timeout_of(uint32_t interval_ms)
 
     if (t < 250u)
         t = 250u;
-    /* `iv_probe_retune()` 的硬约束是 timeout < interval。周期最小值 500 ⇒
-     * 上一步得到 250，天然满足；这里仍留一道，防止将来改小周期下界时踩空。 */
+    /* `iv_probe_retune()` 的硬约束是 timeout < interval。**单包间隔**最小值
+     * `IV_AGENT_PROBE_PKT_MIN_MS`(250) ⇒ 上一步得到 250，已不小于它，退到
+     * interval-1（249）。这道兜底不能省：配置下界虽有 2000，但 `0xF2` / 单测
+     * 都可能直接给一个小值，退不出去就会让 retune 回 EINVAL ⇒ 整次热更失败，
+     * 现场表现为"改了配置没反应"。 */
     if (t >= interval_ms)
         t = (interval_ms > 1u) ? (interval_ms - 1u) : 1u;
     return t;
@@ -205,9 +208,19 @@ static uint32_t probe_io_timeout_of(uint32_t interval_ms)
 
 static void probe_cfg_of(const iv_agent_cfg_t *cfg, iv_probe_cfg_t *pc)
 {
+    uint32_t round_ms;
+    uint32_t pkt_ms;
+
     iv_probe_cfg_default(pc);
-    if (cfg->probe_interval_ms != 0u)
-        pc->interval_ms = cfg->probe_interval_ms;
+    /* 配置值＝**轮间隔**（"多久跑一轮"），引擎只认**单包间隔** ⇒ 这里做除法。
+     * 一轮 IV_PROBE_ROUND_SAMPLES 个包，一圈正好 round_ms。见 iv_agent.h 的
+     * `IV_AGENT_PROBE_ROUND_MS_DEFAULT` 注释。 */
+    round_ms = (cfg->probe_interval_ms != 0u) ? cfg->probe_interval_ms
+                                              : IV_AGENT_PROBE_ROUND_MS_DEFAULT;
+    pkt_ms = round_ms / IV_PROBE_ROUND_SAMPLES;
+    if (pkt_ms < IV_AGENT_PROBE_PKT_MIN_MS)
+        pkt_ms = IV_AGENT_PROBE_PKT_MIN_MS;
+    pc->interval_ms = pkt_ms;
     /* ⚠ 这一行是本轮语义纠正的落点（2026-10-26 用户）：
      *   配置里的 `probe.timeout_ms`（平台「有线网络超时时间(ms)」）
      *   ＝ **延时门限** ⇒ 喂 `degrade_rtt_ms`，**不**喂 `timeout_ms`。
@@ -663,6 +676,24 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
             ccfg.mode = (int)cfg->camera_detect_mode;
         if (cfg->camera_detect_rtt_ms != 0u)
             ccfg.rtt_thr_ms = cfg->camera_detect_rtt_ms;
+        /* 摄像机 PING 的节拍与主网探活**同源**：一轮 4 个包（2026-10-29 用户
+         * 口径"每 ping 一次发 4 个包、每轮 10 s、改一个参数全生效"）⇒ 包间隔
+         * ＝轮间隔 / 4。配置只填 `probe.interval_ms` 一处，两个引擎都跟着变。 */
+        {
+            uint32_t round = (cfg->probe_interval_ms != 0u)
+                                 ? cfg->probe_interval_ms
+                                 : IV_AGENT_PROBE_ROUND_MS_DEFAULT;
+            uint32_t pkt = round / IV_PROBE_ROUND_SAMPLES;
+
+            if (pkt < IV_AGENT_PROBE_PKT_MIN_MS)
+                pkt = IV_AGENT_PROBE_PKT_MIN_MS;
+            ccfg.ping_interval_ms = pkt;
+        }
+        /* 告诉 camdet 我们这边的排空节拍（`on_probe_drain_timer` 每 10 ms 驱动
+         * 一次 `iv_camdet_drain()`）—— 它用这个值判"延时门限配得有没有意义"。
+         * 不传的话它按 200 ms 保守估计，会在每次 open 时刷一条假的"阈值为 200 ms
+         * 太小"告警（2026-10-29 板端实测就是这么刷的）。 */
+        ccfg.drain_ms = IV_AGENT_PROBE_DRAIN_MS;
         /* S4.4：把 "正常 → 故障" 的沿直接接进自愈模块。回调里只做
          * "判断 ＋ 入队"，不做任何 I/O；真正的 0xD1 由下面 step/timer
          * 里的 iv_recovery_tick 每拍最多发 1 条（同 cmd 在飞唯一）。 */
@@ -1636,10 +1667,18 @@ static void probe_drain(iv_agent_t *a, uint64_t now_ms)
 static void on_probe_drain_timer(void *arg)
 {
     iv_agent_t *a = arg;
+    uint64_t    now;
 
     if (a == NULL)
         return;
-    probe_drain(a, iv_clock_monotonic_ms());
+    now = iv_clock_monotonic_ms();
+    probe_drain(a, now);
+    /* 摄像机 PING 也必须在**这条密节拍**上排空。只跟 200 ms 的 tick 读回包，
+     * 局域网 0.5 ms 的往返会被记成 200 ms ⇒ 门限配 100 就把全好的摄像机标成
+     * "延时"（R-02，2026-10-22）。用户 2026-10-29 说的"网络正常检测时间肯定
+     * 在 1 ms 以内"要解决的就是这件事。 */
+    if (iv_camdet_is_open(&a->cd))
+        (void)iv_camdet_drain(&a->cd, now);
     if (a->r != NULL)
         a->pb_drain_timer =
             iv_timer_add(a->r, IV_AGENT_PROBE_DRAIN_MS, on_probe_drain_timer, a);
@@ -2156,7 +2195,8 @@ const iv_camdet_t *iv_agent_camdet(const iv_agent_t *a)
  * 摄像机检测方式热生效 ＋ 立即重测一路（2026-10-22）
  * ------------------------------------------------------------------------- */
 int iv_agent_reload_camdet(iv_agent_t *a, int mode, uint32_t rtt_ms,
-                          const uint32_t *ip_be, uint64_t now_ms)
+                          uint32_t ping_ms, const uint32_t *ip_be,
+                          uint64_t now_ms)
 {
     int rc = IV_OK;
     int mrc;
@@ -2185,6 +2225,17 @@ int iv_agent_reload_camdet(iv_agent_t *a, int mode, uint32_t rtt_ms,
             rc = mrc;
         } else {
             a->cfg.camera_detect_rtt_ms = rtt_ms;
+        }
+    }
+    /* 节拍：`probe.interval_ms` 是**轮间隔**，摄像机一轮 4 个包 ⇒ 包间隔 = 轮/4。
+     * 放在 mode 之前 —— `set_ping_interval()` 会重建引擎（仅在 PING 方式下），
+     * 先定节拍再定方式，重建次数少一趟。 */
+    if (ping_ms > 0u) {
+        mrc = iv_camdet_set_ping_interval(&a->cd, ping_ms);
+        if (mrc != IV_OK) {
+            IV_LOG_W(AG_MOD, "camdet ping interval %u rejected (%d)",
+                     (unsigned)ping_ms, mrc);
+            rc = mrc;
         }
     }
     /* 通道表：NULL ⇒ 不动。表没变时 `iv_camdet_set_channels()` 自己早返回，
@@ -2534,23 +2585,41 @@ uint8_t iv_agent_mn(const iv_agent_t *a, int w)
  * 这两项只回答"这个地址通不通"，不参与切链路、不进上报、不触发故障码。 */
 uint8_t iv_agent_target_state(const iv_agent_t *a, int i)
 {
-    int idx;
+    iv_probe_stat_t s;
+    int             idx;
 
     if (a == NULL || i < 0 || i >= (int)IV_AGENT_TGT_N)
         return 0u;
     idx = a->tgt_probe_idx[i];
     if (idx < 0)
         return 0u;
-    switch (iv_probe_state(&a->pb, idx)) {
-    case IV_PROBE_UP:
-        return 1u;
-    case IV_PROBE_DOWN:
-        return 2u;
-    case IV_PROBE_DEGRADED:
-        return 3u;
-    default:
+    if (iv_probe_stat_get(&a->pb, idx, &s) != IV_OK)
         return 0u;
-    }
+
+    /* 四态判定**只看最近一轮的 4 个包**（2026-10-29 用户口径：
+     * "每 ping 一次发 4 个包，判断是否全部响应，算 4 个包的平均响应时间"）。
+     *
+     *   全无响应              → 2 不通
+     *   部分响应              → 4 丢包
+     *   全响应 且 平均 > 门限 → 3 延时
+     *   全响应 且 平均 ≤ 门限 → 1 通
+     *
+     * 为什么不沿用 `iv_probe_state()`：那是给"要不要切链路"用的，要经过
+     * fail_n/ok_n 迟滞，且 DEGRADED 的门限是 **16 窗**平均 —— 现场问的是
+     * "这台 IP 现在通不通、多快"，等迟滞攒满 3 次失败再显示"不通"就晚了；
+     * 而 16 窗平均会把刚发生的一次丢包摊平掉。
+     *
+     * `round_seq == 0`（第一轮还没攒满 4 个包）一律报"未知"：拿半轮数据下结论
+     * 正是"刚开机就显示故障"的来源。 */
+    if (s.round_seq == 0u)
+        return 0u;
+    if (s.round_ok == 0u)
+        return 2u;
+    if (s.round_lost != 0u)
+        return 4u;
+    if (a->cfg.probe_delay_ms != 0u && s.round_avg_rtt_ms > a->cfg.probe_delay_ms)
+        return 3u;
+    return 1u;
 }
 
 int iv_agent_target_ip(const iv_agent_t *a, int i, char *buf, size_t cap)

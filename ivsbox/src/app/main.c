@@ -511,6 +511,23 @@ static uint32_t cfg_ip_be(const char *key)
     return in.s_addr; /* 已是网络序 */
 }
 
+/* 摄像机 PING 的**单包间隔**（毫秒）＝探活轮间隔 / 4。
+ *
+ * 2026-10-29 用户口径："每 ping 一次发 4 个包、每一轮间隔 10 s、改一个参数全生效"。
+ * 配置里只有 `probe.interval_ms`（轮间隔）一处，主网探活与摄像机检测都从它换算，
+ * 别在 camera 分类下再立一个节拍键（那会变成"改了这个、那个没变"）。 */
+static uint32_t cam_ping_pkt_ms(void)
+{
+    int64_t  v     = 0;
+    uint32_t round = IV_AGENT_PROBE_ROUND_MS_DEFAULT;
+    uint32_t pkt;
+
+    if (iv_config_get_int(g_cfg, "probe.interval_ms", &v) == IV_OK && v > 0)
+        round = (uint32_t)v;
+    pkt = round / IV_PROBE_ROUND_SAMPLES;
+    return (pkt < IV_AGENT_PROBE_PKT_MIN_MS) ? IV_AGENT_PROBE_PKT_MIN_MS : pkt;
+}
+
 /* 配置里的字符串：空/未配 → NULL（指针指向配置模块内部缓冲，配置存活期内有效） */
 static const char *cfg_str(const char *key)
 {
@@ -782,6 +799,18 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
                                     iv_clock_monotonic_ms());
         if (prc != IV_OK)
             IV_LOG_W(APP_MOD, "probe.* not applied (%d)", prc);
+        /* 摄像机 PING 的两个参数都与探活**同源**：延时门限＝`probe.timeout_ms`、
+         * 包间隔＝`probe.interval_ms`/4 ⇒ 改这两个键都必须顺带热更 camdet，
+         * 否则要等重启才生效（现场会认为"改了没用"）。
+         * mode 传 0＝不动检测方式；通道表传 NULL＝不动。 */
+        {
+            int crc2 = iv_agent_reload_camdet(&g_agent, 0, d_ms,
+                                              cam_ping_pkt_ms(), NULL,
+                                              iv_clock_monotonic_ms());
+
+            if (crc2 != IV_OK)
+                IV_LOG_W(APP_MOD, "camdet probe params not applied (%d)", crc2);
+        }
     }
     if ((mask & (IV_CFG_CLASS_MASK(IV_CFG_CLS_ELEC) |
                  IV_CFG_CLASS_MASK(IV_CFG_CLS_SENSOR))) != 0u) {
@@ -808,10 +837,13 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
             cips[ci] = cfg_ip_be(CAM_IP_KEY[ci]);
         if (iv_config_get_int(g_cfg, "camera.detect.mode", &cv) == IV_OK && cv > 0)
             cmode = (int)cv;
-        if (iv_config_get_int(g_cfg, "camera.detect.rtt_ms", &cv) == IV_OK && cv > 0)
+        /* 摄像机 PING 延时门限＝「有线网络超时时间(ms)」（`probe.timeout_ms`）。
+         * 2026-10-29 用户口径：全工程**只有一个**延时门限，摄像机与探活共用，
+         * 别再另立 `camera.detect.rtt_ms` 那套（该键已无消费方，见 iv_config.c）。 */
+        if (iv_config_get_int(g_cfg, "probe.timeout_ms", &cv) == IV_OK && cv > 0)
             crtt = (uint32_t)cv;
-        crc = iv_agent_reload_camdet(&g_agent, cmode, crtt, cips,
-                                     iv_clock_monotonic_ms());
+        crc = iv_agent_reload_camdet(&g_agent, cmode, crtt, cam_ping_pkt_ms(),
+                                     cips, iv_clock_monotonic_ms());
         if (crc != IV_OK)
             IV_LOG_W(APP_MOD, "camera.* not applied (%d)", crc);
 
@@ -2085,7 +2117,8 @@ static void on_plat_search_mode(const iv_proto_frame_t *f, void *arg)
         (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
         return;
     }
-    arc = iv_agent_reload_camdet(&g_agent, mode, 0u, NULL, iv_clock_monotonic_ms());
+    arc = iv_agent_reload_camdet(&g_agent, mode, 0u, 0u, NULL,
+                                 iv_clock_monotonic_ms());
     if (arc != IV_OK) {
         /* 已落盘但没生效：如实回失败（下次重启会生效，这条日志是现场唯一能看出
          * "存了没生效"的地方）。 */
@@ -2329,9 +2362,10 @@ static void on_plat_camera_ip(const iv_proto_frame_t *f, void *arg)
         cips[ci] = cfg_ip_be(CAM_IP_KEY[ci]);
     if (iv_config_get_int(g_cfg, "camera.detect.mode", &cv) == IV_OK && cv > 0)
         cmode = (int)cv;
-    if (iv_config_get_int(g_cfg, "camera.detect.rtt_ms", &cv) == IV_OK && cv > 0)
+    /* 延时门限与探活同源：`probe.timeout_ms`（「有线网络超时时间(ms)」） */
+    if (iv_config_get_int(g_cfg, "probe.timeout_ms", &cv) == IV_OK && cv > 0)
         crtt = (uint32_t)cv;
-    crc = iv_agent_reload_camdet(&g_agent, cmode, crtt, cips,
+    crc = iv_agent_reload_camdet(&g_agent, cmode, crtt, cam_ping_pkt_ms(), cips,
                                  iv_clock_monotonic_ms());
     if (crc != IV_OK) {
         /* 已落盘但没生效（如 camdet 未 open）：如实回失败，下次启动按新值建表。
@@ -2896,7 +2930,9 @@ static int agent_setup(void)
         ac.camera_ip_be[i] = cfg_ip_be(CAM_IP_KEY[i]);
     if (iv_config_get_int(g_cfg, "camera.detect.mode", &v) == IV_OK && v > 0)
         ac.camera_detect_mode = (uint32_t)v;
-    if (iv_config_get_int(g_cfg, "camera.detect.rtt_ms", &v) == IV_OK && v > 0)
+    /* 摄像机延时门限＝探活延时门限＝「有线网络超时时间(ms)」（2026-10-29 用户口径：
+     * 全工程只有一个延时门限）。`camera.detect.rtt_ms` 不再是来源。 */
+    if (iv_config_get_int(g_cfg, "probe.timeout_ms", &v) == IV_OK && v > 0)
         ac.camera_detect_rtt_ms = (uint32_t)v;
 
     /* 自愈（S4.4）：netthr.reboot_max（**0 = 禁用自愈**，对齐现网 net_reload=0）

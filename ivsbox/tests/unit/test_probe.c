@@ -15,7 +15,9 @@
  *   c08 ICMP 回包按 (id,seq) 匹配 —— 不匹配会把别人的回包算成自己的成功；
  *   c09 TCP 立即失败要计失败 —— 吞掉则拒绝服务永远不算失败；
  *   c10 超时以调用方 now 为准 —— 若自己取时，单测无法断言时间轴；
- *   c12 ICMP 报文校验和字节序 —— 漏 htons 则真内核丢包、回包全丢（联调实证）。
+ *   c12 ICMP 报文校验和字节序 —— 漏 htons 则真内核丢包、回包全丢（联调实证）；
+ *   c16 ICMP 报文带 `IP_PKTINFO.ipi_ifindex` —— 不带则所有 WAN 都按默认路由探，
+ *       2026-10-29 现场"4G 通、两条一起判 DOWN"就是这么来的。
  *
  * 临时产物：无（全部内存内构造）。AGENTS.md 规则 6。
  */
@@ -66,6 +68,14 @@ static size_t   g_sent_len     = 0;
 /* 所有发出过的 ICMP echo 序号（c14 用：验证多项目序号不撞号） */
 static uint16_t g_seqs[8];
 static int      g_seq_n        = 0;
+
+/* 出口绑定（c16）：setsockopt 放不放行 IP_PKTINFO、sendmsg 实际带的出口 ifindex */
+static int      g_pktinfo_ok   = 1;   /* 0 = setsockopt 拒（模拟老/裁剪内核） */
+static int      g_setsockopt_n = 0;   /* start 里开 IP_PKTINFO 的次数 */
+static int      g_sendmsg_n    = 0;   /* 走 sendmsg（＝绑出口）的报文数 */
+static int      g_sendmsg_einval = 0; /* 1 = sendmsg 报 EINVAL（模拟内核不认 control） */
+static int      g_bind_ifindex[8];
+static int      g_bind_n       = 0;   /* g_bind_ifindex 已填个数 */
 
 static int mk_socket(int d, int t, int p)
 {
@@ -158,8 +168,59 @@ static uint64_t mk_now(void)
     return g_now;
 }
 
+/* IP_PKTINFO 开关（c16）：非 IP_PKTINFO 的 setsockopt 一律成功，不影响其它用例 */
+static int mk_setsockopt(int fd, int level, int optname, const void *val, socklen_t len)
+{
+    (void)fd;
+    (void)val;
+    (void)len;
+    if (level != IPPROTO_IP || optname != IP_PKTINFO)
+        return 0;
+    g_setsockopt_n++;
+    if (!g_pktinfo_ok) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+/* 带控制消息发包（c16）：抓 ancillary 里那个 `ipi_ifindex`，它就是"这块 WAN"的证据 */
+static ssize_t mk_sendmsg(int fd, const struct msghdr *msg, int flags)
+{
+    (void)fd;
+    (void)flags;
+    g_sendmsg_n++;
+    if (g_sendmsg_einval) {
+        errno = EINVAL;
+        return -1;
+    }
+    {
+        const struct cmsghdr *cm = CMSG_FIRSTHDR(msg);
+
+        if (cm != NULL && cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_PKTINFO &&
+            cm->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+            const struct in_pktinfo *pi =
+                (const struct in_pktinfo *)(const void *)CMSG_DATA(cm);
+
+            if (g_bind_n < (int)(sizeof(g_bind_ifindex) / sizeof(g_bind_ifindex[0])))
+                g_bind_ifindex[g_bind_n++] = pi->ipi_ifindex;
+        }
+    }
+    if (msg->msg_iov != NULL && msg->msg_iovlen > 0)
+        return (ssize_t)msg->msg_iov[0].iov_len;
+    return 0;
+}
+
 static const iv_probe_iops_t g_mock = {
-    mk_socket, mk_connect, mk_sendto, mk_recv, mk_getsockopt, mk_close, mk_now
+    .socket     = mk_socket,
+    .connect    = mk_connect,
+    .sendto     = mk_sendto,
+    .recv       = mk_recv,
+    .getsockopt = mk_getsockopt,
+    .close      = mk_close,
+    .now_ms     = mk_now,
+    .sendmsg    = mk_sendmsg,
+    .setsockopt = mk_setsockopt
 };
 
 static iv_probe_cfg_t mk_cfg(void)
@@ -185,6 +246,11 @@ static void mock_reset(void)
     g_pend_len      = 0;
     g_sent_len      = 0;
     g_seq_n         = 0;
+    g_pktinfo_ok    = 1;
+    g_setsockopt_n  = 0;
+    g_sendmsg_n     = 0;
+    g_sendmsg_einval = 0;
+    g_bind_n        = 0;
 }
 
 /* 构造 ICMP echo reply 字节流（IP 头 + ICMP 头），返回总长 */
@@ -803,6 +869,74 @@ static void c15_dual_wan_shared_dst(void)
     (void)iv_probe_stop(&p);
 }
 
+/* ICMP 探测报文必须按项的 `ifindex` 指定出口网卡（2026-10-29）。
+ *
+ * 反向证伪点（每一条都对应一次真实误判）：
+ *   1) 报文不带 `IP_PKTINFO.ipi_ifindex` ⇒ 两条 WAN 的探测全按**系统默认路由**
+ *      出去，判出来的不是"这条链路通不通"。现场原样复现：4G `ping -I usb0` 3/3
+ *      通，两块 WAN 却一起判 DOWN ⇒ netmgr 进 BOTH_DOWN ⇒ 按设计"双断只告警不
+ *      动作" ⇒ 卡在没网的出口上，平台断联 4 小时；
+ *   2) 两个项带的是同一个 ifindex（或者干脆写死 0）⇒ 等于没绑，同 1)；
+ *   3) `IP_PKTINFO` 开不出来时要退回 `sendto()`，**不能**把开不出来算成探测失败
+ *      —— 那会让"绑不上"直接变成"所有 WAN 都断"；
+ *   4) `sendmsg` 报 EINVAL 时要当拍退回 `sendto()` 重发，且**不记失败** —— 同上，
+ *      绑定失败不是目标不可达。 */
+static void c16_icmp_egress_bind(void)
+{
+    iv_probe_t      p;
+    iv_probe_cfg_t  c = mk_cfg();
+    iv_probe_stat_t st;
+
+    /* (1) 正常路径：两个项各带各的出口 */
+    mock_reset();
+    (void)iv_probe_init(&p, &c);
+    chk(iv_probe_add_icmp(&p, DST, 8, "usb0") == 0, "c16 usb0 idx0");
+    chk(iv_probe_add_icmp(&p, DST, 4, "eth0") == 1, "c16 eth0 idx1");
+    chk(iv_probe_start(&p, g_now) == IV_OK, "c16 start");
+    chk(g_setsockopt_n == 1, "c16 有绑定项时 start 开一次 IP_PKTINFO");
+    (void)iv_probe_tick(&p, g_now);
+    chk(g_sendmsg_n == 2, "c16 两个绑定接口的项都走 sendmsg");
+    chk(g_bind_n == 2 && g_bind_ifindex[0] == 8 && g_bind_ifindex[1] == 4,
+        "c16 每个探测报文带自己的出口 ifindex（否则两条 WAN 都走默认路由）");
+    (void)iv_probe_stop(&p);
+
+    /* (2) 没有绑定接口的项：走 sendto，且不该白开 IP_PKTINFO */
+    mock_reset();
+    (void)iv_probe_init(&p, &c);
+    (void)iv_probe_add_icmp(&p, DST, 0, "any");
+    (void)iv_probe_start(&p, g_now);
+    chk(g_setsockopt_n == 0, "c16 无绑定项时不开 IP_PKTINFO");
+    (void)iv_probe_tick(&p, g_now);
+    chk(g_sendmsg_n == 0 && g_sent_len > 0, "c16 未绑接口的项仍走 sendto");
+    (void)iv_probe_stop(&p);
+
+    /* (3) IP_PKTINFO 开不出来：退回 sendto，不判死 */
+    mock_reset();
+    g_pktinfo_ok = 0;
+    (void)iv_probe_init(&p, &c);
+    (void)iv_probe_add_icmp(&p, DST, 8, "usb0");
+    (void)iv_probe_start(&p, g_now);
+    chk(p.icmp_bind_ok == 0, "c16 setsockopt 被拒 -> 绑定关闭");
+    (void)iv_probe_tick(&p, g_now);
+    chk(g_sendmsg_n == 0 && g_sent_len > 0, "c16 绑定关闭后走 sendto");
+    (void)iv_probe_stat_get(&p, 0, &st);
+    chk(st.lost == 0, "c16 绑定失败不算目标不可达");
+    (void)iv_probe_stop(&p);
+
+    /* (4) sendmsg 报 EINVAL：当拍退回 sendto 重发，同样不判死 */
+    mock_reset();
+    g_sendmsg_einval = 1;
+    (void)iv_probe_init(&p, &c);
+    (void)iv_probe_add_icmp(&p, DST, 8, "usb0");
+    (void)iv_probe_start(&p, g_now);
+    (void)iv_probe_tick(&p, g_now);
+    chk(p.icmp_bind_ok == 0, "c16 sendmsg EINVAL -> 绑定关闭");
+    chk(g_sent_len > 0, "c16 EINVAL 当拍退回 sendto 重发");
+    (void)iv_probe_stat_get(&p, 0, &st);
+    chk(st.lost == 0, "c16 EINVAL 不算目标不可达");
+    (void)iv_probe_stop(&p);
+}
+
 int main(void)
 {
     c01_args_and_guards();
@@ -820,13 +954,14 @@ int main(void)
     c13_retune();
     c14_icmp_seq_engine_unique();
     c15_dual_wan_shared_dst();
+    c16_icmp_egress_bind();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_probe FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_probe passed (args, stat window, hysteresis, degrade, link event, "
-           "icmp disable/reply/packet-bytes/seq-unique, tcp result, timeout, lifecycle, "
-           "retune, dual-wan-shared-dst)\n");
+           "icmp disable/reply/packet-bytes/seq-unique/egress-bind, tcp result, timeout, "
+           "lifecycle, retune, dual-wan-shared-dst)\n");
     return 0;
 }

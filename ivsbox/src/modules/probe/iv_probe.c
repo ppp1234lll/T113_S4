@@ -33,8 +33,11 @@
 #include <unistd.h>
 
 #include "ivsbox/iv_clock.h"
+#include "ivsbox/iv_log.h"
 #include "ivsbox/iv_probe.h"
 #include "ivsbox/iv_ret.h"
+
+#define PRB_MOD "probe"
 
 /* ---------------------------------------------------------------------------
  * 默认注入点（生产路径）
@@ -66,6 +69,17 @@ static int real_getsockopt(int fd, int level, int optname, void *optval,
     return getsockopt(fd, level, optname, optval, optlen);
 }
 
+static int real_setsockopt(int fd, int level, int optname, const void *optval,
+                           socklen_t optlen)
+{
+    return setsockopt(fd, level, optname, optval, optlen);
+}
+
+static ssize_t real_sendmsg(int fd, const struct msghdr *msg, int flags)
+{
+    return sendmsg(fd, msg, flags);
+}
+
 static int real_close(int fd)
 {
     return close(fd);
@@ -77,8 +91,15 @@ static uint64_t real_now_ms(void)
 }
 
 static const iv_probe_iops_t g_default_iops = {
-    real_socket, real_connect, real_sendto, real_recv,
-    real_getsockopt, real_close, real_now_ms
+    .socket     = real_socket,
+    .connect    = real_connect,
+    .sendto     = real_sendto,
+    .recv       = real_recv,
+    .getsockopt = real_getsockopt,
+    .close      = real_close,
+    .now_ms     = real_now_ms,
+    .sendmsg    = real_sendmsg,
+    .setsockopt = real_setsockopt
 };
 
 const iv_probe_iops_t *iv_probe_default_iops(void)
@@ -119,6 +140,9 @@ static void copy_name(char *dst, const char *src)
     }
     dst[n] = '\0';
 }
+
+/* 定义在下面的 ICMP 段；`iv_probe_start()` 要用，故先声明在前。 */
+static void icmp_bind_enable(iv_probe_t *p);
 
 static int link_is_down(const iv_probe_t *p, int ifindex)
 {
@@ -343,6 +367,7 @@ void iv_probe_reset(iv_probe_t *p)
     p->n_items        = 0;
     p->started        = 0;
     p->icmp_disabled  = 0;
+    p->icmp_bind_ok   = 0;
     if (p->icmp_fd >= 0 && p->cfg.iops != NULL)
         (void)p->cfg.iops->close(p->icmp_fd);
     p->icmp_fd = -1;
@@ -485,6 +510,7 @@ int iv_probe_start(iv_probe_t *p, uint64_t now_ms)
         else
             p->icmp_fd = fd;
     }
+    icmp_bind_enable(p); /* 按 ifindex 指定出口；失败只留 WARN，不阻断 start */
 
     /* 首轮立即探测（next_due = now），随后按 interval 周期 */
     for (i = 0; i < p->n_items; i++) {
@@ -512,6 +538,7 @@ int iv_probe_stop(iv_probe_t *p)
         (void)p->cfg.iops->close(p->icmp_fd);
         p->icmp_fd = -1;
     }
+    p->icmp_bind_ok = 0; /* socket 换了，旧绑定随之作废；下次 start 重开 */
     for (i = 0; i < p->n_items; i++) {
         iv_probe_item_t *it = &p->item[i];
 
@@ -604,6 +631,92 @@ static iv_probe_item_t *icmp_find_by_seq(iv_probe_t *p, uint16_t seq)
     return NULL;
 }
 
+/* 打开"按 ifindex 指定出口"的能力（`IP_PKTINFO`）。见 iv_probe.h `icmp_bind_ok`。
+ *
+ * 为什么是 IP_PKTINFO 而不是 SO_BINDTODEVICE：本引擎**一条 raw socket 服务全部
+ * ICMP 项**（见文件头第 2 条），而 `SO_BINDTODEVICE` 是 **fd 级**属性 —— 用它就得
+ * 每块网卡开一条 socket，并把 N 个 fd 一起交给调用方的事件循环
+ * （`iv_probe_fd_count/fd_at` 的语义、装配层的 fd 注册全都要跟着改）。
+ * `IP_PKTINFO.ipi_ifindex` 是**逐包**的，一条 socket 足够。
+ *
+ * 失败（老内核 / 被裁 / 无权限）**不报错**，只留 `icmp_bind_ok=0` 退回老路径 ——
+ * 但那样结账口径就回到"所有 WAN 都按系统默认路由探"，正是 2026-10-29 现场
+ * "4G 能到平台、有线断网，两条却一起判 DOWN" 的病根，所以这里必须留一条 WARN，
+ * 不能再静默降级。 */
+static void icmp_bind_enable(iv_probe_t *p)
+{
+    int need = 0;
+    int on   = 1;
+    int i;
+
+    p->icmp_bind_ok = 0;
+    for (i = 0; i < p->n_items; i++) {
+        if (p->item[i].layer == IV_PROBE_ICMP && p->item[i].ifindex > 0)
+            need = 1;
+    }
+    if (!need || p->icmp_fd < 0)
+        return; /* 没有绑定接口的 ICMP 项：绑不绑结论一样，不必出声 */
+
+    if (p->cfg.iops->sendmsg == NULL || p->cfg.iops->setsockopt == NULL) {
+        IV_LOG_W(PRB_MOD, "no sendmsg/setsockopt hook: ICMP not bound to egress iface, "
+                          "all WANs share the default route (verdicts may be wrong)");
+        return;
+    }
+    if (p->cfg.iops->setsockopt(p->icmp_fd, IPPROTO_IP, IP_PKTINFO,
+                                &on, (socklen_t)sizeof(on)) != 0) {
+        IV_LOG_W(PRB_MOD, "IP_PKTINFO unavailable (errno=%d): ICMP not bound to egress "
+                          "iface, all WANs share the default route (verdicts may be wrong)",
+                 errno);
+        return;
+    }
+    p->icmp_bind_ok = 1;
+    IV_LOG_I(PRB_MOD, "icmp egress binding on (IP_PKTINFO), per-item ifindex honored");
+}
+
+/* 发一次 ICMP echo：能绑出口就按项的 `ifindex` 绑（`icmp_bind_ok` 且该项绑了接口），
+ * 否则退回 `sendto()`（行为与 2026-10-29 之前完全一致）。
+ * 返回 sendmsg/sendto 的结果，errno 由调用方处理。 */
+static ssize_t icmp_send(iv_probe_t *p, const iv_probe_item_t *it,
+                         void *buf, size_t len, const struct sockaddr_in *sa)
+{
+    union {
+        struct cmsghdr    cm;
+        char              pad[CMSG_SPACE(sizeof(struct in_pktinfo))];
+    } ctl;
+    struct msghdr      msg;
+    struct iovec       iov;
+    struct cmsghdr    *cm;
+    struct in_pktinfo *pi;
+
+    if (!p->icmp_bind_ok || it->ifindex <= 0)
+        return p->cfg.iops->sendto(p->icmp_fd, buf, len, 0,
+                                   (const struct sockaddr *)sa, (socklen_t)sizeof(*sa));
+
+    (void)memset(&ctl, 0, sizeof(ctl));
+    (void)memset(&msg, 0, sizeof(msg));
+    iov.iov_base        = buf;
+    iov.iov_len         = len;
+    msg.msg_name        = (void *)sa;
+    msg.msg_namelen     = (socklen_t)sizeof(*sa);
+    msg.msg_iov         = &iov;
+    msg.msg_iovlen      = 1;
+    msg.msg_control     = ctl.pad;
+    msg.msg_controllen  = sizeof(ctl.pad);
+
+    cm                  = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level      = IPPROTO_IP;
+    cm->cmsg_type       = IP_PKTINFO;
+    cm->cmsg_len        = CMSG_LEN(sizeof(struct in_pktinfo));
+    pi                  = (struct in_pktinfo *)(void *)CMSG_DATA(cm);
+    (void)memset(pi, 0, sizeof(*pi));
+    /* 只给 ifindex：源地址交给内核按这块网卡的地址取（`ipi_spec_dst` 留 0）。
+     * 出口一旦定死，路由查表就只看这块网卡上有没有到目标的路由 —— 这正是
+     * "这条 WAN 能不能到目标"该问的问题，而不是"系统默认路由能不能到"。 */
+    pi->ipi_ifindex     = it->ifindex;
+
+    return p->cfg.iops->sendmsg(p->icmp_fd, &msg, 0);
+}
+
 static void start_icmp(iv_probe_t *p, iv_probe_item_t *it, uint64_t now)
 {
     icmp_pkt_t          pkt;
@@ -636,8 +749,16 @@ static void start_icmp(iv_probe_t *p, iv_probe_item_t *it, uint64_t now)
     sa.sin_family      = AF_INET;
     sa.sin_addr.s_addr = it->dst_be;
 
-    n = p->cfg.iops->sendto(p->icmp_fd, &pkt, sizeof(pkt), 0,
-                            (struct sockaddr *)&sa, sizeof(sa));
+    n = icmp_send(p, it, &pkt, sizeof(pkt), &sa);
+    if (n < 0 && errno == EINVAL && p->icmp_bind_ok) {
+        /* 内核不认 IP_PKTINFO 的 control 消息（极老 / 裁剪过的内核）：关掉绑定，
+         * 本拍退回 sendto —— 不能把这个错误算成"目标不可达"，否则一开绑定就
+         * 全 WAN 判 DOWN，比绑不上还糟。 */
+        p->icmp_bind_ok = 0;
+        IV_LOG_W(PRB_MOD, "IP_PKTINFO rejected on send (EINVAL): binding off, "
+                          "ICMP falls back to the default route");
+        n = icmp_send(p, it, &pkt, sizeof(pkt), &sa);
+    }
     if (n < 0) {
         if (errno == EPERM || errno == EACCES) {
             p->icmp_disabled = 1; /* 运行时才发现被拒：同样降级 */

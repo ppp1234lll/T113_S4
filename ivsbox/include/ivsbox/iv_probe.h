@@ -11,6 +11,9 @@
  *           up/down（`iv_probe_set_link()`）。链路一断，绑定该接口的目标**立即**
  *           判 DOWN（不等计数）——拔网线要秒级可见。
  *   - ICMP  网络层：raw socket ICMP echo（需 `CAP_NET_RAW`），RTT 用回包时间算。
+ *           **探测报文按项的 `ifindex` 指定出口网卡**（`IP_PKTINFO.ipi_ifindex`）。
+ *           不这么做的话，两条 WAN 的探测都会走系统默认路由，判出来的根本不是
+ *           各自的通断 —— 见 `struct iv_probe` 里 `icmp_bind_ok` 的说明。
  *   - TCP   传输层：非阻塞 connect 到 `addr:port`，**connect 完成即断开**（不做
  *           任何应用层交互，只验证"路通、端口开"）。
  *   - APP   应用层：**引擎不探测**，由上层（RTSP OPTIONS / SNMP GET / 心跳）
@@ -160,6 +163,15 @@ typedef struct {
                            socklen_t *optlen);
     int      (*close)(int fd);
     uint64_t (*now_ms)(void); /* 默认 iv_clock_monotonic_ms() */
+
+    /* 「按出口网卡发 ICMP」这一能力的两个可选钩子（2026-10-29 加）。
+     * **任一为 NULL 就退回 `sendto()`（不绑出口）**，行为与加这两个钩子之前完全
+     * 一致 —— 单测里显式给 NULL 即可保持老路径。生产默认注入点两个都提供，见
+     * `iv_probe_default_iops()`。为什么用 sendmsg+IP_PKTINFO 而不是
+     * SO_BINDTODEVICE，见 `iv_probe.c` 的 `icmp_bind_enable()`。 */
+    ssize_t  (*sendmsg)(int fd, const struct msghdr *msg, int flags);
+    int      (*setsockopt)(int fd, int level, int optname, const void *optval,
+                           socklen_t optlen);
 } iv_probe_iops_t;
 
 /* 默认注入点：真 libc socket / getsockopt / close + iv_clock 时钟。永不返回 NULL。 */
@@ -228,6 +240,18 @@ struct iv_probe {
     int             started;
     int             icmp_fd;       /* 引擎级共享 ICMP socket，-1 = 无 */
     int             icmp_disabled; /* 1 = raw ICMP 不可用（降级，见文件头） */
+    /* 1 = ICMP 已按项的 `ifindex` 指定出口网卡（`IP_PKTINFO` 开成功）。
+     *
+     * 为什么需要（2026-10-29 现场事故）：**ICMP 是一条第 3 层 socket，`sendto()`
+     * 不带 `ipi_ifindex` 时由内核按"系统默认路由"选出口**，与项上那个 `ifindex`
+     * 一点关系都没有 —— `ifindex` 原先只用来判"这块网卡 carrier 掉了没有"。
+     * 现场于是出现：4G 明明能到平台（`ping -I usb0` 3/3），但两块 WAN 的探测报文
+     * 全从 eth0 出去、全打不通 ⇒ 两条一起判 DOWN ⇒ netmgr 进 BOTH_DOWN ⇒ 按设计
+     * "双断只告警不动作" ⇒ 卡在没网的出口上，平台断联 4 小时。
+     *
+     * 这个标志为 0 时退回"共用一个出口"的老行为，`iv_probe_start()` 会打一条
+     * WARN —— 别再让它静默降级，上面那次事故就是这么被掩盖的。 */
+    int             icmp_bind_ok;
     /* ICMP echo 序号**引擎级**单调递增（2026-10-22 起）。
      * 病根：序号原先挂在项上、每项各自从 0 起，于是同一引擎的两个 ICMP 项
      * 发出的回显请求**序号一模一样**，而回包只按 `seq + inflight` 认领

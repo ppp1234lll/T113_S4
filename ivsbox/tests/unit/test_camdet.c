@@ -121,8 +121,18 @@ static uint64_t pb_now(void)
     return 0;
 }
 
+/* camdet 的 ICMP 项都不绑接口（ifindex=0，摄像机在局域网内、按默认路由走），
+ * 所以「带出口发包」这两个钩子保持 NULL —— 引擎会照旧走 sendto()。 */
 static const iv_probe_iops_t g_mock_pb = {
-    pb_socket, pb_connect, pb_sendto, pb_recv, pb_getsockopt, pb_close, pb_now
+    .socket     = pb_socket,
+    .connect    = pb_connect,
+    .sendto     = pb_sendto,
+    .recv       = pb_recv,
+    .getsockopt = pb_getsockopt,
+    .close      = pb_close,
+    .now_ms     = pb_now,
+    .sendmsg    = NULL,
+    .setsockopt = NULL
 };
 
 /* 构造 ICMP echo reply 字节流（IP 头 + ICMP 头），返回总长（同 test_probe.c） */

@@ -460,8 +460,27 @@ int iv_onvif_parse(const char *buf, size_t len, iv_dev_desc_t *out) {
     memset(out, 0, sizeof(*out));
     out->port = 80;
 
-    /* 品牌判定 */
-    if (strstr(tmp, "DHIP") != NULL || strstr(tmp, "\"mac\"") != NULL) {
+    /* 品牌判定。
+     *
+     * **厂商自报的名字优先**（2026-10-29 板端实证）：现场 5 台档案里 4 台被判成
+     * 泛 ONVIF，可其中两台的应答里明写着 `"DeviceType":"Dahua"`，另一台海康的
+     * ProbeMatch Scopes 里带着 `hardware/DS-2CD3T27EDWD-L`。原判定把 `"mac"` /
+     * `hardware` 这类**通用字段**放在厂商名前面，于是只认得出"这是台 ONVIF 设备"、
+     * 认不出"是谁家的" ⇒ 网页品牌下拉里没有 onvif 这一项，自动匹配永远落空，
+     * 用户看到的就是"搜到了、型号也解析出来了，品牌却还是默认海康"。
+     *
+     * 判定顺序改成：厂商自报名字 → 私有字段 → 泛 ONVIF 兜底。
+     * 三条厂商线索都来自设备自己发的文本，不靠型号前缀猜（`DS-2` 是海康
+     * DS-2CD/DS-2DE 系列的固定前缀，大华是 `IPC-`/`DH-`、宇视是 `IPC2xx`，不冲突）。
+     */
+    if (strstr(tmp, "Dahua") != NULL || strstr(tmp, "DAHUA") != NULL) {
+        out->brand = IV_DEV_BRAND_DAHUA;
+    } else if (strstr(tmp, "HIKVISION") != NULL ||
+               strstr(tmp, "Hikvision") != NULL || strstr(tmp, "DS-2") != NULL) {
+        out->brand = IV_DEV_BRAND_HIKVISION;
+    } else if (strstr(tmp, "Uniview") != NULL || strstr(tmp, "uniview") != NULL) {
+        out->brand = IV_DEV_BRAND_UNV;
+    } else if (strstr(tmp, "DHIP") != NULL || strstr(tmp, "\"mac\"") != NULL) {
         out->brand = IV_DEV_BRAND_DAHUA;
     } else if (strstr(tmp, "/macaddr/") != NULL) {
         out->brand = IV_DEV_BRAND_UNV;
@@ -692,7 +711,18 @@ static int add_item(iv_device_t *d, const iv_dev_desc_t *desc) {
             if (desc->serial[0] != '\0')
                 strncpy(d->item[i].serial, desc->serial,
                         sizeof(d->item[i].serial) - 1);
-            if (desc->brand != IV_DEV_BRAND_UNKNOWN)
+            /* 品牌**不能被"更弱的结论"覆盖**（2026-10-29 板端）：
+             * 同一台设备会被多个相位各答一次 —— 私有协议/SADP 那一次能认出
+             * "海康/大华/宇视"，ONVIF Probe 那一次只认得出"这是台 ONVIF 设备"。
+             * 原来谁的包后到谁说了算，于是两台海康（型号 `DS-2CD3T27EDWD-L`、
+             * `DS-2DC4425DW-D`）的档案被迟到的 ONVIF 应答改写成泛品牌，
+             * 网页品牌下拉里又没有 onvif 这一项 ⇒ 自动匹配永远落空。
+             * 规则：新结论是泛 ONVIF 而旧结论已是具体厂商 ⇒ 保持旧的；
+             * 其余情况照旧覆盖（含"泛 ONVIF → 具体厂商"的升格）。 */
+            if (desc->brand != IV_DEV_BRAND_UNKNOWN &&
+                !(desc->brand == IV_DEV_BRAND_ONVIF &&
+                  d->item[i].brand != IV_DEV_BRAND_UNKNOWN &&
+                  d->item[i].brand != IV_DEV_BRAND_ONVIF))
                 d->item[i].brand = desc->brand;
             d->dup++;
             return 0;

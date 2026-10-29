@@ -312,6 +312,39 @@ static void d07_onvif_parse(void) {
     chk(strcmp(out.model, "IPCamera") == 0, "d07 onvif model from scopes");
     chk(out.ip_be == inet_addr("192.168.9.9"), "d07 onvif ip");
 
+    /* 板端实测（2026-10-29）：设备自报的厂商名要优先于 `hardware`/`onvif.org`
+     * 这些**通用字段**，否则"搜到了、型号也解析出来了，品牌还是泛 ONVIF"，
+     * 网页下拉里没有 onvif 这一项 ⇒ 自动匹配永远落空。
+     * 三段都不含 `"mac"` / `/macaddr/` / `<MAC>`，即老规则必然判 onvif。 */
+    {
+        /* 大华：名在 Scopes 与 DeviceType 里（现场 `.108` 的原始形态） */
+        const char *dh =
+            "<ProbeMatch><d:Scopes>onvif://www.onvif.org/name/Dahua</d:Scopes>"
+            "<d:DeviceType>Dahua</d:DeviceType>"
+            "<d:XAddrs>http://192.168.1.108/onvif/device_service</d:XAddrs>"
+            "</ProbeMatch>";
+        chk(iv_onvif_parse(dh, strlen(dh), &out) == IV_OK, "d07 dahua-named ok");
+        chk(out.brand == IV_DEV_BRAND_DAHUA, "d07 dahua-named brand");
+        chk(out.ip_be == inet_addr("192.168.1.108"), "d07 dahua-named ip");
+
+        /* 海康：只有 Scopes 里的 hardware/DS-2CD…（现场 `.78` 的原始形态），
+         * 老规则会先在 `hardware` 上判成 onvif */
+        const char *hiksc =
+            "<d:Scopes>onvif://www.onvif.org/hardware/DS-2CD3T27EDWD-L"
+            " onvif://www.onvif.org/name/HIKVISION</d:Scopes>"
+            "<d:XAddrs>http://192.168.1.78/onvif/device_service</d:XAddrs>";
+        chk(iv_onvif_parse(hiksc, strlen(hiksc), &out) == IV_OK, "d07 hik-scopes ok");
+        chk(out.brand == IV_DEV_BRAND_HIKVISION, "d07 hik-scopes brand");
+
+        /* 宇视：自报 Uniview（老固件才带 /macaddr/，新固件只有这个） */
+        const char *unvname =
+            "<d:Scopes>onvif://www.onvif.org/name/Uniview</d:Scopes>"
+            "<d:XAddrs>http://192.168.1.90/onvif/device_service</d:XAddrs>";
+        chk(iv_onvif_parse(unvname, strlen(unvname), &out) == IV_OK,
+            "d07 uniview-named ok");
+        chk(out.brand == IV_DEV_BRAND_UNV, "d07 uniview-named brand");
+    }
+
     /* 无关文本应拒绝 */
     chk(iv_onvif_parse("hello world", 11, &out) != IV_OK, "d07 reject junk");
 }
@@ -423,6 +456,70 @@ static void d10_dedup(void) {
     iv_device_get(&d, 0, &e);
     chk(e.ip_be == inet_addr("192.168.1.201"), "d10 ip updated");
     chk(strcmp(e.model, "NEW") == 0, "d10 model updated");
+    iv_device_close(&d);
+}
+
+/* ---------------------------------------------------------------------------
+ * d15：品牌不能被"更弱的结论"覆盖（2026-10-29 板端实测）
+ *
+ * 现场形态：两台海康（型号 `DS-2CD3T27EDWD-L`、`DS-2DC4425DW-D`）的档案最后
+ * 显示 `brand=onvif` —— 私有协议/SADP 那一次已经认出"海康"，迟到的 ONVIF 泛应答
+ * 又把品牌改写回 onvif。网页品牌下拉里没有 onvif 选项 ⇒ 自动匹配永远落空。
+ * ------------------------------------------------------------------------- */
+static void d15_brand_no_downgrade(void) {
+    iv_device_t d;
+    iv_device_cfg_t cfg;
+    iv_dev_desc_t e;
+
+    io_reset();
+    iv_device_cfg_default(&cfg);
+    cfg.iops = &g_io;
+    cfg.ifname = NULL;
+    cfg.rounds = 1;
+    iv_device_init(&d, &cfg);
+    iv_device_open(&d, &cfg, 0);
+    iv_device_start_search(&d, 0);
+
+    /* ① 先认出具体厂商（海康二层/私有应答，无 `"mac"` 键但带型号）。
+     * 必须带 XAddrs：否则 `desc.ip_be` 走发送方地址兜底，与 ② 那包的 IP
+     * 对不上，档案按 IP/MAC 都判不成同一台 ⇒ 会多出一条（本用例踩过）。 */
+    const char *hik = "<MAC>3a:82:b4:1d:3c:bf</MAC>"
+                      "<XAddrs>http://192.168.1.200/onvif/device_service</XAddrs>"
+                      "<DeviceType>DS-2CD3T27EDWD-L</DeviceType>";
+    io_push(hik, strlen(hik));
+    iv_device_tick(&d, 0);
+    chk(iv_device_count(&d) == 1, "d15 archived");
+    chk(iv_device_get(&d, 0, &e) == IV_OK, "d15 get ok");
+    chk(e.brand == IV_DEV_BRAND_HIKVISION, "d15 brand hik first");
+
+    /* ② 同一台的 ONVIF 泛应答后到 ⇒ 不得把"海康"降级成 onvif */
+    const char *ov = "<d:Scopes>onvif://www.onvif.org/name/IPCamera</d:Scopes>"
+                     "<d:XAddrs>http://192.168.1.200/onvif/device_service</d:XAddrs>";
+    io_push(ov, strlen(ov));
+    iv_device_tick(&d, 100);
+    chk(iv_device_count(&d) == 1, "d15 still one entry after onvif reply");
+    iv_device_get(&d, 0, &e);
+    chk(e.brand == IV_DEV_BRAND_HIKVISION, "d15 hik not downgraded to onvif");
+
+    /* ③ 反过来必须升格：先 onvif、后认出大华 ⇒ 变大华 */
+    io_reset();
+    iv_device_init(&d, &cfg);
+    iv_device_open(&d, &cfg, 0);
+    iv_device_start_search(&d, 0);
+    const char *ov2 =
+        "<ProbeMatch><d:Scopes>onvif://www.onvif.org/name/IPCamera</d:Scopes>"
+        "<d:XAddrs>http://192.168.1.90/onvif/device_service</d:XAddrs></ProbeMatch>";
+    io_push(ov2, strlen(ov2));
+    iv_device_tick(&d, 0);
+    chk(iv_device_get(&d, 0, &e) == IV_OK, "d15 second search archived");
+    chk(e.brand == IV_DEV_BRAND_ONVIF, "d15 onvif first");
+    const char *dh =
+        "<ProbeMatch><d:Scopes>onvif://www.onvif.org/name/Dahua</d:Scopes>"
+        "<d:XAddrs>http://192.168.1.90/onvif/device_service</d:XAddrs></ProbeMatch>";
+    io_push(dh, strlen(dh));
+    iv_device_tick(&d, 100);
+    iv_device_get(&d, 0, &e);
+    chk(e.brand == IV_DEV_BRAND_DAHUA, "d15 onvif upgraded to dahua");
     iv_device_close(&d);
 }
 
@@ -599,6 +696,7 @@ int main(void) {
     d12_malformed();
     d13_peer_ip_fallback();
     d14_hik_udp_xml();
+    d15_brand_no_downgrade();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_device FAILED (%d)\n", g_fail);
@@ -606,6 +704,6 @@ int main(void) {
     }
     printf("test_device passed (sadp csum/build/parse, hik probe, dahua probe/parse, "
            "onvif probe/parse, discovery time-window fsm, archive dedup/full/clear, malformed, "
-           "peer-ip fallback, hik-udp xml model/ip)\n");
+           "peer-ip fallback, hik-udp xml model/ip, brand no-downgrade)\n");
     return 0;
 }

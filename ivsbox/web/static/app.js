@@ -1990,6 +1990,53 @@
     return [b.v, b.label];
   }));
 
+  /* 设备发现报的品牌 → 配置键 `camera.ch.N.vendor` 的取值（2026-10-29）。
+   *
+   * 这是两套**互不相同**的命名，别指望字符串直接对上：
+   *   `iv_device.c:iv_dev_brand_name()` ⇒ hikvision / dahua / unv / onvif / unknown
+   *   `camera.ch.N.vendor` 的取值域     ⇒ hik / dahua / uniview / huawei / jovision（空＝海康）
+   * 少了这层映射，`select.value = 'hikvision'` 在下拉里找不到对应项，浏览器会把
+   * select 留空 ⇒ 界面回落"（默认：海康）"—— 看起来就是"品牌识别出来了却没匹配"。
+   * `onvif`（泛 ONVIF）与 `unknown` **故意不映射**：前端没有这一项，硬填只会按
+   * 某个厂商的路径生成一条大概率拉不通的地址，交给用户手选更诚实。 */
+  var DEV_BRAND_VENDOR = { hikvision: 'hik', dahua: 'dahua', unv: 'uniview' };
+
+  /* 按 IP 去「设备档案」（发现结果）里找那一台。页面每路通道都要查一次，
+   * 缓存 5 s 免得 8 路打 8 次 `/api/devices`。返回 Promise<item|null>。 */
+  var devListCache = null, devListAt = 0, devListP = null;
+  function devicesByIp(ip) {
+    var p;
+    ip = String((ip === undefined || ip === null) ? '' : ip).replace(/^\s+|\s+$/g, '');
+    if (!ip) return Promise.resolve(null);
+    if (devListCache && (Date.now() - devListAt) < 5000) {
+      p = Promise.resolve(devListCache);
+    } else if (devListP) {
+      /* **飞行中的请求要复用**：8 路通道几乎同时建卡片，只靠"5 s 结果缓存"
+       * 挡不住 —— 第一个请求还没回来时，另外 7 路都会各发一次（首版就这么
+       * 被用例 v06a 抓到：3 路打了 3 次）。 */
+      p = devListP;
+    } else {
+      devListP = api('/api/devices').then(function (r) {
+        devListCache = (r && r.ok && r.d && r.d.items) ? r.d.items : [];
+        devListAt = Date.now();
+        devListP = null;
+        return devListCache;
+      }).catch(function () {
+        /* 拉不到就当"没发现过"：自动匹配是锦上添花，绝不能因为它让页面报错 */
+        devListCache = []; devListAt = Date.now(); devListP = null; return devListCache;
+      });
+      p = devListP;
+    }
+    return p.then(function (list) {
+      var i, it, want = ip;
+      for (i = 0; i < (list || []).length; i++) {
+        it = list[i];
+        if (it && String(it.ip || '').replace(/^\s+|\s+$/g, '') === want) return it;
+      }
+      return null;
+    });
+  }
+
   /* 拼 RTSP 地址。IP 为空 ⇒ 返回空串（不生成半截地址，免得被当成"已配好"）。
    * 没品牌／品牌不认识 ⇒ 海康（用户口径：没有品牌默认用海康）。
    * 用户名密码**原样拼**，不做百分号编码：多数 IPC 不认 `%XX`，反而认证失败；
@@ -2096,7 +2143,71 @@
        * 用户点「保存修改」才会写进配置；`dirty` 高亮就是"待保存"）。 */
       if (urlInp.value === '' && ipInp.value !== '') regen();
 
+      /* ------------------------------------------------------------------
+       * 品牌自动匹配（2026-10-29，用户现场提问："搜索到摄像机、也解析出品牌了，
+       * 配完 IP 为什么品牌不自动匹配？"）
+       *
+       * 只在两个时机查：① 进页面（配置里 vendor 为空但 IP 已填）；② IP 这一格
+       * 提交（失焦 / 回车）。**不用 input 事件** —— 敲一个字符打一次
+       * `/api/devices` 没有意义。
+       *
+       * 三条边界（少一条现场就会骂人）：
+       *   · 用户手选过品牌（userPicked）就不再覆盖 —— 否则"我明明选了华为"会被改回去；
+       *   · 发现结果只有泛 ONVIF / 未知 ⇒ **只提示、不改下拉**：填了也只能按某家
+       *     的路径拼地址，一半概率拉不通，不如让用户自己选；
+       *   · 手改过拉流地址（manual）时只换品牌、不重算地址，不覆盖现场手调的串。
+       * ------------------------------------------------------------------ */
+      var autoVendor = '';   /* 上一次由程序填进去的值 */
+      var userPicked = false;
+      var brandHint = el('p', 'hint', '');
+      brandHint.style.display = 'none';
+      sec.appendChild(brandHint);
+
+      function brandLabel(v) {
+        var k;
+        for (k = 0; k < CAM_BRAND.length; k++)
+          if (CAM_BRAND[k].v === v) return CAM_BRAND[k].label;
+        return v;
+      }
+
+      function brandSay(msg) {
+        if (!msg) { brandHint.textContent = ''; brandHint.style.display = 'none'; return; }
+        brandHint.textContent = msg;
+        brandHint.style.display = '';
+      }
+
+      function tryMatch() {
+        var ip = String(ipInp.value || '').replace(/^\s+|\s+$/g, '');
+        if (!ip || userPicked) return;
+        devicesByIp(ip).then(function (dev) {
+          if (!dev) { brandSay(''); return; }
+          var v = DEV_BRAND_VENDOR[String(dev.brand || '')];
+          if (!v) {
+            brandSay('设备档案里这台只识别到「' + (dev.brand || '未知') +
+                     '」（型号 ' + (dev.model || '—') + '），判断不出厂商，' +
+                     '请手动选品牌 —— 现在按海康拼地址可能是错的。');
+            return;
+          }
+          brandSay('已按设备档案自动选择品牌：' + brandLabel(v) + '（' + ip +
+                   '），点「保存修改」后写进配置。');
+          if (brandSel.value === v) return;
+          brandSel.value = v;
+          autoVendor = v;
+          /* `fieldSelect()` 只在 change 事件里刷 dirty：程序赋值不派发事件，
+           * 所以这里手动补一次，让"待保存"的高亮与手选时一致。 */
+          brandSel.className = (v === JSON.parse(brandSel.dataset.orig)) ? '' : 'dirty';
+          regen();
+        }).catch(function () { brandSay(''); });
+      }
+
+      brandSel.addEventListener('change', function () {
+        if (brandSel.value !== autoVendor) { userPicked = true; brandSay(''); }
+      });
+      ipInp.addEventListener('change', tryMatch);
+      if (String(get('vendor') || '') === '' && ipInp.value !== '') tryMatch();
+
       return sec;
+
     }
 
     function load() {

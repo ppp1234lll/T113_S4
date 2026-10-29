@@ -62,6 +62,7 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | 录像**运行期复检**（断流 10 s 内发现并重开，不再"UI 显示在录、其实没录"） | 已实现（`iv_recctl` 新增 `IV_RECCTL_RECHECK_MS`=10 s ＋ `recheck_ms` ＋ `recheck_channels()`，放在 `force` 判断之前；全掉线 ⇒ `recording` 归 0 ＋ 退避 10 s 且不重走 hold；部分掉线 ⇒ 立刻整批重开；`pending` 期间不参与、`ops->status` 为空静默跳过；`test_recctl` 新增 c13 六段；`make test`/`asan`/`tsan` 49 passed、`make itest` 16 passed＋1 SKIP、`analyze` 0 报告、`arm` 0 告警、jsdom 10 用例全绿；反向证伪 6 条 c13 FAIL；**板端实测通过**：媒体侧清会话后 10 s 内 `record ch0 lost while recording` → 重开 → `record confirm: 2 ch actually recording`） | 2026-10-28 18:53 | 启动确认只在开录后做一次；对端随后关掉拉流时没人再看 ⇒ 录像永久停、`record.page` 仍报每路 `on:true`（现场形态："摄像机重启过一次，之后再也不录，界面却说在录"）。详见本文件文末 2026-10-28 18:53 节。 |
 | 0xE1 **超时无应答 → 迟到应答**仍落地补报（现场 42 s 延迟的真因） | 已实现（`rep_apply_query()` 由 `on_link_done()` 与 `on_link_upstream()` 共用；超时且 `want_report` 挂着 → `rep_poll_soon()` 立刻再催；`test_e2e_report` 新增 c04f，c05 计数 9→10；`make test`/`asan`/`tsan` 49 passed、itest 16 passed＋1 SKIP、`platcmd_e2e.py` 全通过、`arm` 0 告警、`analyze` 0 报告；反向证伪 5 条 ＋ 1 条；**已换版上板（`b825a4a1`）待现场触发确认**） | 2026-10-28 18:29 | 17:45 那条换版后现场实测暴露：采集板 13 s 后才回 0xE1 ⇒ 事务已摘槽 ⇒ 整帧被丢 ＋ 超时后无人再催 ⇒ 事件后 42 s 才上平台。详见本文件文末 2026-10-28 18:29 节。 |
 | Web 界面「会话过期」不再伪装成设备故障（401 统一接管 ＋ 会话滑动续期） | 已实现（`app.js:api()` 遇 401 回登录卡片并写明原因；`iv_web_api.c:iv_web_sess_check()` 命中即续期；新增 `tests/web/ui_session_401.mjs` 11 条断言、反向证伪 3 条 FAIL；前端 11 个 jsdom 用例全绿、`make test` 49 passed、`itest` 16＋1 SKIP、`arm` 0 告警；**已上板**：`ivsbox-web` `c0ce9634…`＋`app.js` `d8633d71…`） | 2026-10-29 08:53 | 页面放过一夜后满屏"未获取到…/读取失败：unauthorized"，实际只是 8 h 会话过期。详见本文件文末 2026-10-29 08:53 节。 |
+| 摄像机**品牌自动匹配**（发现结果按 IP 回填 `camera.ch.N.vendor` ＋ 修复品牌认错） | 已实现（`iv_onvif_parse()` 厂商自报名字优先于 `hardware`/`MacAddress` 等通用字段；`add_item()` 合并档案时泛 ONVIF 不得覆盖已认出的具体厂商；`app.js` 新增 `DEV_BRAND_VENDOR` 映射 ＋ `devicesByIp()`（5 s 缓存＋飞行中复用）＋ 进页面/IP 提交时自动选品牌并重算地址；新增 `tests/web/ui_camera_vendor.mjs` 16 条、`test_device` 新增 d15 与 d07 三段；`make test`/`asan`/`tsan` 各 49 passed、`itest` 16＋1 SKIP、`analyze` 0、`arm` 0 告警、前端 13 用例全绿；反向证伪 3＋1 条 FAIL；**已上板**：发现结果由 4 台 `onvif` 变为 `hikvision`/`dahua`，`ivsboxd` `bfd17f60…`＋`app.js` `7a83e3a5…`） | 2026-10-29 15:22 | 用户问"搜到了、也解析出品牌了，配完 IP 为什么不自动匹配"。三层原因：页面没接线 / 前后端品牌命名两套 / 发现侧把厂商判成泛 ONVIF 且合并时被降级覆盖。详见本文件文末 2026-10-29 15:22 节。 |
 |===
 
 
@@ -9891,3 +9892,141 @@ lGrid.appendChild(kv('主网2（4G）',   MN_NAME[nt.mn[0]] || '—', mnCls(nt.m
 
 
 
+
+== 2026-10-29 15:22 摄像机品牌自动匹配：从"搜到了却不认识"到按 IP 回填
+
+=== 用户问的是什么
+
+搜索完摄像机、`/api/devices` 里也解析出型号与品牌了，可摄像机页配好 IP 之后，
+「第 N 路 品牌」下拉仍是「（默认：海康）」，拉流地址也按海康拼。用户截图里
+第 3 路是 `192.168.1.108`，地址 `rtsp://192.168.1.108:554/Streaming/Channels/101`
+—— 而这台其实是**大华**，正确路径应是 `/cam/realmonitor?channel=1&subtype=0`。
+地址不对，这一路录像是起不来的。
+
+=== 三层原因（板端 `device.list` 取证）
+
+第一层，**页面从来没接过这根线**：`/api/devices` 的发现结果只画在「设备档案」
+表格里（`pageDevices()`），`camera.ch.N.vendor` 下拉只从配置里读（`get('vendor')`），
+两者之间没有任何"按 IP 匹配"的代码。所以就算后端答对，界面也不会动。
+
+第二层，**前后端品牌是两套命名**：
+
+[cols="1,1"]
+|===
+| `iv_dev_brand_name()` 返回 | `camera.ch.N.vendor` 的取值
+| hikvision | hik
+| dahua | dahua
+| unv | uniview
+| onvif / unknown | （无对应项）
+|===
+
+`select.value = 'hikvision'` 在下拉里找不到这一项，浏览器会把 select 留空 ⇒
+界面回落"（默认：海康）"，看起来就是"没匹配"。
+
+第三层，**发现侧本身把厂商认错了**。换版前 `device.list` 的实际返回（节选）：
+
+[source,json]
+----
+{"brand":"onvif","ip":"192.168.1.108","model":"Dahua","found_by":"dahua-mcast"}
+{"brand":"onvif","ip":"192.168.1.106","model":"Dahua","found_by":"dahua-mcast"}
+{"brand":"onvif","ip":"192.168.1.78","model":"DS-2CD3T27EDWD-L","found_by":"dahua-5050"}
+{"brand":"onvif","ip":"192.168.1.200","model":"DS-2DC4425DW-D","found_by":"unv"}
+----
+
+6 台里 4 台是 `onvif`。可 `.108`/`.106` 的应答里明写着 `"DeviceType":"Dahua"`，
+`.78`/`.200` 的 Scopes 里带着 `hardware/DS-2CD3T27EDWD-L`（海康型号）——
+`iv_onvif_parse()` 的品牌判定却把 `"mac"` / `MacAddress` / `hardware` 这些
+**通用字段**排在厂商名前面，先撞上就判泛 ONVIF，再没机会看厂商名。
+
+更麻烦的是**合并**：同一台设备会被多个相位各答一次（SADP／私有协议一次认出厂商，
+ONVIF Probe 再一次只认得出"这是台 ONVIF 设备"），`add_item()` 原来是"谁后到谁说了算"，
+于是 SADP 已认出的"海康"被迟到的 ONVIF 应答改回 `onvif`。
+
+=== 做法
+
+`src/modules/device/iv_device.c`：
+
+* `iv_onvif_parse()` 品牌判定顺序改为 **厂商自报名字 → 私有字段 → 泛 ONVIF 兜底**：
+
+[source,c]
+----
+if (strstr(tmp, "Dahua") || strstr(tmp, "DAHUA"))                     → DAHUA
+else if (strstr(tmp, "HIKVISION") || strstr(tmp, "Hikvision")
+         || strstr(tmp, "DS-2"))                                      → HIKVISION
+else if (strstr(tmp, "Uniview") || strstr(tmp, "uniview"))            → UNV
+else if (strstr(tmp, "DHIP") || strstr(tmp, "\"mac\""))               → DAHUA
+else if (strstr(tmp, "/macaddr/"))                                    → UNV
+else if (strstr(tmp, "<MAC>"))                                        → HIKVISION
+else if (strstr(tmp, "MacAddress") || strstr(tmp, "/MAC/")
+         || strstr(tmp, "hardware") || strstr(tmp, "ProbeMatches")
+         || strstr(tmp, "onvif.org"))                                 → ONVIF
+----
+
+* `add_item()` 合并时加"不得降级"：
+
+[source,c]
+----
+/* 新结论是泛 ONVIF、旧结论已是具体厂商 ⇒ 保持旧的；其余照旧覆盖（含升格） */
+if (desc->brand != IV_DEV_BRAND_UNKNOWN &&
+    !(desc->brand == IV_DEV_BRAND_ONVIF &&
+      d->item[i].brand != IV_DEV_BRAND_UNKNOWN &&
+      d->item[i].brand != IV_DEV_BRAND_ONVIF))
+    d->item[i].brand = desc->brand;
+----
+
+三条厂商线索都取自设备自己发的文本，不靠型号前缀猜（`DS-2` 是海康 DS-2CD/DS-2DE
+系列的固定前缀，大华是 `IPC-`/`DH-`、宇视是 `IPC2xx`，不冲突）。
+
+`web/static/app.js`：
+
+* `DEV_BRAND_VENDOR` 把发现品牌翻成配置值域（`hikvision→hik`、`dahua→dahua`、
+  `unv→uniview`）；`onvif`/`unknown` **故意不映射** —— 硬填只能猜一家，
+  按猜出来的路径拼地址一半概率拉不通，不如只提示"判断不出厂商，请手动选"；
+* `devicesByIp(ip)` 查 `/api/devices` 并按 IP 精确匹配。两层缓存：
+  5 s 结果缓存 ＋ **飞行中请求复用**（8 路通道几乎同时建卡片，只靠结果缓存挡不住，
+  首版就被用例 v06a 抓到"3 路打了 3 次"）；
+* `channelSection()` 里两个时机触发：**进页面**（`vendor` 空但 IP 有值）与
+  **IP 提交**（change 事件，不用 input —— 敲一个字符打一次接口没有意义）；
+* 三条边界：用户手选过品牌（`userPicked`）不再覆盖；泛 ONVIF 只提示不改下拉；
+  手改过拉流地址（`manual`）时只换品牌、不重算地址。
+
+=== 验证
+
+VM 全量：`make test` / `make asan` / `setarch -R make tsan` 各 **49 passed**、
+`make itest` **16 passed ＋ 1 SKIP**、`make analyze` **0 warning**、
+`make arm` **0 告警**（`ivsboxd` `bfd17f605e6729330beb7b402548b867`）。
+前端 13 个 jsdom 用例全绿（新增 `ui_camera_vendor.mjs` 16 条，覆盖三条边界）。
+
+反向证伪两条：
+
+* 把厂商名三条线索改成永不命中 ⇒ `test_device` **3 条红**（d07 三段品牌断言）；
+* 去掉合并的降级保护 ⇒ **1 条红**（`d15 hik not downgraded to onvif`）。
+
+板端（192.168.1.120，换版后重新发现）：
+
+|===
+| IP | 换版前 | 换版后 | 型号
+
+| 192.168.1.200 | onvif | **hikvision** | DS-2DC4425DW-D
+| 192.168.1.78 | onvif | **hikvision** | DS-2CD3T27EDWD-L
+| 192.168.1.108 | onvif | **dahua** | Dahua
+| 192.168.1.106 | onvif | **dahua** | Dahua
+| 192.168.2.18 / .2.102 | hikvision | hikvision | DS-IPC-T12HV3-IA / HS-AFS-MAGE20
+|===
+
+换版前 6 台里 4 台泛品牌，换版后 **0 台**。
+
+接口侧再核一遍（`/api/devices` ＋ `GET /api/config?cls=camera`）：
+`camera.ch.2.ip='192.168.1.108'`、`vendor=''`、`url=''` —— 正是用户截图那一刻的
+状态。页面加载后会自动选中"大华"、地址草稿变成
+`rtsp://192.168.1.108:554/cam/realmonitor?channel=1&subtype=0`，
+**点「保存修改」才写进配置**（与既有的"草稿 + dirty 高亮"口径一致）。
+
+=== 影响面与未做
+
+* 平台上报的摄像机品牌码（`iv_agent.c:ipc_brand_code()`）会跟着变：原先那 4 台
+  报"其它(3)"，现在按真实厂商报 0/1/2。是修正，但平台侧展示会变。
+* 发现结果只在内存里，进程重启后要等开机那次搜索才有品牌可匹配；手工配一台
+  从未被发现过的 IP 时不会自动填（也不提示）。
+* 复检只处理"ONVIF 泛应答降级"这一种覆盖；`found_by` 仍可能显示"迟到的那个相位"
+  （如 `.78` 显示 `hik-sadp`），它只是"收包时处于哪个相位"，不代表协议来源。

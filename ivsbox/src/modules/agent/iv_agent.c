@@ -168,6 +168,8 @@ void iv_agent_init(iv_agent_t *a)
     iv_cell_init(&a->cell, 0);
     for (w = 0; w < IV_WAN_N; w++)
         a->wan_probe_idx[w] = -1;
+    for (w = 0; w < (int)IV_AGENT_TGT_N; w++)
+        a->tgt_probe_idx[w] = -1;
     a->opened = 0;
 }
 
@@ -284,6 +286,7 @@ static const char *ipv4_dotted(uint32_t be, char *buf, size_t cap)
 static int agent_probe_build(iv_agent_t *a, uint64_t now_ms)
 {
     int w;
+    int i;
     int n = 0;
 
     for (w = 0; w < IV_WAN_N; w++) {
@@ -314,6 +317,37 @@ static int agent_probe_build(iv_agent_t *a, uint64_t now_ms)
                      : (dst != 0u ? " (probe.target fallback)" : " (link only)"));
         n++;
     }
+    /* ---- 两个「主网检测 IP」（`probe.target1/2`）：**只显示**，不参与判链路 ----
+     *
+     * 2026-10-29 用户口径：界面要能看到这两个检测 IP 各自通不通 —— 否则"有线断了"
+     * 时分不清是"本地网络断了"还是"本地通、平台不可达"。
+     *
+     * 出口绑有线（`eth0` 没绑上才走默认路由）；与平台地址相同的**跳过**：同一目标
+     * 同一出口再建一份，结论必然和 mn 一样，白占一个探测项。
+     * 这两项下标不喂 `netmgr_feed()`、不进 `MN=`、不触发故障码 —— 见
+     * `iv_agent.h:IV_AGENT_TGT_N` 的说明。 */
+    for (i = 0; i < (int)IV_AGENT_TGT_N; i++) {
+        uint32_t dst = a->cfg.probe_target_be[i];
+        int      ifi = a->wan_ifindex[IV_WAN_WIRED];
+        char     nm[IV_AGENT_WAN_NAME_MAX];
+        char     db[INET_ADDRSTRLEN];
+        int      idx;
+
+        a->tgt_probe_idx[i] = -1;
+        if (dst == 0u || dst == a->probe_dst_be[IV_WAN_WIRED])
+            continue;
+        (void)snprintf(nm, sizeof(nm), "tgt%d", i + 1);
+        idx = iv_probe_add_icmp(&a->pb, dst, ifi, nm);
+        if (idx < 0) {
+            IV_LOG_W(AG_MOD, "probe item add failed for target%d (%d)", i + 1, idx);
+            continue;
+        }
+        a->tgt_probe_idx[i] = idx;
+        IV_LOG_I(AG_MOD, "probe target%d -> %s (display only, via %s)", i + 1,
+                 ipv4_dotted(dst, db, sizeof(db)),
+                 (ifi != 0) ? a->cfg.wan_name[IV_WAN_WIRED] : "default route");
+    }
+
     if (iv_probe_start(&a->pb, now_ms) != IV_OK)
         IV_LOG_W(AG_MOD, "probe start failed (icmp may be unavailable)");
     return n;
@@ -1912,7 +1946,9 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
     iv_agent_cfg_t tmp;
     iv_probe_cfg_t pc;
     int            dst_changed;
+    int            tgt_changed;
     int            w;
+    int            i;
     int            rc;
 
     if (a == NULL) {
@@ -1946,6 +1982,15 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
         if (iv_agent_probe_target_of(&tmp, w) != a->probe_dst_be[w])
             dst_changed = 1;
     }
+    /* 「主网检测 IP」也会参与建项（显示用的两个独立项），改它们同样要重建 ——
+     * 否则现场改了 IP、界面上的状态还在报旧地址的结论（2026-10-29 实测栽过：
+     * `probe.target1` 从 192.168.2.3 改成 192.168.1.1，`net.targets` 一动不动，
+     * 因为早期只比较了"探平台地址"的那两项）。 */
+    tgt_changed = 0;
+    for (i = 0; i < (int)IV_AGENT_TGT_N; i++) {
+        if (tmp.probe_target_be[i] != a->cfg.probe_target_be[i])
+            tgt_changed = 1;
+    }
 
     /* 完全没变 ⇒ 立刻返回，连日志都不打。`on_cfg_committed(PROBE)` 在该分类任何
      * 一个键变化时都会进来，没有这个早返回的话，改个 target2 也会刷一条
@@ -1960,12 +2005,13 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
             /* 延时门限必须参与比较：它是 `probe.timeout_ms` 唯一的消费者，
              * 漏掉就等于"平台 0xFE 改完落盘了、探测引擎还是旧门限"—— 而且
              * 会静默走下面 retune 分支并被 retune 的同值早返回吞掉。 */
-            oldpc.degrade_rtt_ms == pc.degrade_rtt_ms && dst_changed == 0) {
+            oldpc.degrade_rtt_ms == pc.degrade_rtt_ms && dst_changed == 0 &&
+            tgt_changed == 0) {
             return IV_OK;
         }
     }
 
-    if (dst_changed != 0) {
+    if (dst_changed != 0 || tgt_changed != 0) {
         /* 快照要先落：`agent_probe_build()` 是按 `a->cfg` 逐路取目标的 */
         a->cfg = tmp;
         agent_probe_rebuild(a, &pc, now_ms);
@@ -2482,6 +2528,39 @@ uint8_t iv_agent_mn(const iv_agent_t *a, int w)
         w >= (int)IV_WAN_N)
         return 0u;
     return a->mn_last[w];
+}
+
+/* 「主网检测 IP」的显示用结论（契约见 `iv_agent.h`）。与 `iv_agent_mn()` 无关：
+ * 这两项只回答"这个地址通不通"，不参与切链路、不进上报、不触发故障码。 */
+uint8_t iv_agent_target_state(const iv_agent_t *a, int i)
+{
+    int idx;
+
+    if (a == NULL || i < 0 || i >= (int)IV_AGENT_TGT_N)
+        return 0u;
+    idx = a->tgt_probe_idx[i];
+    if (idx < 0)
+        return 0u;
+    switch (iv_probe_state(&a->pb, idx)) {
+    case IV_PROBE_UP:
+        return 1u;
+    case IV_PROBE_DOWN:
+        return 2u;
+    case IV_PROBE_DEGRADED:
+        return 3u;
+    default:
+        return 0u;
+    }
+}
+
+int iv_agent_target_ip(const iv_agent_t *a, int i, char *buf, size_t cap)
+{
+    if (a == NULL || buf == NULL || cap == 0u || i < 0 || i >= (int)IV_AGENT_TGT_N)
+        return 0;
+    if (a->cfg.probe_target_be[i] == 0u)
+        return 0;
+    (void)ipv4_dotted(a->cfg.probe_target_be[i], buf, cap);
+    return 1;
 }
 
 /* ---------------------------------------------------------------------------

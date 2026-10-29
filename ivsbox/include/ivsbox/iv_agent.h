@@ -116,6 +116,14 @@ extern "C" {
 /* WAN 接口名长度（含结尾 NUL） */
 #define IV_AGENT_WAN_NAME_MAX 16u
 
+/* 「主网检测 IP」的个数（`probe.target1` / `probe.target2`）。
+ *
+ * 这两项自 2026-10-29 起**不再是探测目标**（探测改探平台地址，见
+ * `iv_agent_probe_target_of()`），但现场仍要能看出"这两个检测 IP 通不通" ——
+ * 用来分清"本地网络断了"和"本地通、平台不可达"。所以额外建两个只读探测项，
+ * **只喂界面显示**：不参与 netmgr 判链路、不进 `MN=` 上报、不触发故障码。 */
+#define IV_AGENT_TGT_N 2
+
 /* ---------------------------------------------------------------------------
  * M4-S4.2 摄像机信息探测（设备发现）与 M4-S4.3 SNMP 采集的装配常量
  * ------------------------------------------------------------------------- */
@@ -484,6 +492,9 @@ typedef struct {
      * "建表时到底用的哪个地址"，`net.server.*` / `probe.*` 热更时才能判出要不要重建。
      * 漏了这一步的症状是"配置改了、探测还在探旧地址"，而且日志上看不出异常。 */
     uint32_t     probe_dst_be[IV_WAN_N];
+    /* 两个「主网检测 IP」的独立探测项下标；-1＝没建（没配 / 与平台地址相同 /
+     * 建项失败）。**只用于界面显示**，见 `IV_AGENT_TGT_N` 的说明。 */
+    int          tgt_probe_idx[IV_AGENT_TGT_N];
     uint8_t      wan_link_up[IV_WAN_N];   /* 最近一次 netlink carrier 状态 */
     uint64_t     door_events;             /* S4.5 累计门开事件次数（M4 阶段可观测用） */
 
@@ -889,6 +900,18 @@ int iv_agent_record_held_off(const iv_agent_t *a);
 /* S4.4 主网第 w 路（0/1）的 MN 状态：1=正常 / 2=断开（迟滞判定后；0=尚未判定）。
  * 就是上报数据段 `MN=` 字段的生产者（见 iv_report.h 的 env.mn[]）。 */
 uint8_t           iv_agent_mn(const iv_agent_t *a, int w);
+
+/* 「主网检测 IP」（`probe.target1/2`）的探测结论，**仅供界面显示**：
+ *   0 未知（没配 / 还没探 / 没建成项）· 1 通 · 2 不通 · 3 通但延时超门限
+ * 越界或没建项一律返回 0。
+ *
+ * ⚠ 与 `iv_agent_mn()` 是两件事：`mn` 判的是"这条链路能不能到平台"（参与切链路
+ * 与上报），这里判的是"这个检测 IP 通不通"（纯显示）。别拿它去做决策。 */
+uint8_t iv_agent_target_state(const iv_agent_t *a, int i);
+
+/* 第 i 个检测 IP 的点分串（网络序原样转文本）。没配返回 0，配了写进 buf 返回 1。
+ * 供界面把"IP → 状态"配起来显示；`cap` 建议 `INET_ADDRSTRLEN`。 */
+int iv_agent_target_ip(const iv_agent_t *a, int i, char *buf, size_t cap);
 
 /* ---------------------------------------------------------------------------
  * S4.2 设备发现（摄像机信息探测）

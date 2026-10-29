@@ -450,7 +450,9 @@
     'switch.snmp': '交换机 SNMP', 'switch.snmp.oid': '交换机 OID 槽位'
   };
 
-  function fieldFor(key, val, desc) {
+  /* 单个配置项的小编辑框。`note` 是可选的只读状态小字（例如「主网检测 IP」后面
+   * 跟一句"当前状态：通"），默认不传就不显示 —— 保持老调用点行为不变。 */
+  function fieldFor(key, val, desc, note) {
     var lab = el('label', 'field');
     var isBool = (typeof val === 'boolean');
 
@@ -492,6 +494,11 @@
     }
     inp.addEventListener('input', check);
     inp.addEventListener('change', check);
+    if (note) {
+      var nt = el('span', 'hint', note);
+      nt.dataset.note = key;   /* 用例/排查时按配置键定位这句小字 */
+      lab.appendChild(nt);
+    }
     return lab;
   }
 
@@ -1014,8 +1021,22 @@
         grid.appendChild(fieldFor('net.ip', it['net.ip'], '本机 IP'));
         grid.appendChild(fieldFor('net.mask', it['net.mask'], '子网掩码'));
         grid.appendChild(fieldFor('net.gateway', it['net.gateway'], '网关 IP'));
-        grid.appendChild(fieldFor('probe.target1', it['probe.target1'], '主网检测 IP 1'));
-        grid.appendChild(fieldFor('probe.target2', it['probe.target2'], '主网检测 IP 2'));
+        /* 两个「主网检测 IP」的连通状态（只显示）：后端为这两项单独建了探测项
+         * （出口绑有线），与"有线/4G 能不能到平台"**不同源** —— 前者说明"本地网络
+         * 通不通"，后者说明"能不能到平台"。两者一起看才分得清是谁的问题。
+         * 数据来自 `/api/overview` 的 `net.targets`：0 未知 / 1 通 / 2 不通 / 3 延时。 */
+        var tgs = (ro.ok && ro.d && ro.d.net && ro.d.net.targets) ? ro.d.net.targets : [];
+        var TGT_TXT = { 0: '未检测', 1: '通', 2: '不通', 3: '延时' };
+        var tgtNote = function (i) {
+          var t = tgs[i];
+          if (!t || !t.ip) return '';
+          var s = TGT_TXT[t.state];
+          return '当前状态：' + (s === undefined ? t.state : s);
+        };
+        grid.appendChild(fieldFor('probe.target1', it['probe.target1'], '主网检测 IP 1',
+                                  tgtNote(0)));
+        grid.appendChild(fieldFor('probe.target2', it['probe.target2'], '主网检测 IP 2',
+                                  tgtNote(1)));
         /* 平台「参数设置」页把这一项摆在"配置IP和网关 / 主网检测IP"同一组里，
          * 名字是「有线网络超时时间(ms)」。我们原来只在「检测与自愈」页用配置键的
          * 中文描述「单次探测超时」显示 —— 名字对不上、又换了一页，现场照着平台

@@ -1113,6 +1113,32 @@ static json_object *build_overview(const iv_ctl_ctx_t *ctx)
             json_object_array_add(mn, json_object_new_int((int)iv_agent_mn(ctx->agent, w)));
         json_object_object_add(net, "mn", mn);
 
+        /* 「主网检测 IP」（`probe.target1/2`）两项的探测结论 —— **只给界面显示**：
+         *   0 未知（没配/未探/与平台地址相同而没建项）· 1 通 · 2 不通 · 3 延时
+         * 与 `mn` 不同源：这两项探的是配置里的检测 IP、出口绑有线，既不参与切链路
+         * 也不进 `MN=` 上报（见 `iv_agent.h:IV_AGENT_TGT_N`）。
+         * `ip` 为空串＝该项没配，界面据此不显示状态行。 */
+        {
+            json_object *tg = json_object_new_array();
+            int          i;
+
+            for (i = 0; i < (int)IV_AGENT_TGT_N; i++) {
+                char         ip[INET_ADDRSTRLEN] = "";
+                json_object *e = json_object_new_object();
+
+                if (e == NULL)
+                    continue;
+                (void)iv_agent_target_ip(ctx->agent, i, ip, sizeof(ip));
+                json_object_object_add(e, "ip", json_object_new_string(ip));
+                json_object_object_add(
+                    e, "state",
+                    json_object_new_int((int)iv_agent_target_state(ctx->agent, i)));
+                json_object_array_add(tg, e);
+            }
+            if (tg != NULL)
+                json_object_object_add(net, "targets", tg);
+        }
+
         /* 摄像机：CNS 六路（0 无IP/1 正常/2 故障/4 延时/5 丢包）＋ 当前检测方式 */
         if (cd != NULL) {
             for (c = 0; c < IV_CAMDET_CH_N; c++)

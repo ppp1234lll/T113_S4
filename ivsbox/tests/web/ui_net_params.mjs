@@ -90,7 +90,13 @@ window.fetch = function (u, o) {
                         ]
                     },
                     wan: { transport: 'up', bound: 'usb0', server: '47.104.250.225',
-                           port: 6013, queue: 0, bound_ok: true, switches: 0, txn_fail: 0 }
+                           port: 6013, queue: 0, bound_ok: true, switches: 0, txn_fail: 0 },
+                    /* 两个「主网检测 IP」的探测结论（2026-10-29 新增，只显示）：
+                     * IP1 不通、IP2 通 —— 用例要能从状态小字里读出来。 */
+                    targets: [
+                        { ip: '192.168.2.1', state: 2 },
+                        { ip: '192.168.2.2', state: 1 }
+                    ]
                 }
             }
         }));
@@ -170,6 +176,16 @@ const main = async () => {
     chk(gw && gw.value === '192.168.2.1', 'n01d: 网关输入框带真实值');
     chk(t1 && t1.value === '192.168.2.1' && t2 && t2.value === '192.168.2.2',
         'n01e: 主网检测 IP 1/2 带真实值');
+
+    /* n01f/n01g：两个「主网检测 IP」各自的状态小字（2026-10-29 新增，只读显示）。
+     * 判据用 `dataset.note` 精确落到字段上 —— 按文字找会被别处的"通"字撞上。 */
+    const nt1 = content.querySelector('[data-note="probe.target1"]');
+    const nt2 = content.querySelector('[data-note="probe.target2"]');
+    chk(nt1 !== null && nt1.textContent.indexOf('不通') >= 0,
+        'n01f: 主网检测 IP 1 显示「当前状态：不通」（state=2）');
+    chk(nt2 !== null && nt2.textContent.indexOf('通') >= 0 &&
+        nt2.textContent.indexOf('不通') < 0,
+        'n01g: 主网检测 IP 2 显示「当前状态：通」（state=1）');
 
     /* n02：MAC 只读 */
     chk(content.textContent.indexOf(ETH_MAC) >= 0, 'n02a: 显示 eth0 的真实 MAC');

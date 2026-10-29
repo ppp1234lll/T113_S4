@@ -85,7 +85,7 @@ extern "C" {
 #define IV_WEB_MAX_CONN   8u        /* 并发连接上限（超出的直接 503 并关闭） */
 #define IV_WEB_HEAD_MAX   4096u     /* 请求行 ＋ 头总长上限 */
 #define IV_WEB_BODY_MAX   32768u    /* 请求体上限（配置提交） */
-#define IV_WEB_RSP_MAX    (128u * 1024u) /* 响应缓冲上限（静态资源整体读入） */
+#define IV_WEB_RSP_MAX    (512u * 1024u) /* 响应缓冲上限（静态资源整体读入 / 反代正文） */
 #define IV_WEB_PATH_MAX   256u
 #define IV_WEB_TOKEN_MAX  48u
 #define IV_WEB_SESS_N     8u
@@ -98,7 +98,17 @@ extern "C" {
  *   历史：2026-10-22 恢复出厂那张卡把 app.js 顶到 99207 B > 当时的 96256 B，只能把
  *   96 KiB 抬到 128 KiB；2026-10-28 app.js 长到 133673 B 又顶穿 129024 B ⇒ 板端
  *   `/app.js` 回 413、Web UI 整页白屏。这次按当时写下的办法改成分流，没再抬上限
- *   （抬上限的代价是 `g_conn[]` 每连接多占 32 KiB，8 连接 ≈ +256 KiB BSS）。 */
+ *   （抬上限的代价是 `g_conn[]` 每连接多占 32 KiB，8 连接 ≈ +256 KiB BSS）。
+ *
+ * ⚠ **2026-10-29 抬到 512 KiB —— 但这次不是为静态资源**。摄像机反代
+ *   （`iv_web_cam.c`）是"整份正文先收进缓冲、再改写、再回"的同步模型，**没有
+ *   流式路径**；而大华的语言表 `/custom_lang/SimpChinese.txt` 就是 **391087 B**
+ *   的 JSON。128 KiB 时它被收满即停、却照样回 200 ⇒ 浏览器拿到半个 JSON ⇒
+ *   `JSON.parse` 失败 ⇒ 语言表空 ⇒ 摄像机界面全是 `med.MainStream` 这种原始 key
+ *   （现场原话："108 明明是中文界面，为什么你变成了英文"）。
+ *   代价：`g_conn[]` 8 连接共多占 3 MiB BSS（板端 220 MiB 内存、可用 147 MiB，
+ *   `ivsbox-web` 原本 RSS 只有 3 MiB，可以接受）。同时反代侧补了"收不满就 502"，
+ *   超过这个上限的正文会明确报错，**不再静默截断**。 */
 
 /* S6.4：媒体下载的块大小。**必须 ≤ rbuf 容量**（块缓冲复用 rbuf，见文件头）。 */
 #define IV_WEB_FILE_CHUNK  32768u

@@ -46,7 +46,9 @@
 #define TIMEOUT_MS    5000
 #define CONNECT_RETRY 5000
 #define CONNECT_STEP  100
-#define RSP_CAP       (256u * 1024u)
+/* 与生产侧 `IV_WEB_RSP_MAX` 对齐：反代正文整份收进这块缓冲，测试缓冲比它小
+ * 就只能断言到"被测试缓冲截断"，测不出生产行为（2026-10-29 大华语言表 391 KB）。 */
+#define RSP_CAP       (512u * 1024u)
 
 static int   g_fail;
 static pid_t g_kid_ivsboxd = -1;
@@ -473,6 +475,28 @@ static void fake_camera_main(void)
                 }
                 (void)close(cfd);
                 continue;
+            } else if (strcmp(path, "/bigjson") == 0 || strcmp(path, "/huge") == 0) {
+                /* 大文本正文。2026-10-29 现场：大华的语言表
+                 * `/custom_lang/SimpChinese.txt` 是 **391087 B** 的 JSON，代理当时
+                 * 缓冲只有 128 KiB ⇒ 收满即停、却照样回 200 ⇒ 浏览器拿到半个 JSON
+                 * ⇒ 语言表解析失败 ⇒ 界面全是 `med.MainStream` 这种未翻译的 key。
+                 * `/bigjson`（400 KiB）走"放得下"、`/huge`（600 KiB）走"放不下必须
+                 * 502"，两条夹住"不许静默截断"。
+                 * 末两字节固定 `z}`：位置固定的哨兵，能直接断言"尾巴还在"。 */
+                static char   big[700u * 1024u];
+                static size_t big_len;
+                size_t        want = (strcmp(path, "/huge") == 0) ? (600u * 1024u)
+                                                                 : (400u * 1024u);
+
+                if (big_len != want) {
+                    memset(big, 'a', want);
+                    big[0]         = '{';
+                    big[want - 2u] = 'z';
+                    big[want - 1u] = '}';
+                    big[want]      = '\0';
+                    big_len        = want;
+                }
+                body = big;
             } else if (strcmp(path, "/bin") == 0) {
                 /* 二进制体（含 0 字节）：代理若拿 strlen() 量长度会截成 0 字节。 */
                 static const char bin[6] = { 0x00, 0x01, 0x02, 0x00, 0x03, 0x04 };
@@ -905,6 +929,35 @@ int main(int argc, char *argv[])
             "c15c: binary content intact (no strlen truncation)");
     }
 
+    /* ---------------- c16 大文本正文（400 KiB，模拟大华 391 KB 语言表）---------------- */
+    {
+        int  len = snprintf(g_req, sizeof g_req,
+                            "GET /cam/0/bigjson HTTP/1.1\r\nHost: x\r\n"
+                            "Connection: close\r\n\r\n");
+        int  total = exchange(g_cam_lport, g_req, (size_t)len);
+        long off   = hdr_end_off((size_t)total);
+
+        chk(total > 0 && rsp_status() == 200, "c16a: 400 KiB text body answered 200");
+        chk(off > 0 && (size_t)total - (size_t)off == 400u * 1024u,
+            "c16b: all 400 KiB delivered (no truncation)");
+        /* 尾巴是指纹：被截断的响应这里一定对不上 */
+        chk(off > 0 && (size_t)total >= 2u && g_rsp[total - 2] == 'z' &&
+                g_rsp[total - 1] == '}',
+            "c16c: tail bytes intact");
+    }
+
+    /* ---------------- c17 超过缓冲的正文：必须 502，不许静默截断 ---------------- */
+    {
+        int  len = snprintf(g_req, sizeof g_req,
+                            "GET /cam/0/huge HTTP/1.1\r\nHost: x\r\n"
+                            "Connection: close\r\n\r\n");
+        int  total = exchange(g_cam_lport, g_req, (size_t)len);
+
+        chk(total > 0 && rsp_status() == 502,
+            "c17a: oversize body => 502 (silent truncation was the old bug)");
+        chk(strstr(g_rsp, "too large") != NULL, "c17b: body names the reason");
+    }
+
     cleanup();
     if (g_fail != 0) {
         fprintf(stderr, "test_web_cam_e2e FAILED (%d checks)\n", g_fail);
@@ -912,6 +965,6 @@ int main(int argc, char *argv[])
     }
     printf("test_web_cam_e2e passed (route isolation, proxy+rewrites, header/body "
            "passthrough, 502 paths, loopback guard, fd stability, no-EOF upstream, "
-           "binary body)\n");
+           "binary body, big text body)\n");
     return 0;
 }

@@ -626,10 +626,11 @@ int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_c
     }
 
     deadline = (uint64_t)time(NULL) * 1000u + IV_WEB_CAM_TOTAL_MS;
+    /* 这两个出块后还要用（判"上游声明的长度有没有收满"），所以声明在块外。
+     * `he == 0` ＝ 头区还没收齐（此时整段不能当字符串用）；`clen < 0` ＝ 没该头。 */
+    size_t he   = 0u;
+    long   clen = -1;
     {
-        size_t he   = 0u;  /* 头区结束偏移；0 ＝ 还没收齐（此时整段不能当字符串用） */
-        long   clen = -1;  /* Content-Length；-1 ＝ 没有该头或非法 */
-
         while (off < cap - 1u) {
             ssize_t r = recv(fd, out + off, cap - 1u - off, 0);
 
@@ -669,6 +670,23 @@ int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_c
     }
     (void)close(fd);
     out[off] = '\0';
+
+    /* ⑤ 上游声明的长度没收满 ⇒ **必须明确报错**，绝不能把半份正文当成功回出去。
+     * 2026-10-29 现场：大华的语言表 `/custom_lang/SimpChinese.txt` 是 **391087 B**
+     * 的 JSON，而缓冲当时只有 128 KiB —— 循环收满即停、状态照样回 200 ⇒ 浏览器拿到
+     * 被截断的半个 JSON ⇒ `JSON.parse` 失败 ⇒ 语言表空 ⇒ 摄像机界面全是
+     * `med.MainStream` 这种未翻译的 key（用户原话："108 明明是中文界面，为什么你
+     * 变成了英文"）。缓冲已抬到 512 KiB，这条闸门保证"再顶穿时说话，不是装没事"。 */
+    if (he != 0u && clen >= 0 && off < he + (size_t)clen) {
+        IV_LOG_W(CAM_MOD,
+                 "cam/%u: response truncated (%ld B declared, %zu B received, cap %zu)",
+                 n, clen, (off > he) ? (off - he) : 0u, cap);
+        rsp->status = 502;
+        (void)snprintf(rsp->ctype, sizeof rsp->ctype, "text/plain");
+        *out_len = (size_t)snprintf(out, cap,
+                                    "camera response too large for the proxy buffer\n");
+        return IV_OK;
+    }
 
     /* ⑤ 拆应答：状态行 + 头 + 体 */
     {

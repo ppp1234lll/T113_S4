@@ -5475,6 +5475,12 @@ if (!slots.length) { box.appendChild(el('p', 'hint', '尚无采集结果')); ret
 上限抬到 **128 KiB**（`g_conn[]` 每连接多 32 KiB，8 连接 ≈ +256 KiB BSS），并在常量旁写死
 "再顶到就改走 S6.4 的文件体分流（`rsp->file_path`），**不要再抬**"。
 
+* **2026-10-29 19:17 更正**：这条结论只对**静态资源**成立，对**反代**不成立。
+  摄像机语言表是 342～391 KiB，走的是"整体收进 `wbuf`"的另一条路，128 KiB 注定不够
+  ⇒ `IV_WEB_RSP_MAX` 已抬到 **512 KiB**，并给反代加了"没收满就回 502"的闸门。
+  静态资源仍走文件体分流、**没有**回到"整体读入"的老路。详见本文件
+  `2026-10-29 19:17 反代响应缓冲抬到 512 KiB` 节。
+
 === 验证
 
 * 门禁（VM）：`test` **43/43**、`arm`、`analyze` 0 告警、`asan` 43/43、`setarch -R make tsan`
@@ -10742,6 +10748,76 @@ fi
   No such file 还以为是"根本没生成"。排障时先 `grep '^STATE=' scripts/monitor.sh`。
 * 熔断本身仍然只能靠删状态文件解除，没做"界面上一键恢复"。`failsafe` 期间界面
   只显示 `ivsboxd not running`，看不出是"故意不拉"还是"真挂了"。
+
+== 2026-10-29 19:17 反代响应缓冲抬到 512 KiB：语言表被静默截断，界面退回英文
+
+=== 现象
+
+经隧道打开大华 192.168.1.108 的网页，**界面全是未翻译的 i18n key**：
+`med.MainStream`、`sys.SubStreamService`、`per.Alarm`、`com.Logout`、
+`com.UserOrGroupUser`……同一台机器直连是中文。第一反应是"语言包没下发"，
+但板端日志显示三个语言请求**全部发生、全部 200**：
+
+[source,text]
+----
+/web_caps/preLanguage            200    33 B
+/custom_lang/SimpChinese.txt     200 130465 B   ← 直连是 391087 B
+/default_lang/SimpChinese.txt    404    48 B   （404 是正常的，前端兜底另一份）
+----
+
+=== 根因：200 ＋ 半份 JSON
+
+`IV_WEB_RSP_MAX` 当时是 **128 KiB**，反代把上游正文**整体收进缓冲**，收包循环写的是
+`while (off < cap - 1u)` —— **收满即停**，随后照原样回 200 和上游声明的
+`Content-Length` 之外的"实际收到的长度"。于是：
+
+* 直连 `/custom_lang/SimpChinese.txt` = **391087 B**，md5 `d023296a35e336b9212a8c7502751867`
+* 反代同一 URL = **130465 B**，md5 `013848fcd589e767c4566fc54da10e97`
+
+`130465 = 131072 − 607`，607 是那份响应头长度 —— 正好是"128 KiB 减去响应头"，
+一眼就能认出是缓冲顶上去了。前端拿到半份 JSON，`JSON.parse` 抛异常、进 catch 把
+字典留空，于是每个 key 原样显示。**"翻译丢了"和"传输断了"在界面上长得一模一样**，
+这也是这条被误判成语言包问题的原因。
+
+=== 处理方式
+
+. **把上限抬到 512 KiB**（`web/src/iv_web.h`）。这不是"再多给一点"的调参：大华这台
+   **391 KiB**、同现场另一台 192.168.1.106 是 **342 KiB**，128 KiB 差一个数量级，
+  下次换个型号照样顶。代价是 `iv_web_conn_t::wbuf` 变大 ⇒ `g_conn[]` 8 个连接
+  多占约 **3 MiB BSS**，板上 RAM 扛得住（这台的 Web 侧本就不吃内存）。
+. **必须补闸门，光抬缓冲是错的**（`web/src/iv_web_cam.c`）。收完头解析出
+  `Content-Length` 后，若 `off < he + clen` 就说明被 `cap` 截断，此时
+  **绝不能回 200**：改 502 ＋ 正文 `camera response too large for the proxy buffer`
+  ＋ WARN 日志（`declared / received / cap` 三个数）。理由是这次真正的教训 ——
+  "静默截断"比"明确的 502"坏得多：502 一眼看出是代理的问题，200 半份却把矛头
+  指向前端和语言包。`he`/`clen` 原本声明在收包块内，闸门要用，提到块外。
+
+=== 验证
+
+* 集成 `test_web_cam_e2e`：假摄像机新增 `/bigjson`（400 KiB）与 `/huge`（600 KiB），
+  断言 c16a/b/c —— 400 KiB **全量到达**且尾哨兵 `z}` 完整（证明不是"长度对、尾巴丢"）；
+  c17a/b —— 600 KiB ⇒ **502** 且正文含 `too large`。`RSP_CAP` 同步到 512 KiB。
+* **反向证伪两条**：缓冲退回 128 KiB ⇒ c16a/b/c **3 条红**；闸门改 `if (0)` ⇒
+  c17a/b **2 条红**；还原复绿。
+* 门禁：`make test` **49 passed**、`make host` 0 告警、`make arm` 0 error/warning。
+* **真机逐字节比对**（`S66ivsboxweb restart` 后从本机回环 wget）：
+  108 `:8083` **391087 B** md5 `d023296a…`、106 `:8082` **342820 B** md5 `b5f59cfe…`，
+  与两台直连 **md5 完全相同**；日志无 `truncated`；`/` 首页仍 41803 B。
+
+=== 踩坑
+
+* **换二进制要看 `/proc/<pid>/exe`，不是 `ls -l`**：`pscp` 覆盖文件后旧进程仍跑旧
+  inode，`ls -l /proc/<pid>/exe` 会显示 `→ …/ivsbox-web (deleted)`。本轮因此
+  "换了也不生效"，白重编了一轮 ARM 二进制。重启后用 `(deleted)` 是否消失作判据。
+
+=== 未做 / 已知边界
+
+* **仍是"整体缓冲"模型**：正文超过 512 KiB 一律 502，不做流式转发。真要转发更大的
+  上游（比如摄像机的录像文件），得把反代改成"边收边 `send`"的状态机，而不是继续抬 buffer
+  —— 那时 `wbuf` 的大小就和"页面能多大"彻底解耦了。
+* **不转发 `Referer` / `Accept-Language`**：这次语言问题与它们无关（日志证明语言表请求
+  确实发出了、也确实回了 200），但上游若按 `Accept-Language` 做内容协商，这里会退化到默认值。
+* 反代不对 `Content-Length` 重算：闸门只判"收满没"，不改写上游声明值。
 
 
 

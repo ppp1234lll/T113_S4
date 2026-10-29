@@ -10566,5 +10566,80 @@ if (a->snmp_state[which] == IV_AGENT_SNMP_RUN)
 * 前端只在点「发起采集」时才知道原因；采集**结果卡**本身仍显示 `状态：空闲`，
   没做成"未开开关／未配 IP"两种灰字提示。两者能互补，但没合并。
 
+== 2026-10-29 19:03 「SIM 卡未插入」是误报：卡在槽里，模组读不动
+
+=== 现场现象
+
+用户连插三次 SIM 卡，4G 页仍显示 `当前断点：SIM 卡未插入`、`最近成功：从未`。
+
+=== 板端取证（先有证据再改代码）
+
+`AT` 口是 `/dev/ttyUSB0`（被 `ivsboxd` 的 cellport 只读占用，探之前要先
+`/etc/init.d/S65ivsboxd stop`；`ttyUSB2` 不回话，`ttyUSB3` 是模块调试口吐乱码）。
+同一张卡读出：
+
+----
+ATI            → Quectel / EC200G / EC200GCNLER01A13M04   （模块好的）
+AT+CPIN?       → +CME ERROR: 13        （SIM failure，不是 10"未插入"）
+AT+QSIMSTAT?   → +QSIMSTAT: 0,0        （enable=0！）
+AT+QCCID       → +CME ERROR: 50
+AT+CIMI        → +CME ERROR: 10
+AT+CSQ         → +CSQ: 99,99           （无卡即无信号）
+----
+
+`AT+CFUN=4` / `AT+CFUN=1` 都拉不回来，`AT+CFUN=1,1`（软复位、USB 重枚举）之后
+同一张卡立刻 `+CPIN: READY` / `+QSIMSTAT: 0,1` / `CSQ 24` / `+CEREG: 0,1`，
+`usb0` 拿到地址，`cellular.status` 的 `usable` 变 `true`。**卡是好的，是读卡子系统挂住了。**
+
+=== 两个缺陷
+
+. **把"读卡失败"说成"没插卡"**。`parse_qsimstat()` 只读
+  `+QSIMSTAT: <enable>,<inserted>` 的**第二个数**，不看第一个 `enable`。本板
+  `enable=0`（插拔 URC 没开）时模组恒回 `0,0`，于是把 `CPIN?` 已经给出的
+  `SIM FAILURE` 直接改写成 `NOT INSERTED`。而 `reset_dynamic()` 按设计**不清**
+  `sim_state`（避免链路抖动时数值闪空）⇒ 这句话会一直挂在界面上，直到某轮
+  CPIN 读到 READY。现场照着它去反复拔插卡，方向完全错。
+. **读卡挂死后没有任何恢复路径**。`iv_cell_redial_due()` 触发条件的第一层就是
+  "卡就绪"，卡读不到 ⇒ 连拨号都不会发起 ⇒ 这台设备的 4G 只能等人工断电。
+
+=== 改法
+
+* `parse_qsimstat()`：`enable != 1` 整条丢弃（第二字段不随插拔更新）；且
+  `CPIN?` 已给结论时旁证不得改判。
+* `compute_usable()`：`CME 13` 单独出文案
+  「SIM 卡读取失败（模块读不到卡，检查卡座/触点）」，与"未插入"分开。
+* `reason[64]` → `reason[96]`：该句 UTF-8 共 66 B，64 会触发
+  `-Wformat-truncation`，本项目 `-Werror` 下直接编译失败。
+* 装配层新增 `cell_sim_recover()`：连续 **3 个完整轮次** `sim_present != 1`
+  ⇒ 发一次 `AT+CFUN=1,1`，冷却 30 min；发出后立刻 `cell_link_drop()`，交给
+  5 s 的重开循环重新探口（复位会重枚举 USB，`ttyUSB` 编号可能变）。
+
+计数口径是这条的关键：只在 `ok_rounds + fail_rounds` 变大（= 一轮真的跑完）时
+结算。被拨号脚本抢口打断的半轮不计；`sim_state` 为空（本轮 `CPIN?` 一条没回 =
+抢不到口）也不计 —— 否则每次拨号都会攒出一个假复位。
+
+=== 验证
+
+* VM：`make test` **49 passed**（基线不变）；`make arm` 0 告警。
+* `test_cellular` 新增两组：c11 用 2026-10-29 实测样本（`CME 13` + `QSIMSTAT: 0,0`）
+  断言 `sim_present == -1`、`sim_state == "SIM FAILURE"`、`reason` 含"读取失败"
+  且**不含**"未插入"；c12 断言 `enable=0` 不下结论、`enable=1,inserted=0` 才判"未插入"。
+* 反向证伪：去掉 `enable != 1` 闸门 ⇒ **8 条 FAIL**；去掉 `SIM FAILURE` 分支 ⇒
+  **1 条 FAIL**；两条还原后复绿。
+* 板端：`ivsboxd` 换为 `86ad6b16…`（备份 `ivsboxd.bak-b86d3eca`）。
+
+=== 未做 / 已知边界
+
+* **自愈路径未在真机触发**：`AT+CFUN=4` 下 `CPIN?` 仍回 READY，无法在不拆卡的
+  前提下制造 `CME 13`。逻辑有单测覆盖（`test_cellport`/`test_cellular` 层面无法
+  覆盖 agent 内的静态函数），真机触发待现场或专门造具。
+* 复位一次会让 4G 断二十来秒、`usb0` 换地址、平台 TCP 重连，所以阈值取 3 轮
+  （约 90 s）＋冷却 30 min，不做更激进的重试。
+* 期间发现一条**未结案**的现象：4G 不通的那段时间板子每 ~100 s 被看门狗复位一次
+  （`ivsbox-boot.log` 连续 `boot-begin`、日志里 `unclean shutdown detected:
+  prev state='dirty'`，且日志直接中断、没来得及写一行）。4G 恢复后未再复发，
+  判为"某处阻塞 > 16 s 的看门狗超时"，待单独定位。
+
+
 
 

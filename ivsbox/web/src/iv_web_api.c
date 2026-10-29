@@ -214,8 +214,16 @@ int iv_web_sess_check(iv_web_ctx_t *ctx, const char *token)
             ctx->sess[i].token[0] = '\0'; /* 过期即清 */
             continue;
         }
-        if (strcmp(ctx->sess[i].token, token) == 0)
+        if (strcmp(ctx->sess[i].token, token) == 0) {
+            /* **滑动续期**：只要有请求，到期时间就往后推一个 TTL。
+             * 原先只在登录取槽时定一次 8 h、之后不再动 ⇒ 页面一直开着也准点掉线；
+             * 现场表现是"放一夜，早上切页满屏『未获取到…/unauthorized』"
+             * （2026-10-29，与前端 401 不跳登录叠加，看着像设备故障）。
+             * 放在 `sess_check()` 里而不是各接口里：`iv_web_logs.c`/`iv_web_media.c`
+             * 也走这里，改一处全覆盖。TTL 之后仍然失效（8 h 无任何请求）。 */
+            ctx->sess[i].expires_ms = now + IV_API_SESS_TTL_MS;
             return 1;
+        }
     }
     return 0;
 }

@@ -1879,8 +1879,8 @@
           hint.textContent = '未获取到摄像机状态（检测模块未装配或尚未开始检测）。';
           return;
         }
-        hint.textContent = '判定口径：0 无IP／1 正常／2 故障／4 延时／5 丢包。' +
-          '「测」＝立刻用当前检测方式重测这一路，不必等下一轮。';
+        hint.textContent = '判定口径：0 无IP／1 正常／2 故障（ping 通就正常、不通就故障，' +
+          '不再区分延时与丢包）。「测」＝立刻用当前检测方式重测这一路，不必等下一轮。';
         for (var k = 0; k < cm.cns.length; k++) {
           var v = CNS_NAME[cm.cns[k]] === undefined ? cm.cns[k] : CNS_NAME[cm.cns[k]];
           var cls = cm.cns[k] === 1 ? 'ok' : (cm.cns[k] === 2 ? 'err' : 'warn');

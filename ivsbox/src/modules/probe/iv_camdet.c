@@ -468,43 +468,28 @@ static void ring_clear(iv_camdet_t *d, int ch)
 }
 
 /*
- * 本轮（4 个样本）→ 五态。与现网 lwip_ping_multi_result_to_status() 同判据：
- *   全应答 → 平均 RTT > 阈值 ? 延时(4) : 正常(1)
- *   部分应答 → 丢包(5)
- *   全无应答 → 故障(2)
+ * 本轮（4 个样本）→ **两态**（2026-10-29 用户口径）：
+ *   有任何一个应答 → 正常(1)
+ *   四个全没应答   → 故障(2)
  *
- * ⚠ 边界从 `>=` 改成 `>`（R-02，2026-10-22 板端实测）：RTT 是**按调用方 tick
- * 采样**的 —— 本层没有自己的事件循环，回包只能在 `iv_camdet_tick()` 里被读走，
- * 而 tick 周期是 `IV_AGENT_PROBE_TICK_MS`（200 ms）。所以本机测得的 RTT 是
- * **200 ms 的整数倍**：0.47 ms 的局域网摄像机，回包要等到下一个 tick 才被读，
- * rtt 就是 **200**；阈值默认也是 200，`>=` 于是恒判"延时" —— 现场看到的正是
- * "ping 明明是 0.5 ms，页面报延时(4)"。
- * 改判据为严格大于之后：一个 tick 内应答（本机可测的最好情况）⇒ 正常；
- * 两个 tick 才有回包 ⇒ 400 > 200 ⇒ 延时。分辨率仍是一个 tick，这一点写在
- * `iv_camdet.h` 的阈值常量旁边，不夸大成"毫秒级测量"。
+ * 「延时(4)」「丢包(5)」**不再产生**。用户原话："摄像机状态不区分，ping 通就正常、
+ * 不通就故障，不要乱添加其他检测"。这也顺带消掉了旧判据的老毛病：RTT 是按 tick
+ * （200 ms）采样出来的整数倍，0.5 ms 的局域网摄像机常被测成 200 ms，于是"ping
+ * 明明很通、页面却报延时"（R-02）。两态之后不存在这个歧义。
+ *
+ * `rtt_thr_ms` / `iv_camdet_set_rtt_thr()` 保留但**不再参与判定**（配置键
+ * `camera.detect.rtt_ms` 早已标注"保留键：无消费方"，延时门限统一走
+ * `probe.timeout_ms`），调用它们不会改变本函数的结果。
  */
 static iv_camdet_status_t ping_verdict(const iv_camdet_t *d, int ch)
 {
-    uint32_t sum   = 0u;
-    int      acked = 0;
-    int      i;
-    uint32_t avg;
+    int i;
 
     for (i = 0; i < (int)IV_CAMDET_PING_SAMPLES; i++) {
-        if (d->pk_ok[ch][i] != 0u) {
-            sum += d->pk_rtt[ch][i];
-            acked++;
-        }
+        if (d->pk_ok[ch][i] != 0u)
+            return IV_CAMDET_NORMAL;
     }
-    if (acked == 0)
-        return IV_CAMDET_FAULT;
-    if (acked < (int)IV_CAMDET_PING_SAMPLES)
-        return IV_CAMDET_LOSS;
-    avg = sum / (uint32_t)acked;
-    /* 严格大于：见函数头关于"采样分辨率＝一个 tick"的说明 */
-    if (d->cfg.rtt_thr_ms != 0u && avg > d->cfg.rtt_thr_ms)
-        return IV_CAMDET_DELAY;
-    return IV_CAMDET_NORMAL;
+    return IV_CAMDET_FAULT;
 }
 
 /*

@@ -432,14 +432,15 @@ static void c03_ping_delay_boundary(void)
     chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL, "avg==thr -> normal (R-02c)");
     iv_camdet_close(&f.d);
 
-    /* 平均只超 1 ms → 延时，证明不是把判定整条撤了 */
-    fx_open(&f, IV_CAMDET_MODE_PING, 99u); /* 阈值 99 */
+    /* 平均远超阈值也是正常（2026-10-29 两态口径：有应答就算通，不再判延时） */
+    fx_open(&f, IV_CAMDET_MODE_PING, 1u); /* 阈值 1 ms，样本 100 ms */
     one_cam(ips);
     (void)iv_camdet_set_channels(&f.d, ips, 1000u);
     t = 1000u;
     for (i = 0; i < 4; i++)
         ping_pkt(&f, &t, 1, 100);
-    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_DELAY, "avg>thr -> delay(4)");
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL,
+        "avg>>thr -> still normal (two-state)");
     iv_camdet_close(&f.d);
 
     /* 现场形态原样复刻：默认阈值 200 ＋ 一个 tick 的 RTT 200 → 必须正常 */
@@ -452,10 +453,10 @@ static void c03_ping_delay_boundary(void)
     chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL,
         "rtt==one tick under default thr -> normal (board case)");
 
-    /* 两个 tick 才有回包（400 > 200）→ 延时，阈值仍然有效 */
+    /* 两个 tick 才有回包：仍旧正常 —— 延时不再是一种状态 */
     for (i = 0; i < 4; i++)
         ping_pkt(&f, &t, 1, (int)(2u * IV_CAMDET_TICK_RESOLUTION_MS));
-    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_DELAY, "two ticks -> delay");
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL, "two ticks -> still normal");
     iv_camdet_close(&f.d);
 }
 
@@ -477,7 +478,7 @@ static void c04_ping_loss(void)
     ping_pkt(&f, &t, 1, 20); /* 3 成功 */
     ping_pkt(&f, &t, 1, 20); /* 4 成功 */
 
-    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_LOSS, "3/4 ok -> loss(5)");
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL, "3/4 ok -> normal (two-state)");
     iv_camdet_close(&f.d);
 }
 
@@ -879,8 +880,8 @@ static void c13_probe_now_and_rtt(void)
     chk(iv_camdet_set_rtt_thr(&f.d, 100u) == IV_OK, "c13: lower thr to 100");
     for (i = 0; i < 4; i++)
         ping_pkt(&f, &t, 1, 150);
-    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_DELAY,
-        "c13: same rtt 150 now over thr 100 -> delay (hot effect)");
+    chk(iv_camdet_status(&f.d, 0) == IV_CAMDET_NORMAL,
+        "c13: same rtt 150 now over thr 100 -> still normal (thr no longer judges)");
     iv_camdet_close(&f.d);
 }
 

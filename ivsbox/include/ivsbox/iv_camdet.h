@@ -117,17 +117,17 @@ extern "C" {
  * 看门狗 16 s 后复位整机）。见 `pb_rebuild()` / `sample_ping()` 的注释。 */
 #define IV_CAMDET_PING_MAX_STEP    8u
 
-/* 延时判定阈值默认值：现网 `DEFALUT_NETWORK_DELAY` = 200 ms。
+/* 延时阈值默认值：现网 `DEFALUT_NETWORK_DELAY` = 200 ms。
  *
- * ⚠ **RTT 的采样分辨率＝调用方 tick 周期**（`IV_AGENT_PROBE_TICK_MS`，200 ms）：
- * 本模块没有自己的事件循环，ICMP 回包只在 `iv_camdet_tick()` 里被读走，所以
- * 测得的 RTT 只能是 tick 的整数倍（0 / 200 / 400 …），不是真实往返时延。
- * 因此：
- *   - 判定用**严格大于**（`avg > thr`）：局域网摄像机在一个 tick 内应答 ⇒ 正常；
- *   - 把阈值配成 <= 一个 tick 没有意义（任何应答都会被判延时，日志里会告警）；
- *   - 要亚毫秒级 RTT 就必须把 ICMP fd 挂进事件循环（当前**不做**，见
- *     `src/modules/probe/iv_camdet.c` 的 `ping_verdict()` 说明）。
- */
+ * ⚠ 2026-10-29 起**不参与判定**：摄像机状态已改两态（有应答＝正常、全无应答＝故障），
+ * 用户口径"ping 通就正常、不通就故障，不要乱添加其他检测"。全工程的延时门限只保留
+ * 一处 —— `probe.timeout_ms`（平台「有线网络超时时间(ms)」），摄像机那边也只跟随它
+ * （`main.c` 用 `probe.timeout_ms` 填 `camera_detect_rtt_ms`，`camera.detect.rtt_ms`
+ * 是保留键）。这里保留常量与 `rtt_thr_ms` 字段只为兼容既有调用点。
+ *
+ * 历史说明（仍然有效）：RTT 的采样分辨率＝调用方 tick（200 ms），测出来只能是
+ * tick 的整数倍；当年为了不误判"延时"才把边界改成严格大于，现在判定已无阈值参与，
+ * 那段坑不会复发。 */
 #define IV_CAMDET_RTT_THR_MS_DEFAULT 200u
 
 /* 典型调用方 tick（agent 巡检周期 `IV_AGENT_PROBE_TICK_MS`）——只用来判"阈值配得
@@ -154,13 +154,15 @@ extern "C" {
  * 枚举
  * ------------------------------------------------------------------------- */
 
-/* 五态编码。**数值即上报编码**，不得改动（现网 NET_STATUS_E）。 */
+/* 状态编码。**数值即上报编码**，不得改动（现网 NET_STATUS_E）。
+ * ⚠ 2026-10-29 用户口径：摄像机**只分通/不通**，`DELAY`/`LOSS` 保留编码但
+ * **不再产生**（`ping_verdict()` 已改两态）。平台侧若仍按五态解释，4/5 永远不会出现。 */
 typedef enum {
     IV_CAMDET_NO_IP  = 0, /* 未配置该路 IP */
-    IV_CAMDET_NORMAL = 1, /* 网络正常 */
-    IV_CAMDET_FAULT  = 2, /* 网络故障（含"网线断开"覆盖） */
-    IV_CAMDET_DELAY  = 4, /* 延时（仅 PING 方式产生） */
-    IV_CAMDET_LOSS   = 5  /* 丢包（仅 PING 方式产生） */
+    IV_CAMDET_NORMAL = 1, /* 网络正常（ping 有应答即为正常） */
+    IV_CAMDET_FAULT  = 2, /* 网络故障（含"网线断开"覆盖、四个样本全无应答） */
+    IV_CAMDET_DELAY  = 4, /* 保留编码；**不再产生** */
+    IV_CAMDET_LOSS   = 5  /* 保留编码；**不再产生** */
 } iv_camdet_status_t;
 
 /* 检测方式。数值与现网 `search_mode` 一致（1/2/3）。 */

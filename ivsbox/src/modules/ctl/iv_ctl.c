@@ -1699,6 +1699,34 @@ static int m_snmp_result(const iv_ctl_ctx_t *ctx, json_object *p,
     return rsp_data(d, out, cap, out_len);
 }
 
+/* 采集被拒时给出**能直接指导操作**的原因（2026-10-29）。
+ *
+ * 病根：原先无论哪种拒法一律回 `"snmp start rejected"`，界面 toast 就显示这一句
+ * ⇒ 用户只能反复问"为什么失败"（当天问了两次）。`iv_agent_snmp_start()` 的守卫
+ * 全用 `IV_ESTATE` 表达，ctl 层不区分就永远说不清 —— 这里按同一个 `cfg` 反推。
+ *
+ * msg 是**短标记**不是给人看的句子：中文文案在前端 `SNMP_RUN_ERR` 里（本项目
+ * 其它 msg 都是英文短语，界面要中文，所以分工成"定原因"与"说人话"两段）。
+ * 顺序必须与 `iv_agent_snmp_start()` 的守卫一致，否则会指错方向。 */
+static const char *snmp_deny_msg(const iv_ctl_ctx_t *ctx, int which, int rc)
+{
+    const iv_agent_t *a = ctx->agent;
+
+    if (rc == IV_EBUSY)
+        return "busy"; /* 上一轮在飞，等落地 */
+    if (rc != IV_ESTATE || a == NULL)
+        return "rejected";
+    if (which < 0 || which >= IV_AGENT_SNMP_TARGET_N)
+        return "rejected";
+    if (!a->cfg.snmp[which].enable)
+        return "disabled"; /* 采集开关没开 */
+    if (a->cfg.snmp[which].ip_be == 0u)
+        return "noip"; /* 目标没配 IP */
+    if (a->snmp_job[which].n_slot <= 0)
+        return "noid"; /* 一个 OID 都没配 */
+    return "nopool"; /* 只剩慢任务池不可用 */
+}
+
 static int m_snmp_run(const iv_ctl_ctx_t *ctx, json_object *p,
                       char *out, size_t cap, size_t *out_len)
 {
@@ -1712,7 +1740,7 @@ static int m_snmp_run(const iv_ctl_ctx_t *ctx, json_object *p,
         return rsp_err(IV_EINVAL, "which must be cam, cam0..cam5 or sw", out, cap, out_len);
     rc = iv_agent_snmp_start(ctx->agent, which, iv_clock_monotonic_ms());
     if (rc != IV_OK)
-        return rsp_err(rc, "snmp start rejected", out, cap, out_len);
+        return rsp_err(rc, snmp_deny_msg(ctx, which, rc), out, cap, out_len);
     d = json_object_new_object();
     if (d == NULL)
         return IV_ENOMEM;

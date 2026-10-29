@@ -10495,4 +10495,76 @@ cfg_snmp_target(&sc[IV_AGENT_SNMP_SW], "switch.snmp", "switch.snmp.oid", ...);
   选定的 WAN（产品化缺口，待定）。
 
 
+== 2026-10-29 18:48 采集被拒要说得清原因：短标记归后端，中文归前端
+
+=== 为什么动
+
+Web 上点「发起采集」失败时，toast 只显示一句 `失败：snmp start rejected`。
+这句话既没说缺什么，也没说去哪补 —— 同一天里用户为同一件事问了两遍
+"SNMP 采集为什么失败"。
+
+根因不在文案，在**错误码被压平了**。`iv_agent_snmp_start()` 的守卫是这样写的：
+
+[source,c]
+----
+if (a->cfg.pool == NULL)
+    return IV_ESTATE;                       /* 无慢任务池 */
+sc = &a->cfg.snmp[which];
+if (!sc->enable || sc->ip_be == 0u || a->snmp_job[which].n_slot <= 0)
+    return IV_ESTATE;                       /* 四种病因挤在一个码里 */
+if (a->snmp_state[which] == IV_AGENT_SNMP_RUN)
+    return IV_EBUSY;
+----
+
+四种完全不同的病因（没开开关／没配 IP／没配 OID／没有线程池）共用一个
+`IV_ESTATE`，ctl 层再一律翻译成同一句话，调用方拿到的信息量就是零。
+
+=== 怎么改
+
+**定原因与说人话分开。** 后端 `snmp_deny_msg()` 按与守卫**同一顺序**反推短标记：
+
+[cols="1,2"]
+|===
+|短标记 |含义
+
+|`disabled` |采集开关没开（`camera.snmp.enable` / `switch.snmp.enable`）
+|`noip`     |目标没配 IP（`camera.ch.N.ip` / `switch.ip`）
+|`noid`     |一个 OID 槽位都没配
+|`nopool`   |慢任务池不可用
+|`busy`     |上一轮还在飞（`IV_EBUSY`，不是 `IV_ESTATE`）
+|===
+
+后端 msg 只回标记，中文指导在 `app.js` 的 `SNMP_RUN_ERR` 里，并且**指出该去改哪个
+开关** —— 摄像机 6 路共用「摄像机 OID」卡那一个，交换机用「交换机 OID」卡自己的。
+缺 key 时退回显示裸标记，不静默。
+
+两点刻意没动：
+
+. **返回码不变**：`IV_ESTATE → HTTP 409` 的映射照旧。409 的含义仍是"状态不允许"，
+  不是"网络采不到" —— 把两者混起来才是最初误判的源头。
+. **顺序必须与守卫一致**：`snmp_deny_msg()` 判 `enable` 在 `ip_be` 之前，因为
+  `iv_agent_snmp_start()` 就是这么短路求值的；反过来写会指错方向（开关没开却报
+  "没配 IP"）。
+
+=== 验证
+
+* `make host` / `make arm` 0 告警（arm `6ff0789d`，ELF32 ARM EABI5）；
+* `make test` / `asan` / `tsan`（须 `setarch -R`）各 **49/49**；`make analyze` 0；
+* `make itest` **16 passed ＋ 1 SKIP**（tunnel 缺设备身份，与基线同）；
+* `hotcfg_e2e.py` **39/39**（新增 H10 四条：关开关回 `disabled`、开着开关但第 6 路
+  没 IP 回 `noip`）；`platcmd_e2e.py` 全部通过；
+* 本机 jsdom **14 个文件**全过（`ui_snmp_page` 30 条，新增 s09 四条锁住"不把短标记
+  裸抛给用户"）；
+* **反向证伪 2 条**：① 去掉 `snmp_deny_msg()` 的 `enable` 分支改回 `rejected`
+  ⇒ H10b 红（实得 `'rejected'`）；② `app.js` 的 toast 退回 `r.msg` ⇒ s09a~s09d
+  四条全红（实得 `失败：disabled`）。还原后 md5 与改前一致、全部复绿。
+
+=== 未做 / 已知边界
+
+* 平台侧 `0xE7` 查 SNMP 失败仍只回 `0x74`（`IV_PROTO_ERR_EXEC`），帧里没有带原
+  因的位置 —— 要细分得先扩协议，不在本次范围。
+* 前端只在点「发起采集」时才知道原因；采集**结果卡**本身仍显示 `状态：空闲`，
+  没做成"未开开关／未配 IP"两种灰字提示。两者能互补，但没合并。
+
+
 

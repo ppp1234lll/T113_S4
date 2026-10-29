@@ -2018,6 +2018,22 @@
     ['switch', '交换机']
   ];
 
+  /* 采集被拒的中文说明（2026-10-29）。
+   * 后端 `/api/snmp/run` 现在只回短标记（`snmp_deny_msg()` 的返回值），中文指导
+   * 放在这里 —— 原先一律回 `snmp start rejected`，界面原样抛出，用户看到的是一句
+   * 什么信息都没有的英文，一天里问了两次"为什么失败"。
+   * 少写一条 key 会退回显示裸标记（不至于静默），所以不必强求全覆盖。 */
+  var SNMP_RUN_ERR = {
+    disabled: '采集开关没开。把对应卡片里的「SNMP 采集开关」改成「已启用」，' +
+              '点「保存修改」后再采 —— 摄像机 6 路共用「摄像机 OID」卡那一个开关，' +
+              '交换机用「交换机 OID」卡里自己的',
+    noip: '这个目标没配 IP。摄像机去「摄像机」页填该路 IP，交换机去「交换机」页' +
+          '填交换机 IP，保存后再采',
+    noid: '这个目标一个 OID 都没配，至少填一项再采',
+    nopool: '采集线程池不可用（守护进程异常），查 /mnt/UDISK/log 下的日志',
+    busy: '上一轮采集还在跑，等 2~3 秒再点'
+  };
+
   /* 一张「字段 → OID」网格。每个输入框仍然是 `fieldFor()` 造的，所以
    * `collectChanges()` / `applyChanges()` 一个字都不用改就能收它 ——
    * 自己另写一套收集逻辑，脏标记、布尔/数字分流迟早和通用那条漂开。 */
@@ -2228,7 +2244,8 @@
     rl.addEventListener('click', show);
     btn.addEventListener('click', function () {
       api('/api/snmp/run', { method: 'POST', body: { which: sel.value } }).then(function (r) {
-        toast(r.ok ? '已发起采集' : ('失败：' + (r.msg || r.e)), r.ok ? 'ok' : 'err');
+        var why = SNMP_RUN_ERR[r.msg] || r.msg || r.e;
+        toast(r.ok ? '已发起采集' : ('失败：' + why), r.ok ? 'ok' : 'err');
         if (r.ok) setTimeout(show, 2500);
       });
     });

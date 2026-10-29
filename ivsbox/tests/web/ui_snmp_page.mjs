@@ -70,6 +70,9 @@ let ver = 41;
 const applyCalls = [];
 const snmpRunCalls = [];
 const snmpGets = [];
+/* 非 null 时 `/api/snmp/run` 回 `ok:false / e:-7 / msg:<它>`，用来验证界面把后端的
+ * 短标记（disabled/noip/noid/nopool/busy）翻成了中文指导（s09）。 */
+let snmpRunDeny = null;
 
 /* 出厂默认的**真实形态**：标准 MIB-II 三项三品牌都有值，私有节点只有海康有，
  * 大华/宇视留空（没有可靠依据就不编 OID —— 编错了现场拿到"有值但是错的"）。 */
@@ -156,6 +159,8 @@ window.fetch = function (u, o) {
     }
     if (u.indexOf('/api/snmp/run') === 0) {
         snmpRunCalls.push(JSON.parse(o.body));
+        if (snmpRunDeny !== null)
+            return Promise.resolve(rsp({ ok: false, e: -7, msg: snmpRunDeny }));
         return Promise.resolve(rsp({ ok: true, d: { accepted: true } }));
     }
     if (u.indexOf('/api/snmp?which=') === 0) {
@@ -323,6 +328,35 @@ const main = async () => {
     chk(snmpRunCalls.length === 1 &&
             snmpRunCalls[0].which === 'cam2',
         's08g: snmp.run 的 which 跟着下拉走（cam2），实得 ' + JSON.stringify(snmpRunCalls));
+
+    /* 2026-10-29：采集被拒时后端只回短标记（先前的 "snmp start rejected" 一天里
+     * 被问了两次"为什么失败"）。这里锁住"界面必须翻成中文并指出该改哪个开关"。 */
+    console.log('s09 采集被拒时给中文原因，不把后端短标记裸抛出来');
+    let txt;
+
+    const toastOf = () => {
+        const t = doc.getElementById('toast');
+
+        return t ? t.textContent : '';
+    };
+
+    snmpRunDeny = 'disabled';
+    runBtn.click();
+    await sleep(80);
+    txt = toastOf();
+    chk(/采集开关没开/.test(txt),
+        's09a: disabled 翻成「采集开关没开」，实得 ' + JSON.stringify(txt));
+    chk(/SNMP 采集开关/.test(txt), 's09b: 顺带指出该去改哪个开关');
+    chk(txt.indexOf('disabled') < 0, 's09c: 不出现裸标记 disabled');
+
+    snmpRunDeny = 'noip';
+    runBtn.click();
+    await sleep(80);
+    txt = toastOf();
+    chk(/没配 IP/.test(txt) && txt.indexOf('noip') < 0,
+        's09d: noip 翻成「没配 IP」且不出现裸标记，实得 ' + JSON.stringify(txt));
+
+    snmpRunDeny = null;
 };
 
 main().then(() => {

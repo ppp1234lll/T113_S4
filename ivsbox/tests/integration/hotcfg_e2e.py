@@ -278,6 +278,26 @@ def main():
         chk(len(cam_slots('cam0')) == 8 and len(cam_slots('cam2')) == 8,
             'H9j 两路都回到 8 槽')
 
+        # ── H10（2026-10-29）：采集被拒的原因必须能分辨 ────────────────────
+        # 原先 `m_snmp_run()` 一律回 "snmp start rejected"：界面 toast 就这一句，
+        # 一天里被问了两次"为什么失败"。现在按 `iv_agent_snmp_start()` 的同一组
+        # 守卫反推短标记（disabled / noip / noid / nopool / busy），中文在 app.js
+        # 的 `SNMP_RUN_ERR` 里。**排在 H8 之前**：H8 是收尾恢复默认。
+        print('H10 采集被拒要说得清原因（不是一律 rejected）')
+        r = apply_items('camera', {'camera.snmp.enable': False})
+        chk(r.get('ok') is True, 'H10a 关掉 camera.snmp.enable')
+        r = ctl('snmp.run', {'which': 'cam0'})
+        chk(r.get('ok') is False and r.get('msg') == 'disabled',
+            'H10b 没开采集开关 ⇒ msg=disabled，实得 ' + repr(r.get('msg')))
+        r = apply_items('camera', {'camera.snmp.enable': True, 'camera.ch.5.ip': ''})
+        chk(r.get('ok') is True, 'H10c 打开 camera.snmp.enable（第 6 路 IP 显式清空）')
+        # 开关开着、但这一路没 IP ⇒ 应该指到 noip 上，而不是笼统的 rejected。
+        # 用第 6 路：前几路在别的用例里填过 IP，默认值不可靠。
+        r = ctl('snmp.run', {'which': 'cam5'})
+        chk(r.get('ok') is False and r.get('msg') == 'noip',
+            'H10d 开关开着但该路没 IP ⇒ 说 noip（不是笼统 rejected），实得 ' +
+            repr(r.get('msg')))
+
         print('H8 收尾恢复默认')
         r = apply_items('camera', {'camera.ch.0.url': '', 'camera.ch.0.record': False,
                                    'camera.rec.hold_ms': 10000,

@@ -243,6 +243,86 @@ static void p09_guards(void)
         "p09 NULL port out-param is allowed");
 }
 
+/* =========================================================================
+ * p10~p13 探测目标：平台地址优先，`probe.target1/2` 只在"平台地址不是字面 IPv4"
+ * 时兜底（2026-10-29 用户口径）
+ *
+ * 反向证伪点：
+ *   - 若仍按 `probe.target1` 取目标（改前的行为）⇒ p10 必红（探的根本不是平台）；
+ *   - 若去掉"另一口回退"⇒ p11 必红；
+ *   - 若把兜底当成常态（平台地址是域名时也返回 0、不做兜底）⇒ p12 必红；
+ *   - 若把兜底排在平台地址前面 ⇒ p10/p12 至少一条红。
+ * ========================================================================= */
+static void p10_platform_address_wins(void)
+{
+    iv_agent_cfg_t c;
+
+    pick_reset(&c);
+    c.srv_host[IV_WAN_WIRELESS] = "47.104.250.225";
+    c.srv_port[IV_WAN_WIRELESS] = 6013u;
+    /* 同时给一组完全不同的"主网检测 IP"，它是旧行为的目标 —— 必须被忽略 */
+    c.probe_target_be[0]        = 0x0302A8C0u; /* 192.168.2.3 */
+    c.probe_target_be[1]        = 0x0202A8C0u; /* 192.168.2.2 */
+
+    /* 47.104.250.225 = 2F 68 FA E1（内存字节序）；小端机上读成 uint32 就是 E1FA682F */
+    chk(iv_agent_probe_target_of(&c, IV_WAN_WIRELESS) == 0xE1FA682Fu,
+        "p10 探的是平台地址，不是主网检测 IP");
+    /* 有线口没配自己的地址 ⇒ `pick_host` 回退到无线口，目标仍应可用 */
+    chk(iv_agent_probe_target_of(&c, IV_WAN_WIRED) == 0xE1FA682Fu,
+        "p10 另一口没配地址时回退到本口平台地址");
+}
+
+static void p11_each_wan_own_address(void)
+{
+    iv_agent_cfg_t c;
+
+    pick_reset(&c);
+    c.srv_host[IV_WAN_WIRELESS] = "10.9.8.7";
+    c.srv_port[IV_WAN_WIRELESS] = 6000u;
+    c.srv_host[IV_WAN_WIRED]    = "10.9.8.6";
+    c.srv_port[IV_WAN_WIRED]    = 6000u;
+
+    chk(iv_agent_probe_target_of(&c, IV_WAN_WIRELESS) == 0x0708090Au,
+        "p11 无线口探自己的平台地址");
+    chk(iv_agent_probe_target_of(&c, IV_WAN_WIRED) == 0x0608090Au,
+        "p11 有线口探自己的平台地址（两路各探各的）");
+}
+
+static void p12_domain_falls_back_to_probe_target(void)
+{
+    iv_agent_cfg_t c;
+
+    pick_reset(&c);
+    c.srv_host[IV_WAN_WIRELESS] = "plat.example.com"; /* 域名：这一层不解析 */
+    c.srv_port[IV_WAN_WIRELESS] = 6013u;
+    c.probe_target_be[0]        = 0x0302A8C0u;        /* 192.168.2.3 */
+
+    chk(iv_agent_probe_target_of(&c, IV_WAN_WIRELESS) == 0x0302A8C0u,
+        "p12 平台地址不是字面 IPv4 ⇒ 用主网检测 IP 兜底");
+
+    /* target1 空 ⇒ 退 target2 */
+    c.probe_target_be[0] = 0u;
+    c.probe_target_be[1] = 0x0202A8C0u;
+    chk(iv_agent_probe_target_of(&c, IV_WAN_WIRELESS) == 0x0202A8C0u,
+        "p12 target1 空则退 target2");
+}
+
+static void p13_no_target_at_all(void)
+{
+    iv_agent_cfg_t c;
+
+    pick_reset(&c);
+    /* 平台地址与检测 IP 全空 ⇒ 0：该路只做被动 LINK 探测，不凭空造目标 */
+    chk(iv_agent_probe_target_of(&c, IV_WAN_WIRELESS) == 0u,
+        "p13 什么都没配 ⇒ 0（LINK 层）");
+    chk(iv_agent_probe_target_of(NULL, IV_WAN_WIRELESS) == 0u, "p13 NULL cfg 守卫");
+    /* 端口 0 与 `pick_host` 同口径："没配"，不拿它去探 */
+    c.srv_host[IV_WAN_WIRELESS] = "10.9.8.7";
+    c.srv_port[IV_WAN_WIRELESS] = 0u;
+    chk(iv_agent_probe_target_of(&c, IV_WAN_WIRELESS) == 0u,
+        "p13 平台端口为 0 视作没配（与 pick_host 一致）");
+}
+
 int main(void)
 {
     p01_primary_wins();
@@ -254,12 +334,16 @@ int main(void)
     p07_no_failover_state();
     p08_both_directions();
     p09_guards();
+    p10_platform_address_wins();
+    p11_each_wan_own_address();
+    p12_domain_falls_back_to_probe_target();
+    p13_no_target_at_all();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_agent_pick FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_agent_pick passed (4-link priority chain, no failover state, "
-           "guards)\n");
+           "guards, probe-target=%s)\n", "platform-first");
     return 0;
 }

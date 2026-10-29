@@ -656,6 +656,53 @@ static void c11_set_fail_n(void)
     chk(m.cfg.fail_n == 3u, "c11 fail_n 0 normalizes to default");
 }
 
+/* =========================================================================
+ * c12 双断且当前不在无线 -> 出口落到无线（4G）当默认，且不反复打事务
+ *      （2026-10-29 用户口径："都连不上时默认用 4G"）
+ *
+ * 反向证伪点：
+ *   - 去掉 `BOTH_DOWN` 里新增的那条分支 ⇒ 第一条 active 断言必红（出口仍冻在
+ *     出故障前那块网卡上，就是现场卡在 eth0 4 小时的形态）；
+ *   - 去掉 `m->active != WIRELESS` 这道门 ⇒ 后续每拍 tick 都要打一次完整七步
+ *     事务，`switches == 2` 的断言必红。
+ * ========================================================================= */
+static void c12_both_down_fallback(void)
+{
+    iv_netmgr_t     m;
+    iv_netmgr_cfg_t c;
+    fake_t          f;
+
+    fake_init(&f);
+    cfg_auto(&c, &f);
+    iv_netmgr_init(&m);
+    chk(iv_netmgr_open(&m, &c, 0) == IV_OK, "c12 open");
+    drive_to_wired(&m, 1000); /* 活动口＝有线，无线已判死 */
+    chk(iv_netmgr_switches(&m) == 1u, "c12 pre: 已切到有线一次");
+
+    /* 有线也断：WIRED_UP 分支看到 wd=0 且 wl=0 ⇒ BOTH_DOWN（这一拍不动出口） */
+    feed_n(&m, IV_WAN_WIRED, 0, FAIL_N, 2000);
+    chk(iv_netmgr_state(&m) == IV_NETMGR_BOTH_DOWN, "c12 判双断");
+    chk((int)iv_netmgr_active_wan(&m) == (int)IV_WAN_WIRED,
+        "c12 判双断那一拍还没切（事务在 tick 里做）");
+
+    /* 关键：下一拍必须把出口落到无线（4G），而不是冻在有线上 */
+    chk(iv_netmgr_tick(&m, 2001) == IV_OK, "c12 tick fallback");
+    chk((int)iv_netmgr_active_wan(&m) == (int)IV_WAN_WIRELESS,
+        "c12 双断时出口落到 4G（否则永远卡在没网的那块网卡上）");
+    chk(f.switch_from == WD_IF && f.switch_to == WL_IF,
+        "c12 切路由是 有线 -> 无线");
+    chk(iv_netmgr_switches(&m) == 2u, "c12 只切这一次");
+
+    /* 两条都不通的稳态：收敛回 BOTH_DOWN，但**不许**再打事务（否则每拍一次风暴） */
+    (void)iv_netmgr_tick(&m, 3000);
+    (void)iv_netmgr_tick(&m, 4000);
+    (void)iv_netmgr_tick(&m, 5000);
+    chk(iv_netmgr_state(&m) == IV_NETMGR_BOTH_DOWN, "c12 稳态仍是双断");
+    chk(iv_netmgr_switches(&m) == 2u, "c12 双断稳态下不再反复打事务");
+    chk((int)iv_netmgr_active_wan(&m) == (int)IV_WAN_WIRELESS,
+        "c12 稳态停在 4G（默认出口）");
+}
+
 int main(void)
 {
     c01_lifecycle();
@@ -669,6 +716,7 @@ int main(void)
     c09_modes();
     c10_set_mode();
     c11_set_fail_n();
+    c12_both_down_fallback();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_netmgr FAILED (%d)\n", g_fail);
@@ -676,6 +724,7 @@ int main(void)
     }
     printf("test_netmgr passed (lifecycle/normalize, hysteresis, switch-order+args, "
            "media-resume, txn-rollback+retry-window, hold-s-return, wired-down-immediate, "
-           "both-down-recovery, modes, runtime-set-mode, runtime-set-fail-n)\n");
+           "both-down-recovery, both-down-fallback-to-4g, modes, runtime-set-mode, "
+           "runtime-set-fail-n)\n");
     return 0;
 }

@@ -221,9 +221,45 @@ static void probe_cfg_of(const iv_agent_cfg_t *cfg, iv_probe_cfg_t *pc)
     pc->timeout_ms = probe_io_timeout_of(pc->interval_ms);
 }
 
-/* 目标 IP：优先 target1，没配则退 target2；都没有 ⇒ 0（只做被动 LINK 探测）。 */
-static uint32_t agent_probe_dst(const iv_agent_cfg_t *cfg)
+/* 字面 IPv4 串 -> 网络序值；不是字面 IPv4（域名 / 空 / 非法）返回 0。
+ *
+ * **只认字面值**：域名要先解析，而"能不能解析"本身依赖"哪条 WAN 能出去" ——
+ * 在探活这一层做解析会变成循环依赖（解析失败时说不清该怪 DNS 还是怪链路）。 */
+static uint32_t ipv4_be_of(const char *s)
 {
+    struct in_addr a;
+
+    if (s == NULL || s[0] == '\0')
+        return 0u;
+    if (inet_pton(AF_INET, s, &a) != 1)
+        return 0u;
+    return a.s_addr;
+}
+
+/* 这一路 WAN 的探测目标：**探平台地址**（2026-10-29 用户口径）。
+ *
+ * 原先是"两条 WAN 共用 `probe.target1`（主网检测 IP）"，把两件事混成了一件：
+ * 主网检测 IP 是独立配置（平台 0xF8 也能改），问的是"这路隧道通不通"；
+ * 而 netmgr 拿这个结论去决定**上报报文从哪块网卡出去** —— 那要问的其实是
+ * "这路能不能连上平台"。目标配错（现场填了不存在的 `192.168.2.3`）就得出
+ * "两条都断"，把设备钉死在没网的出口上（2026-10-29 断联 4 小时的直接原因）。
+ *
+ * 现在探的就是自己要连的那个地址，优先级：
+ *   `net.server.<本口>.host` → 另一口（`iv_agent_pick_host()` 自带这层回退）
+ *   →（都不是字面 IPv4）`probe.target1/2` 兜底。
+ * 最后一档只是兜底：平台写成域名时这一步解析不了，就退回原来的检测目标，
+ * 并由 `agent_probe_build()` 打日志说明"实际探的是哪个"，不让它静默发生。
+ *
+ * 契约（含四级优先级、为什么不做 DNS）见 iv_agent.h。 */
+uint32_t iv_agent_probe_target_of(const iv_agent_cfg_t *cfg, int wan)
+{
+    uint32_t ip;
+
+    if (cfg == NULL)
+        return 0u;
+    ip = ipv4_be_of(iv_agent_pick_host(cfg, wan, NULL));
+    if (ip != 0u)
+        return ip;
     return (cfg->probe_target_be[0] != 0u) ? cfg->probe_target_be[0]
                                            : cfg->probe_target_be[1];
 }
@@ -242,15 +278,21 @@ static const char *ipv4_dotted(uint32_t be, char *buf, size_t cap)
 }
 
 /* 逐 WAN 建项并开跑。**调用前必须已经 init/reset 过**（n_items 归零、started=0）。
+ * 目标**逐路取**（`iv_agent_probe_target_of()`）：两条 WAN 各自的平台地址可能不同，
+ * 即使相同也要各探一次 —— 判的是"这条链路通不通"，不是"目标活不活"。
  * 返回值＝建起来的项数；某个 WAN 建失败只打日志，不影响其它 WAN。 */
-static int agent_probe_build(iv_agent_t *a, uint32_t dst, uint64_t now_ms)
+static int agent_probe_build(iv_agent_t *a, uint64_t now_ms)
 {
     int w;
     int n = 0;
 
     for (w = 0; w < IV_WAN_N; w++) {
-        int idx;
+        uint32_t dst = iv_agent_probe_target_of(&a->cfg, w);
+        char     db[INET_ADDRSTRLEN];
+        int      idx;
 
+        /* 记住"建表时探的是谁"，热更时靠它判要不要重建（见 iv_agent.h 该字段） */
+        a->probe_dst_be[w] = dst;
         a->wan_probe_idx[w] = -1;
         if (a->wan_ifindex[w] == 0)
             continue; /* 接口不存在：无项可建，该 WAN 恒 UNKNOWN */
@@ -263,6 +305,13 @@ static int agent_probe_build(iv_agent_t *a, uint32_t dst, uint64_t now_ms)
                      a->cfg.wan_name[w], idx);
             continue;
         }
+        /* 探的是平台地址还是兜底的"主网检测 IP"，必须能从日志上看出来 ——
+         * 这两种情况在界面/上报里长得一模一样，出事时只能靠这一行分辨。 */
+        IV_LOG_I(AG_MOD, "probe target for wan %s -> %s%s",
+                 a->cfg.wan_name[w], ipv4_dotted(dst, db, sizeof(db)),
+                 (ipv4_be_of(iv_agent_pick_host(&a->cfg, w, NULL)) != 0u)
+                     ? " (platform)"
+                     : (dst != 0u ? " (probe.target fallback)" : " (link only)"));
         n++;
     }
     if (iv_probe_start(&a->pb, now_ms) != IV_OK)
@@ -293,6 +342,44 @@ static void agent_probe_seed_links(iv_agent_t *a, uint64_t now_ms)
          * 0，拿它判"网线断开"会一直误报（`MN=3`）。seed 这一刻才是权威事实。 */
         a->wan_link_up[w] = (uint8_t)up;
         IV_LOG_I(AG_MOD, "link seed: %s %s", a->cfg.wan_name[w], up ? "up" : "down");
+    }
+}
+
+/* 重建整张探测表 —— **只在"探的是谁"变了时用**（变参数走 `iv_probe_retune()`，
+ * 重建会把滑窗与连续成败计数清零，一次改节拍不该付这个代价）。
+ *
+ * 三步顺序不能换：
+ *   ① 先 `stop()` 关掉旧 socket —— `init()` 会 memset 整个结构，先 init 就把 fd 号
+ *      连同结构一起忘了（泄漏）；
+ *   ② `init()` 清统计；
+ *   ③ 建项后立刻重播链路现状 —— netlink 只报"变化"、不回放现状，不重播的话两条
+ *      WAN 都已 UP 的板上，状态机会一直"看不见"任何可用 WAN（2026-10-12 查出的故障）。
+ *
+ * 逐路打一行"旧目标 -> 新目标"：探测目标自 2026-10-29 起默认取**平台地址**，
+ * 而平台地址会被 `net.server.*` 热更改掉 —— 不把这件事写进日志，现场就只能看到
+ * "配置改了但探活还是老结论"，无从判断是没重建还是重建错了。 */
+static void agent_probe_rebuild(iv_agent_t *a, const iv_probe_cfg_t *pc, uint64_t now_ms)
+{
+    uint32_t old_dst[IV_WAN_N];
+    int      w;
+
+    for (w = 0; w < IV_WAN_N; w++)
+        old_dst[w] = a->probe_dst_be[w];
+
+    (void)iv_probe_stop(&a->pb);
+    (void)iv_probe_init(&a->pb, pc);
+    (void)agent_probe_build(a, now_ms); /* 内部逐路打 "probe target for wan ..." */
+    agent_probe_seed_links(a, now_ms);
+
+    for (w = 0; w < IV_WAN_N; w++) {
+        char ob[INET_ADDRSTRLEN];
+        char nb[INET_ADDRSTRLEN];
+
+        if (old_dst[w] == a->probe_dst_be[w])
+            continue;
+        IV_LOG_I(AG_MOD, "probe dst rebuilt: wan %s %s -> %s",
+                 a->cfg.wan_name[w], ipv4_dotted(old_dst[w], ob, sizeof(ob)),
+                 ipv4_dotted(a->probe_dst_be[w], nb, sizeof(nb)));
     }
 }
 
@@ -377,7 +464,6 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     iv_netmgr_cfg_t            mc;
     iv_netmgr_mode_t           mode;
     const iv_netmgr_txn_ops_t *dflt;
-    uint32_t                   dst;
     int                        w;
     int                        w0;   /* 初始活动出口（地址与绑定网卡都按它取） */
     int                        t;
@@ -446,8 +532,8 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     /* ---- 3. probe（每条 WAN 一项：有目标走 ICMP，否则被动 LINK）---- */
     probe_cfg_of(cfg, &pc);
     (void)iv_probe_init(&a->pb, &pc);
-    dst = agent_probe_dst(cfg);
-    agent_probe_build(a, dst, now_ms);
+    /* 目标逐路取（默认＝该路的平台地址），不再共用 `probe.target1` */
+    (void)agent_probe_build(a, now_ms);
 
     /* ---- 3b. 开局摸底（必须）----
      * netlink 只报"变化"、不回放现状（见 iv_netlink.h 取舍 2），而 netmgr_feed()
@@ -1782,6 +1868,27 @@ int iv_agent_reload_server(iv_agent_t *a)
              (a->cfg.wan_name[w] != NULL) ? a->cfg.wan_name[w] : "-",
              (bind != NULL) ? bind : "-");
 
+    /* 探测目标默认就是平台地址（见 `iv_agent_probe_target_of()`）⇒ 平台地址一变，
+     * 探测表必须跟着重建，否则"连的是新平台、探的仍是旧地址"，切换判据全错。
+     * 这里刻意不看 `changed`：本函数只在 `agent_sync_server_cfg()` 判过"真的变了"
+     * 之后才被调用，而探测目标本身就比挑选出来的 host 更严格（只认字面 IPv4）。 */
+    {
+        int             w2;
+        int             need = 0;
+        iv_probe_cfg_t  pc2;
+
+        for (w2 = 0; w2 < IV_WAN_N; w2++) {
+            if (iv_agent_probe_target_of(&a->cfg, w2) != a->probe_dst_be[w2])
+                need = 1;
+        }
+        /* 顺带把延时门限/节拍也重算：`probe.*` 没变时 rebuild 出来的参数与现状一致，
+         * 这一步不会引入抖动（重建的判据只有"目标变了"）。 */
+        if (need != 0) {
+            probe_cfg_of(&a->cfg, &pc2);
+            agent_probe_rebuild(a, &pc2, iv_clock_monotonic_ms());
+        }
+    }
+
     return iv_report_reconnect(&a->rp, iv_clock_monotonic_ms());
 }
 
@@ -1804,9 +1911,8 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
 {
     iv_agent_cfg_t tmp;
     iv_probe_cfg_t pc;
-    uint32_t       old_dst;
-    uint32_t       new_dst;
-    char           nb[INET_ADDRSTRLEN];
+    int            dst_changed;
+    int            w;
     int            rc;
 
     if (a == NULL) {
@@ -1815,8 +1921,6 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
     if (!a->opened) {
         return IV_ESTATE;
     }
-
-    old_dst = agent_probe_dst(&a->cfg);
 
     /* 在**快照的副本**上落值再归一化：`probe_cfg_of()` 把 0 翻成默认值，
      * 运行期直接拿 0 去建项会得到 interval=0（一拍都不探）这种"看起来在跑"的假活。 */
@@ -1833,7 +1937,15 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
     tmp.probe_fail_n       = fail_n;
     probe_cfg_of(&tmp, &pc);
 
-    new_dst = agent_probe_dst(&tmp);
+    /* 目标变了 ⇒ 必须重建（"有目标走 ICMP、没目标退被动 LINK"在 iv_probe 里是两种
+     * 不同的项，改层只能重来；而且新目标本来就该配一组新统计）。
+     * 注意比较的是**建表时真正用的地址**（`probe_dst_be[]`）而不是配置项：
+     * 平台地址优先时改 `probe.target1` 并不改变探测目标，那就不该重建。 */
+    dst_changed = 0;
+    for (w = 0; w < IV_WAN_N; w++) {
+        if (iv_agent_probe_target_of(&tmp, w) != a->probe_dst_be[w])
+            dst_changed = 1;
+    }
 
     /* 完全没变 ⇒ 立刻返回，连日志都不打。`on_cfg_committed(PROBE)` 在该分类任何
      * 一个键变化时都会进来，没有这个早返回的话，改个 target2 也会刷一条
@@ -1848,26 +1960,15 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
             /* 延时门限必须参与比较：它是 `probe.timeout_ms` 唯一的消费者，
              * 漏掉就等于"平台 0xFE 改完落盘了、探测引擎还是旧门限"—— 而且
              * 会静默走下面 retune 分支并被 retune 的同值早返回吞掉。 */
-            oldpc.degrade_rtt_ms == pc.degrade_rtt_ms && old_dst == new_dst) {
+            oldpc.degrade_rtt_ms == pc.degrade_rtt_ms && dst_changed == 0) {
             return IV_OK;
         }
     }
 
-    if (new_dst != old_dst) {
-        char ob[INET_ADDRSTRLEN];
-
-        IV_LOG_I(AG_MOD, "probe target changed (%s -> %s), rebuild",
-                 ipv4_dotted(old_dst, ob, sizeof(ob)),
-                 ipv4_dotted(new_dst, nb, sizeof(nb)));
-        /* 顺序不能换：先 stop 关掉旧 socket，再 init（init 会 memset 整个结构，
-         * 先 init 就把 fd 号连同结构一起忘了 ⇒ 泄漏）。 */
-        (void)iv_probe_stop(&a->pb);
-        (void)iv_probe_init(&a->pb, &pc);
-        (void)agent_probe_build(a, new_dst, now_ms);
-        /* 建完必须立刻重播一次链路现状：init/reset 把 link_ifindex/link_up 清空了，
-         * 而 netlink 只报"变化"、不回放现状 ⇒ 不重播的话，两条 WAN 都已经 UP 的
-         * 板上，状态机会一直"看不见"任何可用 WAN（2026-10-12 板端真链路验收的故障）。 */
-        agent_probe_seed_links(a, now_ms);
+    if (dst_changed != 0) {
+        /* 快照要先落：`agent_probe_build()` 是按 `a->cfg` 逐路取目标的 */
+        a->cfg = tmp;
+        agent_probe_rebuild(a, &pc, now_ms);
     } else {
         rc = iv_probe_retune(&a->pb, pc.interval_ms, pc.timeout_ms, pc.fail_n, now_ms);
         if (rc != IV_OK) {
@@ -1897,9 +1998,17 @@ int iv_agent_reload_probe(iv_agent_t *a, uint32_t target1_be, uint32_t target2_b
      * `netthr.loss_count`（`iv_agent_reload_netthr()` 管），PROBE 分类只负责
      * 探测自身的判定门限。 */
 
-    IV_LOG_I(AG_MOD, "probe reloaded: interval=%u io_timeout=%u fail_n=%u delay=%u dst=%s",
-             (unsigned)pc.interval_ms, (unsigned)pc.timeout_ms, (unsigned)pc.fail_n,
-             (unsigned)pc.degrade_rtt_ms, ipv4_dotted(new_dst, nb, sizeof(nb)));
+    {
+        char b0[INET_ADDRSTRLEN];
+        char b1[INET_ADDRSTRLEN];
+
+        IV_LOG_I(AG_MOD,
+                 "probe reloaded: interval=%u io_timeout=%u fail_n=%u delay=%u dst=%s,%s",
+                 (unsigned)pc.interval_ms, (unsigned)pc.timeout_ms,
+                 (unsigned)pc.fail_n, (unsigned)pc.degrade_rtt_ms,
+                 ipv4_dotted(a->probe_dst_be[IV_WAN_WIRELESS], b0, sizeof(b0)),
+                 ipv4_dotted(a->probe_dst_be[IV_WAN_WIRED], b1, sizeof(b1)));
+    }
     return IV_OK;
 }
 

@@ -9596,12 +9596,107 @@ src/modules/probe/iv_probe.c::
 
 * **`sys.transport.mode` 现在是 4(AUTO)**，依赖 `probe.target1` 可达。换到其它现场时
   这个键必须按该现场的平台/网关地址填，不能沿用 `192.168.2.x`。
+  ⇒ **2026-10-29 10:53 已作废**：探测目标改为直接取平台地址，`probe.target1` 只作
+  域名兜底，见下一节。
 * **TCP 层探测（`iv_probe_add_tcp`）同样不绑出口**，但生产装配层不用 TCP 项
   （`agent_probe_build()` 只建 ICMP 或 LINK），故本轮未改；一旦启用需补
   `SO_BINDTODEVICE`（TCP 无 `IP_PKTINFO` 等价能力）。
 * `iv_probe` 的 `set_links`/`reset` 后绑定会重开，但**已存在的 raw socket 不重建** ——
   若运行期换网卡（ifindex 变化），需 `stop()`+`start()`，现有装配路径（`reload_probe`）
   是这么做的。
+
+---
+
+== 2026-10-29 10:53 探测目标改为"平台地址" ＋ 双断默认落到 4G
+
+上一节修的是"ICMP 没绑出口"，但**探谁**这件事本身也是错的 —— 这一节是它的后续。
+
+=== 为什么 `probe.target1/2` 不该当连通性判据
+
+`probe.target1/2` 是独立配置项（界面/平台叫「主网检测 IP」，现场填 `192.168.2.3`），
+它回答的是"这路隧道通不通"；而 `iv_netmgr` 拿这个结论去决定**上报报文从哪块网卡
+出去** —— 那要回答的其实是"这路能不能连上平台"。两件事被混成一件，后果是：
+
+. 目标配错（现场 `192.168.2.x` 与设备所在网段都不匹配）⇒ 两条都判不通；
+. `BOTH_DOWN` 分支原来**什么都不做** ⇒ 默认出口冻在出故障前那一块网卡上；
+. 现场卡在 `eth0`：4G 明明能到平台，却永远不被使用 ⇒ 平台断联 4 小时。
+
+第 2 条比第 1 条更致命：探活错只是结论错，不动作则是连"试一试另一条"都不做。
+
+=== 探测目标：四级优先级
+
+[source,c]
+----
+iv_agent_probe_target_of(cfg, wan):
+    本口主 → 本口备 → 另一口主 → 另一口备      （全走 iv_agent_pick_host，即平台地址）
+    都不是字面 IPv4（域名 / 未配）→ probe.target_be[0] → probe.target_be[1] → 0
+----
+
+* **平台地址优先**。`iv_agent_pick_host()` 本来就有"本口没配就顶上另一口"的回退，
+  正好是这里要的语义；它不做失败切换，只管"没配"。
+* `probe.target1/2` 降级为**兜底**：平台写成域名时这一层不解析（不做 DNS），
+  退回原来的检测目标，并由 `agent_probe_build()` 打日志说明实际探的是哪个。
+* 返回 0 ⇒ 该项建 `LINK` 项（被动吃 carrier 事件），即"什么都没配"的退化形态。
+
+每路一行日志，让"探平台"和"探兜底 IP"在日志上分得开（界面上这两种情况长得一样）：
+
+[source,text]
+----
+probe target for wan usb0 -> 47.104.250.225 (platform)
+probe target for wan eth0 -> 47.104.250.225 (platform)
+probe target for wan usb0 -> 192.168.2.3 (probe.target fallback)
+probe target for wan eth0 -> 0.0.0.0 (link only)
+----
+
+=== 热更：别出现"连新平台、探旧地址"
+
+`struct iv_agent` 新增 `probe_dst_be[IV_WAN_N]`，记"建表时这一路探的是谁"。两个入口
+都拿它和目标做对比，**变了才** `stop()→init()→build()→seed_links()`（重建打
+`probe dst rebuilt: wan usb0 A -> B`）：
+
+* `iv_agent_reload_probe()`：`probe.*` / `net.mn.*` 一类配置变化；
+* `iv_agent_reload_server()`：`net.server.*` 变化 —— 这一处最容易漏。平台地址改了，
+  传输层会去连新地址，但探测表还指着旧地址，切完 WAN 结论还是错的。
+
+=== 双断默认落到 4G
+
+[source,c]
+----
+case IV_NETMGR_BOTH_DOWN:
+    if (wl)      run_txn(WIRELESS);   /* 无线优先 */
+    else if (wd) run_txn(WIRED);
+    else if (m->active != WIRELESS) run_txn(WIRELESS);   /* ← 本轮新增 */
+----
+
+两条都不通时把出口落到 4G。**不是**断言 4G 一定通（真不通时 `transport` 继续按退避
+重试），而是 4G 是唯一可能独立恢复的那条：它不依赖现场交换机/上游出口。
+
+`m->active != WIRELESS` 这个判断不能省：少了它，`BOTH_DOWN` 稳态下**每拍 tick 都会
+打一次完整七步事务**（切路由 ＋ 断 TCP ＋ 重连），直接变成风暴。`c12` 用例专门钉了
+"只切这一次"和"稳态不再反复打事务"。
+
+=== 对集成用例的连带影响（`test_agent_switch`）
+
+该用例原先靠 `probe_target_be = 0` 建"被动吃 carrier 事件的 LINK 项"，正好是在建模
+上面那个错误前提。语义改正后探活项变成 ICMP 探测，**UP 不再随 LINK_UP 瞬时翻转** ——
+要先攒够 `ok_n`(2) 个成功回包，而原用例的 `wait_link()` 只拉 netlink、不推拍，
+于是状态永远停在 UNKNOWN ⇒ 19 条假红。改法：
+
+* 新增 `wait_probe_up()`：拉 netlink ＋ `pump_agent()`（推拍才会真的发探、读回包）；
+* `probe_interval_ms = 500`（库下界），让这段等待短到不影响后续时序；
+* `nm_hold_s` 1 → 3 s，容得下这段等待（否则 k06「hold_s 未到不许回切」假红）；
+* **关掉延时降级门限**：用例的时间是注入的（按拍跳 200 ms，k06 一次跨过 hold_s），
+  回包被读到时 RTT 会算成整段跳变量 ⇒ 默认 800 ms 门限把好链路判成 DEGRADED、MN 变 4。
+  降级判定本身由 `test_probe` / `test_agent_mn` 覆盖，不必在这里重复测。
+* k01 的"开局摸底"断言：真网卡模式下探活项开局是 UNKNOWN（还没回包），不再是 UP。
+
+=== 未做
+
+* `probe.target1/2` 只作兜底，**现场仍应把它填成该现场真实存在的地址**（现在不影响
+  连通性判据，但界面/上报的「主网检测 IP」字段还是它）。
+* 域名型的平台地址不做 DNS 解析（`iv_agent_probe_target_of()` 层），落到兜底目标。
+  要支持就得把解析结果缓存进 `probe_dst_be`，并处理 TTL 与重解析。
+
 
 
 

@@ -477,6 +477,13 @@ typedef struct {
 
     int          wan_ifindex[IV_WAN_N];   /* 启动时按名字解析；0=未绑定 */
     int          wan_probe_idx[IV_WAN_N]; /* 绑该 WAN 的 probe 项下标；-1=无 */
+    /* 探测表**当前探的是谁**（下标＝`iv_wan_t`，网络序；0＝该路只有被动 LINK 项）。
+     *
+     * 与 `cfg.probe_target_be[]`（配置算出来的"主网检测 IP"）分开存，因为探测目标
+     * 自 2026-10-29 起默认取**平台地址**，而配置快照随时会被热更改写 —— 只有记住
+     * "建表时到底用的哪个地址"，`net.server.*` / `probe.*` 热更时才能判出要不要重建。
+     * 漏了这一步的症状是"配置改了、探测还在探旧地址"，而且日志上看不出异常。 */
+    uint32_t     probe_dst_be[IV_WAN_N];
     uint8_t      wan_link_up[IV_WAN_N];   /* 最近一次 netlink carrier 状态 */
     uint64_t     door_events;             /* S4.5 累计门开事件次数（M4 阶段可观测用） */
 
@@ -544,6 +551,24 @@ void iv_agent_cfg_default(iv_agent_cfg_t *cfg);
  * 单测直接钉住比"起一整套 report 只为了看选中谁"便宜得多。
  */
 const char *iv_agent_pick_host(const iv_agent_cfg_t *cfg, int wan, uint16_t *port);
+
+/*
+ * 这一路 WAN 的**探测目标**（网络序 IPv4；0 = 该路只做被动 LINK 探测）。
+ *
+ * 自 2026-10-29 起取的是**平台地址**，不再是 `probe.target1/2`。理由（用户口径）：
+ * 探活结论唯一的用途是让 netmgr 决定"上报报文从哪块网卡出去"，所以该问的是
+ * "这条路能不能连上平台"，而不是"这条路能不能 ping 通某个检测 IP"。此前两者共用
+ * `probe.target1`，现场把它填成不存在的 `192.168.2.3` 之后得出"两条都断"，
+ * 设备被钉死在没网的出口上（平台断联 4 小时）。
+ *
+ * 优先级：`iv_agent_pick_host()` 选出的 host 若是**字面 IPv4** 就用它（含
+ * "本口没配 → 另一口"那层回退）→ 否则退回 `probe_target_be[0]` → `[1]` → 0。
+ * 域名/未配才走那个兜底：这一层不做 DNS（解析本身依赖"哪条 WAN 能出去"，是循环依赖）。
+ *
+ * **纯函数**（只读 cfg）：导出是为了让单测直接钉住这四级优先级，不必为了看一眼
+ * "探的是谁"去起一整套 report —— 与 `iv_agent_pick_host()` 同一个理由。
+ */
+uint32_t iv_agent_probe_target_of(const iv_agent_cfg_t *cfg, int wan);
 
 /* 清零句柄（不碰系统资源）。使用前必须先 init（或 `= {0}`）。 */
 void iv_agent_init(iv_agent_t *a);

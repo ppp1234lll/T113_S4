@@ -618,6 +618,26 @@ static int wait_link(int wan, int want_up)
     return 0;
 }
 
+/* 等某一路探活项翻 UP。和 `wait_link()` 的区别：现在探活项是 ICMP 探测（探的是
+ * 平台地址），**状态要靠 iv_agent_step() 真的把探测发出去、把回包读回来**才能攒够
+ * `ok_n` 个成功样本 —— 光拉 netlink 只会停在 UNKNOWN（2026-10-29 语义纠正后
+ * `test_agent_switch` 一开始就是栽在这里的）。所以这里推拍（含 pty 抽干）。 */
+static int wait_probe_up(int wan, int master, int max_steps)
+{
+    int i;
+    int idx = g_agent.wan_probe_idx[wan];
+
+    if (idx < 0)
+        return 0;
+    for (i = 0; i < max_steps; i++) {
+        (void)iv_netlink_poll(&g_agent.nl); /* 无 Reactor 时 netlink 由调用方拉 */
+        if (iv_probe_state(&g_agent.pb, idx) == IV_PROBE_UP)
+            return 1;
+        pump_agent(master, 1);
+    }
+    return iv_probe_state(&g_agent.pb, idx) == IV_PROBE_UP;
+}
+
 static int wait_transport_up(int max_steps)
 {
     int i;
@@ -738,12 +758,29 @@ static int scenario(void)
     cfg.poll_ms      = 3600u * 1000u; /* 关 0xE1 轮询：镜像不参与本用例 */
     (void)snprintf(cfg.wan_name[IV_WAN_WIRELESS], IV_AGENT_WAN_NAME_MAX, "%s", WAN_WL);
     (void)snprintf(cfg.wan_name[IV_WAN_WIRED], IV_AGENT_WAN_NAME_MAX, "%s", WAN_WD);
-    cfg.probe_target_be[0] = 0u; /* 无目标 → 建 LINK 项（被动吃 carrier 事件） */
+    /* 探测目标不再取 `probe_target_be`（2026-10-29 语义纠正）：装配层现在按
+     * `iv_agent_probe_target_of()` **逐路探平台地址**，也就是上面那几个
+     * `srv_host[]`（各自网卡自己的 IPv4 ⇒ 本地回环直答应答，可控可复现）。
+     * `probe_target_be` 只剩"平台写成域名时的兜底"，本用例留 0 即可。
+     *
+     * 连带后果：探活项从"被动吃 carrier 事件的 LINK 项"变成了"要发 ICMP 的
+     * 探测项"，所以状态不再随 LINK 事件瞬时翻 UP —— 得先把 2 个成功样本攒够
+     * （见 `wait_probe_up()`）。周期压到库的下界 500 ms，让这段等待短到不会
+     * 把 k04/k06 的时间模型带歪。 */
+    cfg.probe_target_be[0] = 0u;
     cfg.probe_target_be[1] = 0u;
+    cfg.probe_interval_ms   = 500u;
+    /* 关掉延时降级门限：本用例的时间是**注入**的（`g_now` 按拍跳 200 ms，k06
+     * 还会一次跨过 hold_s），回包被读到的那一刻 RTT 会算成整段跳变量 ⇒ 默认的
+     * 800 ms 门限会把好链路判成 DEGRADED，MN 变 4、k02b/k06b 假红。降级阈值
+     * 已由 `test_probe` / `test_agent_mn` 单独覆盖，这里不重复测。 */
+    cfg.probe_delay_ms      = 60000u;
     cfg.mode       = IV_NETMGR_MODE_AUTO;
     cfg.nm_fail_n  = 1u; /* 迟滞压到 1：一次结论即判，用例不必灌多次 */
     cfg.nm_ok_n    = 1u;
-    cfg.nm_hold_s  = 1u; /* 回切稳定期 1 s（时间轴由用例注入，瞬间可跨） */
+    cfg.nm_hold_s  = 3u; /* 回切稳定期 3 s：要容得下 wait_probe_up() 攒样本那点
+                          * 时间（≤2 s），否则 k06 的"hold_s 未到不许回切"会假红。
+                          * 时间轴仍由用例注入，瞬间即可跨过。 */
     cfg.nm_stable_s = 0u; /* 立即恢复媒体；本用例不驱动媒体步 */
     /* M4-S4.4：出厂默认 reboot_max=0（禁用自愈）—— 那条路径已经在
      * test_recovery 单测里钉死；本用例要验的是**接线**，故打开它。 */
@@ -804,12 +841,15 @@ static int scenario(void)
      * 场景（板端开机就是如此）会一直等不到事件。真网卡模式＝真接口本来就 UP
      * ⇒ 应播成 UP；netns 模式＝dummy 刚建出来是 DOWN ⇒ 应播成 DOWN。 */
     {
-        iv_probe_state_t want = g_realnic ? IV_PROBE_UP : IV_PROBE_DOWN;
+        /* 探活项现在是 ICMP（探平台地址）：DOWN 那一侧仍是"链路状态直接播进来"
+         * （真接口 UP、dummy 刚建是 DOWN）；UP 那一侧要先有回包，开局必然是
+         * UNKNOWN —— 所以真网卡模式这里只能断"没被判死"，不能断 UP。 */
+        iv_probe_state_t want = g_realnic ? IV_PROBE_UNKNOWN : IV_PROBE_DOWN;
 
         chk(iv_probe_state(&g_agent.pb, g_agent.wan_probe_idx[IV_WAN_WIRELESS]) == want,
-            "k01 wireless link seeded from current kernel state");
+            "k01 wireless probe seeded from current kernel state");
         chk(iv_probe_state(&g_agent.pb, g_agent.wan_probe_idx[IV_WAN_WIRED]) == want,
-            "k01 wired link seeded from current kernel state");
+            "k01 wired probe seeded from current kernel state");
     }
 
     /* ---- k02 摸底：真内核 LINK_UP → probe UP → netmgr 标记两路可用 ---- */
@@ -819,19 +859,22 @@ static int scenario(void)
         return 0;
     }
     if (g_realnic) {
-        /* 真接口本来就 UP ⇒ 开局摸底应已把它们播成 UP（k01 已钉死）。这里只把
-         * 结论交给状态机，**不需要任何"造事件"的手段**。 */
-        chk(wait_link(IV_WAN_WIRELESS, 1), "k02 wireless UP (seeded at open)");
-        chk(wait_link(IV_WAN_WIRED, 1), "k02 wired UP (seeded at open)");
+        /* 真接口本来就 UP ⇒ 探活项开局不是 DOWN（k01 已钉死），但仍要真的发出
+         * ICMP 拿到回包才算 UP。 */
+        chk(wait_probe_up(IV_WAN_WIRELESS, master, 10), "k02 wireless UP (platform addr reachable)");
+        chk(wait_probe_up(IV_WAN_WIRED, master, 10), "k02 wired UP (platform addr reachable)");
     } else {
         /* netns：dummy 建出来就是 DOWN（摸底应播成 DOWN），再靠**真内核 LINK_UP
-         * 事件**转 UP —— 这一段验的是 netlink → probe 的事件转接。 */
+         * 事件**把探活项从 LINK_DOWN 放出来，然后由 ICMP 回包判 UP —— 前面这半段
+         * 验的是 netlink → probe 的事件转接，后面那半段验的是"探的是平台地址"。 */
         chk(wait_link(IV_WAN_WIRELESS, 0), "k02 wireless starts DOWN (seeded at open)");
         chk(wait_link(IV_WAN_WIRED, 0), "k02 wired starts DOWN (seeded at open)");
         chk(ip_set_state(WAN_WL, 1) == 0, "k02 ip link set usb0 up");
         chk(ip_set_state(WAN_WD, 1) == 0, "k02 ip link set eth0 up");
-        chk(wait_link(IV_WAN_WIRELESS, 1), "k02 wireless probe UP via real kernel link event");
-        chk(wait_link(IV_WAN_WIRED, 1), "k02 wired probe UP via real kernel link event");
+        chk(wait_probe_up(IV_WAN_WIRELESS, master, 10),
+            "k02 wireless probe UP (LINK_UP then ICMP reply)");
+        chk(wait_probe_up(IV_WAN_WIRED, master, 10),
+            "k02 wired probe UP (LINK_UP then ICMP reply)");
     }
     pump_agent(master, 2);
     chk(iv_netmgr_wan_is_up(&g_agent.nm, IV_WAN_WIRELESS) == 1, "k02 netmgr: wireless usable");
@@ -1010,7 +1053,7 @@ static int scenario(void)
     chk(ls >= 0 && port2 == port, "k06 platform re-listened on the same port");
     chk(ip_set_state(WAN_WL, 1) == 0, "k06 ip link set usb0 up");
     {
-        int back = wait_link(IV_WAN_WIRELESS, 1);
+        int back = wait_probe_up(IV_WAN_WIRELESS, master, 10);
 
         chk(back, "k06 wireless probe back UP");
         if (g_realnic) {

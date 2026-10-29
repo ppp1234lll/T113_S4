@@ -321,6 +321,19 @@ static void evaluate(iv_netmgr_t *m, uint64_t now_ms)
             (void)run_txn(m, IV_WAN_WIRELESS, now_ms);     /* 无线优先 */
         } else if (wd) {
             (void)run_txn(m, IV_WAN_WIRED, now_ms);
+        } else if (m->active != (uint8_t)IV_WAN_WIRELESS) {
+            /* 两条都不通 ⇒ 出口落到无线（4G）当默认（2026-10-29 用户口径）。
+             *
+             * 原来这里什么都不做 ⇒ "两条都判不通"时出口就**冻在出故障前那一块网卡**
+             * 上。现场 10-29 就卡在 eth0：4G 明明能到平台，但默认路由永远指 eth0，
+             * 平台断联 4 小时（这一条比探活误判更致命 —— 探活错只是结论错，不动作
+             * 则是连"试一试另一条"都不做）。
+             *
+             * 落到 4G 不等于 4G 一定通（真不通时 transport 继续按退避重试），但
+             * 4G 是唯一可能独立恢复的那条：它不依赖现场交换机/上游出口。
+             * `m->active` 已是无线的判断不能省 —— 少了它每拍 tick 都会打一次完整
+             * 七步事务（切路由 + 断 TCP + 重连），变成风暴。 */
+            (void)run_txn(m, IV_WAN_WIRELESS, now_ms);
         }
         break;
 

@@ -921,7 +921,7 @@ S2.1 实现时，我给串口参数填了 115200 8N1 默认值，并在头文件
 - *`ivsbox/include/ivsbox/iv_probe.h`（新增）*：对外接口与全部契约。
   - 层枚举 `iv_probe_layer_t`：`IV_PROBE_LINK/ICMP/TCP/APP`；状态 `iv_probe_state_t`：`UNKNOWN/UP/DOWN/DEGRADED`；原因码 `iv_probe_reason_t`：`NONE/OK/TIMEOUT/REFUSED/UNREACH/NOPERM/LINK_DOWN/APP_FAIL/IOERR`。
   - 统一输出 `iv_probe_stat_t`：`state`、`reason`、`last_rtt_ms`、`avg_rtt_ms`、`loss_permille`、`sent`、`lost`、`ok_streak`、`fail_streak`、`last_ok_ms`。
-  - 可注入 ops `iv_probe_iops_t`（socket/connect/sendto/recv/getsockopt/close/now_ms）——单测据此在*无真实网络、无 `CAP_NET_RAW`、非 root* 下运行。
+  - 可注入 ops `iv_probe_iops_t`（socket/connect/sendto/recv/getsockopt/close/now_ms ＋ 2026-10-29 追加的两个**可选**钩子 sendmsg/setsockopt，用于按网卡出口发包）——单测据此在*无真实网络、无 `CAP_NET_RAW`、非 root* 下运行。
   - 常量：`IV_PROBE_MAX_ITEMS 8`、`IV_PROBE_MAX_LINKS 8`、`IV_PROBE_WIN_LEN 16`、`IV_PROBE_NAME_LEN 16`、`IV_PROBE_ICMP_PAYLOAD 32`。
   - 踩坑登记：ICMP 序号字段名取 `icmp_echo_seq`，*不可叫 `icmp_seq`*——glibc `<netinet/ip_icmp.h>` 里 `icmp_seq` 是宏（展开成 `icmp_hun.ih_idseq.icd_seq`），会与结构体成员名冲突并报 `expected ':' before '.'`。
 - *`ivsbox/src/modules/probe/iv_probe.c`（新增，进 `libivmodules.a`）*：
@@ -9489,6 +9489,120 @@ GET  /api/overview  Cookie: ivs_sid=deadbeef...       -> 401 {"ok":false,"e":-23
   改 `probe.target*` 属现场配置，需用户拍板（同网段可达地址 / 平台地址 / 公网地址）。
 * 同一时刻 `wan.transport=down`、待发队列 **155** 条（平台 `47.104.250.225:6013` 连不上），
   与上面那条独立，需现场查外网与平台侧。
+
+
+
+== 2026-10-29 09:57 探活 ICMP 按网卡出口发包 —— 双 WAN 一起误判、平台断联 4 小时
+
+=== 现象与证据链
+
+现场（10-29 早上）报「平台断联」。**不是 4G 断**：
+
+[source,text]
+----
+ping -I usb0 47.104.250.225  → 3/3 收，0% 丢包，34/85/162 ms     ← 4G 通路完全正常
+ping -I eth0 47.104.250.225  → 全丢（连网关 192.168.1.1 都丢）
+route -n : default via 192.168.1.1  dev eth0  metric 0
+           default via 10.146.160.1 dev usb0  metric 208
+待发队列 160 条；transport 在 1/3 之间反复，09 点整小时 `transport state -> 2` 出现 0 次
+----
+
+=== 根因（两层叠在一起，缺一不可）
+
+. **`iv_probe` 的 ICMP 探测不按网卡出口发包**。ICMP 是一条第 3 层 socket，
+  `sendto()` **不带 `ipi_ifindex`** ⇒ 出口由内核按"系统默认路由"选。项上的 `ifindex`
+  只被 `link_is_down()` 用来判"这块网卡 carrier 掉了没有"，**与报文从哪块网卡出去
+  毫无关系**。于是两块 WAN 的探测报文全部走 eth0。
+. 现场 `probe.target1/2 = 192.168.2.3 / 192.168.2.2`，与设备所在网段
+  （`192.168.1.0/24`、`10.146.160.0/24`）都不匹配，本来就不通。
+
+两者相乘：两条 WAN **一起**判 DOWN ⇒ `iv_netmgr` 进 `BOTH_DOWN` ⇒ 按设计
+"双断只告警、不动作" ⇒ 永远切不到本来可用的 4G ⇒ 平台断联（队列只进不出）。
+
+=== 改法
+
+include/ivsbox/iv_probe.h::
+
+* `iv_probe_iops_t` 追加两个**可选**钩子：`sendmsg` / `setsockopt`。
+  **任一为 NULL 即退回 `sendto()`**，行为与改前逐字节一致（单测与其它模块不受影响）。
+* `struct iv_probe` 追加 `icmp_bind_ok`：1 = ICMP 已按项的 `ifindex` 指定出口。
+
+src/modules/probe/iv_probe.c::
+
+* `icmp_bind_enable()`（`iv_probe_start()` 里调）：对有绑定接口的 ICMP 项给共享 raw
+  socket `setsockopt(IPPROTO_IP, IP_PKTINFO, 1)`。失败只置 `icmp_bind_ok=0` 并打 WARN
+  —— **不能再静默降级**，上面那次事故就是静默降级掩盖的。
+* `icmp_send()`：能绑就 `sendmsg`，control 里放 `IP_PKTINFO{ipi_ifindex=项自己的 ifindex}`，
+  `ipi_spec_dst` 留 0 由内核按该网卡取源地址；否则走 `sendto()`。
+* `EINVAL` 兜底：内核不认 control 消息（老/裁剪内核）⇒ 关掉绑定、**当拍**退回
+  `sendto()` 重发，且**不记失败**。
+
+=== 为什么不是 `SO_BINDTODEVICE`
+
+`SO_BINDTODEVICE` 是 **fd 级**属性，而本引擎的设计是"一条 raw socket 服务全部 ICMP 项"
+（见 `iv_probe.c` 文件头第 2 条）。用它就得每块网卡开一条 socket，再把 N 个 fd 一起交给
+调用方事件循环 —— `iv_probe_fd_count()` / `iv_probe_fd_at()` 的语义、装配层的 fd 注册
+全都要跟着改。`IP_PKTINFO.ipi_ifindex` 是**逐包**的，一条 socket 就够。
+
+=== 降级口径（三处，都只退不炸）
+
+[cols="1,3,1"]
+|===
+|触发 |行为 |判死？
+
+|`sendmsg`/`setsockopt` 钩子为 NULL |`icmp_bind_ok=0`，全走 `sendto()` ＋ WARN |否
+|`setsockopt(IP_PKTINFO)` 失败 |同上 ＋ WARN（带 errno） |否
+|`sendmsg` 报 `EINVAL` |关绑定，当拍 `sendto()` 重发 ＋ WARN |否
+|===
+
+**绑不上绝不能变成"所有 WAN 都断"**——那比绑不上更糟。这条在单测里各有一条断言。
+
+=== 验证
+
+[cols="1,4,1"]
+|===
+|项 |结果 |结论
+
+|单测 |`make test` **49 passed**（`test_probe` 新增 `c16`，4 段 11 条断言） |通过
+|ASan / TSan |`make asan` 49、`setarch -R make tsan` 49 |通过
+|交叉编译 |`make arm` 0 告警；`ivsboxd` `ecb4be4b73025bb5421900528c5affa8`（`1.0.0+g173e473`） |通过
+|静态分析 |`rm -rf build/analyze && make analyze` 0 报告 |通过
+|反向证伪 ① |`pi->ipi_ifindex = 0` ⇒ **1** FAIL（c16 出口 ifindex） |通过
+|反向证伪 ② |去掉 `EINVAL` 退回 ⇒ **3** FAIL（绑定关闭／当拍重发／不判死） |通过
+|反向证伪 ③ |去掉 `need` 门 ⇒ **1** FAIL（无绑定项仍开 PKTINFO） |通过
+|板端启动 |`09:54:35 [probe] icmp egress binding on (IP_PKTINFO), per-item ifindex honored` |通过
+|板端改目标 |`09:55:10 probe target changed (192.168.2.3 -> 47.104.250.225), rebuild` → 重新绑定 |通过
+|板端切 AUTO |`09:55:13 transport mode -> 4 (active wan 0 -> 0)`、`transport state -> 2` |通过
+|板端读数 |`net.state=WIRELESS_UP`、`mn=[1,2]`、`wan.bound=usb0`、`bind_fail=0`、`queue=0` |通过
+|抖动 |09:55:13 之后 `transport mode ->` 只出现 **1** 次 |通过
+|===
+
+**关键判据**：同一目标、同一时刻，无线 `MN=1`（正常）、有线 `MN=2`（断开），
+而 eth0 的 `carrier=true`。报文若仍全部从默认路由（eth0）出去，两者不可能给出**不同**
+结论 —— 这就是"真的按网卡出口探"的现场证据。`MN=2` 而非 `MN=3`（网线断开）也说明
+是"探不通"而非"线没插"，与现场实际（eth0 有网线、但交换机侧无外网出口）一致。
+
+=== 现场处置记录（恢复优先，再修代码）
+
+. `sys.transport.mode` 4(AUTO) → 2(WIRELESS_ONLY)，绕过探活直定 usb0：
+  `09:10:29 mode -> 2 (active wan 1 -> 0)`、`server addr -> …(wan=usb0, bind=usb0)`、
+  `09:10:30 transport state -> 2`、`09:11:04 queue item written: seq=289 left=1`
+  ⇒ **160 条积压 35 s 内补发完**（4.7/s；平台逐条回 22 B 应答帧
+  `f0f0 11 0a00 0b2cc1 ff… 01 01 c1 ffff`，`cmd=0xFF` 无处理分支，无害）。
+. 换 `ivsboxd` 到 `ecb4be4b`（备份 `ivsboxd.bak-b825a4a1`）。
+. `probe.target1` → `47.104.250.225`，`mode` → 4(AUTO)，实测稳定在无线出口。
+
+=== 未做 / 待办
+
+* **`sys.transport.mode` 现在是 4(AUTO)**，依赖 `probe.target1` 可达。换到其它现场时
+  这个键必须按该现场的平台/网关地址填，不能沿用 `192.168.2.x`。
+* **TCP 层探测（`iv_probe_add_tcp`）同样不绑出口**，但生产装配层不用 TCP 项
+  （`agent_probe_build()` 只建 ICMP 或 LINK），故本轮未改；一旦启用需补
+  `SO_BINDTODEVICE`（TCP 无 `IP_PKTINFO` 等价能力）。
+* `iv_probe` 的 `set_links`/`reset` 后绑定会重开，但**已存在的 raw socket 不重建** ——
+  若运行期换网卡（ifindex 变化），需 `stop()`+`start()`，现有装配路径（`reload_probe`）
+  是这么做的。
+
 
 
 

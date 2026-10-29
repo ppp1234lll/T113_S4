@@ -9697,6 +9697,114 @@ case IV_NETMGR_BOTH_DOWN:
 * 域名型的平台地址不做 DNS 解析（`iv_agent_probe_target_of()` 层），落到兜底目标。
   要支持就得把解析结果缓存进 `probe_dst_be`，并处理 TTL 与重解析。
 
+---
+
+== 2026-10-29 14:35 ICMP 回包认领：只认 (id, seq) 是错的 —— "主网正常"是假的
+
+上一节修了**发送侧**（按 `ifindex` 指定出口）。这一节是同一件事的另一半：**接收侧**。
+
+=== 现象：界面说"主网1 正常"，实际有线 100% 丢包
+
+现场（设备 `192.168.1.120`，两路都探平台 `47.104.250.225`）：
+
+[source,text]
+----
+ping -I eth0   192.168.2.3      → 100% 丢包
+ping -I eth0   192.168.2.2      → 100% 丢包
+ping -I eth0   47.104.250.225   → 100% 丢包     ← 有线到平台本来就不通
+ping -I usb0   47.104.250.225   → 2/2，45 ms    ← 只有 4G 通
+----
+
+但 `/api/overview` 的 `net.mn` 是 `[1,1]`（两路都"正常"）。
+
+用 raw socket 抓 12 秒，抓到同一时刻的两个回包：
+
+[source,text]
+----
+seq=703  ifi=8 usb0  src=47.104.250.225  dst=10.146.160.2    ← 平台真回包
+seq=703  ifi=4 eth0  src=192.168.1.200   dst=192.168.1.120   ← 局域网另一台设备
+----
+
+=== 根因
+
+`iv_probe_on_readable()` 认领回包的条件只有 `(id, seq) + inflight`：
+
+[source,c]
+----
+if (id != IV_PROBE_ICMP_ID) continue;
+seq = ntohs(ih->un.echo.sequence);
+it  = icmp_find_by_seq(p, seq);      /* ← 只看 seq，不看是谁回的、从哪儿回的 */
+if (it == NULL) continue;
+it->inflight = 0;
+note(p, it, 1, ...);                 /* ← 记成功 */
+----
+
+而 raw ICMP socket 收**全部** ICMP 报文。局域网里任意一台机器 ping 时的 seq 也是
+从 1 递增的小整数，和本引擎的 seq 撞上就被记成"这条 WAN 通了"。
+
+seq 是引擎级唯一（2026-10-22 那版改的），只保证**两个探测项之间**不撞 ——
+挡不住"外面来的包"。
+
+=== 修法：两道认领校验
+
+. **源地址必须是该项探的目标本身**（`iph->saddr == it->dst_be`）。
+. **回包必须从该项指定的网卡进来**（`rx_ifindex == it->ifindex`，仅当
+   `icmp_bind_ok` 为 1 且拿得到 `rx_ifindex`）。
+
+第 2 条是必需的：现在两路 WAN 探的是**同一个平台地址**，源地址一模一样，
+光靠第 1 条分不出是哪一路。
+
+不通过就 `continue` —— **不动 `inflight`**，既不记成功也不记超时（这条探测本来就
+还没结果，到点自然会超时判负），只把 `icmp_reject` 加一。首次被拒打一条 WARN：
+
+[source,text]
+----
+WARN [probe] icmp reply seq=2 from 192.168.1.106 (ifindex 4) is not for item 'eth0'
+     (dst 47.104.250.225 ifindex 4): ignored
+----
+
+=== `recvmsg` 钩子
+
+回包入口 ifindex 只有 cmsg（`IP_PKTINFO`）里带得回来，`recv()` 拿不到。所以
+`iv_probe_iops_t` 加了可选的 `recvmsg`：
+
+* 钩子为 NULL ⇒ 退回 `recv()`，`rx_ifindex = 0` ⇒ **自动跳过第 2 条校验**，
+  老路径行为完全不变（camdet 的 mock 就是这种情况）。
+* 生产默认注入点提供 `real_recvmsg()`。
+* `IP_PKTINFO` 由 `icmp_bind_enable()` 在 `iv_probe_start()` 里开，发送和接收共用同一个
+  开关 —— 没有绑定接口的项（`ifindex=0`）不开，也就拿不到 ifindex，只有第 1 条校验。
+
+=== 连带影响：camdet 的摄像机探测
+
+上板后同时抓到：
+
+[source,text]
+----
+WARN [probe] icmp reply seq=3 from 47.104.250.225 (ifindex 0) is not for item 'cam0'
+     (dst 192.168.1.200 ifindex 0): ignored
+----
+
+`iv_camdet` 用同一套 `iv_probe`，摄像机项之前也会被**平台的回包**顶替（dst 是
+`192.168.1.200`，却收到了 `47.104.250.225` 的包）⇒ 会误报"摄像机网络正常"。
+同一处修复一并解决。
+
+=== 对单测的影响
+
+回包 mock 必须给对源地址，否则全红（第一次跑 `test_camdet` 22 条全红就是这么来的）：
+
+* `test_probe.c`：`mk_icmp_reply_from(b, id, seq, saddr_be)`；`g_pend_ifindex` 控制
+  cmsg 里的入口网卡。
+* `test_camdet.c`：`pb_sendto()` 把目的地址记进 `g_last_dst`，`mk_icmp_reply()` 用它
+  填 `ip->saddr` —— 不用改任何调用点。
+
+=== 未做
+
+* 只校验 "源地址 + 入口网卡"，没校验 ICMP payload。要防**同源同接口的伪造包**
+  （例如同网段有人重放）还得带一段随机 payload 校验，当前现场没有这个威胁。
+* `icmp_reject` 只在第一次被拒时打日志。若现场真的长期有撞号流量，需要看这个计数
+  是否持续增长（现在没有对外读数出口，只能从日志判断）。
+
+
 
 
 

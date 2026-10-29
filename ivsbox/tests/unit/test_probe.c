@@ -60,6 +60,8 @@ static uint64_t g_now          = 1000;
 /* 待喂入的回包（一次性）：g_pend_len>0 时 recv 返回它，之后 EAGAIN */
 static uint8_t  g_pend[512];
 static size_t   g_pend_len     = 0;
+/* 回包"从哪块网卡进来"（c17）：0 = 不带 cmsg，认领时跳过入口网卡校验 */
+static int      g_pend_ifindex = 0;
 
 /* 最近一次 sendto 发出的原始字节（用于字节级校验 ICMP 报文，尤其校验和字节序） */
 static uint8_t  g_sent[512];
@@ -144,6 +146,37 @@ static ssize_t mk_recv(int fd, void *buf, size_t len, int flags)
     }
 }
 
+/* 带控制消息收包（c17）：除了照常喂 `g_pend`，还按 `g_pend_ifindex` 挂一条
+ * `IP_PKTINFO`，模拟"这个回包是从哪块网卡进来的"。`g_pend_ifindex==0` 时
+ * 不挂 cmsg，等价于老内核 / 没开绑定 —— 认领时跳过入口网卡校验。 */
+static ssize_t mk_recvmsg(int fd, struct msghdr *msg, int flags)
+{
+    ssize_t n;
+
+    if (msg == NULL || msg->msg_iov == NULL || msg->msg_iovlen == 0)
+        return -1;
+    n = mk_recv(fd, msg->msg_iov[0].iov_base, msg->msg_iov[0].iov_len, flags);
+    if (n < 0)
+        return n;
+    if (g_pend_ifindex != 0 && msg->msg_control != NULL &&
+        msg->msg_controllen >= CMSG_SPACE(sizeof(struct in_pktinfo))) {
+        struct cmsghdr    *cm;
+        struct in_pktinfo *pi;
+
+        memset(msg->msg_control, 0, msg->msg_controllen);
+        cm                  = CMSG_FIRSTHDR(msg);
+        cm->cmsg_level      = IPPROTO_IP;
+        cm->cmsg_type       = IP_PKTINFO;
+        cm->cmsg_len        = CMSG_LEN(sizeof(struct in_pktinfo));
+        pi                  = (struct in_pktinfo *)(void *)CMSG_DATA(cm);
+        pi->ipi_ifindex     = g_pend_ifindex;
+        msg->msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
+    } else if (msg->msg_control != NULL) {
+        msg->msg_controllen = 0;
+    }
+    return n;
+}
+
 static int mk_getsockopt(int fd, int level, int optname, void *val, socklen_t *vlen)
 {
     (void)fd;
@@ -220,7 +253,8 @@ static const iv_probe_iops_t g_mock = {
     .close      = mk_close,
     .now_ms     = mk_now,
     .sendmsg    = mk_sendmsg,
-    .setsockopt = mk_setsockopt
+    .setsockopt = mk_setsockopt,
+    .recvmsg    = mk_recvmsg
 };
 
 static iv_probe_cfg_t mk_cfg(void)
@@ -244,6 +278,7 @@ static void mock_reset(void)
     g_close_count   = 0;
     g_now           = 1000;
     g_pend_len      = 0;
+    g_pend_ifindex  = 0;
     g_sent_len      = 0;
     g_seq_n         = 0;
     g_pktinfo_ok    = 1;
@@ -253,8 +288,11 @@ static void mock_reset(void)
     g_bind_n        = 0;
 }
 
-/* 构造 ICMP echo reply 字节流（IP 头 + ICMP 头），返回总长 */
-static size_t mk_icmp_reply(uint8_t *b, uint16_t id, uint16_t seq)
+/* 构造 ICMP echo reply 字节流（IP 头 + ICMP 头），返回总长。
+ * `saddr_be` 是回包的**源地址**：认领校验要求它等于该项的目标地址
+ * （2026-10-29 加，见 `iv_probe.h` 的 `icmp_reject`）。 */
+static size_t mk_icmp_reply_from(uint8_t *b, uint16_t id, uint16_t seq,
+                                 uint32_t saddr_be)
 {
     struct iphdr   *ip = (struct iphdr *)b;
     struct icmphdr *ic = (struct icmphdr *)(b + 20);
@@ -263,11 +301,17 @@ static size_t mk_icmp_reply(uint8_t *b, uint16_t id, uint16_t seq)
     ip->version  = 4;
     ip->ihl      = 5;
     ip->protocol = IPPROTO_ICMP;
+    ip->saddr    = saddr_be;
     ic->type             = ICMP_ECHOREPLY;
     ic->code             = 0;
     ic->un.echo.id       = htons(id);
     ic->un.echo.sequence = htons(seq);
     return 28;
+}
+
+static size_t mk_icmp_reply(uint8_t *b, uint16_t id, uint16_t seq)
+{
+    return mk_icmp_reply_from(b, id, seq, 0x0102A8C0u /* = DST，见下 */);
 }
 
 #define DST 0x0102A8C0u /* 192.168.2.1 网络序（值本身不影响逻辑） */
@@ -822,8 +866,9 @@ static void c14_icmp_seq_engine_unique(void)
     chk(g_seq_n == 2, "c14 both echoes sent in one tick");
     chk(g_seqs[0] != g_seqs[1], "c14 seq unique across items");
 
-    /* 回**第二路**的包：只能记到 b 名下，a 一点都不能动 */
-    g_pend_len = mk_icmp_reply(g_pend, 0x4950u, g_seqs[1]);
+    /* 回**第二路**的包：只能记到 b 名下，a 一点都不能动。
+     * 源地址必须是 b 自己的目标（DST+1），否则会被认领校验挡掉。 */
+    g_pend_len = mk_icmp_reply_from(g_pend, 0x4950u, g_seqs[1], DST + 1u);
     chk(iv_probe_on_readable(&p, iv_probe_fd_at(&p, 0), 5100) == 1, "c14 b reply handled");
     (void)iv_probe_stat_get(&p, b, &st);
     chk(st.sent == 1 && st.lost == 0, "c14 reply credited to its own item");
@@ -937,6 +982,59 @@ static void c16_icmp_egress_bind(void)
     (void)iv_probe_stop(&p);
 }
 
+/* 回包认领（2026-10-29 加）。raw ICMP socket 收**全部** ICMP，原先只按
+ * `(id, seq) + inflight` 认领 —— 局域网里任意一台设备 ping 时的 seq 也是递增小整数，
+ * 撞上就把这条 WAN 判成"通"。现场实测抓到 `192.168.1.200` 的 echo reply 顶替了平台
+ * 回包：有线到平台 100% 丢包，界面却显示"主网1 正常"。
+ * 这里钉死两道校验：① 源地址必须是该项的 dst；② 绑定开启时回包必须从该项的网卡进来
+ * （两路探同一个平台地址时，光靠 ① 分不清是哪一路）。 */
+static void c17_icmp_reply_owner_check(void)
+{
+    iv_probe_t      p;
+    iv_probe_cfg_t  c = mk_cfg();
+    iv_probe_stat_t st;
+    int             fd;
+
+    mock_reset();
+    (void)iv_probe_init(&p, &c);
+    (void)iv_probe_add_icmp(&p, DST, 8, "eth0");
+    (void)iv_probe_start(&p, g_now);
+    chk(p.icmp_bind_ok == 1, "c17 绑定开启（入口网卡校验才生效）");
+    (void)iv_probe_tick(&p, g_now); /* 发 echo，seq=1 */
+    fd = iv_probe_fd_at(&p, 0);
+
+    /* ① 源地址不是本项目标：局域网别的机器撞了 seq —— 必须拒 */
+    g_pend_ifindex = 8;
+    g_pend_len     = mk_icmp_reply_from(g_pend, 0x4950u, 1u, DST + 7u);
+    chk(iv_probe_on_readable(&p, fd, g_now + 10u) == 0, "c17 源地址不对 -> 拒收");
+    chk(p.icmp_reject == 1u, "c17 拒收计数 +1");
+    (void)iv_probe_stat_get(&p, 0, &st);
+    chk(st.sent == 0 && st.lost == 0, "c17 拒收不记成功也不记超时");
+    chk(iv_probe_state(&p, 0) == IV_PROBE_UNKNOWN, "c17 拒收后状态不动");
+
+    /* ② 源地址对、但回包从别的网卡进来：两路探同一目标时靠这条分开 */
+    g_pend_ifindex = 9;
+    g_pend_len     = mk_icmp_reply(g_pend, 0x4950u, 1u);
+    chk(iv_probe_on_readable(&p, fd, g_now + 20u) == 0, "c17 入口网卡不对 -> 拒收");
+    chk(p.icmp_reject == 2u, "c17 拒收计数 +2");
+
+    /* ③ 两项都对：认领，RTT 按调用方传的 now 算 */
+    g_pend_ifindex = 8;
+    g_pend_len     = mk_icmp_reply(g_pend, 0x4950u, 1u);
+    chk(iv_probe_on_readable(&p, fd, g_now + 30u) == 1, "c17 源地址＋入口都对 -> 认领");
+    (void)iv_probe_stat_get(&p, 0, &st);
+    chk(st.sent == 1 && st.lost == 0 && st.last_rtt_ms == 30u, "c17 认领后 RTT=30");
+
+    /* ④ 绑定没开（老内核 / 无 IP_PKTINFO）：跳过入口网卡校验，只认源地址 */
+    p.icmp_bind_ok = 0;
+    (void)iv_probe_tick(&p, g_now + 100000u); /* 再发一个，seq=2 */
+    g_pend_ifindex = 9;
+    g_pend_len     = mk_icmp_reply(g_pend, 0x4950u, 2u);
+    chk(iv_probe_on_readable(&p, fd, g_now + 100010u) == 1,
+        "c17 绑定关闭时不校验入口网卡（退回老行为）");
+    (void)iv_probe_stop(&p);
+}
+
 int main(void)
 {
     c01_args_and_guards();
@@ -955,13 +1053,14 @@ int main(void)
     c14_icmp_seq_engine_unique();
     c15_dual_wan_shared_dst();
     c16_icmp_egress_bind();
+    c17_icmp_reply_owner_check();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_probe FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_probe passed (args, stat window, hysteresis, degrade, link event, "
-           "icmp disable/reply/packet-bytes/seq-unique/egress-bind, tcp result, timeout, "
-           "lifecycle, retune, dual-wan-shared-dst)\n");
+           "icmp disable/reply/packet-bytes/seq-unique/egress-bind/reply-owner, tcp result, "
+           "timeout, lifecycle, retune, dual-wan-shared-dst)\n");
     return 0;
 }

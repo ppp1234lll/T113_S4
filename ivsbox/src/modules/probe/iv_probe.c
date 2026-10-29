@@ -23,6 +23,7 @@
  *    各判一套导致口径漂移。
  */
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <arpa/inet.h>       /* htons / ntohs */
@@ -80,6 +81,11 @@ static ssize_t real_sendmsg(int fd, const struct msghdr *msg, int flags)
     return sendmsg(fd, msg, flags);
 }
 
+static ssize_t real_recvmsg(int fd, struct msghdr *msg, int flags)
+{
+    return recvmsg(fd, msg, flags);
+}
+
 static int real_close(int fd)
 {
     return close(fd);
@@ -99,7 +105,8 @@ static const iv_probe_iops_t g_default_iops = {
     .close      = real_close,
     .now_ms     = real_now_ms,
     .sendmsg    = real_sendmsg,
-    .setsockopt = real_setsockopt
+    .setsockopt = real_setsockopt,
+    .recvmsg    = real_recvmsg
 };
 
 const iv_probe_iops_t *iv_probe_default_iops(void)
@@ -368,6 +375,7 @@ void iv_probe_reset(iv_probe_t *p)
     p->started        = 0;
     p->icmp_disabled  = 0;
     p->icmp_bind_ok   = 0;
+    p->icmp_reject    = 0;
     if (p->icmp_fd >= 0 && p->cfg.iops != NULL)
         (void)p->cfg.iops->close(p->icmp_fd);
     p->icmp_fd = -1;
@@ -617,6 +625,18 @@ static uint16_t icmp_checksum(const void *data, size_t len)
     return (uint16_t)(~sum & 0xffffu);
 }
 
+/* 网络序 IPv4 -> 点分串（只为日志；静态缓冲，一次 printf 里别用两次）。 */
+static const char *ipv4_text(uint32_t be)
+{
+    static char    b[INET_ADDRSTRLEN];
+    struct in_addr a;
+
+    a.s_addr = be;
+    if (inet_ntop(AF_INET, &a, b, sizeof(b)) == NULL)
+        (void)snprintf(b, sizeof(b), "?");
+    return b;
+}
+
 /* 找绑定某 ifindex 或该 ICMP 项（按 seq）。回包匹配用。 */
 static iv_probe_item_t *icmp_find_by_seq(iv_probe_t *p, uint16_t seq)
 {
@@ -829,12 +849,32 @@ int iv_probe_on_readable(iv_probe_t *p, int fd, uint64_t now_ms)
         return IV_ESTATE;
 
     for (;;) {
-        ssize_t n = p->cfg.iops->recv(fd, rbuf, sizeof(rbuf), 0);
+        struct iovec   iov;
+        struct msghdr  msg;
+        uint8_t        cbuf[64];
+        ssize_t        n;
+        int            rx_ifindex = 0; /* 回包从哪块网卡进来（0＝拿不到，未知） */
         const struct iphdr   *iph;
         const struct icmphdr *ih;
         size_t                ihl;
         uint16_t              id, seq;
         iv_probe_item_t      *it;
+
+        /* 有 `recvmsg` 钩子就走它：**回包从哪块网卡进来**只有 cmsg 里有
+         * （`IP_PKTINFO.ipi_ifindex`）。没有钩子就退回 `recv()`，此时
+         * `rx_ifindex` 恒 0，后面那道校验自动跳过 —— 老路径行为不变。 */
+        memset(&msg, 0, sizeof(msg));
+        memset(cbuf, 0, sizeof(cbuf));
+        iov.iov_base       = rbuf;
+        iov.iov_len        = sizeof(rbuf);
+        msg.msg_iov        = &iov;
+        msg.msg_iovlen     = 1;
+        msg.msg_control    = cbuf;
+        msg.msg_controllen = sizeof(cbuf);
+        if (p->cfg.iops->recvmsg != NULL)
+            n = p->cfg.iops->recvmsg(fd, &msg, 0);
+        else
+            n = p->cfg.iops->recv(fd, rbuf, sizeof(rbuf), 0);
 
         if (n < 0) {
             if (errno == EINTR)
@@ -845,6 +885,20 @@ int iv_probe_on_readable(iv_probe_t *p, int fd, uint64_t now_ms)
         }
         if (n == 0)
             break;
+        /* 入口网卡：只有 recvmsg 那条路带得回来，拿不到就留 0（后续跳过校验）。 */
+        if (p->cfg.iops->recvmsg != NULL) {
+            struct cmsghdr *cm;
+
+            for (cm = CMSG_FIRSTHDR(&msg); cm != NULL; cm = CMSG_NXTHDR(&msg, cm)) {
+                if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_PKTINFO &&
+                    cm->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+                    const struct in_pktinfo *pi =
+                        (const struct in_pktinfo *)(const void *)CMSG_DATA(cm);
+
+                    rx_ifindex = pi->ipi_ifindex;
+                }
+            }
+        }
         if ((size_t)n < sizeof(struct iphdr))
             continue;
         iph = (const struct iphdr *)rbuf;
@@ -861,6 +915,34 @@ int iv_probe_on_readable(iv_probe_t *p, int fd, uint64_t now_ms)
         it  = icmp_find_by_seq(p, seq);
         if (it == NULL)
             continue; /* 迟到的回包（已超时判负） */
+        /* ---- 认领校验（2026-10-29 加，见 iv_probe.h 的 `icmp_reject`）----
+         * raw ICMP socket 收**全部** ICMP 报文，原先只看 `(id, seq) + inflight`。
+         * 局域网里任意一台机器 ping 时的 seq 也是递增小整数，撞上就把这条 WAN
+         * 判成"通"—— 现场实测抓到 `192.168.1.200` 的 echo reply 顶替了平台回包，
+         * 有线到平台实际 100% 丢包，界面却显示"主网1 正常"。两道校验：
+         *   1) 源地址必须是该项探的目标本身；
+         *   2) 绑定开启时，回包必须从该项指定的网卡进来 —— 两路探同一个平台地址
+         *      时，光靠 1) 分不清是哪一路。
+         * 不通过就 `continue`：**不动 `inflight`**，那个包不是我们的。 */
+        if (iph->saddr != it->dst_be ||
+            (p->icmp_bind_ok != 0 && rx_ifindex != 0 && it->ifindex != 0 &&
+             rx_ifindex != it->ifindex)) {
+            p->icmp_reject++;
+            if (p->icmp_reject == 1u) { /* 只第一次，避免坏网络下刷屏 */
+                struct in_addr sa;
+                char           sip[INET_ADDRSTRLEN];
+
+                sa.s_addr = iph->saddr;
+                if (inet_ntop(AF_INET, &sa, sip, sizeof(sip)) == NULL)
+                    (void)snprintf(sip, sizeof(sip), "?");
+                IV_LOG_W(PRB_MOD,
+                         "icmp reply seq=%u from %s (ifindex %d) is not for item "
+                         "'%s' (dst %s ifindex %d): ignored",
+                         (unsigned)seq, sip, rx_ifindex, it->name,
+                         ipv4_text(it->dst_be), it->ifindex);
+            }
+            continue;
+        }
         it->inflight = 0;
         note(p, it, 1, rtt_since(it, now_ms), IV_PROBE_R_NONE, now_ms);
         it->next_due_ms = now_ms + it->interval_ms;

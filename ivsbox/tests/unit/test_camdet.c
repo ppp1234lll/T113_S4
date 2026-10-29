@@ -43,6 +43,10 @@ static uint8_t  g_sent[512];
 static size_t   g_sent_len;
 static int      g_pb_close_cnt;
 static uint16_t g_last_seq; /* 引擎实际发出的 echo seq */
+/* 上一包的目的地址（网络序）。回包的**源地址**必须等于它 —— 2026-10-29 起
+ * `iv_probe_on_readable()` 会校验源地址，否则局域网里任意 ICMP 回包撞上 seq
+ * 都被当成"这台摄像机通了"。 */
+static uint32_t g_last_dst;
 
 static int pb_socket(int d, int t, int p)
 {
@@ -78,6 +82,10 @@ static ssize_t pb_sendto(int fd, const void *buf, size_t len, int flags,
         const struct icmphdr *ic = (const struct icmphdr *)buf;
 
         g_last_seq = ntohs(ic->un.echo.sequence);
+    }
+    if (a != NULL && a->sa_family == AF_INET) {
+        g_last_dst =
+            ((const struct sockaddr_in *)(const void *)a)->sin_addr.s_addr;
     }
     return (ssize_t)len;
 }
@@ -145,6 +153,7 @@ static size_t mk_icmp_reply(uint8_t *b, uint16_t id, uint16_t seq)
     ip->version  = 4;
     ip->ihl      = 5;
     ip->protocol = IPPROTO_ICMP;
+    ip->saddr    = g_last_dst; /* 源地址＝刚刚发出去那一包的目的地址 */
     ic->type             = ICMP_ECHOREPLY;
     ic->code             = 0;
     ic->un.echo.id       = htons(id);

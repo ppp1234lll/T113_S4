@@ -172,6 +172,11 @@ typedef struct {
     ssize_t  (*sendmsg)(int fd, const struct msghdr *msg, int flags);
     int      (*setsockopt)(int fd, int level, int optname, const void *optval,
                            socklen_t optlen);
+
+    /* 「ICMP 回包按入口网卡认领」用的可选钩子（2026-10-29 加）。
+     * 为 NULL 时退回 `recv()`：仍按源地址校验，但**拿不到入口 ifindex**，
+     * 于是同目标的两路 WAN 只能靠 seq 唯一性区分（见 `icmp_reject`）。 */
+    ssize_t  (*recvmsg)(int fd, struct msghdr *msg, int flags);
 } iv_probe_iops_t;
 
 /* 默认注入点：真 libc socket / getsockopt / close + iv_clock 时钟。永不返回 NULL。 */
@@ -260,6 +265,20 @@ struct iv_probe {
      * 现场表现就是"0.47 ms 的摄像机被判定延时 4"。改成引擎级共享计数器后，
      * 同一时刻在飞的两个请求序号必不相同，认领唯一。 */
     uint32_t        icmp_seq_next;
+    /* 被丢弃的 ICMP 回包计数（2026-10-29 加）：`(id, seq)` 对得上，但
+     * **源地址不是该项的 dst**、或**入口网卡不是该项的 ifindex**。
+     *
+     * 为什么必须挡：raw ICMP socket 收**全部** ICMP 报文，原先的认领条件只有
+     * `(id, seq) + inflight`，既不看源地址也不看入口接口。现场实测抓到：
+     * [source,text]
+     * ----
+     * seq=703 ifi=8 usb0 src=47.104.250.225 dst=10.146.160.2   ← 平台真回包
+     * seq=703 ifi=4 eth0 src=192.168.1.200  dst=192.168.1.120  ← 局域网另一台设备
+     * ----
+     * 局域网里任何机器 ping 时的 seq 也是递增小整数，撞上就该线路"判通" ——
+     * 现场于是出现「有线到平台 100% 丢包，界面却显示主网1 正常」。
+     * 这个计数不涨才是正常的；涨了说明现场有别的流量在撞号，日志会 WARN 一次。 */
+    uint32_t        icmp_reject;
     int             link_ifindex[IV_PROBE_MAX_LINKS]; /* 0 = 空槽 */
     uint8_t         link_up[IV_PROBE_MAX_LINKS];
 };

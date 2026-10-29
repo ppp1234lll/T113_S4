@@ -120,25 +120,25 @@ const main = async () => {
 
     const content = doc.getElementById('content');
 
-    console.log('m01 主网1 = 有线，且取的是 mn[1]');
-    const m1 = kvOf(content, '主网1');
-    chk(m1 !== null, 'm01a: 有「主网1」这一行');
+    console.log('m01 有线 = mn[1]');
+    const m1 = kvOf(content, '有线');
+    chk(m1 !== null, 'm01a: 有「有线」这一行');
     if (m1 === null)
         return;
-    chk(m1.textContent.trim() === '断开', 'm01b: mn[1]=2 ⇒ 主网1 显示「断开」（不是「正常」）');
+    chk(m1.textContent.trim() === '断开', 'm01b: mn[1]=2 ⇒ 有线 显示「断开」（不是「正常」）');
     chk(m1.className.indexOf('err') >= 0, 'm01c: 断开按「坏」着色（err）');
 
-    console.log('m02 主网2 = 4G，且取的是 mn[0]');
-    const m2 = kvOf(content, '主网2');
-    chk(m2 !== null, 'm02a: 有「主网2」这一行');
+    console.log('m02 4G = mn[0]');
+    const m2 = kvOf(content, '4G');
+    chk(m2 !== null, 'm02a: 有「4G」这一行');
     if (m2 === null)
         return;
-    chk(m2.textContent.trim() === '正常', 'm02b: mn[0]=1 ⇒ 主网2 显示「正常」');
+    chk(m2.textContent.trim() === '正常', 'm02b: mn[0]=1 ⇒ 4G 显示「正常」');
     chk(m2.className.indexOf('ok') >= 0, 'm02c: 正常按「好」着色（ok）');
 
-    console.log('m03 标签本身要写明是有线还是 4G');
-    chk(kvOf(content, '主网1（有线）') !== null, 'm03a: 主网1 标注「（有线）」');
-    chk(kvOf(content, '主网2（4G）') !== null, 'm03b: 主网2 标注「（4G）」');
+    console.log('m03 标签只写介质名，不出现「主网1／主网2」');
+    chk(kvOf(content, '主网1') === null, 'm03a: 没有「主网1」');
+    chk(kvOf(content, '主网2') === null, 'm03b: 没有「主网2」');
 
     console.log(fail === 0 ? 'ALL PASS' : (fail + ' FAILED'));
     process.exit(fail === 0 ? 0 : 1);

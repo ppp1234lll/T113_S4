@@ -52,8 +52,8 @@
  *   config.defaults    —                   内置默认值表（Web 显示"出厂默认"）
  *   config.apply       {"ver":N,"items":{...}}  事务提交（版本不符即拒绝，S5.4）
  *   device.list        —                   设备发现档案（S4.2）
- *   snmp.result        {"which":"cam"|"sw"} SNMP 采集结果（S4.3）
- *   snmp.run           {"which":"cam"|"sw"} 触发一轮采集（S4.3）
+ *   snmp.result        {"which":"cam"|"cam0".."cam5"|"sw"} SNMP 采集结果（S4.3）
+ *   snmp.run           {"which":"cam"|"cam0".."cam5"|"sw"} 触发一轮采集（S4.3）
  *   camera.search      —                   触发一轮设备发现（S4.2）
  *   system.time        {"ts":<秒>}         设系统墙钟（运维页"同步时间"）
  *   system.reboot      —                   请求重启（运维页"重启"）

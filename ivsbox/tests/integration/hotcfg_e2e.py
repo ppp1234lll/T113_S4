@@ -14,11 +14,13 @@
   - **模块真值**：`snmp.result` 直接读 `iv_agent_snmp_job_t.slot[].oid`
     （作业被重建过才会变成新 OID，读的不是配置值）；
   - **落盘日志**：`ivsboxd` 不往 stdout 打日志，热更成功会打
-    `snmp target N reloaded: …` / `rec sources reloaded: …`（这几行**只有热更
+    `snmp <目标名> reloaded: …` / `rec sources reloaded: …`（这几行**只有热更
     路径**会打 —— 重启后开机装配走的是 open 分支，所以它们同时是"没重启"的证据）。
+    目标名是 `cam0`..`cam5` / `switch`（6 路各一条 ＋ 交换机，2026-10-29 扩表；
+    早先打的是 `snmp target 0/1`）。
 
-  H1 基线：`camera.snmp` 默认 9 个槽位、`sysName` 槽＝1.3.6.1.2.1.1.5.0
-  H2 改 `camera.snmp.oid.sysName` ⇒ `snmp.result` 立即是新 OID ＋ 热更日志
+  H1 基线：`camera.snmp.hik.*` 默认 8 个槽位、`sysName` 槽＝1.3.6.1.2.1.1.5.0
+  H2 改 `camera.snmp.hik.sysName` ⇒ `snmp.result` 立即是新 OID ＋ 热更日志
   H3 改 `camera.ch.0.url` + `.record=true` ⇒ 录像源表 reload（urls=1/1）
   H4 改 `camera.rec.hold_ms` / `.debounce_ms` ⇒ 同一条链上再 reload，参数跟着变
   H5 改 `switch.snmp.community` ⇒ **SWITCH 类**也订阅了；同时摄像机目标一个字不动
@@ -26,6 +28,7 @@
      （整类提交是常态：早返回不是优化，是不把就绪结果/在录会话白白拆掉）
   H7 完全同值 apply ⇒ 配置层就判定无变化，连回调都没有（第二道防线）
   H8 收尾全恢复默认并核对（含 `snmp.result` 回到默认 OID）
+  H9 改 `camera.ch.N.vendor` ⇒ 该路选另一套 OID 表（6 路各按品牌，判据＝槽位数）
 
 用法（必须先 `make build`）：
     cd <repo>/ivsbox
@@ -53,6 +56,7 @@ DEFAULT_SYSNAME_OID = '1.3.6.1.2.1.1.5.0'
 NEW_SYSNAME_OID = '1.3.6.1.4.1.39165.9.9.0'
 
 fails = []
+total = 0   # 断言条数（收尾打印用；硬编码数字迟早和实际条数对不上）
 rid = 0
 
 # 本次拉起 daemon 时的日志长度；只认这之后的追加内容。
@@ -62,6 +66,8 @@ BASE = 0
 
 
 def chk(cond, what):
+    global total
+    total += 1
     if cond:
         print('  PASS ' + what)
     else:
@@ -151,9 +157,10 @@ def apply_items(cls, items):
     return ctl('config.apply', {'ver': ver, 'items': items})
 
 
-def cam_slots():
-    """`snmp.result` 的 slots 段（读作业真值，不是配置值）。"""
-    return (ctl('snmp.result', {'which': 'cam'}).get('d') or {}).get('slots') or []
+def cam_slots(which='cam'):
+    """`snmp.result` 的 slots 段（读作业真值，不是配置值）。
+    `which` 认 `cam` / `cam0`..`cam5` / `switch`（2026-10-29 扩到 6 路 ＋ 交换机）。"""
+    return (ctl('snmp.result', {'which': which}).get('d') or {}).get('slots') or []
 
 
 def main():
@@ -174,7 +181,7 @@ def main():
 
         print('H1 基线')
         # 摄像机默认 **8/9** 条：`n_oid` 是"最后一个非空槽位下标 + 1"的位置语义，
-        # 而 `camera.snmp.oid.devStatus` 出厂默认就是空串（海康 MIB 无此节点、
+        # 而 `camera.snmp.hik.devStatus` 出厂默认就是空串（海康 MIB 无此节点、
         # 留空＝不采）。别把 9 写死 —— 那样改的是出厂默认，不是这条逻辑。
         slots = cam_slots()
         chk(len(slots) == 8, 'H1a 摄像机 SNMP 作业 8 个槽位（9 条里 devStatus 默认空）')
@@ -183,11 +190,11 @@ def main():
         chk(len(slots) > 2 and slots[2].get('name') == 'sysName',
             'H1c 槽位名来自代码表、不来自配置')
 
-        print('H2 改 camera.snmp.oid.sysName ⇒ 不重启即生效')
-        r = apply_items('camera', {'camera.snmp.oid.sysName': NEW_SYSNAME_OID})
+        print('H2 改 camera.snmp.hik.sysName ⇒ 不重启即生效')
+        r = apply_items('camera', {'camera.snmp.hik.sysName': NEW_SYSNAME_OID})
         chk(r.get('ok') is True, 'H2a config.apply 成功')
-        chk(wait_log(r'snmp target 0 reloaded: .*slots=8') is not None,
-            'H2b 出现 snmp target 0 reloaded（CAMERA 类订阅掩码含 SNMP 热更）')
+        chk(wait_log(r'snmp cam0 reloaded: .*slots=8') is not None,
+            'H2b 出现 snmp cam0 reloaded（CAMERA 类订阅掩码含 SNMP 热更）')
         slots = cam_slots()
         chk(len(slots) > 2 and slots[2].get('oid') == NEW_SYSNAME_OID,
             'H2c snmp.result 立即是新 OID（读的是重建后的作业，不是配置）')
@@ -200,7 +207,7 @@ def main():
         line = wait_log(r'rec sources reloaded: urls=1/1 hold=10000ms debounce=60000ms')
         chk(line is not None, 'H3b 出现 rec sources reloaded urls=1/1（默认 hold/debounce）')
         # 同一类里 SNMP 目标没变 ⇒ 不许跟着重建（否则就绪结果每次都被清空）
-        chk('snmp target' not in logtext()[before:],
+        chk('snmp cam0 reloaded' not in logtext()[before:],
             'H3c 只改 camera.ch.* 时 SNMP 作业不重建（早返回）')
 
         print('H4 改 camera.rec.hold_ms / .debounce_ms ⇒ 同一条链上跟着走')
@@ -217,9 +224,9 @@ def main():
         before = len(logtext())
         r = apply_items('switch', {'switch.snmp.community': 'swpriv'})
         chk(r.get('ok') is True, 'H5a config.apply 成功')
-        chk(wait_log(r'snmp target 1 reloaded: .*slots=12') is not None,
-            'H5b 出现 snmp target 1 reloaded（SWITCH 类掩码也对）')
-        chk('snmp target 0 reloaded' not in logtext()[before:],
+        chk(wait_log(r'snmp switch reloaded: .*slots=12') is not None,
+            'H5b 出现 snmp switch reloaded（SWITCH 类掩码也对）')
+        chk('snmp cam0 reloaded' not in logtext()[before:],
             'H5c 摄像机目标没变 ⇒ 不重建（逐目标比对，不是整包重建）')
 
         print('H6 camera 类里的无关键 ⇒ 回调真发生但零热更')
@@ -229,7 +236,7 @@ def main():
         r = apply_items('camera', {'camera.detect.rtt_ms': 300})
         chk(r.get('ok') is True, 'H6a config.apply 成功')
         text = quiet(before, 1.2)
-        chk('rec sources reloaded' not in text and 'snmp target' not in text,
+        chk('rec sources reloaded' not in text and 'snmp cam0 reloaded' not in text,
             'H6b 早返回：不出热更日志（否则每存一次配置就拆一轮在录会话）')
         slots = cam_slots()
         chk(len(slots) > 2 and slots[2].get('oid') == NEW_SYSNAME_OID,
@@ -243,11 +250,39 @@ def main():
         chk('rec sources reloaded' not in text,
             'H7b 无回调也就不可能重建（第一道防线是配置层的变化判定）')
 
+        print('H9 6 路各自按品牌选 OID 表（camera.ch.N.vendor）')
+        # 用户口径「6 路各自按品牌采」：同一份 camera.snmp.* 参数下，每一路用哪套
+        # OID 由**该路自己的 vendor** 决定。这是 `cfg_snmp_targets()` 里唯一的
+        # 品牌分支，也是最容易只对一路生效的地方 —— 写成 `camera.ch.0.vendor`
+        # 常量，第 2~6 路会集体错用第 1 路的表，界面上一点异样都看不出来。
+        #
+        # ⚠ **必须断言非 0 路**：只测 cam0 的话，写成常量那版照样全绿
+        #   （cam0 用的就是 ch.0 的 vendor）。H9c 是这条分支唯一的守卫。
+        #
+        # 判据用**槽位数**而不是 OID 值：三套表里标准 MIB-II 那三项的 OID 一模一样，
+        # 只有私有节点不同 —— 海康私有节点出厂有值（8 槽），大华留空（只剩 3 槽）。
+        chk(len(cam_slots('cam0')) == 8, 'H9a 第 1 路未配 vendor ⇒ 回落海康（8 槽）')
+        r = apply_items('camera', {'camera.ch.2.vendor': 'dahua'})
+        chk(r.get('ok') is True, 'H9b config.apply 成功（第 3 路改大华）')
+        chk(wait_log(r'snmp cam2 reloaded') is not None,
+            'H9c 改第 3 路 vendor 触发的是 cam2 作业（不是 cam0）')
+        chk(len(cam_slots('cam2')) == 3,
+            'H9d 第 3 路走大华表 ⇒ 只剩标准 MIB-II 三项（私有节点出厂空＝不采）')
+        chk(len(cam_slots('cam0')) == 8, 'H9e 第 1 路不受影响（还是海康 8 槽）')
+        r = apply_items('camera', {'camera.ch.0.vendor': 'dahua'})
+        chk(r.get('ok') is True, 'H9f config.apply 成功（第 1 路也改大华）')
+        chk(wait_log(r'snmp cam0 reloaded') is not None, 'H9g 触发 cam0 重装')
+        chk(len(cam_slots('cam0')) == 3, 'H9h 第 1 路也变成 3 槽')
+        r = apply_items('camera', {'camera.ch.0.vendor': '', 'camera.ch.2.vendor': ''})
+        chk(r.get('ok') is True, 'H9i config.apply 成功（换回默认＝海康）')
+        chk(len(cam_slots('cam0')) == 8 and len(cam_slots('cam2')) == 8,
+            'H9j 两路都回到 8 槽')
+
         print('H8 收尾恢复默认')
         r = apply_items('camera', {'camera.ch.0.url': '', 'camera.ch.0.record': False,
                                    'camera.rec.hold_ms': 10000,
                                    'camera.rec.debounce_ms': 60000,
-                                   'camera.snmp.oid.sysName': DEFAULT_SYSNAME_OID,
+                                   'camera.snmp.hik.sysName': DEFAULT_SYSNAME_OID,
                                    'camera.snmp.community': 'public',
                                    'camera.detect.rtt_ms': 200})
         chk(r.get('ok') is True, 'H8a 恢复 camera.* 默认')
@@ -265,7 +300,7 @@ def main():
                 apply_items('camera', {'camera.ch.0.url': '', 'camera.ch.0.record': False,
                                        'camera.rec.hold_ms': 10000,
                                        'camera.rec.debounce_ms': 60000,
-                                       'camera.snmp.oid.sysName': DEFAULT_SYSNAME_OID,
+                                       'camera.snmp.hik.sysName': DEFAULT_SYSNAME_OID,
                                        'camera.snmp.community': 'public',
                                        'camera.detect.rtt_ms': 200})
                 apply_items('switch', {'switch.snmp.community': 'public'})
@@ -286,5 +321,5 @@ if __name__ == '__main__':
     if fails:
         print('%d FAILED' % len(fails))
         sys.exit(1)
-    print('hotcfg e2e passed (25 assertions)')
+    print('hotcfg e2e passed (%d assertions)' % total)
     sys.exit(rc)

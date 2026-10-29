@@ -292,18 +292,61 @@ static void h08_probe_delay_threshold(void)
     chk(a.pb.cfg.degrade_rtt_ms == 120u, "h08 delay-only change really landed");
 }
 
+/* h09 SNMP 目标名与反向解析（2026-10-29 目标从 2 条扩到 7 条）。
+ *
+ * 名字只在一处定义（`iv_agent_snmp_target_name()`）：慢池任务名、结果落库的
+ * `snmp_latest.target`、界面按路显示、ctl 的 `which` 解析全走它。各写一份的话，
+ * 扩到 6 路时就会出现"日志 snmp-cam、库里 camera、界面 cam"三套叫法，
+ * 现场按 target 查库永远查不到东西。
+ *
+ * 反向证伪：把 `iv_agent_snmp_target_of()` 里 `name[3] < '0'+CAM_N` 的上界判据
+ * 去掉，`"cam6"`（只有 6 路）会被当成合法下标 6 ＝**交换机** ⇒ h09 立刻红。
+ * 这正是"想采第 7 路、结果采了交换机"的那类错。 */
+static void h09_snmp_target_names(void)
+{
+    int i;
+    int ok = 1;
+
+    chk(IV_AGENT_SNMP_TARGET_N == 7, "h09 6 cameras + 1 switch = 7 targets");
+    chk(strcmp(iv_agent_snmp_target_name(0), "cam0") == 0, "h09 target 0 -> cam0");
+    chk(strcmp(iv_agent_snmp_target_name(5), "cam5") == 0, "h09 target 5 -> cam5");
+    chk(strcmp(iv_agent_snmp_target_name(IV_AGENT_SNMP_SW), "switch") == 0,
+        "h09 the switch sits at index 6 (no hole in the array)");
+    chk(strcmp(iv_agent_snmp_target_name(IV_AGENT_SNMP_TARGET_N), "?") == 0,
+        "h09 out of range -> \"?\" (never NULL)");
+
+    chk(iv_agent_snmp_target_of("cam") == 0, "h09 \"cam\" alone means camera 1");
+    chk(iv_agent_snmp_target_of("cam0") == 0, "h09 cam0 -> 0");
+    chk(iv_agent_snmp_target_of("cam5") == 5, "h09 cam5 -> 5");
+    chk(iv_agent_snmp_target_of("sw") == IV_AGENT_SNMP_SW, "h09 sw -> switch");
+    chk(iv_agent_snmp_target_of("switch") == IV_AGENT_SNMP_SW, "h09 switch -> switch");
+    chk(iv_agent_snmp_target_of("cam6") < 0, "h09 cam6 does not exist (only 6 cameras)");
+    chk(iv_agent_snmp_target_of("cam55") < 0, "h09 cam55 rejected (trailing byte checked)");
+    chk(iv_agent_snmp_target_of("") < 0, "h09 empty string rejected");
+    chk(iv_agent_snmp_target_of(NULL) < 0, "h09 NULL rejected");
+
+    /* 名字与解析必须互逆：两处各写一套比较，迟早只对一半 */
+    for (i = 0; i < IV_AGENT_SNMP_TARGET_N; i++) {
+        if (iv_agent_snmp_target_of(iv_agent_snmp_target_name(i)) != i)
+            ok = 0;
+    }
+    chk(ok, "h09 name -> index round-trip for all 7 targets");
+}
+
 int main(void)
 {
     h01_guards();
     h02_rec_sources();
     h04_snmp_targets();
     h08_probe_delay_threshold();
+    h09_snmp_target_names();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_agent_hotcfg FAILED (%d)\n", g_fail);
         return 1;
     }
     printf("test_agent_hotcfg passed (guards, same-value early return, rec table "
-           "apply, snmp normalise, in-flight stale, late apply, probe delay threshold)\n");
+           "apply, snmp normalise, in-flight stale, late apply, probe delay "
+           "threshold, snmp target names)\n");
     return 0;
 }

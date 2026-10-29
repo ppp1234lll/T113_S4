@@ -127,9 +127,21 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * M4-S4.2 摄像机信息探测（设备发现）与 M4-S4.3 SNMP 采集的装配常量
  * ------------------------------------------------------------------------- */
-#define IV_AGENT_SNMP_TARGET_N 2 /* [0]=摄像机（camera.ch.0.ip）[1]=交换机（switch.ip） */
-#define IV_AGENT_SNMP_CAM      0
-#define IV_AGENT_SNMP_SW       1
+/* 采集目标自 2026-10-29 起从 2 条扩到 7 条：**6 路摄像机各自一条 + 交换机一条**
+ * （用户口径「6 路各自按品牌采」）。
+ *   - 下标 0..5 ＝ 摄像机第 1..6 路：IP 取 `camera.ch.N.ip`，OID 表按
+ *     `camera.ch.N.vendor` 选 `camera.snmp.<品牌>.<字段>` 那一套；
+ *   - 下标 6 ＝ 交换机：`switch.ip` ＋ `switch.snmp.*`。
+ *
+ * ⚠ **内部下标 ≠ 平台码**：平台 0xE7 的 DATA[0] 用现网 `snmp_dev_type` 口径
+ *   （0~5 摄像机、7 交换机）。内部把交换机放在 6 是为了不留空槽 —— 换算只在
+ *   `on_query_snmp()` 一处做，别让这个偏移漏到接口外面。
+ * ⚠ 6 路上限与平台上报帧 `CNS` 段宽度（`IV_REPORT_CNS_N`）一致：摄像机配置里
+ *   多出来的第 7/8 路是**只录不测**的槽位，同样**不采 SNMP**，别一起抬。 */
+#define IV_AGENT_SNMP_CAM_N    6
+#define IV_AGENT_SNMP_CAM      0 /* 第 1 路；cam0..cam5 从它起连续排 */
+#define IV_AGENT_SNMP_SW       IV_AGENT_SNMP_CAM_N       /* 6：交换机 */
+#define IV_AGENT_SNMP_TARGET_N (IV_AGENT_SNMP_CAM_N + 1) /* 7 */
 
 /* 单目标最多槽位＝交换机 12 槽（摄像机 9 槽是它的子集） */
 #define IV_AGENT_SNMP_SLOT_MAX IV_SNMP_SW_SLOT_N
@@ -234,9 +246,10 @@ _Static_assert(IV_AGENT_PROBE_DRAIN_MS * 5u <= 100u,
 /* ---------------------------------------------------------------------------
  * S4.3 SNMP 采集：目标配置与结果表
  *
- * OID **只来自配置**（`camera.snmp.oid.<槽位>` / `switch.snmp.oid.<槽位>`）。
- * 槽位名固定取 `iv_snmp_cam_slots[]` / `iv_snmp_sw_slots[]` 的前 n_oid 个
- * （顺序即配置默认值表顺序）⇒ 代码内**不内置任何厂家 OID 值**。
+ * OID **只来自配置**：摄像机按品牌分三套（`camera.snmp.hik|dahua|uniview.<槽位>`），
+ * 交换机一套（`switch.snmp.oid.<槽位>`）。槽位名固定取 `iv_snmp_cam_slots[]` /
+ * `iv_snmp_sw_slots[]` 的前 n_oid 个（顺序即配置默认值表顺序）⇒ 代码内
+ * **不内置任何厂家 OID 值**。
  * ------------------------------------------------------------------------- */
 typedef struct {
     int      enable;     /* 0 = 不采该目标 */
@@ -269,7 +282,7 @@ typedef struct {
 typedef struct {
     iv_snmp_target_t     t;    /* 目标参数（worker 只读；iops 已填默认） */
     void                *owner;/* iv_agent_t*（装配层回填；worker 不碰） */
-    int                  which;/* 目标下标 IV_AGENT_SNMP_CAM/_SW（worker 不碰） */
+    int                  which;/* 目标下标 IV_AGENT_SNMP_CAM.._SW（worker 不碰） */
     int                  n_slot;
     iv_agent_snmp_slot_t slot[IV_AGENT_SNMP_SLOT_MAX];
 } iv_agent_snmp_job_t;
@@ -991,10 +1004,19 @@ int iv_agent_build_ipc_json(const iv_agent_t *a, const char *qn, char *out,
  * S4.3 SNMP 采集（慢任务池内执行）
  * ------------------------------------------------------------------------- */
 
-/* 发起一轮采集。which = IV_AGENT_SNMP_CAM / IV_AGENT_SNMP_SW。
+/* 发起一轮采集。which = IV_AGENT_SNMP_CAM..(IV_AGENT_SNMP_TARGET_N-1)。
  * 前置：cfg.pool 非 NULL 且该目标 enable 且 ip_be 非 0（否则 IV_ESTATE）；
  * 上一轮未完成返回 IV_EBUSY。平台 0xE7 / Web 走这里。 */
 int iv_agent_snmp_start(iv_agent_t *a, int which, uint64_t now_ms);
+
+/* 目标名（`"cam0"`..`"cam5"` / `"switch"`）。**唯一的取名处**：
+ * 慢池任务名、结果落库的 `snmp_latest.target`、界面按路显示都用它，
+ * 各写一份迟早漂移。越界返回 `"?"`（永不 NULL）。 */
+const char *iv_agent_snmp_target_name(int which);
+
+/* 目标名反向解析（`"cam"` → 第 1 路；`"cam3"` → 第 4 路；`"sw"` / `"switch"` →
+ * 交换机）。认不出返回 -1。Web / ctl 的 `which` 参数都走这里。 */
+int iv_agent_snmp_target_of(const char *name);
 
 /* 采集状态：IV_AGENT_SNMP_IDLE / _RUN / _DONE；参数非法返回 IV_EINVAL。 */
 int iv_agent_snmp_state(const iv_agent_t *a, int which);

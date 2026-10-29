@@ -114,6 +114,7 @@
     { id: 'camera', name: '摄像机' },
     { id: 'devices', name: '设备档案' },
     { id: 'switch', name: '交换机' },
+    { id: 'snmp', name: 'SNMP' },
     { id: 'media', name: '媒体' },
     { id: 'config', name: '配置' },
     { id: 'maint', name: '运维' }
@@ -396,7 +397,7 @@
       overview: pageOverview, net: pageNet, cell: pageCell, gps: pageGps,
       board: pageBoard,
       camera: pageCamera,
-      devices: pageDevices, switch: pageSwitch, media: pageMedia,
+      devices: pageDevices, switch: pageSwitch, snmp: pageSnmp, media: pageMedia,
       config: pageConfig, maint: pageMaint
     }[page] || pageOverview;
     c.appendChild(builder());
@@ -446,7 +447,8 @@
     'net.server.wireless': '无线平台服务器', 'net.server.upgrade': '升级服务器',
     'net.server.log': '日志服务器',
     'camera.ch': '摄像机通道', 'camera.detect': '摄像机检测',
-    'camera.snmp': '摄像机 SNMP', 'camera.snmp.oid': '摄像机 OID 槽位',
+    'camera.snmp': '摄像机 SNMP', 'camera.snmp.hik': '海康 OID 模板',
+    'camera.snmp.dahua': '大华 OID 模板', 'camera.snmp.uniview': '宇视 OID 模板',
     'switch.snmp': '交换机 SNMP', 'switch.snmp.oid': '交换机 OID 槽位'
   };
 
@@ -1960,25 +1962,238 @@
     };
   }
 
-  /* SNMP 采集结果卡（摄像机页与交换机页共用一份，避免两处两套话术）。
-   * `which`：cam / sw（口径见 iv_ctl 的 snmp_which()）。 */
-  function snmpCard(which, title, hintText) {
+  /* ==================== SNMP（2026-10-29 新建） ====================
+   * 用户口径：「SNMP 配置，参考单片机的 web 界面，单独新建界面进行配置」——
+   * 品牌 tab（海康／大华／宇视）下每行「中文名 ＋ OID 输入框」的网格。
+   *
+   * **为什么不再用通用 `configCard`**：
+   *   ① 27 个 OID 键按字典序铺开是 `camera.snmp.dahua.cpuPercent` 这种裸键名，
+   *      现场看不出「dahua」是哪台设备的那一项；
+   *   ② 品牌必须是**互斥切换**的 tab，不是 27 个输入框堆一屏（用户给的单片机
+   *      界面就是这么排的）；
+   *   ③ 后端 `config.apply` 是整批提交、共用一个版本号 ⇒ 三张表必须**一次渲染
+   *      完、只挂一组「保存」**；分三次提交会撞 `e=-3`（版本过期）。
+   *
+   * **空值＝该项不采**，不是"填错了"：大华／宇视的私有节点出厂就是空的
+   * （没有可靠依据就不编 OID），现场按厂家 MIB 填，填哪项采哪项。
+   * 标准 MIB-II 那三项（系统描述／运行时长／设备名称）三家通用，已预填。
+   */
+  var SNMP_BRAND = [['hik', '海康'], ['dahua', '大华'], ['uniview', '宇视']];
+
+  /* 行序按现场关注度排：先用户截图里那 4 项（设备名称／型号／序列号／状态），
+   * 其余是补充项。**这一列只管显示顺序**，与后端 `iv_snmp_cam_slots[]` 的下标
+   * 无关 —— 键名一一对应，不靠位置（位置只影响落库的槽位名）。 */
+  var SNMP_CAM_FIELD = [
+    ['sysName', '设备名称 OID'],
+    ['deviceType', '设备型号 OID'],
+    ['softVersion', '软件版本 OID'],
+    ['serialNumber', '序列号／项目编码 OID'],
+    ['devStatus', '设备状态 OID'],
+    ['sysDescr', '系统描述 OID'],
+    ['sysUpTime', '运行时长 OID'],
+    ['cpuPercent', 'CPU 使用率 OID'],
+    ['memUsed', '内存使用率 OID']
+  ];
+
+  var SNMP_SW_FIELD = [
+    ['sysDescr', '系统描述 OID'],
+    ['sysUpTime', '运行时长 OID'],
+    ['ifDescr', '端口名称 OID（表列）'],
+    ['ifSpeed', '端口速率 OID（表列）'],
+    ['ifAdminStatus', '管理状态 OID（表列）'],
+    ['ifOperStatus', '运行状态 OID（表列）'],
+    ['ifInOctets', '入字节数 OID（表列）'],
+    ['ifInDiscards', '入丢弃 OID（表列）'],
+    ['ifOutOctets', '出字节数 OID（表列）'],
+    ['ifOutDiscards', '出丢弃 OID（表列）'],
+    ['lldpRemSysName', 'LLDP 邻居名 OID（表列）'],
+    ['lldpRemPortId', 'LLDP 邻居端口 OID（表列）']
+  ];
+
+  /* 采集目标：6 路摄像机 ＋ 交换机（与后端 `IV_AGENT_SNMP_TARGET_N` 同一套名字，
+   * `iv_agent_snmp_target_of()` 就认这些串）。 */
+  var SNMP_TGT = [
+    ['cam0', '第 1 路摄像机'], ['cam1', '第 2 路摄像机'], ['cam2', '第 3 路摄像机'],
+    ['cam3', '第 4 路摄像机'], ['cam4', '第 5 路摄像机'], ['cam5', '第 6 路摄像机'],
+    ['switch', '交换机']
+  ];
+
+  /* 一张「字段 → OID」网格。每个输入框仍然是 `fieldFor()` 造的，所以
+   * `collectChanges()` / `applyChanges()` 一个字都不用改就能收它 ——
+   * 自己另写一套收集逻辑，脏标记、布尔/数字分流迟早和通用那条漂开。 */
+  function snmpGrid(prefix, fields, items) {
+    var grid = el('div', 'grid');
+
+    fields.forEach(function (f) {
+      var key = prefix + '.' + f[0];
+      var v = (key in items) ? items[key] : '';
+      grid.appendChild(fieldFor(key, v, f[1]));
+    });
+    return grid;
+  }
+
+  /* 摄像机 OID 三套表（品牌 tab） ＋ 通用采集参数。 */
+  function snmpCamOidCard() {
     var card = el('div', 'card');
-    card.appendChild(el('h3', null, title));
-    if (hintText) card.appendChild(el('p', 'hint', hintText));
+    card.appendChild(el('h3', null, '摄像机 OID（按品牌）'));
+    card.appendChild(el('p', 'hint',
+      '采集时每一路按自己的「品牌」（摄像机页那一列）选这里三套表之一。' +
+      '某项留空＝该项不采集；改完保存，下一轮采集即生效，不用重启。' +
+      '标准 MIB-II 三项（系统描述／运行时长／设备名称）三家通用，已预填；' +
+      '型号／序列号／CPU 这些是厂家私有节点，大华与宇视出厂留空，按厂家 MIB 填。'));
+
+    var tabs = el('div', 'actions');
+    card.appendChild(tabs);
+    var body = el('div');
+    card.appendChild(body);
+    var bar = el('div', 'actions');
+    var save = el('button', null, '保存修改');
+    save.type = 'button';
+    var reload = el('button', 'ghost', '重新载入');
+    reload.type = 'button';
+    bar.appendChild(save);
+    bar.appendChild(reload);
+
+    var cur = SNMP_BRAND[0][0];
+
+    function mark() {
+      SNMP_BRAND.forEach(function (b) {
+        var d = body.querySelector('[data-brand="' + b[0] + '"]');
+        if (d) d.style.display = (b[0] === cur) ? '' : 'none';
+      });
+    }
+
+    function paintTabs() {
+      tabs.innerHTML = '';
+      SNMP_BRAND.forEach(function (b) {
+        var btn = el('button', b[0] === cur ? 'active' : 'ghost', b[1]);
+        btn.type = 'button';
+        btn.dataset.brand = b[0];
+        btn.addEventListener('click', function () {
+          cur = b[0];
+          paintTabs();
+          mark();
+        });
+        tabs.appendChild(btn);
+      });
+    }
+
+    function load() {
+      body.innerHTML = '';
+      api('/api/config?cls=camera').then(function (r) {
+        if (!r.ok) { body.appendChild(el('p', 'msg', r.msg || '配置不可用')); return; }
+        var items = r.d.items || {};
+        st.ver = r.d.version;
+
+        /* 采集参数与品牌无关，放在 tab 之上（切品牌时它不跟着变）*/
+        var prm = el('div', 'grid');
+        [['camera.snmp.enable', 'SNMP 采集开关'],
+         ['camera.snmp.community', '团体字（读团体）'],
+         ['camera.snmp.timeout_ms', '单次事务超时(ms)'],
+         ['camera.snmp.retries', '重试次数']].forEach(function (p) {
+          if (p[0] in items) prm.appendChild(fieldFor(p[0], items[p[0]], p[1]));
+        });
+        body.appendChild(prm);
+
+        /* 三张表**全部渲染、只显示当前那张**：切 tab 时用 `innerHTML=''` 重画
+         * 会把上一张表里刚敲进去的值一起丢掉（改完 hik 再改 dahua，回头一看
+         * hik 白填了），所以这里只切 display。 */
+        SNMP_BRAND.forEach(function (b) {
+          var d = el('div');
+          d.dataset.brand = b[0];
+          d.style.display = (b[0] === cur) ? '' : 'none';
+          d.appendChild(el('h3', null, b[1] + ' 的 OID 模板'));
+          d.appendChild(snmpGrid('camera.snmp.' + b[0], SNMP_CAM_FIELD, items));
+          body.appendChild(d);
+        });
+        mark();
+      });
+    }
+
+    save.addEventListener('click', function () { applyChanges(body, load); });
+    reload.addEventListener('click', load);
+    card.appendChild(bar);
+    paintTabs();
+    load();
+    return card;
+  }
+
+  /* 交换机 OID 一套表（键名与 2026-10 版一致，现场已有配置继续有效）。 */
+  function snmpSwOidCard() {
+    var card = el('div', 'card');
+    card.appendChild(el('h3', null, '交换机 OID'));
+    card.appendChild(el('p', 'hint',
+      '标准 IF-MIB ＋ 厂家私有节点。**表列**项填到列首实例前（不带末尾 .0），' +
+      '采集时会从该列首实例起连读。'));
+    var body = el('div');
+    card.appendChild(body);
+    var bar = el('div', 'actions');
+    var save = el('button', null, '保存修改');
+    save.type = 'button';
+    var reload = el('button', 'ghost', '重新载入');
+    reload.type = 'button';
+    bar.appendChild(save);
+    bar.appendChild(reload);
+
+    function load() {
+      body.innerHTML = '';
+      api('/api/config?cls=switch').then(function (r) {
+        if (!r.ok) { body.appendChild(el('p', 'msg', r.msg || '配置不可用')); return; }
+        var items = r.d.items || {};
+        st.ver = r.d.version;
+        var prm = el('div', 'grid');
+        [['switch.ip', '交换机 IP'],
+         ['switch.snmp.enable', 'SNMP 采集开关'],
+         ['switch.snmp.port', 'SNMP 端口'],
+         ['switch.snmp.community', '团体字（读团体）'],
+         ['switch.snmp.timeout_ms', '单次事务超时(ms)'],
+         ['switch.snmp.retries', '重试次数']].forEach(function (p) {
+          if (p[0] in items) prm.appendChild(fieldFor(p[0], items[p[0]], p[1]));
+        });
+        body.appendChild(prm);
+        body.appendChild(snmpGrid('switch.snmp.oid', SNMP_SW_FIELD, items));
+      });
+    }
+
+    save.addEventListener('click', function () { applyChanges(body, load); });
+    reload.addEventListener('click', load);
+    card.appendChild(bar);
+    load();
+    return card;
+  }
+
+  /* 采集结果（7 个目标共一张卡，用下拉选目标）。
+   * 原先摄像机页与交换机页各挂一张 `snmpCard(which)`，扩到 6 路后要么每页挂 6 张、
+   * 要么就得在摄像机页里再选一次路号 —— 集中到 SNMP 页一张卡更省事。 */
+  function snmpResultCard() {
+    var card = el('div', 'card');
+    card.appendChild(el('h3', null, '采集结果'));
+    card.appendChild(el('p', 'hint',
+      '采集是阻塞式 UDP 事务，落在慢任务池里跑，点完约 2~3 秒回读结果。' +
+      '目标没配 IP 或没开采集开关时会直接显示「未采集」—— 那不是失败。'));
 
     var bar = el('div', 'actions');
+    var sel = document.createElement('select');
+    SNMP_TGT.forEach(function (t) {
+      var o = document.createElement('option');
+      o.value = t[0];
+      o.textContent = t[1];
+      sel.appendChild(o);
+    });
     var btn = el('button', null, '发起采集');
     btn.type = 'button';
+    var rl = el('button', 'ghost', '刷新');
+    rl.type = 'button';
+    bar.appendChild(sel);
     bar.appendChild(btn);
+    bar.appendChild(rl);
     card.appendChild(bar);
-
     var box = el('div');
     card.appendChild(box);
 
     function show() {
       box.innerHTML = '读取中…';
-      api('/api/snmp?which=' + which).then(function (r) {
+      api('/api/snmp?which=' + sel.value).then(function (r) {
         box.innerHTML = '';
         if (!r.ok) { box.appendChild(el('p', 'msg', r.msg || '读取失败')); return; }
         /* `d`/`slots` 逐层兜底（R-07）：服务端回 `ok:true` 但缺字段时（旧版
@@ -2009,15 +2224,27 @@
       });
     }
 
+    sel.addEventListener('change', show);
+    rl.addEventListener('click', show);
     btn.addEventListener('click', function () {
-      api('/api/snmp/run', { method: 'POST', body: { which: which } }).then(function (r) {
+      api('/api/snmp/run', { method: 'POST', body: { which: sel.value } }).then(function (r) {
         toast(r.ok ? '已发起采集' : ('失败：' + (r.msg || r.e)), r.ok ? 'ok' : 'err');
         if (r.ok) setTimeout(show, 2500);
       });
     });
 
     show();
-    return { node: card, reload: show };
+    return card;
+  }
+
+  /* ==================== SNMP 页 ==================== */
+  function pageSnmp() {
+    var root = document.createDocumentFragment();
+    root.appendChild(el('h2', 'page-title', 'SNMP'));
+    root.appendChild(snmpCamOidCard());
+    root.appendChild(snmpSwOidCard());
+    root.appendChild(snmpResultCard());
+    return root;
   }
 
   /* ==================== 摄像机通道参数（2026-10-27 用户口径） ====================
@@ -2328,22 +2555,25 @@
     modeCard.onSaved(function () { status.reload(); });
     root.appendChild(modeCard.node);
 
-    root.appendChild(snmpCard('cam', '查摄像机（SNMP）',
-      '读第 1 路摄像机（camera.ch.0.ip）的 SNMP 槽位 —— 对应参考 web 系统操作里的' +
-      '「查摄像机1」。采集是阻塞式 UDP 事务，落在慢任务池里跑，点完约 2~3 秒回读结果。').node);
+    /* SNMP 采集结果与 OID 模板 2026-10-29 整体搬到「SNMP」页（用户口径：
+     * SNMP 配置单独一页）。这里只剩通道参数 —— 看到"3 号故障"紧接着就能核对
+     * 它的 IP／账号，两件事放在一张页面上才有用。 */
 
     /* 通道参数走专用卡片（2026-10-27）：品牌/码流要是下拉、拉流地址要能自动生成、
      * MAC 不给入口 —— 通用表单只会渲染成"键＝输入框"，这三件事都做不到。 */
     root.appendChild(cameraParamsCard());
 
     var slot = cameraSlotCard();
-    /* 通用卡片从此刻起只管 `camera.ch.*` **之外**的键（检测参数、录像节拍、
-     * SNMP 连接与 OID 槽位）。通道那 8 个字段已经在新卡片里画过，
-     * 再画一遍就是同一个键两个编辑器 ⇒ 后提交的那个必然带过期 `st.ver`、撞 e=-3。 */
-    root.appendChild(configCard('检测、录像与 SNMP 参数（camera.*）', ['camera'],
-      'OID 槽位按机型填值；录像节拍与检测参数在此。通道（IP／账号／品牌／码流／拉流地址）见上方卡片。',
+    /* 通用卡片从此刻起只管 `camera.ch.*` **之外**的键（检测参数、录像节拍）。
+     * 通道那 8 个字段已经在新卡片里画过，再画一遍就是同一个键两个编辑器
+     * ⇒ 后提交的那个必然带过期 `st.ver`、撞 e=-3。
+     * `camera.snmp.*`（含三套品牌 OID）也整片交给「SNMP」页，
+     * 理由同上：一个键只能有一个编辑器。 */
+    root.appendChild(configCard('检测与录像参数（camera.*）', ['camera'],
+      '录像节拍与检测参数在此。通道（IP／账号／品牌／码流／拉流地址）见上方卡片；' +
+      'SNMP 连接与 OID 模板见「SNMP」页。',
       function (items, reload) { slot.sync(items, reload); },
-      ['camera.ch.*']));
+      ['camera.ch.*', 'camera.snmp.*']));
     root.appendChild(slot.node);
     return root;
   }
@@ -2394,13 +2624,12 @@
   function pageSwitch() {
     var root = document.createDocumentFragment();
     root.appendChild(el('h2', 'page-title', '交换机'));
-    root.appendChild(configCard('交换机参数与 OID（switch.*）', ['switch'],
-      'OID 槽位键名即语义（厂家中立），值按实际机型填。'));
-
-    /* 「采集摄像机」原先也在这张卡上，2026-10-22 挪到摄像机页（`snmpCard('cam')`）：
-     * 摄像机的东西在摄像机页才找得到，而且那边正好挨着"这一路通不通"。 */
-    root.appendChild(snmpCard('sw', 'SNMP 采集结果',
-      '按 switch.* 里的 OID 槽位读交换机（标准 IF-MIB ＋ 厂商私有节点）。').node);
+    /* `switch.snmp.*`（连接参数 ＋ 12 个 OID 槽位）2026-10-29 整片搬到「SNMP」页：
+     * SNMP 的东西集中一页，这个页面只留交换机自己的地址。
+     * 排除用通配 `switch.snmp.*` —— 逐条列 5＋12 个键既写不下也会漏。 */
+    root.appendChild(configCard('交换机地址（switch.ip）', ['switch'],
+      'SNMP 连接参数与 OID 模板见「SNMP」页。',
+      null, ['switch.snmp.*']));
     return root;
   }
 

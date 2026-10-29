@@ -10299,3 +10299,149 @@ VM 全量：`make test` / `make asan` / `setarch -R make tsan` 各 **49 passed**
 * 平台 `0xF2`（ping 间隔）下发值的语义随之从"单包间隔"变成"轮间隔"。平台侧若仍按单包理解，
   设备实际发包频率会降到 1/4 —— 需与平台确认（本次不改协议，只改解释）。
 
+== 2026-10-29 18:04 SNMP 配置独立成页 ＋ 6 路各按品牌采 OID
+
+=== 为什么动
+
+用户口径三句话钉死了范围：
+
+. 「SNMP 配置，参考单片机的 web 界面，**单独新建界面**进行配置」——截图里是
+  品牌 tab（海康／大华／宇视）＋ 每行「中文名 ＋ OID 输入框」的网格；
+. 「这 4 组 OID 存下来之后，采集时怎么选表？」→ **「6 路各自按品牌采」**；
+. 「「光猫」这一组要不要真采集？」→ **「不需要光猫配置」**。
+
+而旧实现三条都对不上：采集目标只有 2 条（摄像机只采 `camera.ch.0.ip` 那一路 ＋ 交换机）；
+OID 是**厂家中立 9 槽**（同一槽位只能存一个值，海康/大华同指标 OID 不同就存不下两套）；
+界面上 `camera.snmp.*` 与 `switch.snmp.*` 混在摄像机页/交换机页的通用表单里，
+27 个裸键名按字典序铺一屏，现场看不出「dahua」是哪台设备的那一项。
+
+=== 目标表 2 → 7（`iv_agent.h` / `iv_agent.c`）
+
+[source,c]
+----
+#define IV_AGENT_SNMP_CAM_N    6
+#define IV_AGENT_SNMP_CAM      0   /* 第 1 路；cam0..cam5 从它起连续排 */
+#define IV_AGENT_SNMP_SW       IV_AGENT_SNMP_CAM_N       /* 6：交换机 */
+#define IV_AGENT_SNMP_TARGET_N (IV_AGENT_SNMP_CAM_N + 1) /* 7 */
+----
+
+三件事必须一起改，漏一件就错位：
+
+. **内部下标 ≠ 平台码**。平台 0xE7 的 `DATA[0]` 沿用现网 `snmp_dev_type`（0~5 摄像机、
+  7 交换机），内部把交换机放在 6 是为了不留空槽。换算只在 `on_query_snmp()` 一处做：
+  `sel < 6` → 摄像机该路，`sel >= 7` → 交换机，其余（缺 DATA／6）按第 1 路
+  （老平台的帧本来就带 DATA，判成非法会把升级前能用的调用打回 `0x74`）。
+. **名字只有一处定义**。`iv_agent_snmp_target_name()` 产出 `cam0`..`cam5` / `switch`，
+  慢池任务名、落库 `snmp_latest.target`、界面按路显示、ctl 的 `which` 解析全走它；
+  反向解析 `iv_agent_snmp_target_of()` 认 `cam`（＝第 1 路，兼容旧调用）/`cam0..cam5`/`sw`/`switch`。
+  早先各处自己 `snprintf("snmp-cam")`，扩到 6 路就会漂成"日志 snmp-cam、库里 camera、界面 cam"三套。
+. **落库 target 必须按路**。`snmp_latest` 的主键是 `(target, slot)`，6 路共用 `"camera"`
+  会让后采的那一路把前面 5 路的值全盖掉。
+
+顺手修掉一处**真缺陷**：`iv_agent_snmp_get()` 里
+`names = (which == IV_AGENT_SNMP_CAM) ? cam : sw` —— `_CAM` 是 0，所以第 2 路（下标 1）
+会拿到**交换机**那张槽位表。只有 2 个目标时这句恰好只对 0 和 1 两种情况都成立，
+扩到 6 路才暴露；判据已改成比 `IV_AGENT_SNMP_SW`。
+
+=== 配置键按品牌分三套（`iv_config.c` / `main.c`）
+
+`IV_CFG_DEPTH_MAX = 4` 把形态锁死：一级分类占 1 段、其下最多再套 3 段，所以只能是
+
+----
+camera.snmp.<品牌>.<槽位>      品牌 ∈ hik / dahua / uniview      27 条
+switch.snmp.oid.<槽位>          交换机 12 条，**键名一个不动**
+----
+
+旧的 `camera.snmp.oid.<槽位>` 9 条**整片删除**：留着就有两套真值，现场改了新的不生效、
+改了旧的被覆盖，比没有更糟。槽位名仍是 `iv_snmp_cam_slots[]` 那套（厂家中立、顺序固定）——
+**槽位语义不分品牌，只有 OID 值分品牌**，装配层按 `camera.ch.N.vendor` 选读哪一套。
+
+默认值只填**确定知道**的，这条是纪律不是省事：
+
+* 标准 MIB-II 三项（`sysDescr` / `sysUpTime` / `sysName`）三品牌都预填，三家都支持；
+* 海康私有节点（enterprise 39165）沿用 2026-10 版默认值；
+* **大华／宇视的私有节点一律留空＝不采**。手里没有可靠的大华（10004）、宇视（50224）
+  子节点依据，编一个"看着像"的 OID，现场拿到的是"有值但是错的"，比"没有值"难发现得多。
+  留空让现场按厂家 MIB 填，填哪项采哪项。
+
+品牌选择放在装配层，`cfg_snmp_targets()` 是**开机装配与热更共用**的那一段：
+
+[source,c]
+----
+for (i = 0; i < IV_AGENT_SNMP_CAM_N; i++) {
+    snprintf(ipk, ..., "camera.ch.%d.ip", i);
+    snprintf(vk,  ..., "camera.ch.%d.vendor", i);
+    snprintf(oid_pfx, ..., "camera.snmp.%s", snmp_brand_seg(v));
+    cfg_snmp_target(&sc[i], "camera.snmp", oid_pfx, iv_snmp_cam_slots, ..., cfg_ip_be(ipk));
+}
+cfg_snmp_target(&sc[IV_AGENT_SNMP_SW], "switch.snmp", "switch.snmp.oid", ...);
+----
+
+`snmp_brand_seg()` 认不出品牌（华为/中维世纪/任意串）**回落海康**——与拼拉流地址同一口径
+（`vendor` 不设枚举）。没配 IP 的路 `ip_be == 0` ⇒ 即使 enable 也不采
+（`iv_agent_snmp_start()` 的第二道守卫），这里不特判。
+
+光猫那一组按用户口径**不做**：没有 `optic.*` 键，也没有第三个采集目标。
+
+=== 接口（`iv_ctl.c` / `iv_web_api.c`）
+
+* `snmp.result` / `snmp.run` 的 `which` 由 `cam`/`sw` 扩成 `cam`/`cam0`..`cam5`/`sw`/`switch`，
+  `snmp_which()` 直接转调 `iv_agent_snmp_target_of()`——ctl 再抄一份判断，迟早和 agent 漂成两套。
+* `/api/overview` 的 `snmp` 段：`{"cam":<int>,"sw":<int>}` → `{"cams":[6 个],"sw":<int>}`。
+  原字段只可能表示"第 1 路"、语义含糊且无处消费（前端只读 `/api/snmp`），换成数组。
+* `/api/snmp?which=` 原样透传，`which` 缓冲 16 字节够（最长 `switch`）。
+
+=== 前端单独一页（`app.js`）
+
+`PAGES` 新增 `{id:'snmp', name:'SNMP'}`，页内三张卡：
+
+. **摄像机 OID（按品牌）**：采集参数（enable／community／timeout／retries）＋ 三个品牌 tab，
+  每 tab 9 行「中文名 ＋ OID 输入框」。行序按现场关注度排（设备名称／设备型号／软件版本／
+  序列号／设备状态，再补系统描述／运行时长／CPU／内存），与后端槽位下标无关——键名对应，不靠位置。
+. **交换机 OID**：连接参数 ＋ 12 行（表列项注明"不带末尾 `.0`，走 GETNEXT"）。
+. **采集结果**：7 个目标的下拉 ＋「发起采集」＋ 结果表。
+
+两条实现约束都是踩过的坑：
+
+* **三张品牌表同时渲染、只切 `display`**。若切 tab 时 `innerHTML=''` 重画，先改海康再改大华，
+  回头海康那格白填了——而用户正是"先改完再点保存"。
+* **三张表共用一个 `st.ver`，必须一次提交**。分三次 `config.apply` 会撞 `e=-3`（版本过期）。
+
+输入框仍由 `fieldFor()` 造（`data-key`/`data-kind`/`data-orig`），所以 `collectChanges()` /
+`applyChanges()` 一个字没改就能收它——自己另写一套收集逻辑，脏标记与布尔/数字分流迟早和通用那条漂开。
+
+摄像机页与交换机页把 `camera.snmp.*`、`switch.snmp.*` 整片设为跳过（`skipMatch` 的通配），
+理由只有一个：**一个键只能有一个编辑器**，否则后提交的那个必然带过期 `st.ver`、撞 `e=-3`。
+原先两页各挂一张 `snmpCard(which)`，扩到 6 路后要么每页挂 6 张、要么还得在摄像机页里再选一次路号，
+集中到 SNMP 页一张卡更省事。
+
+=== 验证
+
+* **VM**：`make host` / `make arm` 各 0 告警（arm 出 ELF32 ARM EABI5）；`make test` / `asan` /
+  `tsan`（`setarch -R`）各 **49/49**；`make analyze` 0 告警；`make itest` **16 passed ＋ 1 SKIP**
+  （tunnel 缺设备身份，与基线一致）。
+* **端到端**：`hotcfg_e2e.py` **35 条全过**；`platcmd_e2e.py` 全部通过。
+* **前端**：本机 jsdom **14 个文件**全过（原 13 ＋ 新增 `ui_snmp_page.mjs`）。新用例 26 条，
+  覆盖"键名前缀是 `camera.snmp.<品牌>.<字段>`、切 tab 不丢输入、三表一次提交、`which` 跟着下拉走"。
+* **反向证伪 3 条**：
+  ** ① `iv_agent_snmp_target_of()` 去掉 `cam5` 上界 ⇒ `test_agent_hotcfg` 的
+    `h09 cam6 does not exist` 红（`cam6` 会被当成交换机）。
+  ** ② `cfg_snmp_targets()` 把 `camera.ch.%d.vendor` 写成 `camera.ch.0.vendor` ⇒ `hotcfg H9d`
+    红。**H9a/H9c/H9e 全绿**——只测 cam0 的用例抓不住"所有路都用第 1 路的表"，H9d 是为这条
+    分支专门加的断言（改第 3 路 vendor，断言 cam2 变 3 槽而 cam0 仍 8 槽）。
+  ** ③ `app.js` 的 OID 前缀退回 `camera.snmp.oid` ⇒ `ui_snmp_page` **5 条红**。
+  三条还原后全部复绿。
+* **一次假绿教训**：首轮 `make host` 有 3 个测试二进制报 `cannot open output file: 权限不够`
+  （上一轮 `sudo make itest` 把 `build/` 归了 root），而 `hotcfg_e2e` **照样全绿**——它跑的是
+  没重链接的旧 `ivsboxd`。`chown -R embedsky:embedsky build tests` 后复跑 0 错误，反向证伪才红。
+  **判据**：先看 `build/host/ivsboxd` 的 mtime/md5 有没有变，再看测试结论。
+
+=== 未做 / 已知边界
+
+* 大华／宇视的私有节点 OID 仍需现场按厂家 MIB 填（出厂空＝不采）。要预置得先拿到两份可靠 MIB。
+* 华为／中维世纪没有独立表，`snmp_brand_seg()` 回落海康那套（标准 MIB-II 三项够用）。
+* 平台 0xE7 一次只能选一路（`DATA[0]` 单字节），平台要全采得发 6 次；协议侧未改。
+* 编号 `0xE7` 仍只回 ACK、**没有 JSON 应答体**（与 0xE4 两段式同批欠账）。
+* 采集仍是手动/平台触发，没有周期性轮采；6 路全采一轮的控制台命令与页面按钮都还没有。
+
+

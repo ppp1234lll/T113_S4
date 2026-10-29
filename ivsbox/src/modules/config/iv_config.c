@@ -262,13 +262,24 @@ static const cfg_default_t s_defaults[] = {
      * 全工程只有一个延时门限，别让人在两个地方各调一个数。键留着只为兼容已落盘的
      * 现场配置与平台契约，改它不生效（同 `net.timeout_ms` 的处理方式）。 */
     D_INT(IV_CFG_CLS_CAMERA, "camera.detect.rtt_ms", "保留键：无消费方（延时门限见 probe.timeout_ms）", 200, 10, 10000),
-    /* M4-S4.3 SNMP 采集：目标参数 4 条 ＋ OID 槽位 9 条。
-     * OID 表**唯一来源＝配置**：代码内不内置任何品牌特化表，换机型只改这里、不改固件。
-     * ⚠ 槽位名必须**厂家中立**（同一槽位只能存一个 OID：海康/大华同指标 OID 不同，
-     *   不能两套并存）；name 由键名承担，type 由本行的 desc 登记（键深 4 段＝
-     *   IV_CFG_DEPTH_MAX 极限，**不能再加第 5 段 name/type 字段**）。
-     * 出厂默认填**海康**那一套（主流机型）；大华套由 Web（S5.1）一键切，
-     *   摄像机为其它品牌时本组私有 OID 无应答属预期（**报"无应答"、不乱填值**）。
+    /* 摄像机 OID 按**品牌分三套**（2026-10-29 用户口径：「6 路各自按品牌采」＋
+     * 「参考单片机 web，品牌 tab 下填 OID」）。键深上限是 4 段，所以布局只能是
+     *     camera.snmp.<品牌>.<槽位>        品牌 ∈ hik / dahua / uniview
+     * 槽位名仍是 `iv_snmp_cam_slots[]` 那一套（厂家中立、顺序固定）——
+     * **槽位语义不分品牌，只有 OID 值分品牌**：`iv_snmp_cam_slots` 与
+     * `camera.snmp.<品牌>.<槽位>` 一一对应，装配层按 `camera.ch.N.vendor` 选哪一套。
+     * 旧的厂家中立键 `camera.snmp.oid.<槽位>` **已删除**：留着就有两套真值，
+     * 现场改了新的不生效、改了旧的被覆盖，比没有更糟。
+     *
+     * 默认值只填**确定知道**的：
+     *   - sysDescr / sysUpTime / sysName ＝ 标准 MIB-II，三家都支持；
+     *   - 海康私有节点沿用 2026-10 版默认值（enterprise 39165 ＝ 海康）；
+     *   - **大华 / 宇视的私有节点一律留空 ＝ 不采**。手里没有可靠的大华、
+     *     宇视子节点依据，编一个"看着像"的 OID，现场拿到的是"有值但是错的"，
+     *     比"没有值"难发现得多。留空让现场按厂家 MIB 填。
+     *   - 空值＝该槽不采（`iv_agent_snmp_start()` 只在 n_oid>0 时才发作业），
+     *     不是"填错了"。
+     *
      * ⚠ `community` 属口令类，架构 §10 本应走 `secure/`；F8 密钥分离未实现，
      *   首版暂落普通配置——**已知欠账**（与 `camera.ch.N.pass` 同类）。 */
     D_BOOL(IV_CFG_CLS_CAMERA, "camera.snmp.enable", "摄像机 SNMP 采集开关", "false"),
@@ -278,26 +289,64 @@ static const cfg_default_t s_defaults[] = {
           1500, 100, 60000),
     D_INT(IV_CFG_CLS_CAMERA, "camera.snmp.retries", "摄像机 SNMP 重试次数（0=只发一次）",
           1, 0, 10),
-    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.sysDescr",
-          "SNMP 槽位 sysDescr＝系统描述（string）", "1.3.6.1.2.1.1.1.0", NULL),
-    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.sysUpTime",
-          "SNMP 槽位 sysUpTime＝运行时长（TimeTicks/counter）", "1.3.6.1.2.1.1.3.0", NULL),
-    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.sysName",
-          "SNMP 槽位 sysName＝设备名称（string）", "1.3.6.1.2.1.1.5.0", NULL),
-    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.deviceType",
-          "SNMP 槽位 deviceType＝设备型号/类型（string）", "1.3.6.1.4.1.39165.1.1.0", NULL),
-    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.softVersion",
-          "SNMP 槽位 softVersion＝软件版本（string）", "1.3.6.1.4.1.39165.1.3.0", NULL),
-    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.serialNumber",
-          "SNMP 槽位 serialNumber＝序列号（string；海康无独立 SN 节点，用 deviceID）",
+    /* ---- 海康（hik）---- */
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.hik.sysDescr",
+          "海康：系统描述（标准 MIB-II）", "1.3.6.1.2.1.1.1.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.hik.sysUpTime",
+          "海康：运行时长（TimeTicks；标准 MIB-II）", "1.3.6.1.2.1.1.3.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.hik.sysName",
+          "海康：设备名称（标准 MIB-II）", "1.3.6.1.2.1.1.5.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.hik.deviceType",
+          "海康：设备型号（私有 39165）", "1.3.6.1.4.1.39165.1.1.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.hik.softVersion",
+          "海康：软件版本（私有 39165）", "1.3.6.1.4.1.39165.1.3.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.hik.serialNumber",
+          "海康：序列号／项目编码（私有 39165；海康无独立 SN 节点，用 deviceID）",
           "1.3.6.1.4.1.39165.1.5.0", NULL),
-    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.cpuPercent",
-          "SNMP 槽位 cpuPercent＝CPU 使用率（integer, %）", "1.3.6.1.4.1.39165.1.7.0", NULL),
-    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.memUsed",
-          "SNMP 槽位 memUsed＝内存已用（gauge；大华为使用率 %）", "1.3.6.1.4.1.39165.1.11.0", NULL),
-    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.oid.devStatus",
-          "SNMP 槽位 devStatus＝设备状态（integer 0=bad/1=good；海康 MIB 无此节点⇒留空＝不采）",
-          "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.hik.cpuPercent",
+          "海康：CPU 使用率（integer, %；私有 39165）", "1.3.6.1.4.1.39165.1.7.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.hik.memUsed",
+          "海康：内存已用（gauge；私有 39165）", "1.3.6.1.4.1.39165.1.11.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.hik.devStatus",
+          "海康：设备状态（integer；海康 MIB 无此节点⇒留空＝不采）", "", NULL),
+    /* ---- 大华（dahua）---- */
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.dahua.sysDescr",
+          "大华：系统描述（标准 MIB-II）", "1.3.6.1.2.1.1.1.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.dahua.sysUpTime",
+          "大华：运行时长（TimeTicks；标准 MIB-II）", "1.3.6.1.2.1.1.3.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.dahua.sysName",
+          "大华：设备名称（标准 MIB-II）", "1.3.6.1.2.1.1.5.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.dahua.deviceType",
+          "大华：设备型号（私有节点，按厂家 MIB 填；留空＝不采）", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.dahua.softVersion",
+          "大华：软件版本（私有节点，按厂家 MIB 填；留空＝不采）", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.dahua.serialNumber",
+          "大华：序列号／项目编码（私有节点，按厂家 MIB 填；留空＝不采）", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.dahua.cpuPercent",
+          "大华：CPU 使用率（私有节点，按厂家 MIB 填；留空＝不采）", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.dahua.memUsed",
+          "大华：内存使用率 %（私有节点，按厂家 MIB 填；留空＝不采）", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.dahua.devStatus",
+          "大华：设备状态（私有节点，按厂家 MIB 填；留空＝不采）", "", NULL),
+    /* ---- 宇视（uniview）---- */
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.uniview.sysDescr",
+          "宇视：系统描述（标准 MIB-II）", "1.3.6.1.2.1.1.1.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.uniview.sysUpTime",
+          "宇视：运行时长（TimeTicks；标准 MIB-II）", "1.3.6.1.2.1.1.3.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.uniview.sysName",
+          "宇视：设备名称（标准 MIB-II）", "1.3.6.1.2.1.1.5.0", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.uniview.deviceType",
+          "宇视：设备型号（私有节点，按厂家 MIB 填；留空＝不采）", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.uniview.softVersion",
+          "宇视：软件版本（私有节点，按厂家 MIB 填；留空＝不采）", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.uniview.serialNumber",
+          "宇视：序列号／项目编码（私有节点，按厂家 MIB 填；留空＝不采）", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.uniview.cpuPercent",
+          "宇视：CPU 使用率（私有节点，按厂家 MIB 填；留空＝不采）", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.uniview.memUsed",
+          "宇视：内存使用率 %（私有节点，按厂家 MIB 填；留空＝不采）", "", NULL),
+    D_STR(IV_CFG_CLS_CAMERA, "camera.snmp.uniview.devStatus",
+          "宇视：设备状态（私有节点，按厂家 MIB 填；留空＝不采）", "", NULL),
     /* M6-S6.5 断网录像的**全局时间参数**：原为 `iv_recctl` 编译期常量
      * （10 s / 60 s），2026-10-14 用户拍板改为可配置。路级开关与地址见下面
      * `camera.ch.N.record`（是否录像）/ `camera.ch.N.url`（录像源 RTSP 地址）。

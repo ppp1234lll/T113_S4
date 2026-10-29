@@ -231,21 +231,15 @@ const main = async () => {
     chk(overviewLoads > loadsBefore,
         'v06a: 到期后回读了一次（' + loadsBefore + ' → ' + overviewLoads + '）');
 
-    console.log('v07 查摄像机（SNMP）');
-    chk(byText(content, 'h3', '查摄像机（SNMP）') !== null, 'v07a: 摄像机页出现 SNMP 卡');
-    const snmpBtn = byText(content, 'button', '发起采集');
+    console.log('v07 SNMP 已迁出摄像机页（2026-10-29 用户口径：单独一页）');
+    chk(byText(content, 'h3', '查摄像机（SNMP）') === null,
+        'v07a: 摄像机页不再挂 SNMP 卡');
+    chk(byText(content, 'button', '发起采集') === null,
+        'v07b: 摄像机页不再有「发起采集」按钮');
+    chk(/camera\.snmp\./.test(content.textContent) === false,
+        'v07c: 摄像机页不再画 camera.snmp.* 的输入框（一个键只能有一个编辑器）');
 
-    chk(snmpBtn !== null, 'v07b: 有「发起采集」按钮');
-    chk(/sysDescr/.test(content.textContent), 'v07c: 结果表渲染出槽位名');
-    if (snmpBtn === null)
-        return;
-    snmpBtn.click();
-    await sleep(80);
-    chk(snmpRunCalls.length === 1, 'v07d: 发一次 snmp.run');
-    chk(snmpRunCalls[0] && snmpRunCalls[0].which === 'cam',
-        'v07e: which=cam（第 1 路摄像机），实得 ' + JSON.stringify(snmpRunCalls[0]));
-
-    console.log('v08 交换机页不再重复挂摄像机采集入口');
+    console.log('v08 交换机页同样不再挂采集入口，导航里有独立「SNMP」页');
     const navSw = byText(doc.getElementById('navList'), 'button', '交换机');
 
     if (navSw !== null) {
@@ -253,16 +247,32 @@ const main = async () => {
         await sleep(80);
         const swContent = doc.getElementById('content');
 
+        chk(byText(swContent, 'button', '发起采集') === null,
+            'v08a: 交换机页也没有「发起采集」（已归 SNMP 页）');
         chk(byText(swContent, 'button', '采集摄像机') === null,
-            'v08a: 交换机页没有「采集摄像机」（已归摄像机页）');
-        chk(byText(swContent, 'button', '发起采集') !== null, 'v08b: 交换机页仍有自己的采集入口');
+            'v08b: 交换机页没有「采集摄像机」');
     } else {
         chk(false, 'v08a: 导航里找不到「交换机」');
+    }
+    const navSnmp = byText(doc.getElementById('navList'), 'button', 'SNMP');
+
+    chk(navSnmp !== null, 'v08c: 导航里有「SNMP」');
+    if (navSnmp !== null) {
+        navSnmp.click();
+        await sleep(120);
+        const snmpContent = doc.getElementById('content');
+
+        chk(byText(snmpContent, 'h3', '摄像机 OID（按品牌）') !== null,
+            'v08d: SNMP 页有「摄像机 OID（按品牌）」卡');
+        chk(byText(snmpContent, 'button', '海康') !== null &&
+                byText(snmpContent, 'button', '大华') !== null &&
+                byText(snmpContent, 'button', '宇视') !== null,
+            'v08e: 三个品牌 tab 都在（海康／大华／宇视）');
     }
 };
 
 main().then(() => {
-    console.log(fail === 0 ? 'ui_camera_test passed (22 assertions)' : fail + ' FAILED');
+    console.log(fail === 0 ? 'ui_camera_test passed (SNMP 迁出后的 20 条断言)' : fail + ' FAILED');
     process.exit(fail === 0 ? 0 : 1);
 }).catch((e) => {
     console.error('HARNESS ERROR', e);

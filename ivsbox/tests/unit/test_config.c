@@ -206,9 +206,9 @@ static void case_defaults_startup(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c1: stat");
     chk(st.loaded == 0, "c1: loaded == 0 (started from built-in defaults)");
-    chk(st.items == 86u, "c1: 86 non-array defaults materialised");
+    chk(st.items == 104u, "c1: 104 non-array defaults materialised");
     chk(st.from_file == 0u, "c1: nothing came from the file");
-    chk(st.from_default == 86u, "c1: everything came from defaults");
+    chk(st.from_default == 104u, "c1: everything came from defaults");
     chk(st.invalid == 0u, "c1: a missing file is NOT an invalid value");
     chk(st.version == 0u, "c1: version is 0 when there is no file");
     chk(st.dirty == 0, "c1: not dirty right after open");
@@ -574,9 +574,9 @@ static void case_fill_and_origin(void)
         return;
 
     chk(iv_config_stat(c, &st) == IV_OK, "c5: stat");
-    chk(st.items == 86u, "c5: all non-array defaults are materialised");
+    chk(st.items == 104u, "c5: all non-array defaults are materialised");
     chk(st.from_file == 1u, "c5: exactly one key came from the file");
-    chk(st.from_default == 85u, "c5: eighty-five were filled from defaults");
+    chk(st.from_default == 103u, "c5: a hundred and three were filled from defaults");
     chk(st.invalid == 0u, "c5: a MISSING key is not an INVALID key");
     chk(st.loaded == 1, "c5: the file itself loaded fine");
 
@@ -617,7 +617,7 @@ static void case_parent_scalar_rejected(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c6: stat");
     chk(st.invalid == 1u, "c6: the scalar that shadows a subtree is counted as invalid");
-    chk(st.items == 86u, "c6: the whole non-array default set is still there");
+    chk(st.items == 104u, "c6: the whole non-array default set is still there");
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && s[0] == '\0',
         "c6: net.* is usable again (defaulted empty)");
     chk(iv_config_get_int(c, "net", &iv) == IV_ENOENT, "c6: the offending key itself is gone");
@@ -1013,8 +1013,8 @@ static void case_array_support(void)
                     strcmp(s, "7") == 0,
                 "c10: the 8th element is reachable");
             chk(iv_config_stat(cx, &st8) == IV_OK, "c10: stat on the eight-camera config");
-            chk(st8.items == 86u + 64u,
-                "c10: 8 slots x 8 fields + 82 base == 146 items (fits ITEMS_MAX 192)");
+            chk(st8.items == 104u + 64u,
+                "c10: 8 slots x 8 fields + 100 base == 164 items (fits ITEMS_MAX 192)");
             iv_config_close(cx);
         }
     }
@@ -1091,7 +1091,7 @@ static void case_comment_roundtrip(void)
     chk(iv_config_stat(c, &st) == IV_OK, "c11: stat after round-trip");
     chk(st.loaded == 1, "c11: the rendered file parses back cleanly");
     chk(st.invalid == 0u, "c11: no value was rejected on the round-trip");
-    chk(st.items == 94u, "c11: 86 base keys plus one 8-field camera survived");
+    chk(st.items == 112u, "c11: 104 base keys plus one 8-field camera survived");
 
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "172.16.0.9") == 0,
         "c11: the string survived");
@@ -1616,8 +1616,9 @@ static void build_oid_text(char *out, size_t len)
 
 /* ===========================================================================
  * §S4.3：SNMP OID 槽位＝"键名即语义、值即 OID 字符串"的 **4 段键**
- *   （`camera.snmp.oid.<槽位>` / `switch.snmp.oid.<槽位>`）。
- * ① 出厂默认（海康套）逐条取回，与计划 §S4.3「OID 蓝本」表一致；
+ *   （`camera.snmp.<品牌>.<槽位>` / `switch.snmp.oid.<槽位>`）。
+ * ① 出厂默认逐条取回：海康私有节点是真值，大华/宇视私有节点**必须留空**
+ *    （没有可靠依据就不编 OID —— 编错了现场拿到"有值但是错的"）；
  * ② 自定义值写盘→重开一致，含两个边界：**31 字符槽位名**、**159 字符 OID 值**；
  * ③ 越界被拒：**32 字符槽位名**（段长上限 `IV_CFG_SEG_MAX-1`）与 **160 字符 OID 值**
  *    （`IV_CFG_STR_MAX` 上限）⇒ 计入 `invalid` 且**不落进句柄**。
@@ -1646,20 +1647,28 @@ static void case_snmp_oid_keys(void)
     slot32[32] = '\0';
     cfg_path(pf, sizeof(pf));
 
-    /* ---- ① 出厂默认（海康套）---- */
+    /* ---- ① 出厂默认（三品牌各一套）---- */
     (void)unlink(pf);
     c = reopen_cfg();
     chk(c != NULL, "c17: open (built-in SNMP OID defaults)");
     if (c == NULL)
         return;
-    chk(iv_config_get_str(c, "camera.snmp.oid.sysDescr", &s) == IV_OK &&
+    chk(iv_config_get_str(c, "camera.snmp.hik.sysDescr", &s) == IV_OK &&
             strcmp(s, "1.3.6.1.2.1.1.1.0") == 0,
-        "c17: camera sysDescr default = MIB-II sysDescr");
-    chk(iv_config_get_str(c, "camera.snmp.oid.cpuPercent", &s) == IV_OK &&
+        "c17: hik sysDescr default = MIB-II sysDescr");
+    chk(iv_config_get_str(c, "camera.snmp.hik.cpuPercent", &s) == IV_OK &&
             strcmp(s, "1.3.6.1.4.1.39165.1.7.0") == 0,
-        "c17: camera cpuPercent default = Hikvision private OID");
-    chk(iv_config_get_str(c, "camera.snmp.oid.devStatus", &s) == IV_OK && s[0] == '\0',
-        "c17: camera devStatus default empty (no Hik node => not collected)");
+        "c17: hik cpuPercent default = Hikvision private OID");
+    chk(iv_config_get_str(c, "camera.snmp.hik.devStatus", &s) == IV_OK && s[0] == '\0',
+        "c17: hik devStatus default empty (no Hik node => not collected)");
+    chk(iv_config_get_str(c, "camera.snmp.dahua.sysName", &s) == IV_OK &&
+            strcmp(s, "1.3.6.1.2.1.1.5.0") == 0,
+        "c17: dahua sysName default = MIB-II sysName");
+    chk(iv_config_get_str(c, "camera.snmp.dahua.deviceType", &s) == IV_OK && s[0] == '\0',
+        "c17: dahua private slot default empty (invented OIDs are worse than none)");
+    chk(iv_config_get_str(c, "camera.snmp.uniview.sysUpTime", &s) == IV_OK &&
+            strcmp(s, "1.3.6.1.2.1.1.3.0") == 0,
+        "c17: uniview sysUpTime default = MIB-II sysUpTime");
     chk(iv_config_get_str(c, "switch.snmp.oid.ifOperStatus", &s) == IV_OK &&
             strcmp(s, "1.3.6.1.2.1.2.2.1.8") == 0,
         "c17: switch ifOperStatus default = IF-MIB column (no trailing .0)");
@@ -1684,8 +1693,8 @@ static void case_snmp_oid_keys(void)
     /* ---- ② 自定义值 + 长度边界：写盘 → 重开一致 ---- */
     (void)snprintf(json, sizeof(json),
                    "{\n"
-                   "  \"camera\": { \"snmp\": { \"oid\": {\n"
-                   "      \"cpuPercent\": \"1.3.6.1.4.1.1004849.1.1.3.0\",\n"
+                   "  \"camera\": { \"snmp\": { \"dahua\": {\n"
+                   "      \"cpuPercent\": \"1.3.6.1.4.1.10004.1.1.3.0\",\n"
                    "      \"%s\": \"%s\"\n"
                    "  } } }\n"
                    "}\n",
@@ -1695,13 +1704,16 @@ static void case_snmp_oid_keys(void)
     chk(c != NULL, "c17: open (custom OID table)");
     if (c == NULL)
         return;
-    chk(iv_config_get_str(c, "camera.snmp.oid.cpuPercent", &s) == IV_OK &&
-            strcmp(s, "1.3.6.1.4.1.1004849.1.1.3.0") == 0,
-        "c17: a swapped-in (Dahua) OID wins over the built-in default");
-    chk(iv_config_origin(c, "camera.snmp.oid.cpuPercent", &org) == IV_OK &&
+    chk(iv_config_get_str(c, "camera.snmp.dahua.cpuPercent", &s) == IV_OK &&
+            strcmp(s, "1.3.6.1.4.1.10004.1.1.3.0") == 0,
+        "c17: a Dahua private OID supplied by file wins over the empty default");
+    chk(iv_config_get_str(c, "camera.snmp.hik.cpuPercent", &s) == IV_OK &&
+            strcmp(s, "1.3.6.1.4.1.39165.1.7.0") == 0,
+        "c17: the hik set is untouched by a dahua edit (three independent tables)");
+    chk(iv_config_origin(c, "camera.snmp.dahua.cpuPercent", &org) == IV_OK &&
             org == IV_CFG_FROM_FILE,
         "c17: origin FILE for the supplied OID");
-    (void)snprintf(key, sizeof(key), "camera.snmp.oid.%s", slot31);
+    (void)snprintf(key, sizeof(key), "camera.snmp.dahua.%s", slot31);
     chk(iv_config_get_str(c, key, &s) == IV_OK && strcmp(s, good) == 0,
         "c17: 31-char slot name + 159-char OID value round-trip from the file");
     chk(iv_config_save(c, NULL, 0u) == IV_OK, "c17: save the custom table");
@@ -1718,7 +1730,7 @@ static void case_snmp_oid_keys(void)
     /* ---- ③ 越界被拒（不静默接受）---- */
     (void)snprintf(json, sizeof(json),
                    "{\n"
-                   "  \"camera\": { \"snmp\": { \"oid\": {\n"
+                   "  \"camera\": { \"snmp\": { \"uniview\": {\n"
                    "      \"%s\": \"1.3.6.1.2.1.1.1.0\",\n"
                    "      \"memUsed\": \"%s\"\n"
                    "  } } }\n"
@@ -1732,10 +1744,10 @@ static void case_snmp_oid_keys(void)
     chk(iv_config_stat(c, &st) == IV_OK, "c17: stat");
     chk(st.invalid == 2u,
         "c17: both the 32-char slot and the 160-char OID count as invalid");
-    (void)snprintf(key, sizeof(key), "camera.snmp.oid.%s", slot32);
+    (void)snprintf(key, sizeof(key), "camera.snmp.uniview.%s", slot32);
     chk(iv_config_get_str(c, key, &s) == IV_ENOENT,
         "c17: a 32-char slot name (>= IV_CFG_SEG_MAX) is rejected");
-    chk(iv_config_get_str(c, "camera.snmp.oid.memUsed", &s) != IV_OK ||
+    chk(iv_config_get_str(c, "camera.snmp.uniview.memUsed", &s) != IV_OK ||
             strcmp(s, bad) != 0,
         "c17: a 160-char OID value (>= IV_CFG_STR_MAX) is never stored");
     iv_config_close(c);

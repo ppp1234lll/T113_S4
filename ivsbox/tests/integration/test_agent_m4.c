@@ -1064,7 +1064,7 @@ static int scenario(void)
                                 v, sizeof v) == IV_OK &&
                 strcmp(v, "SW-NAME") == 0,
             "m09 SW slot0 landed in snmp_latest (recent-value)");
-        chk(iv_store_snmp_value(tstore, "camera", iv_snmp_cam_slots[6],
+        chk(iv_store_snmp_value(tstore, "cam0", iv_snmp_cam_slots[6],
                                 v, sizeof v) == IV_OK &&
                 strcmp(v, "42") == 0,
             "m09 CAM slot6 integer landed as \"42\" (num path)");
@@ -1075,7 +1075,7 @@ static int scenario(void)
         chk(iv_store_snmp_value(tstore, "switch", iv_snmp_sw_slots[1],
                                 v, sizeof v) == IV_ENOENT,
             "m09 SW slot1 (unconfigured, ok=0 row) reads back ENOENT");
-        chk(iv_store_snmp_value(tstore, "camera", iv_snmp_cam_slots[8],
+        chk(iv_store_snmp_value(tstore, "cam0", iv_snmp_cam_slots[8],
                                 v, sizeof v) == IV_ENOENT,
             "m09 CAM slot8 (no response, ok=0) reads back ENOENT (不乱填)");
         chk(iv_store_rows(tstore, "snmp_latest", &n) == IV_OK && n == 15,

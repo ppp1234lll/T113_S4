@@ -1155,14 +1155,27 @@ static json_object *build_overview(const iv_ctl_ctx_t *ctx)
                                json_object_new_int64((int64_t)iv_agent_door_events(ctx->agent)));
 
         {
+            /* 6 路摄像机各一个状态 ＋ 交换机一个（2026-10-29 扩目标）：
+             * `cam` 单值已无处消费（它只可能表示"第 1 路"，语义含糊），
+             * 换成 `cams` 数组，下标就是路号-1。 */
             json_object *snmp = json_object_new_object();
+            json_object *cams = json_object_new_array();
 
-            if (snmp != NULL) {
-                json_object_object_add(snmp, "cam",
-                    json_object_new_int(iv_agent_snmp_state(ctx->agent, IV_AGENT_SNMP_CAM)));
+            if (snmp != NULL && cams != NULL) {
+                int ci;
+
+                for (ci = 0; ci < IV_AGENT_SNMP_CAM_N; ci++)
+                    json_object_array_add(
+                        cams, json_object_new_int(iv_agent_snmp_state(ctx->agent, ci)));
+                json_object_object_add(snmp, "cams", cams);
                 json_object_object_add(snmp, "sw",
                     json_object_new_int(iv_agent_snmp_state(ctx->agent, IV_AGENT_SNMP_SW)));
                 json_object_object_add(d, "snmp", snmp);
+            } else {
+                if (snmp != NULL)
+                    json_object_put(snmp);
+                if (cams != NULL)
+                    json_object_put(cams);
             }
         }
         add_status_view(d, iv_agent_report(ctx->agent));
@@ -1615,16 +1628,12 @@ static int m_device_list(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_t 
     return rsp_data(d, out, cap, out_len);
 }
 
-/* which："cam" → 0，"sw" → 1；其余返回 -1。 */
+/* which："cam" → 第 1 路，"cam0".."cam5" → 第 1..6 路，"sw"/"switch" → 交换机；
+ * 其余返回 -1。名字的唯一出处是 `iv_agent_snmp_target_of()` —— 这里再抄一份
+ * 判断迟早和 agent 那边漂成两套（扩到 6 路时就是靠它一次改完的）。 */
 static int snmp_which(const char *s)
 {
-    if (s == NULL)
-        return -1;
-    if (strcmp(s, "cam") == 0)
-        return IV_AGENT_SNMP_CAM;
-    if (strcmp(s, "sw") == 0)
-        return IV_AGENT_SNMP_SW;
-    return -1;
+    return iv_agent_snmp_target_of(s);
 }
 
 static int m_snmp_result(const iv_ctl_ctx_t *ctx, json_object *p,
@@ -1638,7 +1647,7 @@ static int m_snmp_result(const iv_ctl_ctx_t *ctx, json_object *p,
     if (ctx->agent == NULL)
         return rsp_err(IV_ESTATE, "agent unavailable", out, cap, out_len);
     if (which < 0)
-        return rsp_err(IV_EINVAL, "which must be cam or sw", out, cap, out_len);
+        return rsp_err(IV_EINVAL, "which must be cam, cam0..cam5 or sw", out, cap, out_len);
 
     d = json_object_new_object();
     slots = json_object_new_array();
@@ -1684,7 +1693,7 @@ static int m_snmp_result(const iv_ctl_ctx_t *ctx, json_object *p,
         json_object_array_add(slots, e);
     }
     json_object_object_add(d, "which",
-                           json_object_new_string(which == IV_AGENT_SNMP_CAM ? "cam" : "sw"));
+                           json_object_new_string(iv_agent_snmp_target_name(which)));
     json_object_object_add(d, "state", json_object_new_int(iv_agent_snmp_state(ctx->agent, which)));
     json_object_object_add(d, "slots", slots);
     return rsp_data(d, out, cap, out_len);
@@ -1700,7 +1709,7 @@ static int m_snmp_run(const iv_ctl_ctx_t *ctx, json_object *p,
     if (ctx->agent == NULL)
         return rsp_err(IV_ESTATE, "agent unavailable", out, cap, out_len);
     if (which < 0)
-        return rsp_err(IV_EINVAL, "which must be cam or sw", out, cap, out_len);
+        return rsp_err(IV_EINVAL, "which must be cam, cam0..cam5 or sw", out, cap, out_len);
     rc = iv_agent_snmp_start(ctx->agent, which, iv_clock_monotonic_ms());
     if (rc != IV_OK)
         return rsp_err(rc, "snmp start rejected", out, cap, out_len);

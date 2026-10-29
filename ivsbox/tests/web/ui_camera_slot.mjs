@@ -79,6 +79,9 @@ window.fetch = function (u, o) {
         return Promise.resolve(rsp({ ok: true, d: { version: ver, items: {} } }));
     if (u.indexOf('/api/config?cls=camera') === 0)
         return Promise.resolve(rsp({ ok: true, d: { version: ver, items: items } }));
+    /* u07 会进「SNMP」页，那一页除了 camera 还读一份 switch（交换机 OID 卡） */
+    if (u.indexOf('/api/config?cls=switch') === 0)
+        return Promise.resolve(rsp({ ok: true, d: { version: ver, items: {} } }));
     if (u.indexOf('/api/snmp') === 0)
         return Promise.resolve(rsp({ ok: true, d: { state: 2, slots: [] } }));
     if (u.indexOf('/api/config/apply') === 0) {
@@ -195,12 +198,23 @@ const main = async () => {
     chk(applyCalls[1] !== undefined && applyCalls[1].items['camera.ch.2.ip'] === '10.0.0.10',
         'u06c: 新 IP 已发出');
 
-    console.log('u07 「查摄像机（SNMP）」卡片：接口回空 slots 时不得抛异常（R-07）');
+    console.log('u07 SNMP 卡片迁到独立页：接口回空 slots 时不得抛异常（R-07）');
     /* 原先这里 `r.d.slots.length` 直接取值：桩缺 /api/snmp 时兜底回 `d:{}`，
-     * 于是抛 TypeError，整页后续渲染被带走，而用例因为没人断言这块内容照样全绿。 */
-    chk(byText(content, 'p', '尚无采集结果') !== null,
-        'u07a: SNMP 卡片渲染「尚无采集结果」（旧代码此处 TypeError）');
-    chk(byText(content, 'p', '读取中…') === null, 'u07b: 卡片已走完「读取中…」');
+     * 于是抛 TypeError，整页后续渲染被带走，而用例因为没人断言这块内容照样全绿。
+     * 2026-10-29 卡片从摄像机页搬到「SNMP」页，断言跟着搬 —— 迁移没搬断言，
+     * 就等于把这条回归守卫悄悄丢了。 */
+    const navSnmp = byText(doc.getElementById('navList'), 'button', 'SNMP');
+
+    chk(navSnmp !== null, 'u07a: 导航里有「SNMP」页');
+    if (navSnmp !== null) {
+        navSnmp.click();
+        await sleep(160);
+        const snmpContent = doc.getElementById('content');
+
+        chk(byText(snmpContent, 'p', '尚无采集结果') !== null,
+            'u07b: SNMP 页渲染「尚无采集结果」（旧代码此处 TypeError）');
+        chk(byText(snmpContent, 'p', '读取中…') === null, 'u07c: 卡片已走完「读取中…」');
+    }
 };
 
 main().then(() => {

@@ -1479,7 +1479,24 @@ static int query_cfg_json(char *out, size_t cap, void *arg)
  * **位置保持一一对应**：中间某槽没配就留空串、不压缩下标，否则
  * `iv_agent_snmp_get()` 回报的槽位名会错位。n_oid 取"最后一个非空槽 + 1"。
  * ------------------------------------------------------------------------- */
+/* `camera.ch.N.vendor` → `camera.snmp.<品牌>` 的品牌段。
+ * 认不出的品牌**回落海康**（与拼拉流地址同一口径：`vendor` 不是枚举，后端不设
+ * 白名单）；三套表只覆盖海康/大华/宇视，华为、中维世纪的现场先填海康那套
+ * —— 标准 MIB-II 那三项（描述/运行时长/设备名）三家都通用，够用；
+ * 填不了的私有节点留空＝不采，**不编 OID**。 */
+static const char *snmp_brand_seg(const char *vendor)
+{
+    if (vendor == NULL || vendor[0] == '\0' || strcmp(vendor, "hik") == 0)
+        return "hik";
+    if (strcmp(vendor, "dahua") == 0)
+        return "dahua";
+    if (strcmp(vendor, "uniview") == 0)
+        return "uniview";
+    return "hik";
+}
+
 static void cfg_snmp_target(iv_agent_snmp_cfg_t *sc, const char *pfx,
+                            const char *oid_pfx,
                             const char *const *slots, int n_slot,
                             uint32_t ip_be)
 {
@@ -1512,7 +1529,7 @@ static void cfg_snmp_target(iv_agent_snmp_cfg_t *sc, const char *pfx,
         const char *s = NULL;
 
         sc->oid[i][0] = '\0';
-        if (snprintf(key, sizeof(key), "%s.oid.%s", pfx, slots[i]) >=
+        if (snprintf(key, sizeof(key), "%s.%s", oid_pfx, slots[i]) >=
             (int)sizeof(key))
             continue;
         if (iv_config_get_str(g_cfg, key, &s) != IV_OK || s == NULL)
@@ -1524,14 +1541,37 @@ static void cfg_snmp_target(iv_agent_snmp_cfg_t *sc, const char *pfx,
     }
 }
 
-/* 两个目标一次填好：`agent_setup()` 与"改完热更"（`on_cfg_committed`）共用同一段，
- * 否则开机一套、改配置另一套，迟早漂移。 */
+/* 7 个目标一次填好：`agent_setup()` 与"改完热更"（`on_cfg_committed`）共用同一段，
+ * 否则开机一套、改配置另一套，迟早漂移。
+ *
+ * 摄像机 **6 路各一条**（2026-10-29 用户口径「6 路各自按品牌采」）：
+ *   IP＝该路自己的 `camera.ch.N.ip`；OID 表＝按该路 `camera.ch.N.vendor`
+ *   选 `camera.snmp.<品牌>.*` 那一套。没配 IP 的路 `ip_be == 0` ⇒ 即使 enable
+ *   也不采（`iv_agent_snmp_start()` 的第二道守卫），这里不特判。
+ * 交换机仍是一条（`switch.snmp.*`，OID 键保留 `.oid.` 一段 —— 键名不动，
+ * 现场已有配置继续有效）。 */
 static void cfg_snmp_targets(iv_agent_snmp_cfg_t *sc)
 {
-    cfg_snmp_target(&sc[IV_AGENT_SNMP_CAM], "camera.snmp", iv_snmp_cam_slots,
-                    (int)IV_SNMP_CAM_SLOT_N, cfg_ip_be("camera.ch.0.ip"));
-    cfg_snmp_target(&sc[IV_AGENT_SNMP_SW], "switch.snmp", iv_snmp_sw_slots,
-                    (int)IV_SNMP_SW_SLOT_N, cfg_ip_be("switch.ip"));
+    int i;
+
+    for (i = 0; i < IV_AGENT_SNMP_CAM_N; i++) {
+        char        ipk[32];
+        char        vk[32];
+        char        oid_pfx[40];
+        const char *v = NULL;
+
+        (void)snprintf(ipk, sizeof(ipk), "camera.ch.%d.ip", i);
+        (void)snprintf(vk, sizeof(vk), "camera.ch.%d.vendor", i);
+        if (iv_config_get_str(g_cfg, vk, &v) != IV_OK)
+            v = NULL;
+        (void)snprintf(oid_pfx, sizeof(oid_pfx), "camera.snmp.%s",
+                       snmp_brand_seg(v));
+        cfg_snmp_target(&sc[i], "camera.snmp", oid_pfx, iv_snmp_cam_slots,
+                        (int)IV_SNMP_CAM_SLOT_N, cfg_ip_be(ipk));
+    }
+    cfg_snmp_target(&sc[IV_AGENT_SNMP_SW], "switch.snmp", "switch.snmp.oid",
+                    iv_snmp_sw_slots, (int)IV_SNMP_SW_SLOT_N,
+                    cfg_ip_be("switch.ip"));
 }
 
 /* ---------------------------------------------------------------------------

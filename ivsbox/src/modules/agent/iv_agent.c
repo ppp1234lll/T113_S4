@@ -648,12 +648,16 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
      * 不许出现"开机一套、改配置另一套"。 */
     for (t = 0; t < IV_AGENT_SNMP_TARGET_N; t++)
         snmp_job_apply(a, t);
-    if (cfg->pool != NULL)
-        IV_LOG_I(AG_MOD, "snmp: cam(enable=%d n=%d host=%s) sw(enable=%d n=%d host=%s)",
-                 cfg->snmp[IV_AGENT_SNMP_CAM].enable, a->snmp_job[IV_AGENT_SNMP_CAM].n_slot,
-                 a->snmp_job[IV_AGENT_SNMP_CAM].t.host,
-                 cfg->snmp[IV_AGENT_SNMP_SW].enable, a->snmp_job[IV_AGENT_SNMP_SW].n_slot,
-                 a->snmp_job[IV_AGENT_SNMP_SW].t.host);
+    if (cfg->pool != NULL) {
+        /* 一行一个目标：7 个目标塞一行会超过板端日志的截断长度（~200 字符），
+         * 后面几路的名字直接被切掉，排障时看不出到底哪一路没配上。 */
+        for (t = 0; t < IV_AGENT_SNMP_TARGET_N; t++)
+            IV_LOG_I(AG_MOD, "snmp %s: enable=%d slots=%d host=%s",
+                     iv_agent_snmp_target_name(t), cfg->snmp[t].enable,
+                     a->snmp_job[t].n_slot,
+                     (a->snmp_job[t].t.host[0] != '\0') ? a->snmp_job[t].t.host
+                                                       : "(unset)");
+    }
 
     /* ---- 4d. 平台下行命令路由（0xE4 搜索摄像机 / 0xE7 查 SNMP）----
      * 与 0xA5 同在**装配层**注册：这三条都只影响装配层持有的模块（dev/snmp/cd），
@@ -1459,15 +1463,25 @@ static void on_query_snmp(const iv_proto_frame_t *f, void *arg)
 
     if (f == NULL || a == NULL)
         return;
-    /* DATA[0] 选目标：0/缺省 = 摄像机（现网 snmp_dev_type 0~5），7 = 交换机。
-     * 与现网 com/app 里 snmp_dev_type 的取值口径一致（0~5 摄像机、7 交换机）。 */
+    /* DATA[0] 选目标，码值沿用现网 `snmp_dev_type` 口径：0~5 ＝摄像机第 1~6 路、
+     * 7 ＝交换机。**内部交换机下标是 6**（不留空槽），换算只在这里做。
+     * 缺 DATA / 其它码值一律按第 1 路 —— 老平台的帧就是不带 DATA 的，
+     * 判成非法会把升级前能用的调用打回 0x74。 */
     which = IV_AGENT_SNMP_CAM;
-    if (f->data != NULL && f->len >= 1u && f->data[0] >= 7u)
-        which = IV_AGENT_SNMP_SW;
+    if (f->data != NULL && f->len >= 1u) {
+        unsigned sel = (unsigned)f->data[0];
+
+        if (sel < IV_AGENT_SNMP_CAM_N)
+            which = (int)sel;
+        else if (sel >= 7u)
+            which = IV_AGENT_SNMP_SW;
+    }
     rc = iv_agent_snmp_start(a, which, a->now_ms);
     (void)iv_proto_ack(&a->rp.pf, f->cmd,
                        (rc == IV_OK) ? IV_PROTO_ACK_OK : IV_PROTO_ERR_EXEC);
-    IV_LOG_I(AG_MOD, "platform 0xE7 snmp query target=%d -> rc=%d", which, rc);
+    IV_LOG_I(AG_MOD, "platform 0xE7 snmp query target=%s(sel=%u) -> rc=%d",
+             iv_agent_snmp_target_name(which),
+             (unsigned)((f->data != NULL && f->len >= 1u) ? f->data[0] : 0u), rc);
 }
 
 /* S4.2 发现回调：每新增/更新一条档案调一次（worker/装配层同线程，无阻塞动作）。 */
@@ -1573,7 +1587,9 @@ static void on_snmp_done(uint64_t id, int rc, const void *result,
     if (jb == NULL || a == NULL)
         return;
 
-    target = (jb->which == IV_AGENT_SNMP_SW) ? "switch" : "camera";
+    /* 落库 target 名按路区分（`cam0`..`cam5` / `switch`）：6 路各采各的，
+     * 共用 `"camera"` 会让后采的那一路把前面的值全盖掉。 */
+    target = iv_agent_snmp_target_name(jb->which);
     slots  = (jb->which == IV_AGENT_SNMP_SW) ? iv_snmp_sw_slots : iv_snmp_cam_slots;
     n_slots = (jb->which == IV_AGENT_SNMP_SW) ? IV_SNMP_SW_SLOT_N : IV_SNMP_CAM_SLOT_N;
 
@@ -2476,8 +2492,9 @@ int iv_agent_reload_snmp(iv_agent_t *a, const iv_agent_snmp_cfg_t *sc)
         a->cfg.snmp[t] = newn;
         snmp_job_apply(a, t);
         changed++;
-        IV_LOG_I(AG_MOD, "snmp target %d reloaded: enable=%d host=%s slots=%d%s",
-                 t, newn.enable, a->snmp_job[t].t.host, a->snmp_job[t].n_slot,
+        IV_LOG_I(AG_MOD, "snmp %s reloaded: enable=%d host=%s slots=%d%s",
+                 iv_agent_snmp_target_name(t), newn.enable, a->snmp_job[t].t.host,
+                 a->snmp_job[t].n_slot,
                  (a->snmp_stale[t] != 0u) ? " (job in flight: applied on next poll)"
                                           : "");
     }
@@ -2667,6 +2684,38 @@ iv_device_t *iv_agent_device(iv_agent_t *a)
 /* ---------------------------------------------------------------------------
  * S4.3 SNMP 采集出口
  * ------------------------------------------------------------------------- */
+/* 目标名：**全工程唯一的取名处**（慢池任务名、落库 target、界面按路显示）。
+ * 返回静态常量，调用方可以长期持有 —— 早先各处自己 `snprintf("snmp-cam")`，
+ * 扩到 6 路时就会漂成三套叫法（日志 snmp-cam、库里 camera、界面 cam）。 */
+const char *iv_agent_snmp_target_name(int which)
+{
+    static const char *const cam_name[IV_AGENT_SNMP_CAM_N] = {
+        "cam0", "cam1", "cam2", "cam3", "cam4", "cam5",
+    };
+
+    if (which == IV_AGENT_SNMP_SW)
+        return "switch";
+    if (which >= 0 && which < IV_AGENT_SNMP_CAM_N)
+        return cam_name[which];
+    return "?";
+}
+
+int iv_agent_snmp_target_of(const char *name)
+{
+    if (name == NULL)
+        return -1;
+    if (strcmp(name, "sw") == 0 || strcmp(name, "switch") == 0)
+        return IV_AGENT_SNMP_SW;
+    /* `cam` 单写＝第 1 路：Web 旧接口的缺省值与平台 0xE7 的缺省都这么叫，
+     * 判成非法会让升级前就在用的调用方全部报 -2。 */
+    if (strcmp(name, "cam") == 0)
+        return IV_AGENT_SNMP_CAM;
+    if (strncmp(name, "cam", 3u) == 0 && name[3] >= '0' &&
+        name[3] < (char)('0' + IV_AGENT_SNMP_CAM_N) && name[4] == '\0')
+        return (int)(name[3] - '0');
+    return -1;
+}
+
 int iv_agent_snmp_start(iv_agent_t *a, int which, uint64_t now_ms)
 {
     iv_agent_snmp_job_t  *jb;
@@ -2695,7 +2744,7 @@ int iv_agent_snmp_start(iv_agent_t *a, int which, uint64_t now_ms)
 
     jb = &a->snmp_job[which];
     memset(&req, 0, sizeof(req));
-    req.name        = (which == IV_AGENT_SNMP_CAM) ? "snmp-cam" : "snmp-sw";
+    req.name        = iv_agent_snmp_target_name(which);
     req.fn          = snmp_task_fn;
     req.arg         = jb;
     /* 端到端截止时间：每槽位最坏 = (retries+1) × timeout；表列还会多行。
@@ -2743,7 +2792,9 @@ int iv_agent_snmp_get(const iv_agent_t *a, int which, int i,
     if (i < 0 || i >= jb->n_slot)
         return IV_EINVAL;
 
-    names = (which == IV_AGENT_SNMP_CAM) ? iv_snmp_cam_slots : iv_snmp_sw_slots;
+    /* ⚠ 判交换机要比 `_SW`，**不能比 `_CAM`**：`_CAM` 是 0，写成
+     * `which == _CAM ? cam : sw` 会让第 2 路（下标 1）拿到交换机那张表。 */
+    names = (which == IV_AGENT_SNMP_SW) ? iv_snmp_sw_slots : iv_snmp_cam_slots;
     s     = &jb->slot[i];
     if (slot_name != NULL)
         *slot_name = names[i];

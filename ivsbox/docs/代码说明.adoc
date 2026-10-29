@@ -10641,5 +10641,109 @@ AT+CSQ         → +CSQ: 99,99           （无卡即无信号）
   判为"某处阻塞 > 16 s 的看门狗超时"，待单独定位。
 
 
+== 2026-10-29 19:11 monitor 跨开机判据改 boot_id：人工反复复位不再被误熔断
+
+=== 为什么动
+
+`monitor.sh` 的重启计数是"300 s 内重拉 5 次 ⇒ failsafe 30 分钟不拉起
+`ivsboxd`"。2026-10-29 现场人工反复复位板子，走到第 5 次就熔断了：
+
+....
+18:47:09 monitor: CRASH LOOP: 5 restart(s) within 300s reached the limit 5
+          -- entering failsafe for 1800s, ivsboxd will NOT be started
+18:49:02 monitor: resuming failsafe from persisted state, cooldown restarted (1800s)
+....
+
+于是板子是好的、能 ping 能 ssh，但页面全是 `ivsboxd not running`，且
+**半小时内不会自己恢复**。
+
+根因不在 failsafe 本身，在"这个计数跨不跨开机"。原来的消毒判据是：
+
+[source,sh]
+----
+boot=$(mono_now)
+if [ "$FS" -ne 0 ]; then
+    FS=$((boot + COOLDOWN_S))          # 熔断继承
+elif [ "$WS" -gt "$boot" ]; then       # ← 两个 uptime 秒数比大小
+    WS=$boot; RC=0                     # 才清窗口
+fi
+----
+
+`WS` 是**上一次开机周期**里记的 uptime 秒数。判据成立的前提是"上次开机跑得比
+这次久"。上次只跑了十几秒就被复位，`WS` 是个小值（比如 15），本次开机 `boot`
+几秒就超过它 ⇒ `WS > boot` 为假 ⇒ 窗口没清、`RC` 跨复位继续累加 ⇒ 复位 5 次
+就熔断。
+
+而且循环里的"窗口过期兜底"（`now - WS >= 300`）在 `boot - WS < 300` 时也救不了
+—— 那正好是"上次开机最后 5 分钟内被复位"，也就是反复复位场景本身。
+
+=== 怎么改
+
+状态文件从三列变四列，第 4 列存 `/proc/sys/kernel/random/boot_id` 前 8 位：
+
+....
+<window_start_mono> <restarts> <failsafe_until_mono> <boot_id 前 8 位>
+----
+
+判据改成"boot_id 变了就作废上一轮的 `RC`"。整机一复位它必变，与跑了多久无关：
+
+[source,sh]
+----
+bid=$(boot_id_now)
+if [ "$FS" -ne 0 ]; then
+    FS=$((boot + COOLDOWN_S))                     # 熔断继承，不看开机周期
+elif [ -n "$bid" ] && [ "$BID" != "$bid" ]; then
+    WS=$boot; RC=0                                # 换了开机周期 ⇒ 计数作废
+elif [ "$WS" -gt "$boot" ]; then
+    WS=$boot; RC=0                                # 兜底：取不到 boot_id 时
+fi
+----
+
+三处刻意的取舍：
+
+. **熔断继承逻辑不动。** `FS != 0` 时只继承并重算冷却，**不因复位而清零**。
+   看门狗复位同样是"整机复位"，一复位就清熔断的话，"崩 → 看门狗复位 → 再崩"
+   就永远拦不住 —— 而那正是这套 failsafe 存在的理由。人工复位后要立刻恢复，
+   只能删状态文件（现场排障手册里写这一条）。
+. **`state_write()` 不带第 4 个参数。** 它固定写全局 `bid`。6 个调用点，凡"必须
+   记得传"的参数迟早漏一处，而漏传的表现是"跨开机判据静默失效"—— 又是一次
+   误熔断。少一个参数就少这一类坑。
+. **旧格式向后兼容。** 三列文件读出来 `BID` 为空 ⇒ `BID != bid` 恒真 ⇒ 按"上一次
+   开机"处理。不会因为状态文件是旧版就卡住守护循环。
+
+=== 验证
+
+* `sh -n` / `bash -n` 通过。
+* VM 离线 6 条（临时 `/tmp/t_monitor.sh`，用 `IVSBOX_HOME`、`IVSBOX_APP_DIR`、
+  `IVSBOX_LOG_ROOT`、`IVSBOX_POLL_S`、`IVSBOX_RESTART_WINDOW` 覆盖到临时目录）：
+  **把 `IVSBOX_RESTART_WINDOW` 设成 99999**，让"窗口过期兜底"失效 —— 这样测的
+  就只剩消毒判据本身，不然它会把 bug 盖住（第一版用例就是这么假绿的）。
+  +
+  [cols="1,3"]
+  |===
+  |用例 |结果
+
+  |A 状态文件 `10 4 0 deadbeef`（上次开机十几秒就复位，原 bug 的原形）|`RC` 4→1
+  |B 同一 boot_id、窗口未过期 `WS=now-20` |`RC` 4→5（保留）
+  |C 熔断期内 `FS=99999` |`RC` 不动，冷却重算到未来
+  |D 三列旧文件 `10 4 0` |照样清零
+  |===
+* **反向证伪**：把 boot_id 分支改成 `elif false`（退回旧判据）⇒ A2 与 D1 转红，
+  实得 `RC=5` —— 正是跨开机累加的原 bug。还原后 6/6 复绿。
+* **板端真机复验两条**：造假 boot_id `1618 4 0 deadbeef` 重启 monitor ⇒
+  `1646 0 0 ec757cd5`（清零）；真 boot_id `1626 4 0 ec757cd5` ⇒ 原样保留 `RC=4`。
+* 板端 `monitor.sh 2de417b3 → fc746771`；同批 `app.js cbc9d1ed → 1932d3ae`
+  （`wget http://127.0.0.1/app.js | md5sum` 与磁盘一致，web 侧无静态缓存）。
+
+=== 未做 / 已知边界
+
+* **状态文件路径是 `$IVSBOX_HOME/.monitor.state`，默认 `/mnt/UDISK/ivsbox/`，
+  不是 `/opt/ivsbox/`。** 这次先按 `/opt/ivsbox/` 找了半天，`cat` 一直报
+  No such file 还以为是"根本没生成"。排障时先 `grep '^STATE=' scripts/monitor.sh`。
+* 熔断本身仍然只能靠删状态文件解除，没做"界面上一键恢复"。`failsafe` 期间界面
+  只显示 `ivsboxd not running`，看不出是"故意不拉"还是"真挂了"。
+
+
+
 
 

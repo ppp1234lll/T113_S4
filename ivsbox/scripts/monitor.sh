@@ -89,12 +89,23 @@ TUNNEL_SCRIPT=${TUNNEL_SCRIPT:-$IVSBOX_APP_DIR/scripts/frp.sh}
 TUNNEL_ALERT_GAP=${TUNNEL_ALERT_GAP:-300}
 TUNNEL_LAST_ALERT=0
 
-# 状态文件是单行三列：`<window_start_mono> <restarts> <failsafe_until_mono>`，
-# 全部是 /proc/uptime 的整数秒（见文件头"时间基准"）。读入后逐列做"是不是纯数字"
-# 的兜底：状态文件被写坏/复位打断写半截时按"零历史"处理，绝不让坏文件卡死守护循环。
+# 状态文件是单行四列：
+# `<window_start_mono> <restarts> <failsafe_until_mono> <boot_id 前 8 位>`。
+# 前三列是 /proc/uptime 的整数秒（见文件头"时间基准"），第 4 列 2026-10-29 加。
+#
+# 为什么需要 boot_id：原来判"窗口属不属于上一次开机"用的是 `WS > boot`（秒数比
+# 大小）。它只在"上次开机跑得比这次久"时才成立 —— 上次没跑多久就被复位，WS 是
+# 个小值，本次 boot 几秒就超过它 ⇒ 判据为假 ⇒ 窗口没清、RC 跨复位继续累加 ⇒
+# 人工复位几次就被当成 crash loop 熔断 30 分钟（现场表现是"板子好的、页面全空"）。
+# boot_id 整机一复位必变，与跑了多久无关。旧格式文件没有第 4 列 ⇒ BID 为空 ⇒
+# 判据天然为真、按"上一次开机"处理，向后兼容。
+#
+# 读入后逐列做"是不是纯数字"的兜底：状态文件被写坏/复位打断写半截时按"零历史"
+# 处理，绝不让坏文件卡死守护循环。
 WS=0
 RC=0
 FS=0
+BID=''
 # 本实例的启动时刻（单调秒），用于升级自检超时判定；0 表示"还没拉起过"。
 BOOT_T0=0
 
@@ -102,9 +113,16 @@ mono_now() {
     cut -d. -f1 /proc/uptime 2>/dev/null
 }
 
+# 本开机周期的身份。整机一复位就变，比 uptime 秒数可靠（见状态文件那段注释）。
+# 取前 8 位足够区分，也不至于让状态文件行长漂移。取不到就回空串 —— 空串会让
+# "与文件里的 BID 不同"恒成立，最坏是按"上一次开机"处理，比误熔断安全。
+boot_id_now() {
+    cut -c1-8 /proc/sys/kernel/random/boot_id 2>/dev/null
+}
+
 state_read() {
     if [ -f "$STATE" ]; then
-        read -r WS RC FS < "$STATE" 2>/dev/null || true
+        read -r WS RC FS BID < "$STATE" 2>/dev/null || true
     fi
     case "$WS" in ''|*[!0-9]*) WS=0 ;; esac
     case "$RC" in ''|*[!0-9]*) RC=0 ;; esac
@@ -115,7 +133,10 @@ state_read() {
 # 等于没写（计划 §S6 探针 v1 的踩坑记录：只 fflush 不 fsync，复位后文件是 0 字节）。
 # 写入频率极低（每次重拉 / 状态跃迁），代价可接受。
 state_write() {
-    printf '%s %s %s\n' "$1" "$2" "$3" > "$STATE" 2>/dev/null || true
+    # 第 4 列固定写本开机周期的 `bid`（全局）：调用点不必传它。
+    # 少一个"必须记得传"的参数，就少一类"某处漏传 ⇒ 跨开机判据错 ⇒ 误熔断"的坑，
+    # 这也是它不跟着变成 `state_write <WS> <RC> <FS> <BID>` 的原因。
+    printf '%s %s %s %s\n' "$1" "$2" "$3" "$bid" > "$STATE" 2>/dev/null || true
     sync 2>/dev/null || true
 }
 
@@ -147,11 +168,24 @@ alert "started (max_restarts=$MAX_RESTARTS window=${WINDOW_S}s cooldown=${COOLDO
 # 跨开机消毒（见文件头"时间基准"）：uptime 归零后，状态文件里的旧值不可直接比较。
 boot=$(mono_now)
 case "$boot" in ''|*[!0-9]*) boot=0 ;; esac
+bid=$(boot_id_now)
 if [ "$FS" -ne 0 ]; then
+    # **熔断不因复位而解除**：这里刻意只继承、不看开机周期。看门狗复位同样是
+    # "整机复位"，一复位就清熔断的话，"崩 → 看门狗复位 → 再崩"就永远拦不住 ——
+    # 而那正是这套 failsafe 存在的理由。人工复位后想立刻恢复，只能删状态文件
+    # （`rm -f $STATE` 再 start），现场排障手册里写这一条。
     FS=$((boot + COOLDOWN_S))
     alert "resuming failsafe from persisted state, cooldown restarted (${COOLDOWN_S}s), ivsboxd will NOT be started"
     state_write "$WS" "$RC" "$FS"
+elif [ -n "$bid" ] && [ "$BID" != "$bid" ]; then
+    # 开机周期变了 ⇒ 上一轮的 restart 计数作废。原先靠 `WS > boot` 判，上次开机
+    # 没跑多久就被复位时 WS 是个小值、本次 boot 几秒就超过它 ⇒ 漏判、计数跨复位
+    # 累加、人工复位几次就熔断 30 分钟（见状态文件那段注释）。
+    WS=$boot
+    RC=0
+    state_write "$WS" "$RC" "$FS"
 elif [ "$WS" -gt "$boot" ]; then
+    # 兜底：boot_id 取不到（裁剪内核 / 容器）时退回旧判据，聊胜于无。
     WS=$boot
     RC=0
     state_write "$WS" "$RC" "$FS"

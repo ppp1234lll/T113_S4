@@ -222,12 +222,16 @@ static int cam_route_parse(const char *path, unsigned *n, const char **rest)
 static void rewrite_abs_urls(char *buf, size_t cap, const char *ipstr, uint16_t port,
                              const char *prefix)
 {
-    char needle_sl[64];
-    char needle[48];
-    char repl_sl[24];
-    size_t used = strlen(buf);
-    size_t pn  = strlen(prefix);
-    size_t pns = pn + 1u; /* prefix + "/" */
+    char        needle_sl[64];
+    char        needle[48];
+    char        repl_sl[24];
+    size_t      used = strlen(buf);
+    size_t      pn  = strlen(prefix);
+    size_t      pns = pn + 1u; /* prefix + "/" */
+    /* 空前缀（端口寻址形态）下裸主机 `http://<ip>` 要换成 "/"，不能换成空串 ——
+     * 换成空串会把 `http://<ip>` 连同后面的路径粘成一坨（早先 c03 的同类坑）。 */
+    const char *repl = (pn != 0u) ? prefix : "/";
+    size_t      rn   = strlen(repl);
 
     (void)snprintf(needle, sizeof needle, "http://%s", ipstr);
     (void)snprintf(needle_sl, sizeof needle_sl, "http://%s:%u/", ipstr, (unsigned)port);
@@ -252,11 +256,11 @@ static void rewrite_abs_urls(char *buf, size_t cap, const char *ipstr, uint16_t 
 
         if (hit == NULL)
             break;
-        if (used - hn + pn + 1u > cap)
+        if (used - hn + rn + 1u > cap)
             return;
-        memmove(hit + pn, hit + hn, used - (size_t)(hit - buf) - hn + 1u);
-        memcpy(hit, prefix, pn);
-        used -= hn - pn;
+        memmove(hit + rn, hit + hn, used - (size_t)(hit - buf) - hn + 1u);
+        memcpy(hit, repl, rn);
+        used -= hn - rn;
     }
 }
 
@@ -454,7 +458,7 @@ static int ctype_is_text(const char *ct)
 /* ---------------------------------------------------------------------------
  * 主入口
  * ------------------------------------------------------------------------- */
-int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
+int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_ch,
                       char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp)
 {
     char          ipstr[24];
@@ -480,8 +484,19 @@ int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
     if (ctx == NULL || req == NULL || out == NULL || out_len == NULL || rsp == NULL)
         return IV_EINVAL;
     rc = cam_route_parse(req->path, &n, &rest);
-    if (rc != IV_OK)
-        return rc; /* IV_ENOTSUP ⇒ 上层按 404 应答 */
+    if (rc == IV_OK) {
+        /* ② 路径寻址（兼容旧配置）：/cam/<N>/... —— 前缀就是改写基准 */
+        (void)snprintf(prefix, sizeof prefix, "/cam/%u", n);
+    } else {
+        /* ① 端口寻址（首选）：本连接落在 cam_port+cam_ch 上 ⇒ 根路径即摄像机根。
+         * 前缀留空：改写时 `http://<ip>/x` 变 `/x`，摄像机当成自己的根，前端那些
+         * 根绝对路径（/RPC2、/doc/index.html…）才不会被打成 404。 */
+        if (cam_ch >= (unsigned)CAM_CH_N)
+            return IV_ENOTSUP;
+        n      = cam_ch;
+        rest   = req->path;
+        prefix[0] = '\0';
+    }
 
     if (strcmp(req->method, "GET") != 0 && strcmp(req->method, "POST") != 0) {
         rsp->status = 405;
@@ -515,7 +530,6 @@ int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
         *out_len = (size_t)snprintf(out, cap, "refused\n");
         return IV_OK;
     }
-    (void)snprintf(prefix, sizeof prefix, "/cam/%u", n);
 
     /* ③ 拼上游请求（头白名单 + Connection: close） */
     {

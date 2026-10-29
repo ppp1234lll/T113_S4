@@ -964,10 +964,14 @@ static int tunnel_resolve(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t 
     case IV_TUNNEL_SVC_CAMERA:
         /* S8.5 落地前本机没有这个监听口。报"不可达"（EUNMAPPED 的语义）比把它映射到
          * 一个没人听的端口好：后者会让 frpc 起得来、连得上、但一访问就断，
-         * 现场排查会从"通道"一路查到"摄像机"，方向全错。 */
+         * 现场排查会从"通道"一路查到"摄像机"，方向全错。
+         *
+         * **每路一个口**（2026-10-29）：web 侧按 `cam_port + N` 给每路单独监听，
+         * 该口的根路径就是摄像机根 —— 大华/海康前端用根绝对路径（/RPC2 等），
+         * 共用一个口 + 路径前缀时这些请求必 404，网页登录直接失败。 */
         if (!g_tun_cam_enable)
             return IV_ENOENT;
-        *port = g_tun_port_cam;
+        *port = (uint16_t)(g_tun_port_cam + svc->index);
         return IV_OK;
     default:
         return IV_EINVAL;

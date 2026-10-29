@@ -168,6 +168,7 @@ extern "C" {
 typedef struct {
     int      fd;
     uint8_t  is_cam;    /* S8.5：1 = 来自摄像机代理专用口 ⇒ 只许走 cam 路由 */
+    uint8_t  cam_ch;    /* 该连接落在哪一路摄像机口上（cam_port + cam_ch） */
     uint64_t last_ms;
     size_t   rlen;      /* rbuf 中已收字节 */
     int      hdr_done;  /* 请求头已收齐 */
@@ -372,12 +373,19 @@ int iv_web_ota_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
  * cam.c —— S8.5 摄像机受控代理（架构 §9.3）
  * 只挂在**环回专用监听口**（frp 的 stcp visitor 落点）上，与主口完全隔离：
  * 这里**没有**登录页、没有 /api、没有静态资源 —— 非法路径一律 404 且不透露本机在跑
- * 什么。路由只有 `/cam/<N>/...`，目标 IP 只来自 ivsboxd 的配置键
- * `camera.ch.<N>.ip`（经本地通道查询），端口只有 `cam_upstream` 一个 ⇒
- * "白名单外地址不可达"在这里是物理事实，不是约定。
+ * 什么。目标 IP 只来自 ivsboxd 的配置键 `camera.ch.<N>.ip`（经本地通道查询），
+ * 端口只有 `cam_upstream` 一个 ⇒ "白名单外地址不可达"在这里是物理事实，不是约定。
+ *
+ * **两种寻址形态**（2026-10-29 起）：
+ *   ① 端口寻址（首选）：监听口 `cam_port + N` ⇒ 该口**根路径就是摄像机根**，
+ *      `/RPC2`、`/doc/index.html` 这类根绝对路径原样转给摄像机。
+ *      大华/海康的前端大量使用根绝对路径（实证：`jsCore/app.js` 里
+ *      `DevInit.getStatus("/RPC2", ...)`），走带前缀形态必然 404、网页登录报错。
+ *   ② 路径寻址（兼容旧配置）：任一摄像机口上 `/cam/<N>/...` ⇒ 路号取路径里的 N。
+ * `cam_ch` 是连接落点端口推出的路号（端口形态下用它；路径形态下被路径覆盖）。
  * 返回口径与 api/media 相同：IV_OK = 已填响应；IV_ENOTSUP = 路径不归我（404）。
  * -------------------------------------------------------------------------- */
-int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
+int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_ch,
                       char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp);
 
 /* --------------------------------------------------------------------------

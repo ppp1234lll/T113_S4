@@ -662,7 +662,11 @@ int main(int argc, char *argv[])
             rsp_status() == 200, "c02: main port login still works");
     }
 
-    /* ---------------- c10 专用口路由隔离：/api/login 与 / 都是 404 ---------------- */
+    /* ---------------- c10 专用口路由隔离 ----------------
+     * 2026-10-29 起专用口是**每路一个**（cam_port + N），根路径即摄像机根：
+     * 大华/海康前端用根绝对路径（/RPC2…），带前缀形态必 404。隔离不变的部分是
+     * "本口永远不吐设备自己的 /api、也不会发会话 cookie" —— 请求一律转给摄像机，
+     * 摄像机不认就回它自己的 404。 */
     {
         char b[64];
         int  blen = snprintf(b, sizeof b, "{\"user\":\"admin\",\"pass\":\"x\"}");
@@ -672,7 +676,7 @@ int main(int argc, char *argv[])
 
         memcpy(g_req + n, b, (size_t)blen);
         chk(exchange(g_cam_lport, g_req, (size_t)n + (size_t)blen) > 0 &&
-            rsp_status() == 404, "c10a: dedicated port /api/login -> 404");
+            rsp_status() == 404, "c10a: dedicated port /api/login -> camera 404");
         chk(strstr(g_rsp, "Set-Cookie") == NULL,
             "c10b: dedicated port never issues a session cookie");
     }
@@ -680,8 +684,22 @@ int main(int argc, char *argv[])
         int len = snprintf(g_req, sizeof g_req,
                            "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
 
-        chk(exchange(g_cam_lport, g_req, (size_t)len) > 0 && rsp_status() == 404,
-            "c10c: dedicated port / -> 404");
+        chk(exchange(g_cam_lport, g_req, (size_t)len) > 0 && rsp_status() == 200,
+            "c10c: dedicated port / proxies the camera root -> 200");
+        /* 根形态下 prefix 为空：绝对 URL 该改写成站根相对（`/login.js`），
+         * 不是 `/cam/0/login.js` —— 否则摄像机的根绝对请求还是会被打死。 */
+        chk(strstr(g_rsp, "href=\"/login.js\"") != NULL,
+            "c10d: root form rewrites absolute URL to /login.js (no /cam/N)");
+        chk(strstr(g_rsp, "/cam/0/") == NULL,
+            "c10e: root form must not inject the /cam/N prefix");
+    }
+    {
+        int len = snprintf(g_req, sizeof g_req,
+                           "GET /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+
+        chk(exchange(g_cam_lport, g_req, (size_t)len) > 0 && rsp_status() == 200 &&
+            strstr(g_rsp, "PATH=/echo") != NULL,
+            "c10f: root form passes the path upstream verbatim");
     }
 
     /* ---------------- c03 页面代理 + 绝对 URL/相对路径改写 ---------------- */

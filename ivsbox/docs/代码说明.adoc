@@ -9804,6 +9804,56 @@ WARN [probe] icmp reply seq=3 from 47.104.250.225 (ifindex 0) is not for item 'c
 * `icmp_reject` 只在第一次被拒时打日志。若现场真的长期有撞号流量，需要看这个计数
   是否持续增长（现在没有对外读数出口，只能从日志判断）。
 
+== 2026-10-29 14:58 网络页「主网1／主网2」编号与槽位对反了
+
+=== 干了什么事
+
+只动前端显示层，`web/static/app.js` 的 `pageNet()` 里两行：
+
+[source,js]
+----
+lGrid.appendChild(kv('主网1（有线）', MN_NAME[nt.mn[1]] || '—', mnCls(nt.mn[1])));
+lGrid.appendChild(kv('主网2（4G）',   MN_NAME[nt.mn[0]] || '—', mnCls(nt.mn[0])));
+----
+
+改前是 `主网1 ← mn[0]`、`主网2 ← mn[1]`。新增 `tests/web/ui_net_mn_label.mjs`。
+
+=== 解决什么问题
+
+用户对着网络页问"怎么主网2 是断开，主网1 却是通"。现场事实是有线（eth0）到平台
+100% 丢包、4G 正常，所以**该显示成"主网1 断、主网2 通"**；界面显示的正好相反，
+看着像 14:35 刚修掉的"回包冒充成功"又复发了。
+
+根子是两套编号口径：
+
+* 后端 `net.mn[]` 按 `iv_wan_t` 下标给：`[0]`=usb0/4G、`[1]`=eth0/有线
+  （`iv_netmgr.h`，历史实现，`env_feed()` 也是这么填的）；
+* 产品与故障码里"主网1"特指**有线主链路**（`iv_fault.h` 写着"主网1（有线 eth0）"），
+  4G 是备份＝主网2；`iv_agent.c:fault_feed()` 调 `iv_fault_apply_net()` 时按角色传
+  `mnv[IV_WAN_WIRED]` / `mnv[IV_WAN_WIRELESS]`，**不看槽位**。
+
+前端按槽位直显，就继承了槽位顺序，把"有线断了"说成"主网2 断开"。
+
+=== 影响范围
+
+* 只影响网络页「链路状态」两行的取值与文案，**不改 `/api/overview` 的 JSON 结构**，
+  也不改上报帧 `MN=` 的字节顺序（`iv_report.c` 仍是 `e->mn[0], e->mn[1]` ＝ 先 4G
+  后有线）。平台侧若同样按"第一个数＝主网1"解析，平台上的主网1/主网2 也会反 ——
+  这属协议契约，需平台侧确认后再动，本轮**不擅自改帧**。
+* 标签加了「（有线）」「（4G）」，`ui_net_mn_label.mjs` 的 m03 就钉这两条文案；
+  以后若改标签文案记得同步用例。
+
+=== 验证方式与结果
+
+* `node tests/web/ui_net_mn_label.mjs`（jsdom）：喂 `mn=[1,2]`（即 4G 通、有线断），
+  断言得到「主网1（有线）断开 / 主网2（4G）正常」且着色分别为 `err` / `ok`，9/9 PASS。
+* **反向证伪**：把两行改回按槽位直显 ⇒ 4 条 FAIL（m01b/m01c/m02b/m02c），还原复绿。
+* 全量前端用例 12 个 rc=0（旧 11 个 + 本用例）；`awk '/\r/'` 计 0（LF 未被破坏）；
+  `node --check web/static/app.js` 通过。
+* 板端替换 `/opt/ivsbox/web/static/app.js` 后需强刷浏览器（静态文件带缓存），
+  以 `netthr.status` 的 `probe_rtt_ms` 与 `net.mn` 为判据复核。
+
+
 
 
 

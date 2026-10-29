@@ -1185,8 +1185,14 @@
             if (s === 1) return 'ok';
             return 'warn';
           };
-          lGrid.appendChild(kv('主网1', MN_NAME[nt.mn[0]] || '—', mnCls(nt.mn[0])));
-          lGrid.appendChild(kv('主网2', MN_NAME[nt.mn[1]] || '—', mnCls(nt.mn[1])));
+          /* **槽位顺序 ≠ 主网编号**（2026-10-29 现场栽过）。
+           * 后端 `net.mn` 是按 `iv_wan_t` 下标给的：`[0]`=usb0/4G、`[1]`=eth0/有线；
+           * 而"主网1"在产品口径与故障码里特指**有线主链路**（`iv_fault.h`：主网1＝
+           * eth0，4G 是备份＝主网2）。按槽位直显会把"有线断了"显示成"主网2 断开"，
+           * 现场看着就像回包认领又出假阳性了一次。
+           * 口径对齐 `iv_agent.c:fault_feed()` —— 那里也是按角色分，不看槽位。 */
+          lGrid.appendChild(kv('主网1（有线）', MN_NAME[nt.mn[1]] || '—', mnCls(nt.mn[1])));
+          lGrid.appendChild(kv('主网2（4G）', MN_NAME[nt.mn[0]] || '—', mnCls(nt.mn[0])));
         }
       }
 

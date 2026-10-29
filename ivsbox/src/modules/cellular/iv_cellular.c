@@ -314,21 +314,33 @@ static void parse_qsimstat(iv_cell_t *c, const char *resp)
 
     if (l == NULL)
         return;
-    /* 格式 `+QSIMSTAT: <enable>,<inserted>`，取第二个数。 */
+    /* 格式 `+QSIMSTAT: <enable>,<inserted>`。
+     * **第一字段 enable 必须看**：它表示"插拔 URC 打没打开"，为 0 时第二字段
+     * **不随插拔更新**（EC200G 实测恒回 `0,0`）。早先只读第二个数，于是卡明明
+     * 在槽里也判成"没插" —— 2026-10-29 现场用户连插三次卡后报"为什么显示
+     * 未插入"，真因是模组读卡子系统挂住（`CPIN?` 回 `CME ERROR: 13`），
+     * 而这里把 CPIN 已经给出的"SIM FAILURE"降级成了"NOT INSERTED"。 */
     {
-        const char *comma = strchr(l + 10, ',');
+        const char *p = l + 10;   /* 跳过 "+QSIMSTAT:" */
+        int         enable;
+        const char *comma;
+        int         ins;
 
-        if (comma != NULL) {
-            int ins = to_int(comma + 1);
+        while (*p == ' ')
+            p++;
+        enable = to_int(p);
+        comma  = strchr(p, ',');
+        if (comma == NULL)
+            return;
+        ins = to_int(comma + 1);
 
-            /* 只在 CPIN 没给出结论时采用：CPIN 是权威，QSIMSTAT 是旁证。 */
-            if (ins == 0 && c->snap.sim_present < 0) {
-                c->snap.sim_present = 0;
-                copy_line(c->snap.sim_state, sizeof c->snap.sim_state, "NOT INSERTED");
-            } else if (ins == 1 && c->snap.sim_present < 0) {
-                c->snap.sim_present = 1;
-            }
-        }
+        if (enable != 1)
+            return;               /* URC 没开 ⇒ 第二字段不可信，一个字都不采 */
+        if (c->snap.sim_present >= 0)
+            return;               /* CPIN 已给结论 ⇒ 旁证不改判 */
+        c->snap.sim_present = (ins == 1) ? 1 : 0;
+        copy_line(c->snap.sim_state, sizeof c->snap.sim_state,
+                  (ins == 1) ? "INSERTED" : "NOT INSERTED");
     }
 }
 
@@ -608,6 +620,12 @@ static void compute_usable(iv_cell_snap_t *s)
     if (!sim_ok) {
         if (s->sim_present == 0)
             (void)snprintf(s->reason, sizeof s->reason, "SIM 卡未插入");
+        else if (strstr(s->sim_state, "SIM FAILURE") != NULL)
+            /* `CME ERROR: 13`：卡在槽里但模组读不动（触点/供电/读卡子系统挂住）。
+             * 这句必须与"未插入"分开 —— 否则现场只会去反复拔插卡，
+             * 而真正要做的是给模组复位（见 iv_agent 的卡读不到自愈）。 */
+            (void)snprintf(s->reason, sizeof s->reason,
+                           "SIM 卡读取失败（模块读不到卡，检查卡座/触点）");
         else if (s->sim_present < 0)
             (void)snprintf(s->reason, sizeof s->reason, "SIM 卡状态未知");
         else if (s->sim_state[0] != '\0')

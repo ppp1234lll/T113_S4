@@ -80,6 +80,30 @@ static const char *const k_ok_sim[] = {
     "\"8.8.8.8,114.114.114.114\"\r\n\r\nOK\r\n"
 };
 
+/* ---------------------------------------------------------------------------
+ * 板端实测（2026-10-29）：卡**插在槽里**，但模组读卡子系统挂住了。
+ * `ATI`/`CGMR` 正常、`CSQ` 恒 99（无卡就无信号）、`CPIN?` → `CME ERROR: 13`
+ * （SIM failure，不是 10"未插入"）、`QSIMSTAT?` → `0,0`（**enable=0**，第二字段
+ * 不可信）、`QCCID` → `CME ERROR: 50`、`CIMI` → `CME ERROR: 10`。
+ * 当时界面显示的是"SIM 卡未插入"，用户连插三次卡去查 —— 这就是误诊的来源。
+ * ------------------------------------------------------------------------- */
+static const char *const k_live_simfail[] = {
+    "Quectel\r\nEC200G\r\nRevision: EC200GCNLER01A13M04\r\n\r\nOK\r\n", /* ATI */
+    "EC200GCNLER01A13M04\r\n\r\nOK\r\n",                               /* CGMR */
+    "\r\n+CME ERROR: 13\r\n",                                          /* CPIN? */
+    "\r\n+QSIMSTAT: 0,0\r\n\r\nOK\r\n",                                /* QSIMSTAT? */
+    "\r\n+CME ERROR: 50\r\n",                                          /* QCCID */
+    "\r\n+CME ERROR: 10\r\n",                                          /* CIMI */
+    "\r\n+CSQ: 99,99\r\n\r\nOK\r\n",                                   /* CSQ */
+    "\r\n+COPS: 1\r\n\r\nOK\r\n",                                      /* COPS? */
+    "\r\n+CEREG: 0,0\r\n\r\nOK\r\n",                                   /* CEREG? */
+    "\r\n+CGATT: 0\r\n\r\nOK\r\n",                                     /* CGATT? */
+    "\r\n+CME ERROR: 3\r\n",                                           /* QENG */
+    "\r\nOK\r\n"                                                       /* CGCONTRDP */
+};
+
+/* CPIN 一条都没回（只有裸 OK）：本轮无结论。QSIMSTAT 的第一字段决定采不采。 */
+
 static const int k_cmd_n = (int)(sizeof k_live_nosim / sizeof k_live_nosim[0]);
 
 /* 驱动一轮：模拟 agent 的"取命令 → 写串口 → 读回响应 → 喂解析器"。
@@ -530,6 +554,78 @@ static void c10_redial(void)
     iv_cell_redial_mark(NULL, now);
 }
 
+/* 11) 2026-10-29 实测形态：卡插着但读不动 ⇒ 必须说"读取失败"，不许说"未插入" */
+static void c11_sim_failure_not_absent(void)
+{
+    iv_cell_t      c;
+    iv_cell_snap_t s;
+    uint64_t       t = 1000;
+
+    iv_cell_init(&c, 30000);
+    (void)run_round(&c, k_live_simfail, k_cmd_n, &t);
+    iv_cell_snapshot(&c, &s);
+
+    /* `CME ERROR: 13` = SIM failure：卡在槽里但模组读不动，
+     * 结论必须是"未知(-1)"而不是"明确没插(0)" —— 后者会让现场去拔卡。 */
+    chk(s.sim_present == -1, "c11 CME 13 leaves sim_present unknown(-1), not 0");
+    chk(strcmp(s.sim_state, "SIM FAILURE") == 0, "c11 sim_state keeps SIM FAILURE");
+
+    /* `+QSIMSTAT: 0,0` 的 enable=0 ⇒ 第二字段不可信，一个字都不许采。
+     * 旧实现把它当"没插"，把上面这条 SIM FAILURE 直接降级成 NOT INSERTED。 */
+    chk(strstr(s.sim_state, "NOT INSERTED") == NULL,
+        "c11 QSIMSTAT enable=0 must not rewrite sim_state to NOT INSERTED");
+    chk(strstr(s.reason, "读取失败") != NULL, "c11 reason says read failure");
+    chk(strstr(s.reason, "未插入") == NULL, "c11 reason must NOT say 'not inserted'");
+
+    chk(s.csq == 99, "c11 csq 99 (no SIM => no signal)");
+    chk(s.usable == 0, "c11 not usable");
+}
+
+/* 12) CPIN 无结论 时，QSIMSTAT 的 enable 字段决定采不采 */
+static void c12_qsimstat_enable_gate(void)
+{
+    static const char *const k_cpin_silent_ins0[] = {
+        "Quectel\r\nEC200G\r\nRevision: EC200GCNLER01A13M04\r\n\r\nOK\r\n",
+        "EC200GCNLER01A13M04\r\n\r\nOK\r\n",
+        "\r\nOK\r\n",                                /* CPIN? 无 +CPIN 行也无错误 */
+        "\r\n+QSIMSTAT: 0,0\r\n\r\nOK\r\n",          /* enable=0 ⇒ 不采 */
+        "\r\n+CME ERROR: 50\r\n", "\r\n+CME ERROR: 10\r\n",
+        "\r\n+CSQ: 99,99\r\n\r\nOK\r\n", "\r\n+COPS: 1\r\n\r\nOK\r\n",
+        "\r\n+CEREG: 0,0\r\n\r\nOK\r\n", "\r\n+CGATT: 0\r\n\r\nOK\r\n",
+        "\r\n+CME ERROR: 3\r\n", "\r\nOK\r\n"
+    };
+    static const char *const k_cpin_silent_ins1_0[] = {
+        "Quectel\r\nEC200G\r\nRevision: EC200GCNLER01A13M04\r\n\r\nOK\r\n",
+        "EC200GCNLER01A13M04\r\n\r\nOK\r\n",
+        "\r\nOK\r\n",
+        "\r\n+QSIMSTAT: 1,0\r\n\r\nOK\r\n",          /* enable=1, inserted=0 ⇒ 采 */
+        "\r\n+CME ERROR: 50\r\n", "\r\n+CME ERROR: 10\r\n",
+        "\r\n+CSQ: 99,99\r\n\r\nOK\r\n", "\r\n+COPS: 1\r\n\r\nOK\r\n",
+        "\r\n+CEREG: 0,0\r\n\r\nOK\r\n", "\r\n+CGATT: 0\r\n\r\nOK\r\n",
+        "\r\n+CME ERROR: 3\r\n", "\r\nOK\r\n"
+    };
+    iv_cell_t      c;
+    iv_cell_snap_t s;
+    uint64_t       t = 1000;
+
+    /* enable=0：不许下结论 */
+    iv_cell_init(&c, 30000);
+    (void)run_round(&c, k_cpin_silent_ins0, k_cmd_n, &t);
+    iv_cell_snapshot(&c, &s);
+    chk(s.sim_present == -1, "c12 enable=0 => sim_present stays unknown");
+    chk(s.sim_state[0] == '\0', "c12 enable=0 => sim_state untouched");
+    chk(strstr(s.reason, "状态未知") != NULL, "c12 reason: unknown");
+
+    /* enable=1 + inserted=0：这才是真的"没插" */
+    iv_cell_init(&c, 30000);
+    t = 1000;
+    (void)run_round(&c, k_cpin_silent_ins1_0, k_cmd_n, &t);
+    iv_cell_snapshot(&c, &s);
+    chk(s.sim_present == 0, "c12 enable=1,inserted=0 => not inserted");
+    chk(strcmp(s.sim_state, "NOT INSERTED") == 0, "c12 sim_state NOT INSERTED");
+    chk(strstr(s.reason, "未插入") != NULL, "c12 reason: not inserted");
+}
+
 int main(void)
 {
     c01_init_unknown();
@@ -542,12 +638,15 @@ int main(void)
     c08_cmd_table();
     c09_readonly();
     c10_redial();
+    c11_sim_failure_not_absent();
+    c12_qsimstat_enable_gate();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_cellular: %d check(s) FAILED\n", g_fail);
         return 1;
     }
     printf("test_cellular passed (live no-sim sample, usable path, timeout skip, "
-           "round reset, qeng guard, read-only discipline, redial policy)\n");
+           "round reset, qeng guard, read-only discipline, redial policy, "
+           "sim-failure wording)\n");
     return 0;
 }

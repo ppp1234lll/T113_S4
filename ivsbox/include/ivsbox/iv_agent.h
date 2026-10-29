@@ -191,6 +191,20 @@ extern "C" {
  * 30 s 的间隔保证即使一直探不到也不会拖慢主循环。 */
 #define IV_AGENT_CELL_NOREPLY_RESCAN 3u
 #define IV_AGENT_CELL_RESCAN_GAP_MS  ((uint64_t)30000u)
+
+/* **卡读不到时的自愈**：连续这么多轮 `sim_present != 1` ⇒ 给模组发一次
+ * `AT+CFUN=1,1`（软复位，USB 会重枚举）。
+ * 为什么要它：读卡子系统会挂住 —— 2026-10-29 板端实测，同一张卡在槽里、
+ * `ATI`/`CGMR` 正常、但 `CPIN?` 回 `CME ERROR: 13`、`QSIMSTAT?` 回 `0,0`、
+ * `QCCID` 回 `CME ERROR: 50`、`CSQ` 恒 `99`；此时 `iv_cell_redial_due()` 因为
+ * "卡未就绪"永不触发拨号 ⇒ 这台设备的 4G 只能等人工断电。实测 `AT+CFUN=1,1`
+ * 之后同一张卡立刻 `+CPIN: READY`、`+CEREG: 0,1`、usb0 拿到地址。
+ * 3 轮（约 90 s）与"静默失效"同阈值：一两轮可能只是拨号脚本占着口。 */
+#define IV_AGENT_CELL_SIM_BAD_ROUNDS 3u
+/* 两次 SIM 复位之间的最小间隔。复位一次要断 4G 二十来秒，不能反复来。 */
+#define IV_AGENT_CELL_SIM_RESET_GAP_MS ((uint64_t)1800000u)
+/* SIM 复位用的是"软"命令：`AT+CFUN=1,1` 立即生效并重枚举。 */
+#define IV_AGENT_CELL_SIM_RESET_CMD "AT+CFUN=1,1\r"
 /* 表列 GETNEXT 结果**留存行数**上限（装配层只留前 N 行，避免结果表过大；
  * 完整遍历上限由 iv_snmp_target_t::max_rows 管） */
 #define IV_AGENT_SNMP_ROWS_MAX 4
@@ -503,6 +517,12 @@ typedef struct {
      * 去读那个错的路径，把好不容易探对的口又扔了。 */
     char         cell_dev[IV_AGENT_CELL_DEV_N];
     uint64_t     cell_rescan_ms;    /* 上次因"整轮无响应"而重探的时刻；防风暴 */
+    /* 卡读不到时的自愈（见 iv_cellport.h 与 `cell_sim_recover_tick()`）。
+     * `cell_sim_bad_rounds` 只在"完整跑完一轮"时结算，所以卡在某一轮中间不会被误计。 */
+    uint32_t     cell_sim_bad_rounds;  /* 连续"读不到卡"的轮数；读到 READY 即清零 */
+    uint32_t     cell_sim_resets;      /* 累计发过几次 AT+CFUN=1,1 */
+    uint64_t     cell_sim_reset_ms;    /* 上次发 AT+CFUN=1,1 的时刻；0 = 还没发过 */
+    uint32_t     cell_rounds_seen;     /* 上次看到的 (ok_rounds+fail_rounds)，用来认"新的一轮" */
 
     /* netmgr 的事务执行点：switch_route 复用默认（netlink 改路由），reconnect
      * 接本层 → iv_report_reconnect。ops.arg 指向本结构，故不能是静态常量。 */

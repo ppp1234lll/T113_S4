@@ -3115,6 +3115,76 @@ static int wan_iface_ready(const char *name)
     return (has_addr && has_carrier) ? 1 : 0;
 }
 
+/* 卡读不到时的自愈：连续 N 轮 `sim_present != 1` ⇒ 给模组发一次 `AT+CFUN=1,1`。
+ * 返回 1 = 本拍已发出复位（调用方不要再做重拨判定：口马上要重枚举）。
+ *
+ * 为什么必须有这条路：模组的读卡子系统会挂住。2026-10-29 板端实测同一张卡
+ * 插在槽里，`ATI`/`CGMR` 正常、`CSQ` 恒 99、`CPIN?` 回 `CME ERROR: 13`、
+ * `QSIMSTAT?` 回 `0,0`；而 `iv_cell_redial_due()` 的第一层条件就是"卡就绪"，
+ * 卡读不到 ⇒ 永远不拨号 ⇒ 这台设备的 4G 只能等人工断电。
+ * 实测 `AT+CFUN=1,1` 之后同一张卡立刻 `+CPIN: READY` / `+CEREG: 0,1`、
+ * usb0 拿到地址，所以复位是有效的、也是唯一的自动恢复手段。
+ *
+ * 计数口径：只在"完整跑完一轮"时结算（`ok_rounds + fail_rounds` 变大），
+ * 半轮、被拨号脚本打断的轮都不会推计数 —— 否则每次拨号抢口都会攒出假复位。
+ * `sim_state` 为空表示本轮 `CPIN?` 一条都没回（超时），那是"抢不到口"而不是
+ * "卡坏了"，同样不计数。 */
+static int cell_sim_recover(iv_agent_t *a, const iv_cell_snap_t *s, uint64_t now_ms)
+{
+    uint32_t rounds;
+    int      w;
+
+    if (a == NULL || s == NULL)
+        return 0;
+
+    rounds = s->ok_rounds + s->fail_rounds;
+    if (rounds != a->cell_rounds_seen) {
+        a->cell_rounds_seen = rounds;
+        if (s->sim_present == 1 && strncmp(s->sim_state, "READY", 5) == 0) {
+            if (a->cell_sim_bad_rounds > 0u)
+                IV_LOG_I(AG_MOD, "cell: SIM readable again after %u bad round(s)",
+                         a->cell_sim_bad_rounds);
+            a->cell_sim_bad_rounds = 0;
+        } else if (s->sim_present == 1) {
+            /* 读到了卡但没就绪（要 PIN 之类）：复位治不了，别乱动模组 */
+            a->cell_sim_bad_rounds = 0;
+        } else if (s->sim_present < 0 && s->sim_state[0] == '\0') {
+            /* 本轮 CPIN 没结论（超时）：不计 */
+        } else {
+            a->cell_sim_bad_rounds++;
+        }
+    }
+
+    if (a->cell_sim_bad_rounds < IV_AGENT_CELL_SIM_BAD_ROUNDS)
+        return 0;
+    if (a->cell_fd < 0)
+        return 0;   /* 口都没开，写了也没人收；等重开后再判 */
+    if (a->cell_sim_reset_ms != 0 && now_ms >= a->cell_sim_reset_ms &&
+        now_ms - a->cell_sim_reset_ms < IV_AGENT_CELL_SIM_RESET_GAP_MS)
+        return 0;   /* 冷却中：复位一次要断 4G 二十来秒，不能反复来 */
+
+    IV_LOG_W(AG_MOD,
+             "cell: %u round(s) with no readable SIM (%s), issuing AT+CFUN=1,1 "
+             "(reset #%u)",
+             a->cell_sim_bad_rounds,
+             (s->sim_state[0] != '\0') ? s->sim_state : "no CPIN reply",
+             a->cell_sim_resets + 1u);
+    w = iv_serial_write(a->cell_fd, IV_AGENT_CELL_SIM_RESET_CMD,
+                        sizeof IV_AGENT_CELL_SIM_RESET_CMD - 1u);
+    if (w <= 0) {
+        IV_LOG_W(AG_MOD, "cell: SIM reset write failed (%d), will retry", w);
+        return 0;   /* 冷却不更新：写不出去就下一拍再试 */
+    }
+    a->cell_sim_reset_ms   = now_ms;
+    a->cell_sim_resets++;
+    a->cell_sim_bad_rounds = 0;
+    /* 复位会让 USB 重枚举、ttyUSB 编号可能变：立刻放掉 fd，
+     * 交给 5 s 的重开循环重新探口（`cell_link_open()` 本来就会全扫）。 */
+    cell_link_drop(a);
+    a->cell_reopen_ms = now_ms;
+    return 1;
+}
+
 /* 重拨驱动器：有孩子在跑就收尸，否则按判定条件决定要不要起一个。
  * 每拍调用，代价是一次 waitpid(WNOHANG) ＋（通常）一次快照比较。 */
 static void cell_redial_tick(iv_agent_t *a, uint64_t now_ms)
@@ -3190,6 +3260,11 @@ static void cell_redial_tick(iv_agent_t *a, uint64_t now_ms)
     }
 
     iv_cell_snapshot(&a->cell, &s);
+    /* ③ 卡读不到 ⇒ 复位模组（见 `cell_sim_recover()`）。复位后本拍不再判重拨：
+     *    口马上要重枚举，此时拨号只会占住一个即将消失的 fd。 */
+    if (cell_sim_recover(a, &s, now_ms) != 0)
+        return;
+
     wan = wan_iface_ready(a->cfg.wan_name[IV_WAN_WIRELESS]);
     if (!iv_cell_redial_due(&s, &a->cell_redial, wan, now_ms))
         return;

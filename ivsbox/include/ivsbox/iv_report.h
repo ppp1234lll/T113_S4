@@ -129,6 +129,13 @@ extern "C" {
 /* 上报数据段上限（= iv_proto 的 ## 帧数据段上限） */
 #define IV_REPORT_SEG_MAX      IV_PROTO_TXT_DATA_MAX
 
+/* `iv_report_t::err_sent` 的容量（"上一帧里的 `ERR=`"）。只是为了比对变化，
+ * 6 条码约 56 B、10 条码约 92 B，256 B 足够；帧内容本身不受它限制。 */
+#define IV_REPORT_ERR_MAX      256u
+/* 告警集合变化的补帧地板间隔：同一秒内反复抖动只补一帧（下一拍再判，
+ * 沿不会丢 —— 未补出去的那一次仍然"和 err_sent 不同"） */
+#define IV_REPORT_ERR_EDGE_MS  1000u
+
 /* 串口发送暂存（帧都很小；溢出即丢弃并计数——不覆盖未发完的字节） */
 #define IV_REPORT_TX_MAX       512u
 
@@ -286,6 +293,22 @@ typedef struct {
      * （`RELAY1..3` 与上一轮不同就报），因为状态也可能是采集板自己改的
      * （实测「通道重启」＝断电后采集板自己又上电）。两者同时成立只报一帧。 */
     uint8_t  want_report;
+    /* **告警集合的"上一帧"**（2026-10-30）：`err_sent` 是最近一次真正组进帧里的
+     * `ERR=` 串（`iv_report_build_seg()` 读的那一份，健康态是 `"0"`），
+     * `err_edge_ms` 是下一次允许补帧的时刻（1 s 地板，防抖动风暴）。
+     *
+     * 为什么需要它：平台界面那一列告警是**按最近一帧的 `ERR=` 渲染**的
+     * （不是"事件流"，也不是按数值判），所以故障集合一变就必须马上补一帧；
+     * 只靠周期上报（现场 180 s）会出现"阈值改成 60 了、温度高告警还在"——
+     * 用户 2026-10-30 报的就是这一条。参考固件同一个语义：`COM_FLAG_REPORT_IMMEDIATELY`
+     * （注释原文"异常/恢复立即上报，来自 alarm 等检测"）。
+     *
+     * 判据放在 `iv_report_step()` 里、比较放在组帧**之后**（组帧时更新 `err_sent`），
+     * 所以它不会自己触发自己；发送失败（队列满）时不更新 ⇒ 下一拍自动重试，
+     * 沿不会丢。缓冲 256 B 够放 25 个码以上；真超长的集合被截断只影响"变化比对"
+     * 的精度，不影响帧内容（帧走的是 `iv_report_build_seg()` 的完整串）。 */
+    char     err_sent[IV_REPORT_ERR_MAX];
+    uint64_t err_edge_ms;
 } iv_report_t;
 
 /* 填默认配置（serial/queue 用默认路径、devtype/report/hb/poll 用默认值、devid=0） */

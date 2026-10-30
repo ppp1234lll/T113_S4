@@ -17,6 +17,7 @@
  *   c04e 事件撞上"0xE1 还在飞" → 补报按 IV_REPORT_POLL_RETRY_MS 重试，不退回 30 s；
  *   c04f 事件催的 0xE1 **超窗无应答 → 迟到应答**（现场实测晚 13 s）仍要落地补报；
  *   c04g 组帧前重算 env：事件那一帧必须带事件之后的 ERR（漏水现场 2026-10-30）；
+ *   c04h 告警集合一变（新增/清除）就补一帧，不等 300 s 周期上报（同上）；
  *   c02c 采集板 0xC1 箱门开启 → 同上（顺带验门开钩子经 cfg 装配链挂上）；
  *   c05 平台断开 → 上报入队积压（不丢）；
  *   c06 平台恢复 → 欠包按序补发（CSQ 11/12/13 的到达顺序即序号顺序）、队列清空；
@@ -587,6 +588,58 @@ int main(void)
         rp.env.err = NULL;
     }
 
+    /* ---- c04h 告警集合一变就补一帧，不等周期上报（2026-10-30）----
+     *
+     * 现场症状：平台把温度上限改成 60，采集板 `0xE1` 里 `30100000`（温度高）
+     * 已经清掉，平台界面上的"温度过高"却还在。原因不是设备没报，而是**下一帧
+     * 要等 180 s 的周期上报** —— 平台那一列红字是"按最近一帧的 `ERR=` 渲染"
+     * （同一帧里 `0x30500000`→箱门打开、`0x30700000`→防雷器故障，能翻出来的
+     * 就只有那几条码）。用户口径："告警应该是立刻上报"。
+     *
+     * 断言：改完 env 里那一串 `ERR` 只推进**两拍**（400 ms，周期上报 1 h 关着）
+     * 就必须多出一帧，且帧里是新集合；集合不变时同样推进**不许**多帧。
+     * 最后一条是"恢复"（码被清掉）—— 平台据此撤告警。
+     *
+     * 反向证伪：把 `iv_report_step()` 里那段比对去掉 ⇒ 第一条断言必红。 */
+    {
+        char        rx[4096];
+        size_t      rn   = 0u;
+        const char *seg  = NULL;
+        size_t      sl   = 0u;
+        uint64_t    reps0;
+
+        /* 基线：先让"两条码"这一帧发出去（这一步同时把 `err_sent` 归位） */
+        rp.env.err = "2,20200000,20300000";
+        reps0      = iv_report_reports(&rp);
+        pump(&rp, master, 2);
+        chk(iv_report_reports(&rp) == reps0 + 1u,
+            "c04h alert set change reported at once (no period wait)");
+        rn = drain(cs, rx, sizeof rx, 1000);
+        (void)next_report_frame(rx, rn, 0u, &seg, &sl);
+        chk(seg != NULL && strstr(seg, "ERR=2,20200000,20300000;") != NULL,
+            "c04h frame carries the new fault set");
+
+        /* 集合没变 ⇒ 一拍都不许多报（否则就是"每 200 ms 一帧"的刷屏） */
+        reps0 = iv_report_reports(&rp);
+        pump(&rp, master, 3);
+        chk(iv_report_reports(&rp) == reps0, "c04h unchanged set must not re-report");
+
+        /* 恢复：温度高被清掉 → 立刻再来一帧（> 1 s 地板） */
+        rp.env.err = "1,20200000";
+        pump(&rp, master, 6);
+        chk(iv_report_reports(&rp) == reps0 + 1u, "c04h recovery reported at once");
+        rn = drain(cs, rx, sizeof rx, 1000);
+        seg = NULL;
+        (void)next_report_frame(rx, rn, 0u, &seg, &sl);
+        chk(seg != NULL && strstr(seg, "ERR=1,20200000;") != NULL &&
+                strstr(seg, "20300000") == NULL,
+            "c04h recovery frame drops the cleared code");
+
+        rp.env.err     = NULL;
+        rp.err_sent[0] = '\0'; /* 复位，别把这一串留给后续用例 */
+        rp.err_edge_ms = 0u;
+    }
+
     /* ---- c02c M4-S4.5：0xC1 箱门开启 → DS=2 ＋ 门开钩子 ＋「立刻取全量再上报」 ----
      * 覆盖 plan §S4.5「怎么验证」单元项在**装配链**上的等价物：这里的钩子不是测试
      * 直接调 `iv_status` 挂的，而是经 `iv_report_cfg_t` 在 `iv_report_open()` 时落下的。
@@ -1071,11 +1124,13 @@ int main(void)
             pump(&rp, master, 1);
         }
         chk(iv_report_queue_count(&rp) == 3u, "c05 3 items queued while down");
-        /* 12：c04 1 + c04g 2（组帧前重算 env ＋ 反向证伪各一帧）+ c02c 1（门开事件补报）
+        /* 14：c04 1 + c04g 2（组帧前重算 env ＋ 反向证伪各一帧）
+         *    + c04h 2（告警集合变化 ＋ 恢复各补一帧）
+         *    + c02c 1（门开事件补报）
          *    + c04b 1（动作后补报）+ c04c 1（采集板自己改继电器）
          *    + c04d 1（0xC2 事件补报）+ c04e 1（撞在飞后仍补报）
          *    + c04f 1（迟到应答补报）+ 这里 3 */
-        chk(iv_report_reports(&rp) == 12u, "c05 total reports=12");
+        chk(iv_report_reports(&rp) == 14u, "c05 total reports=14");
         chk(iv_report_queue_full(&rp) == 0u, "c05 nothing dropped");
     }
 

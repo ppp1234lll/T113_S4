@@ -2258,6 +2258,19 @@ static void thresh_drive(iv_agent_t *a, uint64_t now_ms)
         a->th_len    = 0u;
         a->th_tries  = 0u;
         a->th_next_ms = 0u;
+        /* **阈值写下去之后立刻回读 ＋ 补一帧上报**（2026-10-30）。
+         *
+         * 不这么做就只能等采集板自己"想起来"发一条 `0xC2` 事件，或者等 30 s
+         * 的 0xE1 轮询 —— 现场实测（11:21:28 平台下发温度上限 60）：采集板
+         * 11:21:47 才把 `ERR` 里的 `30100000` 清掉，平台上"温度过高"是等到
+         * 下一个周期帧（3 min）才有机会消失的。用户口径是"告警应该立刻上报"。
+         *
+         * `0xF1` 与这次 0xE1 查询走**同一条串口**，线序上一定在它之后 ⇒
+         * 采集板先改阈值再回答查询，读回的就是新状态。`0xF1` 不回 ack
+         * （`board ctrl 0xF1 no ack (rc=-5)` 是采集板的行为，不是失败），
+         * 所以只能靠"回读 0xE1"来确认，这条通路顺带把确认也做了。 */
+        iv_report_request_poll(&a->rp);
+        iv_report_request_report_after_poll(&a->rp);
         return;
     }
 

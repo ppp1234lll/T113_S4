@@ -728,6 +728,16 @@ static int rep_send_report(iv_report_t *rp)
             h *= 16777619u;
         }
         rp->reports++;
+        /* **把这一帧带出去的 `ERR=` 记下来**（2026-10-30）：`iv_report_step()`
+         * 拿它判"告警集合是否变了"。只在这一帧真的进了队列时更新 —— 队列满
+         * （`IV_EFULL`）时保持不变，下一拍会自动重试补帧，沿不会丢。 */
+        {
+            const char *cur = (rp->env.err != NULL && rp->env.err[0] != '\0')
+                                  ? rp->env.err
+                                  : "0";
+
+            (void)snprintf(rp->err_sent, sizeof(rp->err_sent), "%s", cur);
+        }
         /* 每条周期上报留一行 DT —— 这是"设备到底按没按时发"的**唯一现场证据**。
          * 300 s 一条＝12 行/小时，代价可忽略；与平台「历史数据」对账时逐条比。 */
         IV_LOG_I(REP_MOD, "report #%llu DT=%s seg=%d frame=%u m=%08x end=%.4s",
@@ -822,6 +832,35 @@ int iv_report_step(iv_report_t *rp, uint64_t now_ms)
         if (rp->next_report <= now_ms)
             rp->next_report = now_ms + rp->cfg.report_ms;
         (void)rep_send_report(rp);
+    }
+
+    /* **告警发生 / 恢复：立刻补一帧**（2026-10-30）。
+     *
+     * 平台界面那一列红字是**按最近一帧的 `ERR=` 渲染**的（同一帧里
+     * `0x30500000`→"箱门打开"、`0x30700000`→"防雷器故障"能翻出来，
+     * `0x30100000` 没出现就说明上面根本没有这条码），它既不是"事件流"
+     * 也不是按数值自己判。所以故障集合一变就得马上发一帧 —— 只靠周期上报
+     * 就有了现场那一句"我把温度阈值改成 60 了，温度过高告警为什么不消失"：
+     * 采集板 0xE1 里早就把 `30100000` 清掉了，可平台要等下一个周期帧。
+     *
+     * 判据＝"上一帧真带出去的串" vs "此刻 env 里的串"；`err` 为 NULL 与 `"0"`
+     * 同义（与 `iv_report_build_seg()` 里 `ERR=%s` 的兜底一致）。比较放在周期
+     * 上报之后：那一支若刚发过，`rep_send_report()` 已经把 `err_sent` 刷新成当前值，
+     * 这里自然不成立，不会多报。
+     *
+     * 地板 `IV_REPORT_ERR_EDGE_MS`：采集板抖动（漏水口 1 s 内 1/0 往返十几次）时
+     * 只按 1 s 粒度合并；没补出去的那次仍然"和 err_sent 不同"，下一拍接着补。 */
+    {
+        const char *prev = (rp->err_sent[0] != '\0') ? rp->err_sent : "0";
+        const char *cur  = (rp->env.err != NULL && rp->env.err[0] != '\0')
+                               ? rp->env.err
+                               : "0";
+
+        if (strcmp(prev, cur) != 0 && now_ms >= rp->err_edge_ms) {
+            IV_LOG_I(REP_MOD, "fault set changed (%s -> %s), report now", prev, cur);
+            rp->err_edge_ms = now_ms + IV_REPORT_ERR_EDGE_MS;
+            (void)rep_send_report(rp);
+        }
     }
     return IV_OK;
 }

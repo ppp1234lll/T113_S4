@@ -393,6 +393,66 @@ int main(void)
             "b06b all-zero returns ESTATE, not OK");
     }
 
+    /* ---- b06c 阈值下发后**立刻回读**：不等 30 s 轮询、也不等采集板自己发事件 ----
+     *
+     * 现场口径（用户 2026-10-30）："告警应该是立刻上报"。
+     * 实测链路：平台把温度上限改成 60 → 设备 `11:21:28` 下发 `0xF1` → 采集板
+     * `11:21:47` 的 `0xE1` 里 `30100000` 已经清掉 —— 但那一帧之所以发出去，
+     * 是因为采集板**恰好**自己推了一条 `0xC2 {"T":29.58}`。没有那条事件时，
+     * 下一个 0xE1 轮询是 30 s 后、下一帧周期上报是 3 min 后，平台上"温度过高"
+     * 就一直挂着（用户看到的正是这个）。
+     *
+     * 修法＝`thresh_drive()` 发完 `0xF1` 立刻 `request_poll()` ＋
+     * `request_report_after_poll()`。判据取修法的两个直接后果：
+     *   ① 把轮询周期拨到 1 h（排除"恰好轮到轮询"的干扰）后，`0xF1` 一上线，
+     *      `polls` 必须马上加一 —— 那条 0xE1 只可能来自这次 `request_poll()`；
+     *   ② `want_report` 被置位 = 应答一落地就补一帧上报。
+     * 反向证伪：摘掉 `thresh_drive()` 里那两行 ⇒ ① ② 都红（周期还在 1 h，没人拨它）。
+     *
+     * 注：`0xF1` 的**线上字节**由 b06b 的黄金用例钉着，这里不重复比对 —— 这个
+     * 假采集板从不回应答，`iv_link` 的同 cmd 槽位会被上一条 0xF1 占着重传，
+     * 逐字节比对只能测到"谁先排上队"，与被测行为无关。 */
+    {
+        iv_thresh_t       t;
+        static const char alive[] = "{\"V\":234.17}";
+        char              got[512];
+        uint64_t          polls0;
+        int               i;
+
+        iv_report_set_poll_period(&g_agent.rp, 3600u * 1000u);
+        /* 先把上一段留下的挂起状态清掉：b06b 的 `0xF1` 没人应答（真机也不回 ack），
+         * 本层于是每 200 ms 追一条 0xE1 直到有人回答。喂一份合法应答把
+         * `want_report` 消费掉，链路才回到空闲。 */
+        for (i = 0; i < 40; i++) {
+            step(600u);
+            mcu_send(IV_FRAME_CMD_QUERY, alive, (uint16_t)(sizeof alive - 1u));
+            (void)drain(g_master, got, sizeof got, 100);
+            if (i >= 2 && g_agent.rp.want_report == 0u && g_agent.th_len == 0u)
+                break;
+        }
+        chk(g_agent.rp.want_report == 0u, "b06c no pending follow-up before the test");
+
+        memset(&t, 0, sizeof t);
+        t.tu = 61; /* sensor.temp_high */
+        polls0 = g_agent.rp.polls;
+        g_agent.rp.want_report = 0u; /* 只看这一次有没有被 arm */
+        chk(iv_agent_apply_thresh(&g_agent, &t, g_now) == IV_OK, "b06c thresh queued");
+
+        /* 等它真发出去：撞上在飞事务时 `thresh_drive()` 每 1 s 重试一次 */
+        for (i = 0; i < 40 && g_agent.th_len != 0u; i++) {
+            step(300u);
+            (void)drain(g_master, got, sizeof got, 60);
+        }
+        chk(g_agent.th_len == 0u, "b06c 0xF1 actually went out");
+        chk(g_agent.rp.polls > polls0,
+            "b06c read-back 0xE1 right after 0xF1 (poll period is 1 h)");
+        chk(g_agent.rp.want_report == 1u,
+            "b06c read-back armed the follow-up report");
+
+        g_agent.rp.want_report = 0u;
+        iv_report_set_poll_period(&g_agent.rp, 100u); /* 还原，别影响后续用例 */
+    }
+
     /* ---- b08 sys.overview 的 device 段（总览页只答"这台设备是谁"） ----
      * 总览页原先堆的是网络/摄像机/采集板三家的实时数据，现在归各自页面；总览只留
      * 身份与版本。这里钉住三件事：① device 段真的在；② 本机可得的（主机名/内核/

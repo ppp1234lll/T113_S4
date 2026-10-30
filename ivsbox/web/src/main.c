@@ -181,9 +181,18 @@ static void conn_close(int slot)
         (void)close(g_conn[slot].send_fd);
         g_conn[slot].send_fd = -1;
     }
+    /* S8.5：反代上游 fd 必须在这里一起关 —— 页面刷新一轮就有几十个连接，
+     * 漏一个就是一次 fd 泄漏，半天就把 1024 个 fd 吃干净。 */
+    iv_web_cam_abort(&g_conn[slot]);
     if (g_conn[slot].fd >= 0)
         (void)close(g_conn[slot].fd);
     g_conn[slot].fd = -1;
+    /* 响应缓冲是 malloc 来的（见 iv_web.h），关连接即还。 */
+    if (g_conn[slot].wbuf != NULL) {
+        free(g_conn[slot].wbuf);
+        g_conn[slot].wbuf = NULL;
+    }
+    g_conn[slot].wcap = 0u;
 }
 
 static int conn_slot_free(void)
@@ -352,7 +361,7 @@ static void build_response(iv_web_conn_t *c, const iv_web_resp_t *rsp, size_t bo
         }
         if (ffd < 0) {
             /* 竞态：解析后文件被清理/替换。回不带体的 404，别再往下走。 */
-            c->wlen = (size_t)snprintf(c->wbuf, sizeof(c->wbuf),
+            c->wlen = (size_t)snprintf(c->wbuf, c->wcap,
                                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n"
                                        "Connection: close\r\n\r\n");
             c->wsent = 0u;
@@ -427,7 +436,7 @@ static void handle_req(iv_web_conn_t *c, const iv_web_req_t *req)
 {
     iv_web_resp_t rsp;
     char         *body = c->wbuf + RSP_HEAD_OFF;
-    size_t        body_cap = sizeof(c->wbuf) - RSP_HEAD_OFF;
+    size_t        body_cap = c->wcap - RSP_HEAD_OFF;
     size_t        body_len = 0;
     int           rc;
 
@@ -436,10 +445,14 @@ static void handle_req(iv_web_conn_t *c, const iv_web_req_t *req)
     (void)snprintf(rsp.ctype, sizeof(rsp.ctype), "application/json");
 
     if (c->is_cam) {
-        /* S8.5：摄像机代理专用口。**只**认 /cam/<N>/...，其余一律一个不透露信息的
-         * 404 —— 这里没有登录页、没有 /api、没有静态资源，任何东西都不落出层外。 */
-        rc = iv_web_cam_handle(&g_ctx, req, (unsigned)c->cam_ch, body, body_cap,
-                               &body_len, &rsp);
+        /* S8.5：摄像机代理专用口（2026-10-30 起**非阻塞**）。
+         * IV_EAGAIN = 上游还在路上，本轮什么都不发：等主循环把上游 fd 的可读写事件
+         * 交给 on_upstream()。这里一旦返回就必须彻底放手，不能再碰 c->wbuf
+         * —— 它同时是上游正文的收件箱。 */
+        rc = iv_web_cam_begin(&g_ctx, req, (unsigned)c->cam_ch, c, body, body_cap,
+                              &body_len, &rsp);
+        if (rc == IV_EAGAIN)
+            return;
         if (rc == IV_ENOTSUP) {
             rsp.status    = 404;
             rsp.set_cookie = 0;
@@ -491,7 +504,7 @@ static void on_readable(int slot)
     if (c->rlen >= sizeof(c->rbuf) - 1u) {
         /* 缓冲满还没成形：回 413 并准备关。**必须写进 wbuf** —— on_writable 只发
          * wbuf；早先写进 rbuf、发出去的却是 wbuf 里的旧内容/全零（集成用例 w08 实证）。 */
-        c->wlen = (size_t)snprintf(c->wbuf, sizeof(c->wbuf),
+        c->wlen = (size_t)snprintf(c->wbuf, c->wcap,
                                    "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n"
                                    "Connection: close\r\n\r\n");
         c->wsent = 0u;
@@ -518,7 +531,7 @@ static void on_readable(int slot)
         return;
     if (prc != IV_OK) {
         /* 同 413 快路径：响应必须落在 wbuf（on_writable 只发 wbuf）。 */
-        c->wlen = (size_t)snprintf(c->wbuf, sizeof(c->wbuf),
+        c->wlen = (size_t)snprintf(c->wbuf, c->wcap,
                                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
                                    "Connection: close\r\n\r\n");
         c->wsent = 0u;
@@ -623,6 +636,44 @@ static void on_writable(int slot)
         conn_close(slot);
 }
 
+/* S8.5：反代上游事件。上游 fd 与客户端 fd 挂在同一个 poll 里 —— 等摄像机的
+ * 这段时间主循环照常服务其它连接，这就是"设置页不再转圈"的全部秘密。
+ * 收工后立刻 build_response，下一轮 POLLOUT 把响应发给客户端。 */
+static void on_upstream(int slot)
+{
+    iv_web_conn_t *c = &g_conn[slot];
+    iv_web_resp_t  rsp;
+    char          *body;
+    size_t         body_cap;
+    size_t         body_len = 0u;
+    int            rc;
+
+    if (slot < 0 || slot >= (int)IV_WEB_MAX_CONN || c->fd < 0 || c->wbuf == NULL) {
+        conn_close(slot);
+        return;
+    }
+    body     = c->wbuf + RSP_HEAD_OFF;
+    body_cap = c->wcap - RSP_HEAD_OFF;
+    memset(&rsp, 0, sizeof rsp);
+    rsp.status = 200;
+    (void)snprintf(rsp.ctype, sizeof rsp.ctype, "application/json");
+
+    rc = iv_web_cam_event(&g_ctx, c, body, body_cap, &body_len, &rsp);
+    if (rc == IV_EAGAIN) {
+        c->last_ms = iv_web_now_ms(); /* 还在路上：别让空闲回收把连接掐了 */
+        return;
+    }
+    if (rc != IV_OK) {
+        iv_web_cam_abort(c);
+        body_len = (size_t)snprintf(body, body_cap,
+                                    "{\"ok\":false,\"e\":%d,\"msg\":\"internal\"}", rc);
+        rsp.status = 500;
+        (void)snprintf(rsp.ctype, sizeof rsp.ctype, "application/json");
+    }
+    build_response(c, &rsp, body_len);
+    c->last_ms = iv_web_now_ms();
+}
+
 /* --------------------------------------------------------------------------
  * 监听
  * -------------------------------------------------------------------------- */
@@ -691,6 +742,21 @@ static void do_accept(int lfd, int is_cam, unsigned cam_ch)
         }
         memset(&g_conn[slot], 0, sizeof(g_conn[slot]));
         g_conn[slot].fd = cfd;
+        /* 响应缓冲按需分配（512 KiB/连接）。分配失败按 503 回，绝不降级成小缓冲：
+         * "半个响应"比"明确拒绝"坏得多（2026-10-29 语言表截断就是这个味道）。 */
+        g_conn[slot].wbuf = (char *)malloc(IV_WEB_RSP_MAX);
+        if (g_conn[slot].wbuf == NULL) {
+            static const char busy[] =
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n"
+                "Connection: close\r\n\r\n";
+
+            (void)send(cfd, busy, sizeof(busy) - 1u, MSG_NOSIGNAL);
+            (void)close(cfd);
+            g_conn[slot].fd = -1;
+            continue;
+        }
+        g_conn[slot].wcap = IV_WEB_RSP_MAX;
+        g_conn[slot].up_fd = -1;     /* memset 会把它清成 0（＝stdin） */
         g_conn[slot].is_cam = (uint8_t)is_cam; /* 路由隔离的依据（S8.5） */
         g_conn[slot].cam_ch = (uint8_t)cam_ch; /* 该口就是第 cam_ch 路 */
         g_conn[slot].send_fd = -1;   /* memset 会把 send_fd 清成 0（＝stdin！） */
@@ -754,6 +820,7 @@ int main(int argc, char *argv[])
     for (i = 0; i < (int)IV_WEB_MAX_CONN; i++) {
         g_conn[i].fd = -1;
         g_conn[i].send_fd = -1;
+        g_conn[i].up_fd = -1;
     }
 
     for (i = 1; i < argc; i++) {
@@ -921,8 +988,8 @@ int main(int argc, char *argv[])
              (g_ctx.pass_file[0] != '\0') ? g_ctx.pass_file : "(none)");
 
     while (!g_stop) {
-        struct pollfd pf[IV_WEB_MAX_CONN + 2 + WEB_CAM_CH_MAX];
-        int           map[IV_WEB_MAX_CONN + 2 + WEB_CAM_CH_MAX];
+        struct pollfd pf[IV_WEB_MAX_CONN * 2 + 2 + WEB_CAM_CH_MAX];
+        int           map[IV_WEB_MAX_CONN * 2 + 2 + WEB_CAM_CH_MAX];
         int           nfds = 0;
         int           timeout = 1000;
         uint64_t      now;
@@ -966,11 +1033,39 @@ int main(int argc, char *argv[])
              * 空转烧 CPU），改为把等待截止折进 poll 超时，由超时唤醒。 */
             waiting = pending && (g_conn[i].rl_wait_until_ms > now);
             pf[nfds].fd      = g_conn[i].fd;
-            pf[nfds].events  = pending ? (waiting ? 0 : POLLOUT) : POLLIN;
+            /* 反代进行中：客户端这边一律不监听 —— 请求已解析完，再来字节也没用，
+             * 而 POLLIN 是电平触发，不读就一直报，白烧 CPU。 */
+            pf[nfds].events  = pending ? (waiting ? 0 : POLLOUT)
+                                       : (g_conn[i].up_fd >= 0 ? 0 : POLLIN);
             pf[nfds].revents = 0;
             map[nfds] = i;
             if (waiting) {
                 uint64_t d  = g_conn[i].rl_wait_until_ms - now;
+                int      di = (d > 1000u) ? 1000 : (int)d;
+
+                if (di < 1)
+                    di = 1;
+                if (di < timeout)
+                    timeout = di;
+            }
+            nfds++;
+        }
+
+        /* S8.5：反代上游 fd。相位决定等读还是等写：CONNECT/SEND 等可写，RECV 等可读。
+         * 预算到点要主动收尾（504），所以把截止时刻折进 poll 超时。 */
+        for (i = 0; i < (int)IV_WEB_MAX_CONN; i++) {
+            if (g_conn[i].fd < 0 || g_conn[i].up_fd < 0)
+                continue;
+            pf[nfds].fd      = g_conn[i].up_fd;
+            pf[nfds].events  = (g_conn[i].up_phase == (uint8_t)IV_WEB_UP_RECV) ? POLLIN
+                                                                              : POLLOUT;
+            pf[nfds].revents = 0;
+            map[nfds] = 1000 + i;
+            if (g_conn[i].up_deadline_ms <= now) {
+                if (timeout > 1)
+                    timeout = 1;
+            } else {
+                uint64_t d  = g_conn[i].up_deadline_ms - now;
                 int      di = (d > 1000u) ? 1000 : (int)d;
 
                 if (di < 1)
@@ -992,6 +1087,12 @@ int main(int argc, char *argv[])
         for (i = 0; i < nfds; i++) {
             if (pf[i].revents == 0)
                 continue;
+            if (map[i] >= 1000) {
+                /* 上游：POLLERR/POLLHUP 也要进去 —— 里面按相位判 SO_ERROR 或按
+                 * EOF 收尾，不能一律当失败（大华常常"数据发完了还挂着"）。 */
+                on_upstream(map[i] - 1000);
+                continue;
+            }
             if (map[i] < 0) {
                 if (pf[i].revents & POLLIN) {
                     if (map[i] <= -2) {
@@ -1020,10 +1121,15 @@ int main(int argc, char *argv[])
                 on_writable(map[i]);
         }
 
-        /* 空闲超时回收 */
+        /* 超时回收：先收反代预算（8 s 到点按 504 回，不是把连接一掐了事），
+         * 再收空闲连接。 */
         now = iv_web_now_ms();
         for (i = 0; i < (int)IV_WEB_MAX_CONN; i++) {
-            if (g_conn[i].fd >= 0 && now - g_conn[i].last_ms > IV_WEB_IDLE_MS)
+            if (g_conn[i].fd < 0)
+                continue;
+            if (g_conn[i].up_fd >= 0 && now > g_conn[i].up_deadline_ms)
+                on_upstream(i); /* 里面判 504 并发出去 */
+            else if (now - g_conn[i].last_ms > IV_WEB_IDLE_MS)
                 conn_close(i);
         }
     }

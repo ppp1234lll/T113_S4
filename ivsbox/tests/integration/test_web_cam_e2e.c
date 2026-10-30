@@ -48,7 +48,7 @@
 #define CONNECT_STEP  100
 /* 与生产侧 `IV_WEB_RSP_MAX` 对齐：反代正文整份收进这块缓冲，测试缓冲比它小
  * 就只能断言到"被测试缓冲截断"，测不出生产行为（2026-10-29 大华语言表 391 KB）。 */
-#define RSP_CAP       (512u * 1024u)
+#define RSP_CAP       (2u * 1024u * 1024u)
 
 static int   g_fail;
 static pid_t g_kid_ivsboxd = -1;
@@ -253,6 +253,52 @@ static int count_fds(pid_t pid)
 /* --------------------------------------------------------------------------
  * 假 ivsboxd：chan 帧应答 config.get camera.ch.<N>.ip
  * -------------------------------------------------------------------------- */
+/* 并发发 n 个相同请求（每请求一个子进程：子进程各有自己的 g_rsp）。
+ * 返回墙钟毫秒；*ok_cnt = 成功（200）个数，*busy_cnt = 收到 503 的个数（用退出码区分）。 */
+static long burst(int port, const char *req, size_t len, int n, int *ok_cnt, int *busy_cnt)
+{
+    struct timespec t0;
+    struct timespec t1;
+    pid_t           kids[32];
+    int             ok = 0;
+    int             busy = 0;
+    int             i;
+
+    if (n > (int)(sizeof kids / sizeof kids[0]))
+        n = (int)(sizeof kids / sizeof kids[0]);
+    if (ok_cnt != NULL)
+        *ok_cnt = 0;
+    if (busy_cnt != NULL)
+        *busy_cnt = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (i = 0; i < n; i++) {
+        kids[i] = fork();
+        if (kids[i] == 0) {
+            int total = exchange(port, req, len);
+            int st    = rsp_status();
+
+            _exit((total > 0 && st == 200) ? 0 : ((st == 503) ? 2 : 1));
+        }
+    }
+    for (i = 0; i < n; i++) {
+        int st = 0;
+
+        if (kids[i] > 0 && waitpid(kids[i], &st, 0) > 0 && WIFEXITED(st)) {
+            if (WEXITSTATUS(st) == 0)
+                ok++;
+            else if (WEXITSTATUS(st) == 2)
+                busy++;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (ok_cnt != NULL)
+        *ok_cnt = ok;
+    if (busy_cnt != NULL)
+        *busy_cnt = busy;
+    return (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+}
+
 static int fake_ivsboxd_serve_conn(int cfd)
 {
     static unsigned char rx[IV_CHAN_RECV_CAP_MIN];
@@ -328,11 +374,27 @@ static void fake_ivsboxd_main(void)
 /* --------------------------------------------------------------------------
  * 假摄像机：最小 HTTP 服务（echo / 302 / Set-Cookie / 页面含绝对 URL）
  * -------------------------------------------------------------------------- */
+/* 一次 send 不保证发完（1 MiB 的正文在环回上就可能分片），假摄像机也必须老实循环。 */
+static void send_all(int fd, const void *buf, size_t n)
+{
+    const char *p = (const char *)buf;
+
+    while (n > 0) {
+        ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
+
+        if (w <= 0)
+            return;
+        p += w;
+        n -= (size_t)w;
+    }
+}
+
+static void fake_camera_conn(int cfd);
+
 static void fake_camera_main(void)
 {
     struct sockaddr_in a;
     int                lfd = socket(AF_INET, SOCK_STREAM, 0);
-    static char        rbuf[8192];
 
     if (lfd < 0)
         _exit(3);
@@ -350,188 +412,230 @@ static void fake_camera_main(void)
 
     for (;;) {
         int    cfd = accept(lfd, NULL, NULL);
-        size_t got = 0;
-        char  *hed;
-        char   method[8] = "";
-        char   path[128] = "";
-        int    clen = 0;
 
         if (cfd < 0) {
             sleep_ms(20);
             continue;
         }
+        /* 每个连接交给一个子进程。假摄像机**必须并发**，否则测不出"等上游的时候
+         * 主循环还能不能服务别人"——那正是 2026-10-30 现场"设置页一直转圈"的根因：
+         * 旧实现串行等摄像机，一个页面 35 个资源要 6 s 以上。 */
         {
-            struct timeval tv;
+            pid_t kid = fork();
 
-            tv.tv_sec  = 5;
-            tv.tv_usec = 0;
-            (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        }
-        /* 收齐头区 */
-        for (;;) {
-            ssize_t n = recv(cfd, rbuf + got, sizeof rbuf - 1u - got, 0);
-
-            if (n <= 0)
-                break;
-            got += (size_t)n;
-            rbuf[got] = '\0';
-            if (strstr(rbuf, "\r\n\r\n") != NULL || got + 1u >= sizeof rbuf)
-                break;
-        }
-        rbuf[got] = '\0';
-        /* 收体（若有） */
-        hed = strstr(rbuf, "\r\n\r\n");
-        if (hed != NULL) {
-            const char *cl = strcasestr(rbuf, "Content-Length:");
-
-            if (cl != NULL)
-                clen = atoi(cl + 15);
-            {
-                size_t have = got - (size_t)(hed + 4 - rbuf);
-
-                while (have < (size_t)clen && got + 1u < sizeof rbuf) {
-                    ssize_t n = recv(cfd, rbuf + got, sizeof rbuf - 1u - got, 0);
-
-                    if (n <= 0)
-                        break;
-                    got += (size_t)n;
-                    have += (size_t)n;
-                    rbuf[got] = '\0';
-                }
+            if (kid == 0) {
+                (void)close(lfd);   /* 子进程不留监听口，免得收不了尸 */
+                fake_camera_conn(cfd);
+                _exit(0);
             }
+            (void)close(cfd);
         }
-        (void)sscanf(rbuf, "%7s %127s", method, path);
-
-        {
-            char rsp[2048];
-            const char *body = NULL;
-            int         status = 200;
-            const char *ctype = "text/plain";
-            char        extra[256];
-
-            extra[0] = '\0';
-            if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
-                static char page[512];
-
-                ctype = "text/html";
-                (void)snprintf(page, sizeof page,
-                               "<html><a href=\"http://127.0.0.1:%d/login.js\">l</a>"
-                               "<a href=\"/style.css\">s</a>"
-                               "<script src=\"http://127.0.0.1:%d/app.js\"></script>"
-                               "</html>", g_cam_port, g_cam_port);
-                body = page;
-            } else if (strcmp(path, "/go") == 0) {
-                status = 302;
-                (void)snprintf(extra, sizeof extra,
-                               "Location: http://127.0.0.1:%d/idx\r\n", g_cam_port);
-                body = "";
-            } else if (strcmp(path, "/setck") == 0) {
-                (void)snprintf(extra, sizeof extra,
-                               "Set-Cookie: camsid=abc123; Path=/; HttpOnly\r\n");
-                body = "ck";
-            } else if (strcmp(path, "/echo") == 0) {
-                static char ebuf[1024];
-                const char *ct = strcasestr(rbuf, "Content-Type:");
-                const char *ck = strcasestr(rbuf, "Cookie:");
-                const char *au = strcasestr(rbuf, "Authorization:");
-                char        cts[96] = "-";
-                char        cks[128] = "-";
-                char        aus[128] = "-";
-                const char *bodyp = (hed != NULL) ? hed + 4 : "";
-                char        bcopy[256];
-
-                (void)snprintf(bcopy, sizeof bcopy, "%s", bodyp);
-                for (char *q = bcopy; *q; q++)
-                    if (*q == '\r' || *q == '\n')
-                        *q = ' ';
-                if (ct != NULL) (void)sscanf(ct, "Content-Type: %95s", cts);
-                if (ck != NULL) (void)sscanf(ck, "Cookie: %127[^\r]", cks);
-                if (au != NULL) (void)sscanf(au, "Authorization: %127[^\r]", aus);
-                (void)snprintf(ebuf, sizeof ebuf,
-                               "METHOD=%s PATH=%s CT=%s CK=%s AUTH=%s BODY=%s",
-                               method, path, cts, cks, aus, bcopy);
-                body = ebuf;
-            } else if (strcmp(path, "/keepalive") == 0) {
-                /* 摄像机"发完 body 不关连接"的现场行为（2026-10-29 大华 192.168.1.108
-                 * 实证）：即使请求写了 Connection: close，它发完 Content-Length 指定
-                 * 的字节后仍然把连接开着。代理若只等 EOF 就会挂死，进而把单线程 Web
-                 * 主循环冻住 ⇒ 心跳过期 ⇒ monitor-web.sh 杀掉重启。 */
-                static const char kv[] = "<html>keepalive</html>";
-                int w = snprintf(rsp, sizeof rsp,
-                                 "HTTP/1.1 200 X\r\nContent-Type: text/html\r\n"
-                                 "Content-Length: %zu\r\n\r\n%s",
-                                 strlen(kv), kv);
-
-                (void)send(cfd, rsp, (size_t)w, MSG_NOSIGNAL);
-                {
-                    char           drain[256];
-                    struct timeval tv2;
-
-                    tv2.tv_sec  = 5; /* 兜底：代理不关也最多等 5 s，免得整轮测试挂住 */
-                    tv2.tv_usec = 0;
-                    (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof tv2);
-                    while (recv(cfd, drain, sizeof drain, 0) > 0) {
-                    }
-                }
-                (void)close(cfd);
-                continue;
-            } else if (strcmp(path, "/bigjson") == 0 || strcmp(path, "/huge") == 0) {
-                /* 大文本正文。2026-10-29 现场：大华的语言表
-                 * `/custom_lang/SimpChinese.txt` 是 **391087 B** 的 JSON，代理当时
-                 * 缓冲只有 128 KiB ⇒ 收满即停、却照样回 200 ⇒ 浏览器拿到半个 JSON
-                 * ⇒ 语言表解析失败 ⇒ 界面全是 `med.MainStream` 这种未翻译的 key。
-                 * `/bigjson`（400 KiB）走"放得下"、`/huge`（600 KiB）走"放不下必须
-                 * 502"，两条夹住"不许静默截断"。
-                 * 末两字节固定 `z}`：位置固定的哨兵，能直接断言"尾巴还在"。 */
-                static char   big[700u * 1024u];
-                static size_t big_len;
-                size_t        want = (strcmp(path, "/huge") == 0) ? (600u * 1024u)
-                                                                 : (400u * 1024u);
-
-                if (big_len != want) {
-                    memset(big, 'a', want);
-                    big[0]         = '{';
-                    big[want - 2u] = 'z';
-                    big[want - 1u] = '}';
-                    big[want]      = '\0';
-                    big_len        = want;
-                }
-                body = big;
-            } else if (strcmp(path, "/bin") == 0) {
-                /* 二进制体（含 0 字节）：代理若拿 strlen() 量长度会截成 0 字节。 */
-                static const char bin[6] = { 0x00, 0x01, 0x02, 0x00, 0x03, 0x04 };
-                int w = snprintf(rsp, sizeof rsp,
-                                 "HTTP/1.1 200 X\r\n"
-                                 "Content-Type: application/octet-stream\r\n"
-                                 "Content-Length: 6\r\nConnection: close\r\n\r\n");
-
-                (void)send(cfd, rsp, (size_t)w, MSG_NOSIGNAL);
-                (void)send(cfd, bin, sizeof bin, MSG_NOSIGNAL);
-                (void)close(cfd);
-                continue;
-            } else {
-                status = 404;
-                body = "nope";
-            }
-
-            {
-                /* ⚠ Content-Type 故意放**最后一行**：大华等现场摄像机就是这么发的
-                 * （2026-10-29 板端实证）。代理按行解析头区，最后一行没有后续 CRLF
-                 * 时极易被整行漏掉 —— 放了它这条用例才能钉住"类型透传"。 */
-                int w = snprintf(rsp, sizeof rsp,
-                                 "HTTP/1.1 %d X\r\n"
-                                 "Content-Length: %zu\r\n%sConnection: close\r\n"
-                                 "Content-Type: %s\r\n\r\n",
-                                 status, strlen(body), extra, ctype);
-                size_t blen = strlen(body);
-
-                (void)send(cfd, rsp, (size_t)w, MSG_NOSIGNAL);
-                if (blen > 0u)
-                    (void)send(cfd, body, blen, MSG_NOSIGNAL);
-            }
-        }
-        (void)close(cfd);
     }
+}
+
+/* 单个连接的处理（原样从 fake_camera_main 的循环体搬出来）。 */
+static void fake_camera_conn(int cfd)
+{
+    static char rbuf[8192];
+
+    size_t got = 0;
+    char  *hed;
+    char   method[8] = "";
+    char   path[128] = "";
+    int    clen = 0;
+
+    if (cfd < 0) {
+        sleep_ms(20);
+        return;
+    }
+    {
+        struct timeval tv;
+
+        tv.tv_sec  = 5;
+        tv.tv_usec = 0;
+        (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    /* 收齐头区 */
+    for (;;) {
+        ssize_t n = recv(cfd, rbuf + got, sizeof rbuf - 1u - got, 0);
+
+        if (n <= 0)
+            break;
+        got += (size_t)n;
+        rbuf[got] = '\0';
+        if (strstr(rbuf, "\r\n\r\n") != NULL || got + 1u >= sizeof rbuf)
+            break;
+    }
+    rbuf[got] = '\0';
+    /* 收体（若有） */
+    hed = strstr(rbuf, "\r\n\r\n");
+    if (hed != NULL) {
+        const char *cl = strcasestr(rbuf, "Content-Length:");
+
+        if (cl != NULL)
+            clen = atoi(cl + 15);
+        {
+            size_t have = got - (size_t)(hed + 4 - rbuf);
+
+            while (have < (size_t)clen && got + 1u < sizeof rbuf) {
+                ssize_t n = recv(cfd, rbuf + got, sizeof rbuf - 1u - got, 0);
+
+                if (n <= 0)
+                    break;
+                got += (size_t)n;
+                have += (size_t)n;
+                rbuf[got] = '\0';
+            }
+        }
+    }
+    (void)sscanf(rbuf, "%7s %127s", method, path);
+
+    {
+        char rsp[2048];
+        const char *body = NULL;
+        int         status = 200;
+        const char *ctype = "text/plain";
+        char        extra[256];
+
+        extra[0] = '\0';
+        if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
+            static char page[512];
+
+            ctype = "text/html";
+            (void)snprintf(page, sizeof page,
+                           "<html><a href=\"http://127.0.0.1:%d/login.js\">l</a>"
+                           "<a href=\"/style.css\">s</a>"
+                           "<script src=\"http://127.0.0.1:%d/app.js\"></script>"
+                           "</html>", g_cam_port, g_cam_port);
+            body = page;
+        } else if (strcmp(path, "/go") == 0) {
+            status = 302;
+            (void)snprintf(extra, sizeof extra,
+                           "Location: http://127.0.0.1:%d/idx\r\n", g_cam_port);
+            body = "";
+        } else if (strcmp(path, "/setck") == 0) {
+            (void)snprintf(extra, sizeof extra,
+                           "Set-Cookie: camsid=abc123; Path=/; HttpOnly\r\n");
+            body = "ck";
+        } else if (strcmp(path, "/echo") == 0) {
+            static char ebuf[1024];
+            const char *ct = strcasestr(rbuf, "Content-Type:");
+            const char *ck = strcasestr(rbuf, "Cookie:");
+            const char *au = strcasestr(rbuf, "Authorization:");
+            char        cts[96] = "-";
+            char        cks[128] = "-";
+            char        aus[128] = "-";
+            const char *bodyp = (hed != NULL) ? hed + 4 : "";
+            char        bcopy[256];
+
+            (void)snprintf(bcopy, sizeof bcopy, "%s", bodyp);
+            for (char *q = bcopy; *q; q++)
+                if (*q == '\r' || *q == '\n')
+                    *q = ' ';
+            if (ct != NULL) (void)sscanf(ct, "Content-Type: %95s", cts);
+            if (ck != NULL) (void)sscanf(ck, "Cookie: %127[^\r]", cks);
+            if (au != NULL) (void)sscanf(au, "Authorization: %127[^\r]", aus);
+            (void)snprintf(ebuf, sizeof ebuf,
+                           "METHOD=%s PATH=%s CT=%s CK=%s AUTH=%s BODY=%s",
+                           method, path, cts, cks, aus, bcopy);
+            body = ebuf;
+        } else if (strcmp(path, "/keepalive") == 0) {
+            /* 摄像机"发完 body 不关连接"的现场行为（2026-10-29 大华 192.168.1.108
+             * 实证）：即使请求写了 Connection: close，它发完 Content-Length 指定
+             * 的字节后仍然把连接开着。代理若只等 EOF 就会挂死，进而把单线程 Web
+             * 主循环冻住 ⇒ 心跳过期 ⇒ monitor-web.sh 杀掉重启。 */
+            static const char kv[] = "<html>keepalive</html>";
+            int w = snprintf(rsp, sizeof rsp,
+                             "HTTP/1.1 200 X\r\nContent-Type: text/html\r\n"
+                             "Content-Length: %zu\r\n\r\n%s",
+                             strlen(kv), kv);
+
+            send_all(cfd, rsp, (size_t)w);
+            {
+                char           drain[256];
+                struct timeval tv2;
+
+                tv2.tv_sec  = 5; /* 兜底：代理不关也最多等 5 s，免得整轮测试挂住 */
+                tv2.tv_usec = 0;
+                (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof tv2);
+                while (recv(cfd, drain, sizeof drain, 0) > 0) {
+                }
+            }
+            (void)close(cfd);
+            return;
+        } else if (strcmp(path, "/declared-big") == 0) {
+            /* 声明得比反代的硬上限（`IV_WEB_CAM_RSP_MAX` = 8 MiB）还大：必须明确 502，
+             * 不能把半份正文当成功回出去。只发一小段就收，免得测试真的搬 9 MiB。 */
+            int w = snprintf(rsp, sizeof rsp,
+                             "HTTP/1.1 200 X\r\nContent-Type: text/plain\r\n"
+                             "Content-Length: %u\r\nConnection: close\r\n\r\n",
+                             9u * 1024u * 1024u);
+
+            send_all(cfd, rsp, (size_t)w);
+            send_all(cfd, "partial", 7u);
+            (void)close(cfd);
+            return;
+        } else if (strcmp(path, "/bigjson") == 0 || strcmp(path, "/big1m") == 0) {
+            /* 大文本正文。2026-10-29 现场：大华的语言表
+             * `/custom_lang/SimpChinese.txt` 是 **391087 B** 的 JSON，代理当时
+             * 缓冲只有 128 KiB ⇒ 收满即停、却照样回 200 ⇒ 浏览器拿到半个 JSON
+             * ⇒ 语言表解析失败 ⇒ 界面全是 `med.MainStream` 这种未翻译的 key。
+             * `/bigjson`（400 KiB）走"放得下"、`/huge`（600 KiB）走"放不下必须
+             * 502"，两条夹住"不许静默截断"。
+             * 末两字节固定 `z}`：位置固定的哨兵，能直接断言"尾巴还在"。 */
+            static char   big[1100u * 1024u];
+            static size_t big_len;
+            size_t        want = (strcmp(path, "/big1m") == 0) ? (1024u * 1024u)
+                                                              : (400u * 1024u);
+
+            if (big_len != want) {
+                memset(big, 'a', want);
+                big[0]         = '{';
+                big[want - 2u] = 'z';
+                big[want - 1u] = '}';
+                big[want]      = '\0';
+                big_len        = want;
+            }
+            body = big;
+        } else if (strcmp(path, "/slow") == 0) {
+            /* 慢上游：故意拖 300 ms 再应答。c19 用它证明"多个上游请求真的重叠"
+             * （串行实现下 4 个必须 ≥1200 ms）。 */
+            sleep_ms(300);
+            body = "slow";
+        } else if (strcmp(path, "/bin") == 0) {
+            /* 二进制体（含 0 字节）：代理若拿 strlen() 量长度会截成 0 字节。 */
+            static const char bin[6] = { 0x00, 0x01, 0x02, 0x00, 0x03, 0x04 };
+            int w = snprintf(rsp, sizeof rsp,
+                             "HTTP/1.1 200 X\r\n"
+                             "Content-Type: application/octet-stream\r\n"
+                             "Content-Length: 6\r\nConnection: close\r\n\r\n");
+
+            send_all(cfd, rsp, (size_t)w);
+            send_all(cfd, bin, sizeof bin);
+            (void)close(cfd);
+            return;
+        } else {
+            status = 404;
+            body = "nope";
+        }
+
+        {
+            /* ⚠ Content-Type 故意放**最后一行**：大华等现场摄像机就是这么发的
+             * （2026-10-29 板端实证）。代理按行解析头区，最后一行没有后续 CRLF
+             * 时极易被整行漏掉 —— 放了它这条用例才能钉住"类型透传"。 */
+            int w = snprintf(rsp, sizeof rsp,
+                             "HTTP/1.1 %d X\r\n"
+                             "Content-Length: %zu\r\n%sConnection: close\r\n"
+                             "Content-Type: %s\r\n\r\n",
+                             status, strlen(body), extra, ctype);
+            size_t blen = strlen(body);
+
+            send_all(cfd, rsp, (size_t)w);
+            if (blen > 0u)
+                send_all(cfd, body, blen);
+        }
+    }
+    (void)close(cfd);
 }
 
 /* --------------------------------------------------------------------------
@@ -929,33 +1033,79 @@ int main(int argc, char *argv[])
             "c15c: binary content intact (no strlen truncation)");
     }
 
-    /* ---------------- c16 大文本正文（400 KiB，模拟大华 391 KB 语言表）---------------- */
+    /* ---------------- c16 大文本正文（1 MiB，模拟大华 935 KiB 预览模块）----------------
+     * 2026-10-30 板端实证：大华预览页会要一份 **957347 B** 的模块，512 KiB 只能 502 ⇒
+     * 页面卡在转圈。反代现在按上游声明的长度**按需扩容**（硬上限 8 MiB），这条钉住它。 */
     {
         int  len = snprintf(g_req, sizeof g_req,
-                            "GET /cam/0/bigjson HTTP/1.1\r\nHost: x\r\n"
+                            "GET /cam/0/big1m HTTP/1.1\r\nHost: x\r\n"
                             "Connection: close\r\n\r\n");
         int  total = exchange(g_cam_lport, g_req, (size_t)len);
         long off   = hdr_end_off((size_t)total);
 
-        chk(total > 0 && rsp_status() == 200, "c16a: 400 KiB text body answered 200");
-        chk(off > 0 && (size_t)total - (size_t)off == 400u * 1024u,
-            "c16b: all 400 KiB delivered (no truncation)");
+        chk(total > 0 && rsp_status() == 200, "c16a: 1 MiB text body answered 200");
+        chk(off > 0 && (size_t)total - (size_t)off == 1024u * 1024u,
+            "c16b: all 1 MiB delivered (buffer grew on demand)");
         /* 尾巴是指纹：被截断的响应这里一定对不上 */
         chk(off > 0 && (size_t)total >= 2u && g_rsp[total - 2] == 'z' &&
                 g_rsp[total - 1] == '}',
             "c16c: tail bytes intact");
     }
 
-    /* ---------------- c17 超过缓冲的正文：必须 502，不许静默截断 ---------------- */
+    /* ---------------- c17 超过硬上限的正文：必须 502，不许静默截断 ---------------- */
     {
         int  len = snprintf(g_req, sizeof g_req,
-                            "GET /cam/0/huge HTTP/1.1\r\nHost: x\r\n"
+                            "GET /cam/0/declared-big HTTP/1.1\r\nHost: x\r\n"
                             "Connection: close\r\n\r\n");
         int  total = exchange(g_cam_lport, g_req, (size_t)len);
 
         chk(total > 0 && rsp_status() == 502,
             "c17a: oversize body => 502 (silent truncation was the old bug)");
-        chk(strstr(g_rsp, "too large") != NULL, "c17b: body names the reason");
+        chk(strstr(g_rsp, "too large") != NULL, "c17b: body names the reason (9 MiB declared)");
+    }
+
+    /* ---------------- c18 并发突发不该出现 503 ----------------
+     * 2026-10-30 现场：浏览器一个页面 35+ 个资源，加上"设备页 + 几路摄像机页"同时开着，
+     * 8 个连接槽一满就把多余的请求打成 503 ⇒ 页面缺 JS ⇒ 永远转圈。
+     * 槽位抬到 24 之后，16 路突发必须**全部 200**。 */
+    {
+        int  len = snprintf(g_req, sizeof g_req,
+                            "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        int  ok = 0;
+        int  busy = 0;
+        long ms = burst(g_cam_lport, g_req, (size_t)len, 16, &ok, &busy);
+
+        char msg[128];
+
+        (void)snprintf(msg, sizeof msg,
+                       "c18a: 16 concurrent proxied requests all 200 (ok=%d busy=%d %ldms)",
+                       ok, busy, ms);
+        chk(ok == 16, msg);
+        chk(busy == 0, "c18b: no 503 under a 16-request burst");
+        (void)snprintf(msg, sizeof msg, "c18c: burst completes promptly (<3s, took %ldms)", ms);
+        chk(ms < 3000L, msg);
+    }
+
+    /* ---------------- c19 等上游时主循环不能被占住（本次修复的核心） ----------------
+     * 假摄像机对 /slow 故意拖 300 ms。响应是整体缓冲的，所以"重叠"能不能发生，
+     * 全看代理是不是把上游 fd 挂进了同一个 poll：
+     *   串行实现 ⇒ 4 个请求 ≥ 1200 ms；非阻塞 ⇒ 约 300～500 ms。
+     * 反向证伪：把 on_upstream() 退回同步调用，这条必红。 */
+    {
+        int  len = snprintf(g_req, sizeof g_req,
+                            "GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        int  ok = 0;
+        long ms = burst(g_cam_lport, g_req, (size_t)len, 4, &ok, NULL);
+
+        char msg[128];
+
+        (void)snprintf(msg, sizeof msg,
+                       "c19a: 4 slow upstream requests all 200 (ok=%d %ldms)", ok, ms);
+        chk(ok == 4, msg);
+        (void)snprintf(msg, sizeof msg,
+                       "c19b: slow upstreams overlap (<1000ms, took %ldms; serial >=1200)",
+                       ms);
+        chk(ms < 1000L, msg);
     }
 
     cleanup();
@@ -963,8 +1113,9 @@ int main(int argc, char *argv[])
         fprintf(stderr, "test_web_cam_e2e FAILED (%d checks)\n", g_fail);
         return 1;
     }
+
     printf("test_web_cam_e2e passed (route isolation, proxy+rewrites, header/body "
            "passthrough, 502 paths, loopback guard, fd stability, no-EOF upstream, "
-           "binary body, big text body)\n");
+           "binary body, big text body, concurrency: no 503 + overlapping upstreams)\n");
     return 0;
 }

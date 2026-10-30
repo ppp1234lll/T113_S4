@@ -82,10 +82,22 @@ extern "C" {
 /* --------------------------------------------------------------------------
  * 限额（S5.1"上限：连接数、请求体大小、上传大小、各类超时"）
  * -------------------------------------------------------------------------- */
-#define IV_WEB_MAX_CONN   8u        /* 并发连接上限（超出的直接 503 并关闭） */
+/* 并发连接上限（超出的直接 503 并关闭）。
+ * ⚠ 2026-10-30 从 8 抬到 24：摄像机页面一次并发 35+ 个资源，浏览器对单 origin 只开
+ * 6 条，但运维修往往同时开着"设备页 + 两三路摄像机页"（每路一个端口的 origin），
+ * 8 个槽一满，多出来的请求直接吃 503 ⇒ 页面缺 JS 之后永远转圈（实测 10 并发就掉 2 个）。
+ * 槽位只是一个槽位：响应缓冲已改成按需 malloc（见 iv_web_conn_t::wbuf），
+ * 空闲槽几乎不占内存（每槽常驻只有 rbuf 的 36 KiB）。 */
+#define IV_WEB_MAX_CONN   24u
 #define IV_WEB_HEAD_MAX   4096u     /* 请求行 ＋ 头总长上限 */
 #define IV_WEB_BODY_MAX   32768u    /* 请求体上限（配置提交） */
-#define IV_WEB_RSP_MAX    (512u * 1024u) /* 响应缓冲上限（静态资源整体读入 / 反代正文） */
+#define IV_WEB_RSP_MAX    (512u * 1024u) /* 反代正文的**起步**缓冲（按连接 malloc，见 wbuf） */
+/* 反代正文的**硬上限**：头部收齐后按上游声明的 Content-Length 按需 realloc，到这里为止。
+ * 为什么不能只用一个固定值：2026-10-30 板端实测，大华预览页会要一份 **957347 B**
+ * （935 KiB）的模块，512 KiB 只能回 502，页面就卡在转圈。而把它整体抬上去又太浪费 ——
+ * 缓冲是按连接 malloc 的，6 条并发 × 每份几十 KiB 才是常态。
+ * 8 MiB 是"够用且不至于把板子吃死"的量级：只有真在传这么大的文件时才占这么多。 */
+#define IV_WEB_CAM_RSP_MAX (8u * 1024u * 1024u)
 #define IV_WEB_PATH_MAX   256u
 #define IV_WEB_TOKEN_MAX  48u
 #define IV_WEB_SESS_N     8u
@@ -172,6 +184,14 @@ extern "C" {
 #define IV_WEB_PASS_HINT_JSON \
     "请输入正确的密码格式：\\n密码长度:8-12\\n密码由数字+大写英文字母+小写英文字母组成"
 
+/* 反代上游的相位（iv_web_cam.c 的状态机；见 iv_web_conn_t::up_phase） */
+typedef enum {
+    IV_WEB_UP_NONE = 0,
+    IV_WEB_UP_CONNECT,  /* 非阻塞 connect 进行中 */
+    IV_WEB_UP_SEND,     /* 发请求头 / POST 体 */
+    IV_WEB_UP_RECV      /* 收上游响应（收满 Content-Length 或 EOF 即收工） */
+} iv_web_up_phase_t;
+
 /* --------------------------------------------------------------------------
  * 连接
  * -------------------------------------------------------------------------- */
@@ -205,7 +225,34 @@ typedef struct {
     /* 多 1 字节：解析请求头时要在 body 末尾补一个 '\0'，好让 json_tokener_parse
      * 那类"要 C 串"的调用有个明确的结尾（载荷本身不带长度语义）。 */
     char     rbuf[IV_WEB_HEAD_MAX + IV_WEB_BODY_MAX + 1u];
-    char     wbuf[IV_WEB_RSP_MAX];
+    /* 响应缓冲：**堆上按需分配**（一份 IV_WEB_RSP_MAX，连接关闭即 free）。
+     * 2026-10-30 从静态数组改成指针：512 KiB × 24 槽 = 13 MB 常驻 BSS 纯属浪费，
+     * 而浏览器一个页面同时只占 6 条连接、板子可用内存 148 MiB ⇒ 按需分配更划算。
+     * 分配失败按 503 处理（do_accept 里），不降级成"小缓冲" —— 半个响应比拒绝更坏。 */
+    char    *wbuf;
+    size_t   wcap;
+
+    /* ---- S8.5 反代上游：非阻塞（2026-10-30 重做）----
+     * 同步版本把"等摄像机"这段时间整个主循环都占住了：一个页面 35 个资源串起来
+     * 6 s 起步，现场表现就是"界面一直转圈、刷新不出来"。现在把上游 fd 挂进同一个
+     * poll，等待期间主循环照常服务其它连接 ⇒ 多个上游请求天然重叠。 */
+    int      up_fd;          /* -1 = 当前没在代理 */
+    uint8_t  up_phase;       /* iv_web_up_phase_t */
+    uint8_t  up_ch;          /* 路号（日志用） */
+    uint16_t up_port;        /* 上游端口（绝对 URL 改写用） */
+    size_t   up_req_len;     /* 待发请求头长度 */
+    size_t   up_req_sent;
+    size_t   up_body_off;    /* 请求体在 rbuf 中的偏移（POST） */
+    size_t   up_body_len;
+    size_t   up_body_sent;
+    size_t   up_off;         /* 已收进 wbuf+RSP_HEAD_OFF 的上游字节数 */
+    size_t   up_he;          /* 上游响应头区长度；0 = 还没收齐 */
+    long     up_clen;        /* 上游声明的 Content-Length；-1 = 无该头 */
+    uint64_t up_deadline_ms; /* 本次代理的总预算（单调时钟） */
+    char     up_ip[24];
+    char     up_prefix[16];
+    char     up_path[192];   /* 上游路径（只用于日志） */
+    char     up_req[2048];   /* 上游请求头（含 POST 的 Content-Length 行） */
 } iv_web_conn_t;
 
 /* 解析后的请求 */
@@ -395,8 +442,16 @@ int iv_web_ota_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
  * `cam_ch` 是连接落点端口推出的路号（端口形态下用它；路径形态下被路径覆盖）。
  * 返回口径与 api/media 相同：IV_OK = 已填响应；IV_ENOTSUP = 路径不归我（404）。
  * -------------------------------------------------------------------------- */
-int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_ch,
-                      char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp);
+/* 三段式：begin 发起（可能当场就有应答，也可能是 IV_EAGAIN＝等上游事件），
+ * event 由主循环在上游 fd 可读写/超时时推进，abort 在连接关闭时收尾（关上游 fd）。
+ * 为什么拆开：见上面 iv_web_conn_t::up_fd 的注释。
+ * 三者的 `out`/`cap` 一律是"正文落点"（＝ c->wbuf + RSP_HEAD_OFF）。 */
+int iv_web_cam_begin(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_ch,
+                     iv_web_conn_t *c, char *out, size_t cap, size_t *out_len,
+                     iv_web_resp_t *rsp);
+int iv_web_cam_event(iv_web_ctx_t *ctx, iv_web_conn_t *c, char *out, size_t cap,
+                     size_t *out_len, iv_web_resp_t *rsp);
+void iv_web_cam_abort(iv_web_conn_t *c);
 
 /* --------------------------------------------------------------------------
  * static.c —— 静态文件

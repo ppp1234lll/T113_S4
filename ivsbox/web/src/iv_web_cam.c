@@ -139,58 +139,6 @@ static uint32_t ip4_parse(const char *s)
     return ntohl(in.s_addr);
 }
 
-/* 连接上游（**非阻塞 connect + poll**，IV_WEB_CAM_CONNECT_MS 预算 —— 阻塞 connect
- * 的内核兜底可达两分钟，会把整个 Web 事件循环冻死那么久）。成功返回阻塞态 fd。 */
-static int upstream_connect(uint32_t ip_be_val, uint16_t port)
-{
-    struct sockaddr_in sa;
-    struct pollfd      pfd;
-    int                fd;
-    int                on  = 1;
-    int                err = 0;
-    socklen_t          elen = sizeof err;
-
-    fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0)
-        return -1;
-    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port   = htons(port);
-    /* ip_be_val 是"按大端读"的数值（0x7F000001），in_addr 要的是内存序字节 ⇒ htonl */
-    sa.sin_addr.s_addr = htonl(ip_be_val);
-
-    if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0) {
-        (void)close(fd);
-        return -1;
-    }
-    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
-        if (errno != EINPROGRESS) {
-            (void)close(fd);
-            return -1;
-        }
-        pfd.fd      = fd;
-        pfd.events  = POLLOUT;
-        pfd.revents = 0;
-        if (poll(&pfd, 1, (int)IV_WEB_CAM_CONNECT_MS) != 1) {
-            (void)close(fd); /* 超时或出错（摄像机不在线是常态，不是崩溃） */
-            return -1;
-        }
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0 || err != 0) {
-            (void)close(fd);
-            return -1;
-        }
-    }
-    /* 恢复阻塞态：后面的 send/recv 用同一段代码的简单语义（总预算另有 deadline）。 */
-    {
-        int fl = fcntl(fd, F_GETFL, 0);
-
-        if (fl >= 0)
-            (void)fcntl(fd, F_SETFL, fl & ~(int)O_NONBLOCK);
-    }
-    return fd;
-}
-
 /* 请求路径 → 路号（0..CAM_CH_N-1）与代理内的剩余路径。合法返回 0。 */
 static int cam_route_parse(const char *path, unsigned *n, const char **rest)
 {
@@ -456,219 +404,104 @@ static int ctype_is_text(const char *ct)
 }
 
 /* ---------------------------------------------------------------------------
- * 主入口
+ * 主入口：三段式 begin / event / abort
+ *
+ * ============================ 为什么不是"一个函数做完" ============================
+ * 2026-10-30 现场：经隧道打开大华 108 的设置页，界面一直转圈、刷新不出来。
+ * 量出来的事实（板端对摄像机直连 vs 过反代，同一批 35 个资源）：
+ *     直连 2.46 s     反代 6.40 s（＝每个请求 110～250 ms **一个接一个**地等）
+ * 根因不是带宽，是**同步**：旧实现把"connect → send → recv 到收满"整段做在
+ * `handle_req()` 里，单线程主循环在这几百毫秒里谁都服务不了。浏览器对一个 origin
+ * 只开 6 条连接，于是页面加载变成 6 条一波、一波 6 个 RTT。
+ * 现在把上游 fd 挂进同一个 poll：等待期间主循环照常受理其它连接，多个上游天然重叠。
+ *
+ * 相位：CONNECT（非阻塞 connect 中） → SEND（发请求头/体） → RECV（收响应）
+ * 收工条件与同步版完全一致：**收满 Content-Length 立刻收**（大华发完 body 不关连接，
+ * 只等 EOF 会挂死），没有该头就等 EOF。
+ * 预算：总共 IV_WEB_CAM_TOTAL_MS（8 s），到点按 504 收尾 —— 绝不无限挂着。
  * ------------------------------------------------------------------------- */
-int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_ch,
-                      char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp)
+
+/* 统一的错误应答：正文写进 out（＝ wbuf + RSP_HEAD_OFF），状态码给 rsp。 */
+static int cam_err(char *out, size_t cap, size_t *out_len, iv_web_resp_t *rsp,
+                   int status, const char *msg)
 {
-    char          ipstr[24];
-    char          prefix[16];
-    char          upreq[2048];
-    const char   *rest = NULL;
-    unsigned      n = 0u;
-    uint32_t      ip_be_val;
-    uint16_t      port;
-    int           fd;
-    int           rc;
-    size_t        off = 0u;
-    size_t        head_end;
-    char          head[4096];
-    char          location[224];
-    char          ctype[64];
-    int           status = 0;
-    uint64_t      deadline;
+    rsp->status = status;
+    (void)snprintf(rsp->ctype, sizeof rsp->ctype, "text/plain");
+    *out_len = (size_t)snprintf(out, cap, "%s\n", msg);
+    return IV_OK;
+}
 
-    *out_len = 0u;
-    out[0] = '\0';
+static void cam_close_up(iv_web_conn_t *c)
+{
+    if (c->up_fd >= 0) {
+        (void)close(c->up_fd);
+        c->up_fd = -1;
+    }
+    c->up_phase = (uint8_t)IV_WEB_UP_NONE;
+}
 
-    if (ctx == NULL || req == NULL || out == NULL || out_len == NULL || rsp == NULL)
-        return IV_EINVAL;
-    rc = cam_route_parse(req->path, &n, &rest);
-    if (rc == IV_OK) {
-        /* ② 路径寻址（兼容旧配置）：/cam/<N>/... —— 前缀就是改写基准 */
-        (void)snprintf(prefix, sizeof prefix, "/cam/%u", n);
-    } else {
-        /* ① 端口寻址（首选）：本连接落在 cam_port+cam_ch 上 ⇒ 根路径即摄像机根。
-         * 前缀留空：改写时 `http://<ip>/x` 变 `/x`，摄像机当成自己的根，前端那些
-         * 根绝对路径（/RPC2、/doc/index.html…）才不会被打成 404。 */
-        if (cam_ch >= (unsigned)CAM_CH_N)
-            return IV_ENOTSUP;
-        n      = cam_ch;
-        rest   = req->path;
-        prefix[0] = '\0';
-    }
+/* 连接关闭时由 main.c 调用：上游 fd 必须一起关，否则一场页面刷新能泄漏几十个 fd。 */
+void iv_web_cam_abort(iv_web_conn_t *c)
+{
+    if (c != NULL)
+        cam_close_up(c);
+}
 
-    if (strcmp(req->method, "GET") != 0 && strcmp(req->method, "POST") != 0) {
-        rsp->status = 405;
-        (void)snprintf(rsp->ctype, sizeof rsp->ctype, "text/plain");
-        *out_len = (size_t)snprintf(out, cap, "method not allowed\n");
-        return IV_OK;
-    }
+/* 把请求头与请求体推进上游。IV_EAGAIN = 内核发缓冲满了，等下一轮 POLLOUT。 */
+static int cam_send_req(iv_web_conn_t *c)
+{
+    while (c->up_req_sent < c->up_req_len) {
+        ssize_t w = send(c->up_fd, c->up_req + c->up_req_sent,
+                         c->up_req_len - c->up_req_sent, MSG_NOSIGNAL);
 
-    /* ① 目标＝配置里的第 N 路（Web 不读配置，经本地通道问 ivsboxd） */
-    rc = cam_ip_of(ctx, n, ipstr, sizeof ipstr);
-    if (rc != IV_OK) {
-        IV_LOG_W(CAM_MOD, "cam/%u: no configured ip (rc=%d)", n, rc);
-        rsp->status = 502;
-        (void)snprintf(rsp->ctype, sizeof rsp->ctype, "text/plain");
-        *out_len = (size_t)snprintf(out, cap, "camera %u not configured\n", n);
-        return IV_OK;
-    }
-    ip_be_val = ip4_parse(ipstr);
-    port = (ctx->cam_upstream != 0u) ? ctx->cam_upstream : IV_WEB_CAM_UPSTREAM_DEFAULT;
-    if (ip_be_val == 0u || port == 0u) {
-        rsp->status = 502;
-        (void)snprintf(rsp->ctype, sizeof rsp->ctype, "text/plain");
-        *out_len = (size_t)snprintf(out, cap, "camera %u has an invalid address\n", n);
-        return IV_OK;
-    }
-    /* ② 环回护栏：不许代理到本代理自己 */
-    if (ip_be_val == 0x7f000001u && port == (uint16_t)ctx->cam_port) {
-        IV_LOG_W(CAM_MOD, "cam/%u: target is the proxy itself, refused", n);
-        rsp->status = 502;
-        (void)snprintf(rsp->ctype, sizeof rsp->ctype, "text/plain");
-        *out_len = (size_t)snprintf(out, cap, "refused\n");
-        return IV_OK;
-    }
-
-    /* ③ 拼上游请求（头白名单 + Connection: close） */
-    {
-        int w = snprintf(upreq, sizeof upreq,
-                         "%s %s%s%s HTTP/1.1\r\n"
-                         "Host: %s\r\n"
-                         "Connection: close\r\n"
-                         "User-Agent: ivsbox-web-cam\r\n"
-                         "%s%s%s%s%s%s",
-                         req->method, rest,
-                         (req->query[0] != '\0') ? "?" : "", req->query,
-                         ipstr,
-                         (req->ctype[0] != '\0') ? "Content-Type: " : "",
-                         req->ctype,
-                         (req->ctype[0] != '\0') ? "\r\n" : "",
-                         (req->cookie_raw[0] != '\0') ? "Cookie: " : "",
-                         req->cookie_raw,
-                         (req->cookie_raw[0] != '\0') ? "\r\n" : "");
-        if (w < 0 || (size_t)w >= sizeof upreq - 64u) {
-            rsp->status = 400;
-            (void)snprintf(rsp->ctype, sizeof rsp->ctype, "text/plain");
-            *out_len = (size_t)snprintf(out, cap, "request too long\n");
-            return IV_OK;
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return IV_EAGAIN;
+            return IV_EIO;
         }
-        if (req->auth[0] != '\0') {
-            (void)snprintf(upreq + strlen(upreq), sizeof upreq - strlen(upreq),
-                           "Authorization: %s\r\n", req->auth);
-        }
-        if (req->body_len > 0u) {
-            (void)snprintf(upreq + strlen(upreq), sizeof upreq - strlen(upreq),
-                           "Content-Length: %zu\r\n\r\n", req->body_len);
-        } else {
-            (void)snprintf(upreq + strlen(upreq), sizeof upreq - strlen(upreq), "\r\n");
-        }
+        if (w == 0)
+            return IV_EAGAIN;
+        c->up_req_sent += (size_t)w;
     }
-    /* 头在 upreq；体（若 POST）不走这段缓冲，连接后单独 send —— 免得 32 KB 的
-     * 提交体把 2 KB 的头缓冲撑爆。 */
+    while (c->up_body_sent < c->up_body_len) {
+        ssize_t w = send(c->up_fd, c->rbuf + c->up_body_off + c->up_body_sent,
+                         c->up_body_len - c->up_body_sent, MSG_NOSIGNAL);
 
-    /* ④ 连接 + 发送 + 收响应（连接预算 2 s；收发总预算 8 s） */
-    fd = upstream_connect(ip_be_val, port);
-    if (fd < 0) {
-        IV_LOG_W(CAM_MOD, "cam/%u: connect %s:%u failed (%s)", n, ipstr,
-                 (unsigned)port, strerror(errno));
-        rsp->status = 502;
-        (void)snprintf(rsp->ctype, sizeof rsp->ctype, "text/plain");
-        *out_len = (size_t)snprintf(out, cap, "camera unreachable\n");
-        return IV_OK;
-    }
-
-    /* 收发都要有超时：**阻塞 recv 自身没有时间上限时，下面那个 8 s 总预算根本不生效**
-     * —— 摄像机发完 body 不关连接（2026-10-29 板端实证，见收包循环注释），recv 会
-     * 一直挂着，把单线程 Web 主循环冻住。1 s 一跳，让总预算能真正判到。 */
-    {
-        struct timeval tv;
-
-        tv.tv_sec  = 1;
-        tv.tv_usec = 0;
-        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    }
-
-    {
-        size_t sent = 0u;
-        size_t total = strlen(upreq);
-
-        while (sent < total) {
-            ssize_t w = send(fd, upreq + sent, total - sent, MSG_NOSIGNAL);
-
-            if (w < 0) {
-                if (errno == EINTR)
-                    continue;
-                (void)close(fd);
-                rsp->status = 502;
-                (void)snprintf(rsp->ctype, sizeof rsp->ctype, "text/plain");
-                *out_len = (size_t)snprintf(out, cap, "upstream write failed\n");
-                return IV_OK;
-            }
-            sent += (size_t)w;
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return IV_EAGAIN;
+            return IV_EIO;
         }
-        if (req->body_len > 0u) {
-            sent = 0u;
-            while (sent < req->body_len) {
-                ssize_t w = send(fd, req->body + sent, req->body_len - sent,
-                                 MSG_NOSIGNAL);
-
-                if (w < 0) {
-                    if (errno == EINTR)
-                        continue;
-                    break;
-                }
-                sent += (size_t)w;
-            }
-        }
+        if (w == 0)
+            return IV_EAGAIN;
+        c->up_body_sent += (size_t)w;
     }
+    return IV_OK;
+}
 
-    deadline = (uint64_t)time(NULL) * 1000u + IV_WEB_CAM_TOTAL_MS;
-    /* 这两个出块后还要用（判"上游声明的长度有没有收满"），所以声明在块外。
-     * `he == 0` ＝ 头区还没收齐（此时整段不能当字符串用）；`clen < 0` ＝ 没该头。 */
-    size_t he   = 0u;
-    long   clen = -1;
-    {
-        while (off < cap - 1u) {
-            ssize_t r = recv(fd, out + off, cap - 1u - off, 0);
+/* 收工：拆应答 + 改写 + 填 rsp。以下是同步版原样搬过来的那段（逻辑未动），
+ * 只是状态从局部变量改为 conn 上的字段（`up_*`），以便跨 poll 轮次活着。 */
+static int cam_finish(iv_web_conn_t *c, char *out, size_t cap, size_t *out_len,
+                      iv_web_resp_t *rsp)
+{
+    const char *ipstr  = c->up_ip;
+    const char *prefix = c->up_prefix;
+    uint16_t    port   = c->up_port;
+    unsigned    n      = (unsigned)c->up_ch;
+    size_t      he     = c->up_he;
+    long        clen   = c->up_clen;
+    size_t      off    = c->up_off;
+    size_t      head_end;
+    char        head[4096];
+    char        location[224];
+    char        ctype[64];
+    int         status = 0;
 
-            if (r < 0) {
-                if (errno == EINTR)
-                    continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    /* SO_RCVTIMEO 1 s 一跳：判总预算，别在这儿死等（见下） */
-                    if ((uint64_t)time(NULL) * 1000u > deadline)
-                        break;
-                    continue;
-                }
-                break;
-            }
-            if (r == 0)
-                break; /* 上游按 Connection: close 收尾（部分摄像机会） */
-            off += (size_t)r;
-            if (he == 0u) {
-                size_t h = find_head_end(out, off);
-
-                if (h != 0u) {
-                    he   = h;
-                    clen = hdr_clen_bounded(out, h);
-                }
-            }
-            /* ① 有 Content-Length 且已收满 ⇒ 立刻收工。
-             * 板端实证 2026-10-29（大华 192.168.1.108）：**请求里写了
-             * `Connection: close`，它发完 Content-Length 指定的字节后仍然不关连接**
-             * ⇒ 只等 EOF 的写法会把单线程 Web 主循环冻死 8 s 以上，心跳过期后
-             * monitor-web.sh 杀掉重启（浏览器看到 `Connection reset by peer`，
-             * 现场表现就是"远程看摄像机打不开，还把整个 Web 拖挂 10 秒"）。 */
-            if (he != 0u && clen >= 0 && off >= he + (size_t)clen)
-                break;
-            if ((uint64_t)time(NULL) * 1000u > deadline)
-                break; /* 超预算：有多少算多少（下面按截断应答处理） */
-        }
-    }
-    (void)close(fd);
+    cam_close_up(c);
     out[off] = '\0';
 
     /* ⑤ 上游声明的长度没收满 ⇒ **必须明确报错**，绝不能把半份正文当成功回出去。
@@ -679,8 +512,8 @@ int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_c
      * 变成了英文"）。缓冲已抬到 512 KiB，这条闸门保证"再顶穿时说话，不是装没事"。 */
     if (he != 0u && clen >= 0 && off < he + (size_t)clen) {
         IV_LOG_W(CAM_MOD,
-                 "cam/%u: response truncated (%ld B declared, %zu B received, cap %zu)",
-                 n, clen, (off > he) ? (off - he) : 0u, cap);
+                 "cam/%u: response truncated (%s: %ld B declared, %zu B received, cap %zu)",
+                 n, c->up_path, clen, (off > he) ? (off - he) : 0u, cap);
         rsp->status = 502;
         (void)snprintf(rsp->ctype, sizeof rsp->ctype, "text/plain");
         *out_len = (size_t)snprintf(out, cap,
@@ -743,6 +576,10 @@ int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_c
             rsp->status = status;
             (void)snprintf(rsp->ctype, sizeof rsp->ctype, "%s",
                            (ctype[0] != '\0') ? ctype : "application/octet-stream");
+            /* 摄像机资源**不吃媒体限速**：`--media-bps`（默认 256 KiB/s）是给录像
+             * 下载的，拿它卡页面资源等于给每个 300 KB 的语言表/JS 白加 1.2 s。
+             * 2026-10-30 现场：这正是"点设置页一直转圈"的第二个来源。 */
+            rsp->no_throttle = 1;
             rsp->has_extra = 0;
             rsp->extra[0] = '\0';
             if (location[0] != '\0') {
@@ -771,6 +608,276 @@ int iv_web_cam_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_c
     }
 
     IV_LOG_I(CAM_MOD, "cam/%u -> %s:%u %s = %d (%zu B)", n, ipstr, (unsigned)port,
-             rest, rsp->status, *out_len);
+             c->up_path, rsp->status, *out_len);
     return IV_OK;
+}
+
+/* 头部收齐后按声明的长度扩容。**只在大响应时发生**：板端实测大华预览页要一份
+ * 957347 B 的模块，固定 512 KiB 只能 502，页面就永远转圈。
+ * `out` 是 `c->wbuf + 偏移`，realloc 之后必须按同一偏移重新取指针 —— 老指针会悬空。 */
+static int cam_ensure(char **out, size_t *cap, iv_web_conn_t *c, size_t need)
+{
+    size_t hoff = (size_t)(*out - c->wbuf);
+    char  *nb;
+
+    if (need <= *cap)
+        return IV_OK;
+    if (hoff + need > IV_WEB_CAM_RSP_MAX)
+        return IV_ERANGE;
+    nb = (char *)realloc(c->wbuf, hoff + need);
+    if (nb == NULL)
+        return IV_ENOMEM;
+    c->wbuf = nb;
+    c->wcap = hoff + need;
+    *out    = nb + hoff;
+    *cap    = need;
+    return IV_OK;
+}
+
+/* 收上游响应：一直读到 EAGAIN（返回 IV_EAGAIN 让主循环继续轮）、收满、EOF 或超预算。 */
+static int cam_recv_rsp(iv_web_conn_t *c, char *out, size_t cap, size_t *out_len,
+                        iv_web_resp_t *rsp)
+{
+    for (;;) {
+        ssize_t r;
+        int     rc;
+
+        if (c->up_off >= cap - 1u)
+            break; /* 缓冲满：交给 cam_finish 的截断闸门说话 */
+        r = recv(c->up_fd, out + c->up_off, cap - 1u - c->up_off, 0);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return IV_EAGAIN;
+            break;
+        }
+        if (r == 0)
+            break; /* 上游按 Connection: close 收尾（部分摄像机会） */
+        c->up_off += (size_t)r;
+        if (c->up_he == 0u) {
+            size_t h = find_head_end(out, c->up_off);
+
+            if (h != 0u) {
+                c->up_he   = h;
+                c->up_clen = hdr_clen_bounded(out, h);
+                /* 声明的正文放不下 ⇒ 先扩容再继续收，而不是等收满丢掉 */
+                if (c->up_clen > 0) {
+                    rc = cam_ensure(&out, &cap, c,
+                                    c->up_he + (size_t)c->up_clen + 1u);
+                    if (rc == IV_ERANGE) {
+                        IV_LOG_W(CAM_MOD,
+                                 "cam/%u: %s declares %ld B, above the %u B proxy cap",
+                                 (unsigned)c->up_ch, c->up_path, c->up_clen,
+                                 (unsigned)IV_WEB_CAM_RSP_MAX);
+                        break; /* 交给 cam_finish 的截断闸门回 502 */
+                    }
+                    if (rc != IV_OK) {
+                        cam_close_up(c);
+                        return cam_err(out, cap, out_len, rsp, 502,
+                                       "out of memory growing the proxy buffer");
+                    }
+                }
+            }
+        }
+        /* ① 有 Content-Length 且已收满 ⇒ 立刻收工。板端实证 2026-10-29（大华
+         * 192.168.1.108）：**请求里写了 `Connection: close`，它发完 Content-Length
+         * 指定的字节后仍然不关连接** ⇒ 只等 EOF 的写法会把主循环冻死 8 s 以上。 */
+        if (c->up_he != 0u && c->up_clen >= 0 &&
+            c->up_off >= c->up_he + (size_t)c->up_clen)
+            break;
+        if (iv_web_now_ms() > c->up_deadline_ms)
+            break; /* 超预算：有多少算多少（cam_finish 按截断处理） */
+    }
+    return cam_finish(c, out, cap, out_len, rsp);
+}
+
+/* 第一段：解析目标 + 拼上游请求 + 发起非阻塞 connect。
+ * IV_EAGAIN = 已挂上，等主循环推事件；IV_OK = 当场就有应答（405/502/404…）。 */
+int iv_web_cam_begin(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_ch,
+                     iv_web_conn_t *c, char *out, size_t cap, size_t *out_len,
+                     iv_web_resp_t *rsp)
+{
+    char           ipstr[24];
+    char           prefix[16];
+    const char    *rest = NULL;
+    unsigned       n = 0u;
+    uint32_t       ip_be_val;
+    uint16_t       port;
+    struct sockaddr_in sa;
+    int            fd;
+    int            rc;
+    int            on = 1;
+
+    *out_len = 0u;
+    out[0] = '\0';
+
+    if (ctx == NULL || req == NULL || c == NULL || out == NULL || out_len == NULL ||
+        rsp == NULL)
+        return IV_EINVAL;
+    rc = cam_route_parse(req->path, &n, &rest);
+    if (rc == IV_OK) {
+        /* ② 路径寻址（兼容旧配置）：/cam/<N>/... —— 前缀就是改写基准 */
+        (void)snprintf(prefix, sizeof prefix, "/cam/%u", n);
+    } else {
+        /* ① 端口寻址（首选）：本连接落在 cam_port+cam_ch 上 ⇒ 根路径即摄像机根。
+         * 前缀留空：改写时 `http://<ip>/x` 变 `/x`，摄像机当成自己的根，前端那些
+         * 根绝对路径（/RPC2、/doc/index.html…）才不会被打成 404。 */
+        if (cam_ch >= (unsigned)CAM_CH_N)
+            return IV_ENOTSUP;
+        n      = cam_ch;
+        rest   = req->path;
+        prefix[0] = '\0';
+    }
+
+    if (strcmp(req->method, "GET") != 0 && strcmp(req->method, "POST") != 0) {
+        rsp->status = 405;
+        (void)snprintf(rsp->ctype, sizeof rsp->ctype, "text/plain");
+        *out_len = (size_t)snprintf(out, cap, "method not allowed\n");
+        return IV_OK;
+    }
+
+    /* ① 目标＝配置里的第 N 路（Web 不读配置，经本地通道问 ivsboxd） */
+    rc = cam_ip_of(ctx, n, ipstr, sizeof ipstr);
+    if (rc != IV_OK) {
+        IV_LOG_W(CAM_MOD, "cam/%u: no configured ip (rc=%d)", n, rc);
+        return cam_err(out, cap, out_len, rsp, 502, "camera not configured");
+    }
+    ip_be_val = ip4_parse(ipstr);
+    port = (ctx->cam_upstream != 0u) ? ctx->cam_upstream : IV_WEB_CAM_UPSTREAM_DEFAULT;
+    if (ip_be_val == 0u || port == 0u)
+        return cam_err(out, cap, out_len, rsp, 502, "camera has an invalid address");
+    /* ② 环回护栏：不许代理到本代理自己 */
+    if (ip_be_val == 0x7f000001u && port == (uint16_t)ctx->cam_port) {
+        IV_LOG_W(CAM_MOD, "cam/%u: target is the proxy itself, refused", n);
+        return cam_err(out, cap, out_len, rsp, 502, "refused");
+    }
+
+    /* ③ 拼上游请求（头白名单 + Connection: close），存进 conn 供分轮次发送 */
+    {
+        int w = snprintf(c->up_req, sizeof c->up_req,
+                         "%s %s%s%s HTTP/1.1\r\n"
+                         "Host: %s\r\n"
+                         "Connection: close\r\n"
+                         "User-Agent: ivsbox-web-cam\r\n"
+                         "%s%s%s%s%s%s",
+                         req->method, rest,
+                         (req->query[0] != '\0') ? "?" : "", req->query,
+                         ipstr,
+                         (req->ctype[0] != '\0') ? "Content-Type: " : "",
+                         req->ctype,
+                         (req->ctype[0] != '\0') ? "\r\n" : "",
+                         (req->cookie_raw[0] != '\0') ? "Cookie: " : "",
+                         req->cookie_raw,
+                         (req->cookie_raw[0] != '\0') ? "\r\n" : "");
+
+        if (w < 0 || (size_t)w >= sizeof c->up_req - 64u)
+            return cam_err(out, cap, out_len, rsp, 400, "request too long");
+        if (req->auth[0] != '\0') {
+            (void)snprintf(c->up_req + strlen(c->up_req),
+                           sizeof c->up_req - strlen(c->up_req),
+                           "Authorization: %s\r\n", req->auth);
+        }
+        if (req->body_len > 0u) {
+            (void)snprintf(c->up_req + strlen(c->up_req),
+                           sizeof c->up_req - strlen(c->up_req),
+                           "Content-Length: %zu\r\n\r\n", req->body_len);
+        } else {
+            (void)snprintf(c->up_req + strlen(c->up_req),
+                           sizeof c->up_req - strlen(c->up_req), "\r\n");
+        }
+    }
+
+    /* ④ 记下改写上下文与请求体位置，然后发起非阻塞 connect */
+    (void)snprintf(c->up_ip, sizeof c->up_ip, "%s", ipstr);
+    (void)snprintf(c->up_prefix, sizeof c->up_prefix, "%s", prefix);
+    (void)snprintf(c->up_path, sizeof c->up_path, "%s", (rest != NULL) ? rest : "/");
+    c->up_port      = port;
+    c->up_ch        = (uint8_t)n;
+    c->up_req_len   = strlen(c->up_req);
+    c->up_req_sent  = 0u;
+    c->up_body_off  = (req->body_len > 0u && req->body != NULL)
+                          ? (size_t)(req->body - c->rbuf)
+                          : 0u;
+    c->up_body_len  = req->body_len;
+    c->up_body_sent = 0u;
+    c->up_off       = 0u;
+    c->up_he        = 0u;
+    c->up_clen      = -1;
+    c->up_deadline_ms = iv_web_now_ms() + (uint64_t)IV_WEB_CAM_TOTAL_MS;
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return cam_err(out, cap, out_len, rsp, 502, "camera unreachable");
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+    if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0) {
+        (void)close(fd);
+        return cam_err(out, cap, out_len, rsp, 502, "camera unreachable");
+    }
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons(port);
+    /* ip_be_val 是"按大端读"的数值（0x7F000001），in_addr 要的是内存序字节 ⇒ htonl */
+    sa.sin_addr.s_addr = htonl(ip_be_val);
+
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        if (errno != EINPROGRESS) {
+            IV_LOG_W(CAM_MOD, "cam/%u: connect %s:%u failed (%s)", n, ipstr,
+                     (unsigned)port, strerror(errno));
+            (void)close(fd);
+            return cam_err(out, cap, out_len, rsp, 502, "camera unreachable");
+        }
+        c->up_fd    = fd;
+        c->up_phase = (uint8_t)IV_WEB_UP_CONNECT;
+        return IV_EAGAIN; /* 交给主循环里的 poll 等可写 */
+    }
+    c->up_fd    = fd;
+    c->up_phase = (uint8_t)IV_WEB_UP_SEND;
+    return IV_EAGAIN; /* 已连上，下一轮（或本轮末）推进发送 */
+}
+
+/* 第二段：由主循环在上游 fd 有事件（可写/可读/出错）或超时时调用。
+ * IV_EAGAIN = 还需等；IV_OK = 已填好 rsp（正文在 out 里）。 */
+int iv_web_cam_event(iv_web_ctx_t *ctx, iv_web_conn_t *c, char *out, size_t cap,
+                     size_t *out_len, iv_web_resp_t *rsp)
+{
+    int rc;
+
+    (void)ctx;
+    if (c == NULL || out == NULL || out_len == NULL || rsp == NULL)
+        return IV_EINVAL;
+    if (c->up_fd < 0 || c->up_phase == (uint8_t)IV_WEB_UP_NONE)
+        return IV_EINVAL;
+    if (iv_web_now_ms() > c->up_deadline_ms) {
+        IV_LOG_W(CAM_MOD, "cam/%u: upstream %s:%u timeout after %u ms", c->up_ch,
+                 c->up_ip, (unsigned)c->up_port, (unsigned)IV_WEB_CAM_TOTAL_MS);
+        cam_close_up(c);
+        return cam_err(out, cap, out_len, rsp, 504, "camera timeout");
+    }
+
+    if (c->up_phase == (uint8_t)IV_WEB_UP_CONNECT) {
+        int       err  = 0;
+        socklen_t elen = sizeof err;
+
+        if (getsockopt(c->up_fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0 || err != 0) {
+            IV_LOG_W(CAM_MOD, "cam/%u: connect %s:%u failed (%s)", c->up_ch, c->up_ip,
+                     (unsigned)c->up_port, strerror((err != 0) ? err : errno));
+            cam_close_up(c);
+            return cam_err(out, cap, out_len, rsp, 502, "camera unreachable");
+        }
+        c->up_phase = (uint8_t)IV_WEB_UP_SEND;
+    }
+    if (c->up_phase == (uint8_t)IV_WEB_UP_SEND) {
+        rc = cam_send_req(c);
+        if (rc == IV_EAGAIN)
+            return IV_EAGAIN;
+        if (rc != IV_OK) {
+            cam_close_up(c);
+            return cam_err(out, cap, out_len, rsp, 502, "upstream write failed");
+        }
+        c->up_phase = (uint8_t)IV_WEB_UP_RECV;
+    }
+    if (c->up_phase == (uint8_t)IV_WEB_UP_RECV)
+        return cam_recv_rsp(c, out, cap, out_len, rsp);
+    return IV_EINVAL;
 }

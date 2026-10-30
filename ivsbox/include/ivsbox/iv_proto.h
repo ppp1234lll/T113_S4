@@ -118,11 +118,17 @@ extern "C" {
 #define IV_PROTO_CMD_CFG_MODE       0xF3u /* 配置传输模式 */
 #define IV_PROTO_CMD_CFG_LOCAL_NET  0xF4u /* 配置设备 IP、网关 */
 #define IV_PROTO_CMD_CFG_REPORT_INTV 0xF5u /* 配置定时上报间隔 */
-#define IV_PROTO_CMD_CFG_FAN_TEMP   0xF6u /* 配置风扇温度阈值 */
+#define IV_PROTO_CMD_CFG_FAN_TEMP   0xF6u /* 配置风扇温度阈值（字典名；见下方 0xFA 的说明） */
 #define IV_PROTO_CMD_CFG_CAMERA     0xF7u /* 配置摄像机 IP 及连接位 */
 #define IV_PROTO_CMD_CFG_MAIN_NET   0xF8u /* 配置主网检测 IP */
 #define IV_PROTO_CMD_CFG_HUMI       0xF9u /* 配置湿度阈值 */
-#define IV_PROTO_CMD_CFG_TEMP       0xFAu /* 配置温度阈值 */
+#define IV_PROTO_CMD_CFG_TEMP       0xFAu /* 配置温度阈值（字典码） */
+/* 平台**界面上「配置温度阈值」实发的是 0xF6**（2026-10-30 10:39:40 板端真帧：
+ * `f0f0 110a 000b 2cc1 f6 … 05 14 ff ff ff fe …`，载荷 5 B ＝ 上限 1 B(0x14=20)
+ * ＋ 下限 s32 大端(0xFFFFFFFE=-2)，与界面填的「20 / -2」逐字对应；而 0xFA
+ * 平台一次都没发过）。两个码都注册到同一 handler，`pair_decode()` 按实收宽度
+ * 分派 —— 与 0xAD/0xBF 同一条教训：**字典与平台对不上时以真帧为准，
+ * 字典码保留兼容**。 */
 #define IV_PROTO_CMD_CFG_NET_DELAY  0xFEu /* 配置网络延时判断时间 */
 #define IV_PROTO_CMD_CFG_ONVIF_ACC  0xA2u /* 配置摄像机 ONVIF 账号 */
 #define IV_PROTO_CMD_CFG_DEV_NAME   0xA3u /* 设置设备名称 */

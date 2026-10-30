@@ -3282,6 +3282,7 @@ static void on_plat_threshold(const iv_proto_frame_t *f, void *arg)
  * ---------------------------------------------------------------------------
  *   len == 2 ⇒ 各 1 字节（`sign` 为真时按有符号解释：-2℃ 就是 0xFE）
  *   len == 4 ⇒ 各 2 字节大端（有符号同理）
+ *   len == 5 ⇒ **上限 1 字节 ＋ 下限 s32 大端**（0xF6 的温度阈值真帧，见下）
  *   其它     ⇒ `IV_ERANGE`
  *
  * 为什么两种都接：平台侧《指令-通用版》里这几条"配置温度/湿度阈值"**只写了
@@ -3289,6 +3290,12 @@ static void on_plat_threshold(const iv_proto_frame_t *f, void *arg)
  * 80% 用 1 字节放得下，但打包成 u16 也完全可能 —— 与其赌一种、赌错就回 0x74
  * 让平台弹"执行失败"，不如按实收长度分派，并在日志里写明这次用的是哪种。
  * 真正该拒绝的是"长度既不是 2 也不是 4"。
+ *
+ * 2026-10-30 追加 `len == 5`：平台界面「温度阈值 20 / -2」实发的 0xF6 载荷是
+ * `14 ff ff ff fe` —— 上限 1 B（0x14=20）＋ 下限 **s32 大端**（0xFFFFFFFE=-2）。
+ * 很不对称，但那是平台自己的打包方式（上限按 u8、下限按 int32，估计是为了
+ * 放下负温度），界面上填什么就发什么，逐字对得上。**别"顺手改成对称格式"**：
+ * 改完平台的温度阈值就再也配不上。
  * ------------------------------------------------------------------------- */
 static int pair_decode(const iv_proto_frame_t *f, int sign, long long v[2],
                        const char **form)
@@ -3308,6 +3315,16 @@ static int pair_decode(const iv_proto_frame_t *f, int sign, long long v[2],
         *form = "2B-be";
         v[0]  = sign ? (long long)a : (long long)(uint16_t)a;
         v[1]  = sign ? (long long)b : (long long)(uint16_t)b;
+        return IV_OK;
+    }
+    if (f->len == 5u) {
+        uint32_t raw = ((uint32_t)f->data[1] << 24) | ((uint32_t)f->data[2] << 16) |
+                       ((uint32_t)f->data[3] << 8) | (uint32_t)f->data[4];
+        int32_t  lo  = (int32_t)raw;
+
+        *form = "1B+4B-be";
+        v[0]  = sign ? (long long)(int8_t)f->data[0] : (long long)f->data[0];
+        v[1]  = sign ? (long long)lo : (long long)raw;
         return IV_OK;
     }
     return IV_ERANGE;
@@ -3908,8 +3925,15 @@ static int agent_setup(void)
     /* 平台下行 0xFA「配置温度阈值」/ 0xF9「配置湿度阈值」：两个数（上限,下限）
      * → `sensor.temp_high/low`、`sensor.humi_high/low` ＋ `apply_thresh_cfg()`
      * 把九项重新 `0xF1` 下发（否则平台改了、采集板还是旧值）。
-     * 宽度未见于文档 ⇒ `pair_decode()` 按实收字节数分派（见其头部注释）。 */
+     * 宽度未见于文档 ⇒ `pair_decode()` 按实收字节数分派（见其头部注释）。
+     *
+     * **0xF6 也注册到温度 handler**（2026-10-30 10:39:40 真帧）：平台界面上
+     * 「温度阈值」那个按钮实发的就是 0xF6，而字典把它叫"配置风扇温度阈值"、
+     * 把 0xFA 叫"配置温度阈值"—— 字典在这儿是反的，只认 0xFA 会让平台永远
+     * 弹"执行失败"（现场就是这样：0xF6 → `not implemented (5 bytes), ack 0x74`）。 */
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_TEMP,
+                         on_plat_th_pair, (void *)&TH_TEMP);
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_FAN_TEMP,
                          on_plat_th_pair, (void *)&TH_TEMP);
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_HUMI,
                          on_plat_th_pair, (void *)&TH_HUMI);

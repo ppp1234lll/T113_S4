@@ -9223,6 +9223,68 @@ if (cmd == IV_FRAME_CMD_DOOR || cmd == IV_FRAME_CMD_EVENT) {   /* 0xC1 / 0xC2 */
 * 抓拍目录固定 `IV_MEDIA_SNAP_DIR_DEFAULT`（`/mnt/sdcard/snap`）；`media_snap_dir` 仍是
   死配置（装配层从不填），改它需要同时改 `ctx->media_root` 的映射，本轮不动。
 
+== 2026-10-30 10:55 「配置温度阈值」平台实发 0xF6，不是字典里的 0xFA（载荷 1B＋s32）
+
+=== 现象
+
+平台界面「配置温度阈值」点下去弹"**执行失败**"。板端真帧（`10:39:40`）：
+
+----
+rx 26 bytes: f0f0110a000b2cc1 f6 ffffffffffffffff 05 14 ff ff ff fe 18 ffff
+downlink cmd 0xF6 not implemented (5 bytes), ack 0x74
+----
+
+同一时段湿度是另一回事：
+
+----
+10:40:06 rx …f9… 02 1e 14 …  ⇒ platform set humidity high=30 low=20 (1B, saved + 0xF1 queued)   # 成功
+10:40:43 rx …f9… 02 0a 14 …  ⇒ 0xF9 humidity reject (10,20) rc=-2, ack 0x74                        # 上下限倒置，拒得对
+----
+
+=== 根因
+
+`iv_proto.h` 按《指令-通用版》把 **0xF6 叫「配置风扇温度阈值」、0xFA 叫「配置温度阈值」**，
+而平台界面上「温度阈值」那个按钮**实发 0xF6**（0xFA 一次都没发过）。我们只注册了 0xFA
+⇒ 0xF6 落到"未注册"分支回 `0x74`。
+
+这是 0xAD/0xBF 那条教训的第二次出现：**字典与平台对不上时以真帧为准，字典码保留兼容**。
+
+=== 载荷宽度
+
+`14 ff ff ff fe` ＝ **上限 1 B（0x14=20）＋ 下限 s32 大端（0xFFFFFFFE=-2）**，
+与界面填的「20 / -2」逐字对应。不对称（上限按 u8、下限按 int32），但那就是平台的打包
+方式 —— 大概率是它为了放下负温度只把下限放宽了。`pair_decode()` 按实收宽度分派，
+新增 `len==5` 一支，日志里会把这次用的形式打出来（`1B+4B-be`）：
+
+[source,c]
+----
+if (f->len == 5u) {
+    uint32_t raw = (d[1]<<24)|(d[2]<<16)|(d[3]<<8)|d[4];
+    *form = "1B+4B-be";
+    v[0] = sign ? (long long)(int8_t)d[0] : (long long)d[0];
+    v[1] = sign ? (long long)(int32_t)raw : (long long)raw;
+    return IV_OK;
+}
+----
+
+⚠ **别"顺手改成对称格式"**：改成 2B+2B 或 1B+1B 之后，平台这边就再也配不上温度阈值了。
+
+=== 验证
+
+* `platcmd_e2e.py` 新增 C26c~C26f：发 `0xF6 14 FF FF FF FE` ⇒ ack `0x01`、
+  `sensor.temp_high=20`、`sensor.temp_low=-2`、日志含 `1B+4B-be`；
+* **反向证伪**：把 0xF6 的路由注册改成 `if (0) iv_proto_route(…)` 重编 ⇒
+  C26d/C26e/C26f 三条转红（C26e 停在 40/5＝上一次 0xFA 留下的值，证明整条链只认 0xF6），
+  还原即复绿；
+* 门禁：`platcmd_e2e` **146 PASS**、`test` **51 passed**、`asan`/`tsan`/`arm`/`analyze`
+  全 rc=0、`itest` **16 passed**。板端 `2ed66db3…` 已换版。
+
+=== 附：换板时 `Text file busy`
+
+`S65ivsboxd stop` 只停 `ivsboxd.pid` 里那个，`ivsbox_monitor.pid` 的守护进程会把 daemon
+重新拉起来（新 pid），此时 `cp` 报 `Text file busy`。正确顺序：
+`stop` → **`pidof ivsboxd` 确认为空** → `cp -f` → `start`。
+
 == 2026-10-30 10:35 上报帧内容按「发送瞬间」的事实生成（漏水现场那一帧为什么没码）
 
 === 现象

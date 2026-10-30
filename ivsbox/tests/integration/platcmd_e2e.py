@@ -899,6 +899,21 @@ def main():
             'C26b 4 B 真的解成了 40/5（实际 %r/%r）'
             % (se.get('sensor.temp_high'), se.get('sensor.temp_low')))
 
+        print('C26c 0xF6 平台真帧（「配置温度阈值」实发 0xF6，5 B ＝ 上限 1B ＋ 下限 s32 大端）')
+        start = len(logtext())
+        plat.clear()
+        plat.send(build_downlink(0xF6, bytes([20, 0xFF, 0xFF, 0xFF, 0xFE])))
+        f = plat.wait(0xF6, kind='bin')
+        chk(f is not None and f['code'] == 0x01,
+            'C26d 0xF6 ⇒ ack=0x01（**本次修的**：原来 not implemented，必回 0x74）')
+        se = cls_items('sensor')
+        chk(float(se.get('sensor.temp_high') or -1) == 20.0 and
+            float(se.get('sensor.temp_low') or 999) == -2.0,
+            'C26e 5 B 解成 20 / -2℃（实际 %r/%r）'
+            % (se.get('sensor.temp_high'), se.get('sensor.temp_low')))
+        chk(wait_log(r'platform set temperature high=20 low=-2.*1B\+4B-be', start=start)
+            is not None, 'C26f 日志写明这次按 1B+4B-be 解（不猜宽度）')
+
         print('C27 0xF9 配置湿度阈值（1 字节无符号，80 / 20%）⇒ 落 sensor.humi_*')
         plat.clear()
         plat.send(build_downlink(0xF9, bytes([80, 20])))

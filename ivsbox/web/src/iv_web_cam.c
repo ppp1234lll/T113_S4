@@ -29,9 +29,19 @@
  *   - 方法只放行 GET/POST；其余 405。
  *   - 请求头只透传 Content-Type / Cookie / Authorization（Host 由本代理按目标重写；
  *     每请求补 `Connection: close`，上游一应答完就断，不维护上游连接池）。
- *   - 响应**整体缓冲**，上限 `IV_WEB_CAM_RSP_MAX`（≈90 KB，受 wbuf 硬约束）；
- *     超限 502。**登记不承诺**：MJPEG/HTTP 长流、WebSocket 升级、插件页 ——
- *     摄像机的实时视频走 RTSP/私有流，不在本代理的职责内（§9.3 口径）。
+ *   - 响应**整体缓冲**，上限 `IV_WEB_CAM_RSP_MAX`（8 MiB，按需扩容）；
+ *     超限 502，绝不静默截断。
+ *   - **WebSocket 升级（2026-10-30 新增，实时预览的唯一通路）**：请求带
+ *     `Upgrade: websocket` 时改发 `Connection: Upgrade` 并透传
+ *     `Sec-WebSocket-Key/Version/Protocol/Extensions`；上游回 **101** 后**立刻**跳出
+ *     HTTP 解析，连接转入裸字节双向中继（相位 `IV_WEB_UP_TUNNEL`，泵在 main.c）。
+ *     理由：大华/海康的 Web3.0 预览页是 `new WebSocket("ws://host/rtspoverwebsocket")`
+ *     ＋ 前端自己解帧，**不是** MJPEG、也不是 HTTP 长流；旧实现遇到 101 只能等 8 s
+ *     预算到点回 504，视频永远起不来（现场表现＝"WEB 端视频流太慢/出不来"）。
+ *   - **仍不承诺**：MJPEG、无 Content-Length 的 HTTP 长流、需要 NPAPI/ActiveX 的
+ *     插件页（现代浏览器也装不了）。
+ *   - 超时：连接 2 s、响应总预算 8 s；**中继阶段不用这个预算**，改用
+ *     `IV_WEB_WS_IDLE_MS`（120 s 双向都无字节才收）——直播是长连接，8 s 就 504 等于没有视频。
  *   - **Location / Set-Cookie / 绝对 URL 重写**：把 `http://<ip>[:<port>]/x` 与
  *     `/x` 改写成 `/cam/<N>/x`，Cookie 的 `Path=/x` 改成 `Path=/cam/<N>/x` ——
  *     尽力而为的文本替换（只处理这一种形态；"真机兼容性不承诺"已按计划登记）。
@@ -634,6 +644,20 @@ static int cam_ensure(char **out, size_t *cap, iv_web_conn_t *c, size_t need)
     return IV_OK;
 }
 
+/* 101 到手 ⇒ 转入裸字节中继。
+ * **必须把 up_off 全部带走**：摄像机常在一次 read 里把 101 头和首帧一起吐出来，
+ * 只交头就等于丢首帧（画面停在 loading）。调用方原样发给客户端，不许再拼 HTTP 头
+ * （给 101 补 Content-Length/Connection 会让握手当场作废）。 */
+static int cam_tunnel_start(iv_web_conn_t *c, size_t *out_len)
+{
+    c->up_phase       = (uint8_t)IV_WEB_UP_TUNNEL;
+    c->up_deadline_ms = iv_web_now_ms() + (uint64_t)IV_WEB_WS_IDLE_MS;
+    *out_len          = c->up_off;
+    IV_LOG_I(CAM_MOD, "cam/%u: %s:%u %s -> 101 websocket (%zu B buffered, relay starts)",
+             (unsigned)c->up_ch, c->up_ip, (unsigned)c->up_port, c->up_path, c->up_off);
+    return IV_WEB_CAM_TUNNEL;
+}
+
 /* 收上游响应：一直读到 EAGAIN（返回 IV_EAGAIN 让主循环继续轮）、收满、EOF 或超预算。 */
 static int cam_recv_rsp(iv_web_conn_t *c, char *out, size_t cap, size_t *out_len,
                         iv_web_resp_t *rsp)
@@ -660,6 +684,11 @@ static int cam_recv_rsp(iv_web_conn_t *c, char *out, size_t cap, size_t *out_len
 
             if (h != 0u) {
                 c->up_he   = h;
+                /* ① 101 Switching Protocols：**没有 Content-Length**，等下去只会等到
+                 * 8 s 预算到点回 504（2026-10-30 实测就是这条把直播打死）。 */
+                if (c->up_ws != 0 && h >= 12u && strncmp(out, "HTTP/1.", 7) == 0 &&
+                    memcmp(out + 9, "101", 3u) == 0)
+                    return cam_tunnel_start(c, out_len);
                 c->up_clen = hdr_clen_bounded(out, h);
                 /* 声明的正文放不下 ⇒ 先扩容再继续收，而不是等收满丢掉 */
                 if (c->up_clen > 0) {
@@ -753,17 +782,30 @@ int iv_web_cam_begin(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_ch
         return cam_err(out, cap, out_len, rsp, 502, "refused");
     }
 
-    /* ③ 拼上游请求（头白名单 + Connection: close），存进 conn 供分轮次发送 */
+    /* ②' 升级请求？（大华/海康的**实时预览**都走 WebSocket：
+     * `/rtspoverwebsocket`、`/httpprivateoverwebsocket`。）只有客户端明确要升，
+     * 我们才换握手头；普通页面资源一律照旧 `Connection: close`。 */
+    c->up_ws     = (strcasestr(req->upgrade, "websocket") != NULL) ? 1u : 0u;
+    c->ws_on     = 0u;
+    c->ws_ul_len = 0u;
+    c->ws_ul_sent = 0u;
+    c->ws_dl_len = 0u;
+    c->ws_dl_sent = 0u;
+
+    /* ③ 拼上游请求（头白名单 ＋ WebSocket 握手头），存进 conn 供分轮次发送 */
     {
         int w = snprintf(c->up_req, sizeof c->up_req,
                          "%s %s%s%s HTTP/1.1\r\n"
                          "Host: %s\r\n"
-                         "Connection: close\r\n"
+                         "%s"
                          "User-Agent: ivsbox-web-cam\r\n"
                          "%s%s%s%s%s%s",
                          req->method, rest,
                          (req->query[0] != '\0') ? "?" : "", req->query,
                          ipstr,
+                         /* 升级请求**绝不能**带 `Connection: close`：那是让摄像机
+                          * 在应答完就断，101 之后还怎么中继帧。 */
+                         (c->up_ws != 0) ? "Connection: Upgrade\r\n" : "Connection: close\r\n",
                          (req->ctype[0] != '\0') ? "Content-Type: " : "",
                          req->ctype,
                          (req->ctype[0] != '\0') ? "\r\n" : "",
@@ -771,12 +813,34 @@ int iv_web_cam_begin(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_ch
                          req->cookie_raw,
                          (req->cookie_raw[0] != '\0') ? "\r\n" : "");
 
-        if (w < 0 || (size_t)w >= sizeof c->up_req - 64u)
+        if (w < 0 || (size_t)w >= sizeof c->up_req - 128u)
             return cam_err(out, cap, out_len, rsp, 400, "request too long");
         if (req->auth[0] != '\0') {
             (void)snprintf(c->up_req + strlen(c->up_req),
                            sizeof c->up_req - strlen(c->up_req),
                            "Authorization: %s\r\n", req->auth);
+        }
+        /* 握手四件套原样透传（key 缺了摄像机回 400；protocol/extensions 缺了
+         * 前端与摄像机对帧格式的协商会不一致）。版本缺省补 13。 */
+        if (c->up_ws != 0) {
+            (void)snprintf(c->up_req + strlen(c->up_req),
+                           sizeof c->up_req - strlen(c->up_req),
+                           "Upgrade: %s\r\n"
+                           "Sec-WebSocket-Version: %s\r\n"
+                           "Sec-WebSocket-Key: %s\r\n",
+                           (req->upgrade[0] != '\0') ? req->upgrade : "websocket",
+                           (req->ws_ver[0] != '\0') ? req->ws_ver : "13",
+                           req->ws_key);
+            if (req->ws_proto[0] != '\0') {
+                (void)snprintf(c->up_req + strlen(c->up_req),
+                               sizeof c->up_req - strlen(c->up_req),
+                               "Sec-WebSocket-Protocol: %s\r\n", req->ws_proto);
+            }
+            if (req->ws_ext[0] != '\0') {
+                (void)snprintf(c->up_req + strlen(c->up_req),
+                               sizeof c->up_req - strlen(c->up_req),
+                               "Sec-WebSocket-Extensions: %s\r\n", req->ws_ext);
+            }
         }
         if (req->body_len > 0u) {
             (void)snprintf(c->up_req + strlen(c->up_req),
@@ -848,6 +912,9 @@ int iv_web_cam_event(iv_web_ctx_t *ctx, iv_web_conn_t *c, char *out, size_t cap,
         return IV_EINVAL;
     if (c->up_fd < 0 || c->up_phase == (uint8_t)IV_WEB_UP_NONE)
         return IV_EINVAL;
+    /* 中继阶段归 main.c 的 ws 泵推进；这里不参与，更不能按 8 s 预算 504。 */
+    if (c->up_phase == (uint8_t)IV_WEB_UP_TUNNEL)
+        return IV_EAGAIN;
     if (iv_web_now_ms() > c->up_deadline_ms) {
         IV_LOG_W(CAM_MOD, "cam/%u: upstream %s:%u timeout after %u ms", c->up_ch,
                  c->up_ip, (unsigned)c->up_port, (unsigned)IV_WEB_CAM_TOTAL_MS);

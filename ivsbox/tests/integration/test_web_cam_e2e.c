@@ -183,6 +183,41 @@ static int exchange(int port, const char *req, size_t len)
     return (int)total;
 }
 
+/* 在 ms 内收字节直到 buf 里出现 needle（needle 为 NULL 则收到超时/断开为止）。
+ * WS 连接**永远不关**，所以不能用 exchange()（它等 EOF，只能等到超时）。
+ * 调用方应先把该 fd 的 SO_RCVTIMEO 调小（如 200 ms），本函数按单调时钟兜底。 */
+static size_t recv_until(int fd, const char *needle, char *buf, size_t cap, int ms)
+{
+    struct timespec t0;
+    struct timespec t1;
+    size_t          used = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    buf[0] = '\0';
+    for (;;) {
+        ssize_t n;
+        long    elapsed;
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        elapsed = (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+        if (elapsed >= (long)ms || used + 1u >= cap)
+            break;
+        n = recv(fd, buf + used, cap - 1u - used, 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                continue;
+            break;
+        }
+        if (n == 0)
+            break;
+        used += (size_t)n;
+        buf[used] = '\0';
+        if (needle != NULL && strstr(buf, needle) != NULL)
+            break;
+    }
+    return used;
+}
+
 static int rsp_status(void)
 {
     const char *sp;
@@ -612,6 +647,36 @@ static void fake_camera_conn(int cfd)
 
             send_all(cfd, rsp, (size_t)w);
             send_all(cfd, bin, sizeof bin);
+            (void)close(cfd);
+            return;
+        } else if (strcmp(path, "/ws") == 0) {
+            /* 最小 WebSocket 服务端（2026-10-30）。真机行为对齐大华 108 的
+             * `/rtspoverwebsocket`：回 101 之后**立刻**吐首帧（摄像机常把 101 与
+             * 首帧放在同一次 write 里），之后把客户端发来的字节原样回显。
+             * c20 用它钉三件事：101 原样透传、跟 101 一起到的字节不许丢、
+             * 双向中继真的通。 */
+            const char *key = strcasestr(rbuf, "Sec-WebSocket-Key:");
+            char        accept[64] = "-";
+            char        out[256];
+            int         w;
+
+            if (key != NULL)
+                (void)sscanf(key, "Sec-WebSocket-Key: %63[^\r]", accept);
+            w = snprintf(out, sizeof out,
+                         "HTTP/1.1 101 Switching Protocols\r\n"
+                         "Upgrade: WebSocket\r\n"
+                         "Connection: Upgrade\r\n"
+                         "Sec-WebSocket-Accept: %s\r\n\r\n"
+                         "FRAME0", accept);
+            send_all(cfd, out, (size_t)w);
+            for (;;) {
+                char    eb[512];
+                ssize_t r = recv(cfd, eb, sizeof eb, 0);
+
+                if (r <= 0)
+                    break;
+                send_all(cfd, eb, (size_t)r);
+            }
             (void)close(cfd);
             return;
         } else {
@@ -1108,6 +1173,56 @@ int main(int argc, char *argv[])
         chk(ms < 1000L, msg);
     }
 
+    /* ---------------- c20 WebSocket 透传（实时预览的唯一通路） ----------------
+     * 2026-10-30 现场：隧道里打开大华 108 的预览页，画面永远起不来。直连摄像机
+     * `GET /rtspoverwebsocket` 回 `101 Switching Protocols`，过反代却是
+     * **504 "camera timeout"** —— 101 没有 Content-Length，旧实现只能等 8 s 预算到点。
+     * 大华的预览流就架在这条 WS 上（`jsCore/h5player.js` 里 /rtspoverwebsocket、
+     * /httpprivateoverwebsocket），所以"视频慢/出不来"其实是"WS 根本不通"。
+     * 反向证伪：把 cam_recv_rsp() 里的 101 分支去掉，c20b 立刻退回 504。 */
+    {
+        int fd = connect_retry(g_cam_lport);
+
+        chk(fd >= 0, "c20a: dedicated port accepts the upgrade connection");
+        if (fd >= 0) {
+            struct timeval tv;
+            char           hs[256];
+            char           got[1024];
+            int            n;
+            size_t         r;
+
+            tv.tv_sec  = 0;
+            tv.tv_usec = 200000; /* 200 ms：recv_until 自己按单调时钟兜底 */
+            (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+            n = snprintf(hs, sizeof hs,
+                         "GET /ws HTTP/1.1\r\nHost: x\r\n"
+                         "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                         "Sec-WebSocket-Version: 13\r\n"
+                         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+            send_all(fd, hs, (size_t)n);
+
+            r = recv_until(fd, "FRAME0", got, sizeof got, 3000);
+            chk(r > 0 && strncmp(got, "HTTP/1.1 101", 12) == 0,
+                "c20b: 101 Switching Protocols passed through (was 504 camera timeout)");
+            chk(strstr(got, "Sec-WebSocket-Accept:") != NULL,
+                "c20c: Sec-WebSocket-Accept preserved verbatim");
+            chk(strstr(got, "FRAME0") != NULL,
+                "c20d: bytes arriving with the 101 are delivered (first frame not dropped)");
+
+            /* 双向：客户端发什么，摄像机回显什么，必须原样回到浏览器 */
+            send_all(fd, "PING123", 7u);
+            r = recv_until(fd, "PING123", got, sizeof got, 3000);
+            chk(r > 0 && strstr(got, "PING123") != NULL,
+                "c20e: client->camera bytes relayed and echoed back");
+
+            /* 再等一会儿：中继阶段**不能**被 8 s 响应预算掐掉（旧的 504 逻辑） */
+            r = recv_until(fd, NULL, got, sizeof got, 1200);
+            chk(strstr(got, "504") == NULL, "c20f: relay is not killed by the 8 s budget");
+            (void)close(fd);
+        }
+    }
+
     cleanup();
     if (g_fail != 0) {
         fprintf(stderr, "test_web_cam_e2e FAILED (%d checks)\n", g_fail);
@@ -1116,6 +1231,7 @@ int main(int argc, char *argv[])
 
     printf("test_web_cam_e2e passed (route isolation, proxy+rewrites, header/body "
            "passthrough, 502 paths, loopback guard, fd stability, no-EOF upstream, "
-           "binary body, big text body, concurrency: no 503 + overlapping upstreams)\n");
+           "binary body, big text body, concurrency: no 503 + overlapping upstreams, "
+           "websocket upgrade relay)\n");
     return 0;
 }

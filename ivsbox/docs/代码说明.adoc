@@ -10887,3 +10887,88 @@ fi
 * 上游连接**不复用**（每请求一个 `Connection: close`）。摄像机的 keep-alive 支持情况
   各家不一，做了反而要在"半关连接"上再写一堆判据；目前的瓶颈已经不在握手。
 * 反代**不转发 `Referer` / `Accept-Language`**（沿用窄转发面），上游若按语言协商会给默认值。
+== 2026-10-30 09:32 直播不是 HTTP 长流：WebSocket 透传（"视频流太慢"的真因）
+
+=== 现象
+
+用户："**WEB 端的视频流太慢**，Go 版本可以看视频流，只是稍快"，并提议"换个内网穿透方案"。
+
+把它拆成可测的命题，第一条就翻了：
+
+[source,text]
+----
+直连摄像机  GET http://192.168.1.108/rtspoverwebsocket  (Upgrade: websocket)
+            -> HTTP/1.1 101 Switching Protocols
+经反代      GET http://127.0.0.1:9183/rtspoverwebsocket
+            -> HTTP/1.1 504 camera timeout      # 8 s 预算到点
+----
+
+所以不是"慢"，是**流根本没建立**。前端拿不到流就只能退化成抓拍/重连，观感才是"卡"。
+
+=== 直播到底走什么
+
+大华 Web3.0 的 `jsCore/h5player.js` 里同时出现：
+
+* `/rtspoverwebsocket`、`/httpprivateoverwebsocket` —— **WebSocket**，RTSP/私有帧塞在
+  WS 帧里由前端自己解；
+* `/cam/realmonitor?channel=`（RTSP 路径）、`/cgi-bin/Snapshot.cgi`（抓拍）、
+  `/RPC2_DownloadRootCert/RootCert.cer`。
+
+也就是说：**既不是 MJPEG，也不是 HTTP 长流，更不是插件**。旧实现对这三者的判断里，
+唯一没做的那一条恰好是直播用的那一条（文件头当时写的正是"WebSocket 升级不在本代理
+职责内"）。这也解释了为什么"换成别的内网穿透"不会有任何改善 —— 卡在反代，不在隧道。
+
+=== 改法：握手透传 ＋ 101 之后转裸字节中继
+
+. **握手**：请求带 `Upgrade: websocket` ⇒ 上游请求改 `Connection: Upgrade`，并原样带
+  `Upgrade` / `Sec-WebSocket-Version`（缺省补 13）/ `Sec-WebSocket-Key` /
+  `Sec-WebSocket-Protocol` / `Sec-WebSocket-Extensions`。**key 一个都不能少**：摄像机按它
+  算 `Sec-WebSocket-Accept`，缺了直接 400。
+. **101 立刻收手**：`cam_recv_rsp()` 认出头区、状态行是 101，就 `cam_tunnel_start()`，
+  相位切 `IV_WEB_UP_TUNNEL`，把"101 头 ＋ 同一 read 里已经跟到的首帧"整块交出去
+  **原样下发**。绝不能走 `build_response()` —— 它会补 `Content-Length` / `Connection: close`，
+  握手当场作废。
+. **双向中继带背压**：上游→客户端用 `wbuf`（101 头已在前部），客户端→上游复用 `rbuf`
+  （请求已解析完）。某方向有欠账就**不再从对应源读**；poll 注册也按欠账算 ——
+  欠客户端只等 `POLLOUT`、欠上游就不读上游。两个方向都是**电平触发**，不这么写就是
+  100% CPU 空转。
+. **超时口径分开**：中继阶段不用 8 s 响应预算（那等于每 8 s 掐一次视频），改用
+  `IV_WEB_WS_IDLE_MS`＝120 s"双向都没字节"。收尾打一条带字节数的日志：
+  `cam/2 ws closed (client closed): up 161 B, down 0 B in 5903 ms`。
+
+=== 现场判据（比"看着卡不卡"可靠）
+
+[source,text]
+----
+grep 'ws closed' /mnt/UDISK/log/<日期>/<小时>.log
+----
+
+* `up` 侧 0 B ⇒ 摄像机一帧都没吐（账号/通道/码流类型问题，不在代理）；
+* 几十 KB/s ⇒ 只拿到子码流；
+* 几百 KB/s 以上 ⇒ 主码流，代理这一侧没问题。
+* 出现 `camera eof` 而浏览器还在等 ⇒ 摄像机主动断流（会话被顶掉、通道被占）。
+
+=== 验证
+
+* `test_web_cam_e2e` 新增 **c20**（六条）：101 透传、`Sec-WebSocket-Accept` 原样、
+  跟 101 一起到的 `FRAME0` 不丢、客户端→摄像机→客户端双向回显、不被 8 s 预算掐掉。
+  假摄像机的 `/ws` 复刻真机行为（101 后同一次 `write` 里就带首帧）。WS 永不 EOF，
+  所以测试里不能用 `exchange()`，另写了 `recv_until()`。
+* **反向证伪**：把 101 判据里的 `"101"` 改成 `"nope"` ⇒ c20b/c20c/c20d/c20e 四条转红
+  （回落成 504），还原即复绿。
+* **真机**（板端 `e2b46a2e…`）：经反代的 `GET /rtspoverwebsocket` 由
+  `504 camera timeout` 变为 `101 Switching Protocols` ＋ Accept 正确；板端日志
+  `101 websocket (161 B buffered, relay starts)` / `ws closed … up 161 B …`
+  （未发 RTSP 请求时摄像机本就不吐帧，0 B 是预期的）。
+* 门禁：`make host` / `make arm` 0 error 0 warning；`make test` 51 passed；
+  ASan+UBSan 单独构建的 `ivsbox-web` 跑同一套 e2e 无报错。
+
+=== 已知边界
+
+* 中继**不做帧解析**（不去看 WS 的 opcode/mask），只搬字节。这是刻意的：摄像机的
+  私有帧格式各家不同，解析等于把兼容性绑死在某一版固件上。
+* `Sec-WebSocket-Extensions`（permessage-deflate）原样透传，压缩由摄像机与浏览器协商，
+  代理既不参与也不解压 —— 代价是 CPU 省了，收益是永远不会把帧边界弄坏。
+* 一路摄像机同时只该有一条直播 WS（页面切码流时会先断开旧的）。代理层不做限制：
+  多开几条就是在 24 个槽位里各占一条，内存与带宽都按真实用量走。
+* 中继连接**不参与 `--media-bps` 限速**：限速是给录像下载的，给直播加限速就是自己造卡顿。

@@ -189,8 +189,21 @@ typedef enum {
     IV_WEB_UP_NONE = 0,
     IV_WEB_UP_CONNECT,  /* 非阻塞 connect 进行中 */
     IV_WEB_UP_SEND,     /* 发请求头 / POST 体 */
-    IV_WEB_UP_RECV      /* 收上游响应（收满 Content-Length 或 EOF 即收工） */
+    IV_WEB_UP_RECV,     /* 收上游响应（收满 Content-Length 或 EOF 即收工） */
+    IV_WEB_UP_TUNNEL    /* 101 已到手：不再解析 HTTP，裸字节双向中继 */
 } iv_web_up_phase_t;
+
+/* `iv_web_cam_event()` 的特例返回：**上游刚升到 WebSocket（101）**。
+ * 此时 `*out_len` 是 out 里已有的原始字节（101 头 ＋ 可能已经跟着到的若干帧），
+ * 调用方要把它原样发给客户端，然后把连接交给 WS 中继，**不能**走
+ * `build_response()` —— 那会给 101 补上 Content-Length/Connection: close，
+ * 握手当场作废。用正数是为了与 IV_OK(0)/IV_EAGAIN(-4) 这类负码彻底分开。 */
+#define IV_WEB_CAM_TUNNEL 4096
+
+/* WS 中继的空闲上限（毫秒）。**不能用 8 s 的响应总预算**：直播是一路长连接，
+ * 8 s 到点就 504，视频永远起不来。这里只兜"两端都没字节"的情况（摄像机异常
+ * 掉线、浏览器关了页面而 FIN 没到）。 */
+#define IV_WEB_WS_IDLE_MS 120000u
 
 /* --------------------------------------------------------------------------
  * 连接
@@ -238,6 +251,8 @@ typedef struct {
      * poll，等待期间主循环照常服务其它连接 ⇒ 多个上游请求天然重叠。 */
     int      up_fd;          /* -1 = 当前没在代理 */
     uint8_t  up_phase;       /* iv_web_up_phase_t */
+    uint8_t  up_ws;          /* 1 = 请求带 Upgrade: websocket（可能要升到中继） */
+    uint8_t  ws_on;          /* 1 = 上游回了 101，本连接已是裸字节中继 */
     uint8_t  up_ch;          /* 路号（日志用） */
     uint16_t up_port;        /* 上游端口（绝对 URL 改写用） */
     size_t   up_req_len;     /* 待发请求头长度 */
@@ -249,6 +264,24 @@ typedef struct {
     size_t   up_he;          /* 上游响应头区长度；0 = 还没收齐 */
     long     up_clen;        /* 上游声明的 Content-Length；-1 = 无该头 */
     uint64_t up_deadline_ms; /* 本次代理的总预算（单调时钟） */
+
+    /* ---- WebSocket 裸字节中继（2026-10-30；直播预览走的就是这条路）----
+     * 大华 Web3.0 的预览页用 `new WebSocket("ws://<host>/rtspoverwebsocket")` 拉流
+     * （实证：`jsCore/h5player.js` 里同时出现 `/rtspoverwebsocket`、
+     * `/httpprivateoverwebsocket`、`/cam/realmonitor?channel=`、`/cgi-bin/Snapshot.cgi`），
+     * RTSP/私有帧塞在 WS 帧里由前端自己解。**HTTP 代理一遇到 101 就只能回 504**
+     * （2026-10-30 实测：直连 101、过反代 504 "camera timeout"）⇒ 视频永远只能退化成
+     * 抓拍/重连，用户看到的就是"WEB 端视频流太慢"。
+     * 中继是**双向、带背压**的：某方向有欠账就不读该方向的源，绝不无界缓存。 */
+    size_t   ws_ul_len;      /* 上游→客户端 待发字节（缓冲＝wbuf） */
+    size_t   ws_ul_sent;
+    size_t   ws_dl_len;      /* 客户端→上游 待发字节（缓冲＝rbuf，请求已解析完，空着） */
+    size_t   ws_dl_sent;
+    /* 累计搬运字节（收连接时打一条日志）：现场"视频卡不卡"第一手判据就是它 ——
+     * up 侧每秒长多少字节，等于摄像机实际推了多少码率过来。 */
+    uint64_t ws_ul_bytes;
+    uint64_t ws_dl_bytes;
+    uint64_t ws_start_ms;    /* 中继开始时刻（算平均码率用） */
     char     up_ip[24];
     char     up_prefix[16];
     char     up_path[192];   /* 上游路径（只用于日志） */
@@ -269,6 +302,15 @@ typedef struct {
     char    cookie_raw[256];          /* Cookie 头原文（无则空串；token 只取 ivs_sid） */
     char    auth[160];                /* Authorization（无则空串；浏览器对摄像机的
                                          Basic 认证经此透传，**不是**配置里的凭据） */
+    /* 2026-10-30：WebSocket 握手要透传的四个头。**不能只转 Upgrade** ——
+     * 摄像机侧的 101 里 `Sec-WebSocket-Accept` 是按 `Sec-WebSocket-Key` 算的，
+     * 少转一个 key 摄像机直接回 400；协议子协议/extensions 也要原样带过去，
+     * 否则前端与摄像机协商出的帧格式会对不上（压缩位尤其）。 */
+    char    upgrade[24];              /* Upgrade 头（"websocket"；无则空串） */
+    char    ws_key[48];               /* Sec-WebSocket-Key */
+    char    ws_ver[8];                /* Sec-WebSocket-Version */
+    char    ws_proto[80];             /* Sec-WebSocket-Protocol */
+    char    ws_ext[128];              /* Sec-WebSocket-Extensions */
     char   *body;                     /* 指向 conn->rbuf 内的体 */
     size_t  body_len;
 } iv_web_req_t;
@@ -445,7 +487,9 @@ int iv_web_ota_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
 /* 三段式：begin 发起（可能当场就有应答，也可能是 IV_EAGAIN＝等上游事件），
  * event 由主循环在上游 fd 可读写/超时时推进，abort 在连接关闭时收尾（关上游 fd）。
  * 为什么拆开：见上面 iv_web_conn_t::up_fd 的注释。
- * 三者的 `out`/`cap` 一律是"正文落点"（＝ c->wbuf + RSP_HEAD_OFF）。 */
+ * 三者的 `out`/`cap` 一律是"正文落点"（＝ c->wbuf + RSP_HEAD_OFF）。
+ * 特别地 `iv_web_cam_event()` 可能返回 **IV_WEB_CAM_TUNNEL**：上游刚回 101，
+ * `*out_len` 是 out 里已有的原始字节，调用方原样发给客户端后把连接交给 WS 中继。 */
 int iv_web_cam_begin(iv_web_ctx_t *ctx, const iv_web_req_t *req, unsigned cam_ch,
                      iv_web_conn_t *c, char *out, size_t cap, size_t *out_len,
                      iv_web_resp_t *rsp);

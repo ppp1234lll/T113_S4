@@ -322,6 +322,18 @@ static int parse_req(iv_web_conn_t *c, iv_web_req_t *req)
             }
         } else if (strncasecmp(line, "Authorization:", 14) == 0) {
             hdr_value(line + 14, req->auth, sizeof(req->auth));
+        } else if (strncasecmp(line, "Upgrade:", 8) == 0) {
+            /* 2026-10-30：摄像机直播走 WebSocket（/rtspoverwebsocket），
+             * 这里只把握手要用的头抄下来，转发与 101 判定在 iv_web_cam.c。 */
+            hdr_value(line + 8, req->upgrade, sizeof(req->upgrade));
+        } else if (strncasecmp(line, "Sec-WebSocket-Key:", 18) == 0) {
+            hdr_value(line + 18, req->ws_key, sizeof(req->ws_key));
+        } else if (strncasecmp(line, "Sec-WebSocket-Version:", 22) == 0) {
+            hdr_value(line + 22, req->ws_ver, sizeof(req->ws_ver));
+        } else if (strncasecmp(line, "Sec-WebSocket-Protocol:", 23) == 0) {
+            hdr_value(line + 23, req->ws_proto, sizeof(req->ws_proto));
+        } else if (strncasecmp(line, "Sec-WebSocket-Extensions:", 25) == 0) {
+            hdr_value(line + 25, req->ws_ext, sizeof(req->ws_ext));
         }
         p = e + 2;
     }
@@ -636,6 +648,163 @@ static void on_writable(int slot)
         conn_close(slot);
 }
 
+/* --------------------------------------------------------------------------
+ * WebSocket 中继（2026-10-30）
+ *
+ * 上游回 101 之后，这条连接上再没有 HTTP 语义：两个方向都是裸字节（RTSP/私有帧
+ * 塞在 WS 帧里，由摄像机页面的前端自己解）。缓冲分工：
+ *   上游→客户端 ＝ wbuf（101 头已经在前部，够大；按需扩容过就更大）
+ *   客户端→上游 ＝ rbuf（请求已解析完，36 KiB 一直空着 —— 复用不额外占内存）
+ * **带背压**：某方向有欠账就不再从对应源读。绝不无界堆积 —— 板子只有 220 MiB，
+ * 一次 4G 抖动就能把"无脑缓存"的写法吃死。
+ * -------------------------------------------------------------------------- */
+/* 中继连接收尾：**先打一条带字节数的日志再关**。现场"视频卡不卡"看的就是
+ * up 侧平均码率：0 B ⇒ 摄像机一直没吐帧（问题在摄像机/账号/通道）；
+ * 几十 KB/s ⇒ 只在发子码流；几百 KB/s 才是主码流。没有这条日志就只能猜。 */
+static void ws_close(int slot, const char *why)
+{
+    iv_web_conn_t *c = &g_conn[slot];
+    uint64_t       ms = (c->ws_start_ms != 0u) ? (iv_web_now_ms() - c->ws_start_ms) : 0u;
+
+    IV_LOG_I(WEB_MOD,
+             "cam/%u ws closed (%s): up %llu B, down %llu B in %llu ms (%llu B/s)",
+             (unsigned)c->up_ch, why, (unsigned long long)c->ws_ul_bytes,
+             (unsigned long long)c->ws_dl_bytes, (unsigned long long)ms,
+             (unsigned long long)((ms > 0u) ? (c->ws_ul_bytes * 1000u / ms) : 0u));
+    conn_close(slot);
+}
+
+/* 把欠客户端的字节发出去。1 = 已清空（可以继续读上游）；0 = 客户端还没吃下；-1 = 已关连接 */
+static int ws_flush_ul(int slot)
+{
+    iv_web_conn_t *c = &g_conn[slot];
+
+    while (c->ws_ul_sent < c->ws_ul_len) {
+        ssize_t n = send(c->fd, c->wbuf + c->ws_ul_sent, c->ws_ul_len - c->ws_ul_sent,
+                         MSG_NOSIGNAL);
+
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+                return 0;
+            ws_close(slot, "client gone");
+            return -1;
+        }
+        c->ws_ul_sent += (size_t)n;
+        c->ws_ul_bytes += (uint64_t)n;
+        c->last_ms = iv_web_now_ms();
+    }
+    c->ws_ul_len  = 0u;
+    c->ws_ul_sent = 0u;
+    return 1;
+}
+
+/* 把欠上游的字节发出去。返回值同上。 */
+static int ws_flush_dl(int slot)
+{
+    iv_web_conn_t *c = &g_conn[slot];
+
+    while (c->ws_dl_sent < c->ws_dl_len) {
+        ssize_t n = send(c->up_fd, c->rbuf + c->ws_dl_sent, c->ws_dl_len - c->ws_dl_sent,
+                         MSG_NOSIGNAL);
+
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+                return 0;
+            ws_close(slot, "camera gone");
+            return -1;
+        }
+        c->ws_dl_sent += (size_t)n;
+        c->ws_dl_bytes += (uint64_t)n;
+        c->last_ms = iv_web_now_ms();
+    }
+    c->ws_dl_len  = 0u;
+    c->ws_dl_sent = 0u;
+    return 1;
+}
+
+/* 上游可读：取一段推给客户端 */
+static void ws_pump_up(int slot)
+{
+    iv_web_conn_t *c = &g_conn[slot];
+    ssize_t        r;
+
+    if (ws_flush_ul(slot) != 1)
+        return;                              /* 客户端还没吃下：先别读，背压 */
+    if (c->wcap == 0u)
+        return;
+    r = recv(c->up_fd, c->wbuf, c->wcap, 0);
+    if (r == 0) {
+        ws_close(slot, "camera eof");         /* 摄像机收流结束 */
+        return;
+    }
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            return;
+        ws_close(slot, "camera read error");
+        return;
+    }
+    c->ws_ul_len  = (size_t)r;
+    c->ws_ul_sent = 0u;
+    c->last_ms    = iv_web_now_ms();
+    (void)ws_flush_ul(slot);
+}
+
+/* 客户端可读：取一段推给摄像机（WS 控制帧、RTSP 请求、心跳） */
+static void ws_pump_dl(int slot)
+{
+    iv_web_conn_t *c = &g_conn[slot];
+    ssize_t        r;
+
+    if (ws_flush_dl(slot) != 1)
+        return;
+    r = recv(c->fd, c->rbuf, sizeof(c->rbuf) - 1u, 0);
+    if (r == 0) {
+        ws_close(slot, "client closed");     /* 浏览器关页面/刷新 */
+        return;
+    }
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            return;
+        ws_close(slot, "client read error");
+        return;
+    }
+    c->ws_dl_len  = (size_t)r;
+    c->ws_dl_sent = 0u;
+    c->last_ms    = iv_web_now_ms();
+    (void)ws_flush_dl(slot);
+}
+
+/* ws 连接的事件分发。from_up 区分是哪一端的 fd 报了事件。 */
+static void ws_event(int slot, short revents, int from_up)
+{
+    iv_web_conn_t *c = &g_conn[slot];
+
+    if (c->fd < 0)
+        return;
+    if (revents & (POLLERR | POLLNVAL)) {
+        ws_close(slot, "poll error");
+        return;
+    }
+    if (from_up != 0) {
+        if (revents & POLLIN)
+            ws_pump_up(slot);
+        if (g_conn[slot].fd >= 0 && (revents & POLLOUT) &&
+            g_conn[slot].ws_dl_sent < g_conn[slot].ws_dl_len)
+            (void)ws_flush_dl(slot);
+        /* POLLHUP 但没数据可读 ＝ 上游真的断了（数据还没读完时不能断，见 ws_pump_up） */
+        if (g_conn[slot].fd >= 0 && (revents & POLLHUP) && !(revents & POLLIN))
+            ws_close(slot, "camera hup");
+        return;
+    }
+    if (revents & POLLIN)
+        ws_pump_dl(slot);
+    if (g_conn[slot].fd >= 0 && (revents & POLLOUT) &&
+        g_conn[slot].ws_ul_sent < g_conn[slot].ws_ul_len)
+        (void)ws_flush_ul(slot);
+    if (g_conn[slot].fd >= 0 && (revents & POLLHUP) && !(revents & POLLIN))
+        ws_close(slot, "client hup");
+}
+
 /* S8.5：反代上游事件。上游 fd 与客户端 fd 挂在同一个 poll 里 —— 等摄像机的
  * 这段时间主循环照常服务其它连接，这就是"设置页不再转圈"的全部秘密。
  * 收工后立刻 build_response，下一轮 POLLOUT 把响应发给客户端。 */
@@ -659,6 +828,23 @@ static void on_upstream(int slot)
     (void)snprintf(rsp.ctype, sizeof rsp.ctype, "application/json");
 
     rc = iv_web_cam_event(&g_ctx, c, body, body_cap, &body_len, &rsp);
+    if (rc == IV_WEB_CAM_TUNNEL) {
+        /* 101：body 里是"101 头 ＋ 可能已经跟着到的首帧"的原始字节，**原样**发出去。
+         * 绝不能走 build_response —— 它会补 Content-Length/Connection: close，
+         * 握手当场作废（客户端看到的就是"连上又立刻断流"）。 */
+        if (body_len > 0u)
+            memmove(c->wbuf, body, body_len);
+        /* 交给中继泵（ws_ul_*），**不是** wlen/wsent —— 后者是 http 层的记账，
+         * 中继阶段一个字节都不会再走 build_response/on_writable。 */
+        c->ws_ul_len  = body_len;
+        c->ws_ul_sent = 0u;
+        c->wlen       = 0u;
+        c->wsent      = 0u;
+        c->ws_on      = 1u;
+        c->ws_start_ms = iv_web_now_ms();
+        c->last_ms    = c->ws_start_ms;
+        return;
+    }
     if (rc == IV_EAGAIN) {
         c->last_ms = iv_web_now_ms(); /* 还在路上：别让空闲回收把连接掐了 */
         return;
@@ -1027,6 +1213,22 @@ int main(int argc, char *argv[])
 
             if (g_conn[i].fd < 0)
                 continue;
+            /* WS 中继：欠客户端字节 ⇒ 等 POLLOUT；欠上游字节（还没推完）⇒ 客户端这侧
+             * 先别读（背压）；都空着才等 POLLIN。 */
+            if (g_conn[i].ws_on != 0) {
+                short ev = 0;
+
+                if (g_conn[i].ws_ul_sent < g_conn[i].ws_ul_len)
+                    ev = (short)(ev | POLLOUT);
+                if (g_conn[i].ws_dl_sent >= g_conn[i].ws_dl_len)
+                    ev = (short)(ev | POLLIN);
+                pf[nfds].fd      = g_conn[i].fd;
+                pf[nfds].events  = ev;
+                pf[nfds].revents = 0;
+                map[nfds] = i;
+                nfds++;
+                continue;
+            }
             /* S6.4：还欠客户端字节 = 响应头没发完，或文件体还没收尾。 */
             pending = (g_conn[i].wsent < g_conn[i].wlen) || (g_conn[i].send_fd >= 0);
             /* 限速配额用尽：本轮**不注册 POLLOUT**（POLLOUT 电平触发会立刻再报，
@@ -1056,6 +1258,22 @@ int main(int argc, char *argv[])
         for (i = 0; i < (int)IV_WEB_MAX_CONN; i++) {
             if (g_conn[i].fd < 0 || g_conn[i].up_fd < 0)
                 continue;
+            if (g_conn[i].ws_on != 0) {
+                /* 同样带背压：只有"欠客户端那一侧已推完"才继续读上游，
+                 * 否则 POLLIN 电平触发会立刻再报，白白空转烧 CPU。 */
+                short ev = 0;
+
+                if (g_conn[i].ws_ul_sent >= g_conn[i].ws_ul_len)
+                    ev = (short)(ev | POLLIN);
+                if (g_conn[i].ws_dl_sent < g_conn[i].ws_dl_len)
+                    ev = (short)(ev | POLLOUT);
+                pf[nfds].fd      = g_conn[i].up_fd;
+                pf[nfds].events  = ev;
+                pf[nfds].revents = 0;
+                map[nfds] = 1000 + i;
+                nfds++;
+                continue;
+            }
             pf[nfds].fd      = g_conn[i].up_fd;
             pf[nfds].events  = (g_conn[i].up_phase == (uint8_t)IV_WEB_UP_RECV) ? POLLIN
                                                                               : POLLOUT;
@@ -1090,7 +1308,12 @@ int main(int argc, char *argv[])
             if (map[i] >= 1000) {
                 /* 上游：POLLERR/POLLHUP 也要进去 —— 里面按相位判 SO_ERROR 或按
                  * EOF 收尾，不能一律当失败（大华常常"数据发完了还挂着"）。 */
-                on_upstream(map[i] - 1000);
+                int s = map[i] - 1000;
+
+                if (g_conn[s].fd >= 0 && g_conn[s].ws_on != 0)
+                    ws_event(s, pf[i].revents, 1); /* 中继阶段：按事件泵字节 */
+                else
+                    on_upstream(s);
                 continue;
             }
             if (map[i] < 0) {
@@ -1104,6 +1327,11 @@ int main(int argc, char *argv[])
                         do_accept(g_listen_fd, 0, 0u);
                     }
                 }
+                continue;
+            }
+            /* WS 中继阶段：客户端这侧的读写都走 ws_event（不再有 HTTP 解析） */
+            if (g_conn[map[i]].fd >= 0 && g_conn[map[i]].ws_on != 0) {
+                ws_event(map[i], pf[i].revents, 0);
                 continue;
             }
             if (pf[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
@@ -1127,6 +1355,14 @@ int main(int argc, char *argv[])
         for (i = 0; i < (int)IV_WEB_MAX_CONN; i++) {
             if (g_conn[i].fd < 0)
                 continue;
+            if (g_conn[i].ws_on != 0) {
+                /* 中继阶段：双向都长时间没字节才收（`IV_WEB_WS_IDLE_MS`＝120 s）。
+                 * 这里**不能**沿用上面 8 s 的响应预算 —— 那是给「一次请求一次响应」
+                 * 定的，用在长连接上就是每 8 s 掐一次视频。 */
+                if (now - g_conn[i].last_ms > IV_WEB_WS_IDLE_MS)
+                    conn_close(i);
+                continue;
+            }
             if (g_conn[i].up_fd >= 0 && now > g_conn[i].up_deadline_ms)
                 on_upstream(i); /* 里面判 504 并发出去 */
             else if (now - g_conn[i].last_ms > IV_WEB_IDLE_MS)

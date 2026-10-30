@@ -169,29 +169,17 @@ static const cfg_default_t s_defaults[] = {
      * `mod` 在 E3 应答里按 IV_REPORT_MOD_MAX（31 字符）截断。 */
     D_STR(IV_CFG_CLS_SYS, "sys.device.model", "硬件型号（平台查询版本时上报的 mod）",
           "FN_RZTY_PY", NULL),
-    /* M8-S8.3 受控远程通道。这里**只放非机密的落点与端口**：令牌不进配置 —— 配置是
-     * 明文 JSON，而 `config.all` 会把整份配置导出去给前端，把共享密钥的原料塞进去
-     * 等于明文下发。令牌读 `<secure>/tunnel.token`（见 src/app/main.c 的 tunnel_token）。
+    /* M8-S8.3 受控远程通道。**按 BIRD 运维箱收口（2026-10-30）**：通道只有一条
+     * stcp 代理、转发本机 sshd(22)，所以这里只需要"服务端落点"两项 —— BIRD 的出厂
+     * 配置里也只有 `debugServerAddr` / `debugToken` 两个字段（令牌不进配置：配置是
+     * 明文 JSON，而 `config.all` 会把整份配置导给前端；令牌读
+     * `<secure>/tunnel.token`，见 src/app/main.c 的 tunnel_read_token）。
+     * 原先的 web/media/cam/ftp 端口项随"按服务开代理"一起去掉：访问端用 `ssh -L`
+     * 按需转发，设备侧不需要知道世界上有哪些服务。
      * `server.host` 空 ⇒ 开不了通道（fail-closed，与 iv_tunnel 的 ENOSERVER 同源）。 */
     D_STR(IV_CFG_CLS_SYS, "sys.tunnel.server.host",
           "frps 地址（空＝不开通道；受控远程通道的服务端）", "", NULL),
     D_INT(IV_CFG_CLS_SYS, "sys.tunnel.server.port", "frps 端口（0＝默认 7000）", 0, 0, 65535),
-    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.ttl_s",
-          "通道默认有效期（秒；单次开启可用 ttl 覆写，上限 86400）", 3600, 60, 86400),
-    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.web.port",
-          "本机 Web 服务端口（`web` 的代理目标，一律 127.0.0.1）", 80, 1, 65535),
-    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.media.port",
-          "本机媒体服务端口（`media:N` 的代理目标；ivsbox-media 桥接）", 18000, 1, 65535),
-    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.cam.port",
-          "摄像机受控代理端口（`camera:N` 的代理目标；S8.5 落地后由 ivsbox-web 监听）",
-          8081, 1, 65535),
-    D_BOOL(IV_CFG_CLS_SYS, "sys.tunnel.cam.enable",
-          "摄像机受控代理可用（S8.5 落地前恒 false ⇒ `camera:N` 一律判不可达）", "false"),
-    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.ftp.port",
-          "本机 FTP 控制端口（`ftp` 的代理目标；vsftpd 控制口）", 21, 1, 65535),
-    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.ftp.data_port",
-          "本机 FTP 被动数据端口（`ftp` 的第二条代理目标；须与 vsftpd 的 "
-          "pasv_min_port/pasv_max_port 同值）", 50000, 1, 65535),
 
     /* ---- net. 网络配置（架构 §10.2；原 net.wan.* 六项已删，网口由 sys.transport.mode 隐含） ---- */
     D_STR(IV_CFG_CLS_NET, "net.ip", "本机 IP 地址（空＝由 DHCP 分配）", "", NULL),

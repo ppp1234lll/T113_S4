@@ -7,10 +7,15 @@
 # 只管 **frpc 进程的起与停**。通道"该不该开"由 `ivsboxd` 里的 `iv_tunnel` 决定
 # （写好 `/etc/frp/frpc.toml` 后置起标记文件）。**标记文件是唯一真相**：
 #   标记在 ⇒ 进程该在；标记不在 ⇒ 进程必须不在。
-# 本脚本不造标记、不删标记（除 `stop` 与"发现已过期"）—— 造标记等于让脚本自己决定
-# "要不要开远程入口"，那道闸门就名存实亡了（这也是与 BIRD 版唯一有意不同的地方：
-# BIRD 的 `start` 自己 touch 标记，它的开关由 Go 侧的 SetDebugMode 管；本工程把开关
-# 与**有效期**一起交给 iv_tunnel，到期自动清标记，脚本跟着把进程收掉）。
+#
+# 与 BIRD（GO 版 `scripts/frp.sh`）的对应关系逐条如下：
+#   BIRD `start`  = 本脚本 `start`：先清进程 → `touch` 标记 → 起 frpc → 记 pid
+#   BIRD `stop`   = 本脚本 `stop` ：先删标记 → 杀进程（**顺序不能反**）
+#   BIRD `restart`= 本脚本 `restart`（等价 start）
+# 唯一有意保留的差异：BIRD 的 `start` 无条件 `touch`，本脚本只在**标记不存在**时
+# 补建 —— 因为本工程的标记内容就是有效期到期时刻（见下节），覆盖等于把 TTL 闸门
+# 冲掉。标记因"补建"而出现的场景只有一种：运营手工删了标记但 frpc 还在跑，此时
+# 补建＝恢复不变量，不是新开远程入口。
 #
 # ============================ 有效期为什么要在这一层也判一次 ============================
 # `iv_tunnel_tick()` 跑在 `ivsboxd` 进程里 —— 主控不在（被 kill -9、崩溃、停在 monitor
@@ -21,12 +26,16 @@
 # 标记里没有数字（例如运维手工 `touch`）⇒ 视为**未过期**：不擅自关掉别人手工开的通道
 # （能 touch 这个文件的人本来就已经是 root，不是本闸门要防的对象）。
 #
-# ============================ 动作 ============================
-#   up    标记存在且未过期 ⇒ 拉起 frpc（幂等：已在跑就什么都不做）；已过期 ⇒ 收掉；
-#         标记不在 ⇒ 静默退出 0（monitor 每圈都调，不能因为"本来就该关"而报错刷屏）
-#   down  停掉 frpc（不动标记）
-#   stop  删标记 + 停进程：**运维手工关闭**用，等价于 iv_tunnel_disable() 的兜底
-#   status 诊断：打印标记 / 到期 / 配置 / 进程四者的状态
+# ============================ 动作（与 BIRD 同名的三件套 + 本工程诊断） ============================
+#   start   标记存在且未过期 ⇒ 拉起 frpc（幂等：已在跑就什么都不做）；已过期 ⇒ 收掉；
+#           标记不在 ⇒ **补建标记**后再拉起（BIRD 的 `start` 自己 `touch`）。
+#           补建只在"标记不存在"时做，绝不覆盖已有内容 —— 覆盖会把到期时刻冲掉，
+#           TTL 闸门就漏了。
+#   stop    删标记 + 停进程（BIRD `disable_frp`，运维手工关闭走这个）
+#   restart 等价于 start（BIRD 同）
+#   up      等价于 start（本工程 monitor 旧名，保留兼容）
+#   down    只停进程、**不动标记**（BIRD 没有这个动作；留给"临时断连"用）
+#   status  诊断：打印标记 / 到期 / 配置 / 进程四者的状态
 #
 # ============================ 为什么用 stcp 而不是 tcp ============================
 # 配置里的代理项一律 `type = "stcp"`：访问方必须也跑 frpc 并持有同一个 secretKey，
@@ -37,12 +46,12 @@
 #   IVSBOX_FRP_CONF    frpc 配置路径（默认 /etc/frp/frpc.toml）
 #   IVSBOX_FRPC_BIN    frpc 二进制（默认 /usr/bin/frpc）
 #   IVSBOX_FRP_PIDFILE pid 文件（默认 /var/run/frpc.pid）
-#   IVSBOX_TUNNEL_FLAG 标记文件（默认 /tmp/ivsbox-tunnel.enabled）
+#   IVSBOX_TUNNEL_FLAG 标记文件（默认 /tmp/frp.enabled，与 BIRD 同名）
 
 FRP_CONF=${IVSBOX_FRP_CONF:-/etc/frp/frpc.toml}
 FRPC_BIN=${IVSBOX_FRPC_BIN:-/usr/bin/frpc}
 PID_FILE=${IVSBOX_FRP_PIDFILE:-/var/run/frpc.pid}
-ENABLED_FLAG=${IVSBOX_TUNNEL_FLAG:-/tmp/ivsbox-tunnel.enabled}
+ENABLED_FLAG=${IVSBOX_TUNNEL_FLAG:-/tmp/frp.enabled}
 
 frpc_alive() {
     # `-o comm` 只看进程名；frpc 是 ELF 二进制，判定可靠（对 shell 脚本会看到解释器，
@@ -77,28 +86,31 @@ stop_process_only() {
 }
 
 do_up() {
-    # 闸门优先：没有标记就不许起。这是"远程入口默认关闭"的物理保证。
-    if [ ! -f "$ENABLED_FLAG" ]; then
+    # 幂等短路：进程在、标记在、没过期 ⇒ 什么都不做。BIRD 的 start 不具备幂等性
+    # （它无条件 stop+start，由 monitor 的 `! is_running` 保证不被反复调）；本脚本
+    # 也可能被 ctl / 人手直接调，所以自带这一层，避免每调一次就把通道重连一次。
+    if frpc_alive && [ -f "$ENABLED_FLAG" ] && ! flag_expired; then
         return 0
     fi
-    # 第二道闸门：标记在但已过期 ⇒ 收掉（主控不在时只剩这一层能管）。先删标记再杀
+    # 第一道闸门：标记在但已过期 ⇒ 收掉（主控不在时只剩这一层能管）。先删标记再杀
     # 进程，免得 monitor 下一圈看到标记还在又把它拉起来。
     if flag_expired; then
         echo "frp.sh: 标记已过期（主控不在或已挂），停掉 frpc 并清标记"
         do_stop
         return 0
     fi
-    if frpc_alive; then
-        return 0
-    fi
     if [ ! -f "$FRP_CONF" ]; then
-        echo "frp.sh: up 跳过，配置不存在：$FRP_CONF"
+        echo "frp.sh: start 跳过，配置不存在：$FRP_CONF"
         return 1
     fi
     if [ ! -x "$FRPC_BIN" ]; then
-        echo "frp.sh: up 跳过，frpc 不可执行：$FRPC_BIN"
+        echo "frp.sh: start 跳过，frpc 不可执行：$FRPC_BIN"
         return 1
     fi
+    # 配置与二进制都就位才补建标记：与 BIRD 的 `touch "$ENABLED_FLAG"` 同一个位置
+    # （在起进程之前，让 monitor 看到标记后即使进程还没起来也不会误删）。
+    # **只在标记不存在时建** —— 已有内容就是到期时刻，覆盖等于把 TTL 闸门冲掉。
+    [ -f "$ENABLED_FLAG" ] || : > "$ENABLED_FLAG"
     # `( ... ) &` + exec：让 $! 就是 frpc 自己的 pid（写成 `cmd &` 时若 cmd 是
     # 复合列表，$! 可能拿到子 shell；这里 exec 保证 pid 与进程一一对应）。
     ( exec "$FRPC_BIN" -c "$FRP_CONF" >/dev/null 2>&1 ) &
@@ -113,10 +125,13 @@ do_stop() {
 }
 
 case "$1" in
-up)
+start|up|restart)
+    # BIRD 的 `start` / `restart` 都是"要它开"，本工程旧名 `up` 同义（monitor 兼容）。
     do_up
     ;;
 down)
+    # BIRD 里没有这个动作：只断连、**不动标记**，下一圈 monitor 会把它拉回来。
+    # 留给"临时掐断看现场反应"用，不是关闭通道的正规入口。
     stop_process_only
     ;;
 stop)
@@ -124,17 +139,17 @@ stop)
     ;;
 status)
     if [ -f "$ENABLED_FLAG" ]; then
-        echo "flag: present (expire=$(flag_expire))"
+        echo "flag: present ($ENABLED_FLAG, expire=$(flag_expire))"
         if flag_expired; then echo "expired: yes"; else echo "expired: no"; fi
     else
-        echo "flag: absent"
+        echo "flag: absent ($ENABLED_FLAG)"
         echo "expired: -"
     fi
-    if [ -f "$FRP_CONF" ]; then echo "conf: present"; else echo "conf: absent"; fi
+    if [ -f "$FRP_CONF" ]; then echo "conf: present ($FRP_CONF)"; else echo "conf: absent ($FRP_CONF)"; fi
     if frpc_alive; then echo "proc: running"; else echo "proc: stopped"; fi
     ;;
 *)
-    echo "Usage: $0 {up|down|stop|status}"
+    echo "Usage: $0 {start|stop|restart|up|down|status}"
     exit 1
     ;;
 esac

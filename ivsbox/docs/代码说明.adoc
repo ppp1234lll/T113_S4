@@ -11587,3 +11587,97 @@ name = "<sn>-ftpdata"  localPort = 50000   secretKey = MD5(sn+token+"ftpdata")
 
 这些是**镜像级**改动（`/etc` 在 rw ext4 上，重启保留；重新烧写会丢），
 落盘脚本见 `_deploy/ftp_fix.sh`。
+
+NOTE: **本节的"一条服务名两条代理"模型已作废**（同日 11:23 按参考项目 BIRD 逐条对齐，
+换成"设备侧只有一条到 22 的 stcp 代理，其余全靠访问端 `ssh -L`"）。FTP 仍然可用，
+但它不再是一条 frp 代理 —— 由访问端 `ssh -L 2121:127.0.0.1:21 -L 50000:127.0.0.1:50000`
+搬出来。下面的 PASV 改写与设备侧前提**依然成立**，仅"代理怎么配"这段过时。
+
+== 2026-10-30 11:23 内网穿透按参考项目 BIRD（GO 版）逐条对齐
+
+=== 为什么推翻自己上一版
+
+上一版把通道做成"按服务名开代理"（`web` / `camera:N` / `media:N` / `ftp`，最多 8 条），
+是自创模型。现场的要求是"**GO 版怎么实现的，你就怎么实现**"—— 参考项目
+`bird_20260623` 才是运维侧既有工具链的事实标准，模型一分叉，访问端配置、钥匙公式、
+端口约定就全对不上，运维手里两套工具互不通用。
+
+=== BIRD 的事实（全部可在 GO 源码逐条核对）
+
+[cols="1,3,3"]
+|===
+| 项 | BIRD（GO） | 本工程（对齐后）
+
+| 代理条数 | **1 条**（`factory_manager.go: writeFrpConfig()`） | 同
+| 代理名 | `name = "<SN>"` | 同
+| 转发目标 | `localIP = "127.0.0.1"` / **`localPort = 22`**（硬编码） | 同
+| 类型 | `type = "stcp"`（端口不开在 frps 上） | 同
+| 钥匙 | `utils.GenerateSTCPKey()` = `hex(MD5(sn+token)[0..8))` | 同（去掉了旧版自创的 `svc` 分量）
+| 配置 | `/etc/frp/frpc.toml`，`os.WriteFile(..., 0600)` | 同（原子落盘 + 0600）
+| 标记 | `/tmp/frp.enabled`（`frp.sh start` 里 `touch`） | 同；`ttl>0` 时写到期时刻（扩展）
+| 守护 | `monitor.sh` 每 5 s：标记在、frpc 不在 ⇒ `frp.sh start` | 同
+| 进程退出 | 不影响通道（标记与 frpc 都归脚本管） | 同（原实现会关，已改）
+| 有效期 | **没有**，只有重启或平台显式关 | `ttl=0` 与 GO 一致；`ttl>0` 是扩展
+|===
+
+设备侧只开 SSH 的好处是确定的：① 与设备上"有什么服务"解耦，加摄像机不用改
+`frpc.toml`、不用重开通道；② `ssh -L` 是裸 TCP，视频流不经过任何 HTTP 反代，
+不会碰到 504 / 缓冲截断 / 每条流一个槽位这些坑；③ 认证、加密、审计复用 sshd 一套，
+frp 只管搬运。
+
+=== 渲染：逐字等于 GO 的 `fmt.Sprintf` 产物
+
+`iv_tunnel_render()` 输出的九行（含空行位置与结尾换行）与本工程测试里的 `EXPECT`
+逐字比对，任何一处漂移都会让 `test_tunnel` t02 判红：
+
+[source,toml]
+----
+serverAddr = "<addr>"
+serverPort = 7000
+auth.token = "<token>"
+
+[[proxies]]
+name = "<SN>"
+type = "stcp"
+secretKey = "<16 hex>"
+localIP = "127.0.0.1"
+localPort = 22
+----
+
+=== 三处"照着抄不下去"的地方（都有原因，不是偷懒）
+
+. **`start` 只在标记不存在时补建，不是无条件 `touch`。**
+  BIRD 的 `touch` 语义是"保证标记存在"；本工程把**到期时刻写在标记内容里**，
+  无条件 `touch`（`touch` 不截断已有文件，但若改用 `: >` 就会）会冲掉 TTL 闸门。
+  用 `[ -f "$ENABLED_FLAG" ] || : > "$ENABLED_FLAG"` 同时满足两边。
+. **`monitor.sh` 多了一条"标记不在 ⇒ 停 frpc"。**
+  BIRD 没有这条（它只单向拉活）。但"标记没了进程还在"＝远程入口绕过有效期常开，
+  比"通道静默失效"危险得多，所以留作第二道闸门。
+. **`iv_tunnel_restore()`（BIRD 里不需要）。**
+  GO 的通道状态只存在文件与进程里，Go 进程重启不受影响。本工程的 `state` 是内存态，
+  进程一重启就归零；不认领就会出现"通道开着、`tunnel.status` 说 `on=false`、
+  `tick()` 也不判过期"的脱节。启动时读标记认领，空文件⇒不过期，到期时刻已过⇒清标记。
+
+=== 板端实测（2026-10-30 11:20 前后，设备 192.168.1.120）
+
+* `tun.py on` 生成的 `/etc/frp/frpc.toml` 与上段模板逐字一致，
+  `secretKey = a13db1c3eb45118f` 与 PC 侧独立用 .NET MD5 算出的一致；
+* 标记 `/tmp/frp.enabled` 为 **0 字节**（GO 的 `touch` 等价物）；
+* 重启 `ivsboxd`（`S65ivsboxd restart`）⇒ 日志 `tunnel: adopted an already-open channel`，
+  frpc 未断、`tunnel.status` 仍 `on=true`；
+* 访问端 `ssh -p 6000 root@127.0.0.1` 登录成功；
+  `ssh -L 9090:192.168.1.200:80` 打开摄像机页 **HTTP 200 / 334 B / 0.20 s**；
+  `ssh -L 2121:127.0.0.1:21 -L 50000:127.0.0.1:50000` 经 FTP 列出 `/mnt/sdcard` 10 项、
+  取回 473 B 文件内容完整；
+* `tun.py on --ttl 60`：标记内容为到期 unix 秒、`remain_s` 倒数，到期后标记消失、
+  frpc 停止、日志 `tunnel: ttl expired, channel closed and flag cleared`。
+
+=== 访问端（运维 PC）
+
+`_deploy/frpwin/connect.bat` 与 BIRD `tools/visitor/connect.bat` 同结构：
+`certutil -hashfile` 算钥匙 → 生成 `temp_frpc.toml`（**一条 visitor**，`bindPort = 6000`）
+→ 拉起 `frpc.exe` → `ssh -p 6000 -L ... root@127.0.0.1 -N`。`visitor.toml` 是"钥匙算好
+的固定版"，手跑时用。`start_tunnel.bat` 只作薄壳转发到 `connect.bat`。
+
+`_deploy/tun.py` 的 `--svcs` 参数已退化为"接受但忽略"（保证老命令行不报错），
+`status` 改为显示 `local_port` 与访问端命令。

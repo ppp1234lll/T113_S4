@@ -3095,20 +3095,15 @@ static int m_ota_request(const iv_ctl_ctx_t *ctx, json_object *p, char *out, siz
  * 调用方注入"，这里就是那个调用方。
  */
 
-/* 服务集合 → JSON 字符串数组（渲染失败的名跳过，不因此整条失败） */
-static json_object *svc_arr(const iv_tunnel_svc_t *svc, unsigned n)
+/* 服务集合：BIRD 模型下通道只有**一条**代理（转发本机 sshd），这里固定回 "ssh"，
+ * 让前端 / 平台照旧能显示"这条通道是干什么的"，又不假装还能挑服务。 */
+static json_object *svc_arr(void)
 {
     json_object *arr = json_object_new_array();
-    unsigned     i;
-    char         s[IV_TUNNEL_SVC_MAX];
 
     if (arr == NULL)
         return NULL;
-    for (i = 0u; i < n; i++) {
-        if (iv_tunnel_svc_format(&svc[i], s, sizeof s) != IV_OK)
-            continue;
-        json_object_array_add(arr, json_object_new_string(s));
-    }
+    json_object_array_add(arr, json_object_new_string("ssh"));
     return arr;
 }
 
@@ -3136,7 +3131,7 @@ static int m_tunnel_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_
     json_object_object_add(d, "remain_s", json_object_new_int(
                                   (int)iv_tunnel_remain_s(t, now)));
     json_object_object_add(d, "ttl_s", json_object_new_int((int)t->ttl_s));
-    json_object_object_add(d, "svcs", svc_arr(t->svc, t->n_svc));
+    json_object_object_add(d, "svcs", svc_arr());
     json_object_object_add(d, "caps", json_object_new_int((int)caps));
     /* 能力位打成名字，前端不必记位号；ENABLED＝"身份/服务端/映射/落点全就位" */
     json_object_object_add(d, "enabled", json_object_new_boolean(
@@ -3166,7 +3161,6 @@ static int m_tunnel_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_
                                           (int64_t)(last.close_s - last.open_s)));
             json_object_object_add(s, "stop", json_object_new_string(
                                           iv_tunnel_stop_reason_name((int)last.stop_reason)));
-            json_object_object_add(s, "svcs", svc_arr(last.svc, last.n_svc));
             json_object_object_add(d, "last", s);
         }
     }
@@ -3174,71 +3168,32 @@ static int m_tunnel_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_
     return rsp_data(d, out, cap, out_len);
 }
 
-/* 解析 `svcs` 数组：白名单外的名字、重复项、数量越界一律拒（不静默忽略）。 */
-static int parse_svcs(json_object *p, iv_tunnel_svc_t *svcs, unsigned *n)
-{
-    json_object *arr = NULL;
-    int          cnt;
-    int          i;
-
-    if (p == NULL || !json_object_object_get_ex(p, "svcs", &arr) || arr == NULL ||
-        !json_object_is_type(arr, json_type_array))
-        return IV_EINVAL;
-    cnt = json_object_array_length(arr);
-    if (cnt <= 0 || (unsigned)cnt > IV_TUNNEL_PROXIES_MAX)
-        return IV_ERANGE;
-    for (i = 0; i < cnt; i++) {
-        json_object *e = json_object_array_get_idx(arr, i);
-        const char  *s;
-        unsigned     k;
-
-        if (e == NULL || !json_object_is_type(e, json_type_string))
-            return IV_EINVAL;
-        s = json_object_get_string(e);
-        if (s == NULL || iv_tunnel_svc_parse(s, strlen(s), &svcs[i]) != IV_OK)
-            return IV_EINVAL;
-        /* 重复项：同一服务开两次只会让 frpc 报重名，不如当场说清楚 */
-        for (k = 0u; k < (unsigned)i; k++) {
-            if (svcs[k].kind == svcs[i].kind && svcs[k].index == svcs[i].index)
-                return IV_EINVAL;
-        }
-    }
-    *n = (unsigned)cnt;
-    return IV_OK;
-}
-
 static int m_tunnel_enable(const iv_ctl_ctx_t *ctx, json_object *p, char *out, size_t cap,
                            size_t *out_len)
 {
-    iv_tunnel_t         *t = ctx->tunnel;
-    iv_tunnel_svc_t      svcs[IV_TUNNEL_PROXIES_MAX];
-    unsigned             n = 0u;
-    int64_t              ttl = 0;
-    iv_tunnel_reason_t   why = IV_TUNNEL_OK;
-    json_object         *d;
-    int                  rc;
+    iv_tunnel_t       *t = ctx->tunnel;
+    int64_t            ttl = 0;
+    iv_tunnel_reason_t why = IV_TUNNEL_OK;
+    json_object       *d;
+    int                rc;
 
     if (t == NULL)
         return IV_ENOTSUP;
-    rc = parse_svcs(p, svcs, &n);
-    if (rc == IV_EINVAL)
-        return rsp_err(IV_EINVAL, "svcs must be a non-empty array of service names",
-                       out, cap, out_len);
-    if (rc == IV_ERANGE)
-        return rsp_err(IV_ERANGE, "too many services", out, cap, out_len);
 
-    /* 有效期：显式 `ttl` > 配置 `sys.tunnel.ttl_s` > 编译期默认 3600。 */
-    if (param_i64(p, "ttl", &ttl) != IV_OK || ttl <= 0) {
-        int64_t v = 0;
-
-        if (ctx->cfg != NULL &&
-            iv_config_get_int(ctx->cfg, "sys.tunnel.ttl_s", &v) == IV_OK && v > 0)
-            ttl = v;
-        else
-            ttl = (int64_t)IV_TUNNEL_TTL_DEF;
+    /* 有效期：**BIRD 没有 TTL**（`debug.mode` 一开就一直开着，只有重启或显式关才停），
+     * 所以默认 0 ＝ 不过期。平台可以显式给 `ttl`（秒），给了就必须在
+     * 1..IV_TUNNEL_TTL_MAX 之内 —— 越界当场拒，不悄悄夹到边界。
+     * 老客户端仍会带 `svcs` 数组：那是上一版"按服务开代理"的参数，现在忽略即可
+     * （通道固定只转发 sshd），不因此报错，免得现场脚本全部失效。 */
+    if (p != NULL && param_i64(p, "ttl", &ttl) == IV_OK && ttl != 0) {
+        if (ttl < 0 || ttl > (int64_t)IV_TUNNEL_TTL_MAX)
+            return rsp_err(IV_ERANGE, "ttl out of range (0 = never expires)",
+                           out, cap, out_len);
+    } else {
+        ttl = 0;
     }
 
-    rc = iv_tunnel_enable(t, svcs, n, (uint32_t)ttl, (uint64_t)time(NULL), &why);
+    rc = iv_tunnel_enable(t, (uint32_t)ttl, (uint64_t)time(NULL), &why);
     if (rc != IV_OK)
         return rsp_err(rc, iv_tunnel_reason_name(why), out, cap, out_len);
 
@@ -3249,9 +3204,12 @@ static int m_tunnel_enable(const iv_ctl_ctx_t *ctx, json_object *p, char *out, s
     json_object_object_add(d, "ttl_s", json_object_new_int((int)t->ttl_s));
     json_object_object_add(d, "remain_s", json_object_new_int(
                                   (int)iv_tunnel_remain_s(t, (uint64_t)time(NULL))));
-    json_object_object_add(d, "svcs", svc_arr(t->svc, t->n_svc));
+    json_object_object_add(d, "svcs", svc_arr());
+    json_object_object_add(d, "local_port", json_object_new_int((int)t->local_port));
+    json_object_object_add(d, "conf", json_object_new_string(t->conf_path));
     json_object_object_add(d, "note", json_object_new_string(
-        "frpc 由 scripts/monitor.sh 按标记文件拉起；到期后标记被清，进程随之收掉"));
+        "与 BIRD 同款：一条 stcp 转发本机 sshd(22)；frpc 由 scripts/monitor.sh 按标记 "
+        "/tmp/frp.enabled 拉起，ttl_s=0 表示不过期"));
     return rsp_data(d, out, cap, out_len);
 }
 

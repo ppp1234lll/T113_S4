@@ -95,16 +95,9 @@ static void chan_client_drop(int slot);
  * M8-S8.3 受控远程通道 —— 静态句柄（函数体在 cfg 辅助函数之后；app_shutdown 与
  * on_config_event 都先于那些定义用到它们，故声明必须提在这里）。
  * ------------------------------------------------------------------------- */
-static iv_tunnel_t  g_tunnel_store;  /* 句柄（约 2 KB，静态区；不占栈） */
+static iv_tunnel_t  g_tunnel_store;  /* 句柄（约 1 KB，静态区；不占栈） */
 static iv_tunnel_t *g_tunnel = &g_tunnel_store;
 static iv_timer_t  *g_tunnel_timer;
-/* resolver 的目标端口与开关（装配时从配置读入；resolver 是回调，不便再读配置） */
-static uint16_t     g_tun_port_web   = 80u;
-static uint16_t     g_tun_port_media = 18000u;
-static uint16_t     g_tun_port_cam   = 8081u;
-static uint16_t     g_tun_port_ftp   = 21u;      /* vsftpd 控制口 */
-static uint16_t     g_tun_port_ftpdata = IV_TUNNEL_FTP_DATA_DEF; /* 被动模式数据口 */
-static int          g_tun_cam_enable;
 
 static void tunnel_apply_cfg(void); /* 配置热更新回调要用 */
 
@@ -126,14 +119,21 @@ static void app_shutdown(void)
         g_listen_fd = -1;
     }
 
-    /* M8-S8.3：主控**干净退出**即关通道。有效期闸门跑在本进程里，进程不在了就不该
-     * 再留一条没人管的远程入口。代价是"运维远程重启主控会断线"—— 但重开只需平台
-     * 再发一条 tunnel.enable，比"重启后通道永久开着"安全。主控被 SIGKILL 时这条
-     * 走不到，兜底交给标记文件里的到期时刻（scripts/frp.sh 独立判过期）。 */
-    if (iv_tunnel_state(g_tunnel) == IV_TUNNEL_ON) {
-        (void)iv_tunnel_disable(g_tunnel, (uint64_t)time(NULL), IV_TUNNEL_STOP_LOCAL);
-        IV_LOG_I(APP_MOD, "tunnel: closed on shutdown");
-    }
+    /* M8-S8.3 —— **2026-10-30 按 BIRD 改掉了原来的"退出即关通道"**。
+     *
+     * 原来的做法（本进程干净退出 ⇒ 删标记 ⇒ monitor 收掉 frpc）有个现场代价：运维正在
+     * 通过这条通道看摄像机 / 取文件时，只要远端重启一下主控（升级、改配置、崩溃被
+     * monitor 重拉），通道就断了，还得去平台上重新开一次 —— 而重启主控恰恰是远程运维
+     * 最常做的事。
+     *
+     * BIRD（GO 版）不是这么做的：标记与 frpc 都归 `scripts/frp.sh` / `monitor.sh` 管，
+     * Go 进程重启**不影响**通道；通道只会在三种情况下关：① 设备重启（`/tmp` 是 tmpfs，
+     * 标记自然丢失）；② 平台显式 `disableDebug()`（`frp.sh stop`）；③ 本工程的显式 TTL
+     * 到期（`iv_tunnel_tick` 或 `frp.sh` 独立判）。
+     *
+     * 故这里只取消定时器、**不动标记**。启动时由 `tunnel_setup()` 的
+     * `iv_tunnel_restore()` 把内存态认领回来，`tunnel.status` 才不会与真相脱节。
+     */
     if (g_tunnel_timer != NULL && g_reactor != NULL) {
         (void)iv_timer_cancel(g_reactor, g_tunnel_timer);
         g_tunnel_timer = NULL;
@@ -939,54 +939,12 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
 /* 到期巡检周期：有效期以小时计，1 s 级没必要，5 s 足够及时且不吵。 */
 #define TUNNEL_TICK_MS 5000
 
-/* 句柄与 resolver 的目标端口在文件头声明（app_shutdown / on_config_event 先于
- * 本块用到它们），这里只放只与本块相关的常量与函数。 */
-
-/* 服务名 → 本机代理入口。**只可能返回环回地址**：frp 的 `localIP` 必须是本机可达
- * 地址，所以摄像机 IP 永远进不了 `frpc.toml` —— 要访问摄像机只能过设备上的受控代理
- * （架构 §9.3 / S8.5）。非环回由 iv_tunnel 再拦一次（EHOST）。 */
-static int tunnel_resolve(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t *port,
-                          void *arg)
-{
-    (void)arg;
-    if (svc == NULL || ip_be == NULL || port == NULL)
-        return IV_EINVAL;
-
-    /* ip_be 的约定＝"数值本身按大端读"（见 test_tunnel 的 rig 与 iv_tunnel 的渲染：
-     * 按字节取位输出 localIP），不要 htonl —— htonl 过的值在小端机上 >>24 是 0x01，
-     * 会被环回闸门当成非环回拒掉。 */
-    *ip_be = 0x7f000001u; /* 127.0.0.1 */
-    switch (svc->kind) {
-    case IV_TUNNEL_SVC_WEB:
-        *port = g_tun_port_web;
-        return IV_OK;
-    case IV_TUNNEL_SVC_MEDIA:
-        *port = g_tun_port_media;
-        return IV_OK;
-    case IV_TUNNEL_SVC_FTP:
-        /* 本机 vsftpd：控制口 21。数据口不走这里，由 resolver 的 ftp_data_port
-         * 单独给（`ftp` 一条服务名要渲染两条代理，见 iv_tunnel_render）。 */
-        *port = g_tun_port_ftp;
-        return IV_OK;
-    case IV_TUNNEL_SVC_CAMERA:
-        /* S8.5 落地前本机没有这个监听口。报"不可达"（EUNMAPPED 的语义）比把它映射到
-         * 一个没人听的端口好：后者会让 frpc 起得来、连得上、但一访问就断，
-         * 现场排查会从"通道"一路查到"摄像机"，方向全错。
-         *
-         * **每路一个口**（2026-10-29）：web 侧按 `cam_port + N` 给每路单独监听，
-         * 该口的根路径就是摄像机根 —— 大华/海康前端用根绝对路径（/RPC2 等），
-         * 共用一个口 + 路径前缀时这些请求必 404，网页登录直接失败。 */
-        if (!g_tun_cam_enable)
-            return IV_ENOENT;
-        *port = (uint16_t)(g_tun_port_cam + svc->index);
-        return IV_OK;
-    default:
-        return IV_EINVAL;
-    }
-}
-
-/* 非 const：`ftp` 的数据口要随配置热更新（见 tunnel_apply_cfg）。 */
-static iv_tunnel_resolver_t s_tunnel_resolver = { tunnel_resolve, NULL, 0u };
+/* 句柄在文件头声明（app_shutdown / on_config_event 先于本块用到它们）。
+ *
+ * **没有 resolver 了**（2026-10-30 对齐 BIRD）：通道只转发本机 sshd（22），
+ * "看摄像机 / 取文件 / 传固件"全部由访问端的 `ssh -L` 按需建立 —— 设备侧不需要
+ * 知道世界上有哪些服务，也就不需要"服务名 → 本机端口"的映射这一步。
+ */
 
 /* 读令牌：取文件第一行、去掉 CR/LF（平台下发多半带换行），其余忽略。
  * 文件不在/为空**不算错误**：出厂未下发令牌的设备本来就该开不了通道。 */
@@ -1063,24 +1021,6 @@ static void tunnel_apply_cfg(void)
 {
     const char *host = cfg_str("sys.tunnel.server.host");
     uint16_t    port = cfg_port("sys.tunnel.server.port");
-    uint16_t    p;
-    int         bv = 0;
-
-    p = cfg_port("sys.tunnel.web.port");
-    if (p != 0u) g_tun_port_web = p;
-    p = cfg_port("sys.tunnel.media.port");
-    if (p != 0u) g_tun_port_media = p;
-    p = cfg_port("sys.tunnel.cam.port");
-    if (p != 0u) g_tun_port_cam = p;
-    p = cfg_port("sys.tunnel.ftp.port");
-    if (p != 0u) g_tun_port_ftp = p;
-    p = cfg_port("sys.tunnel.ftp.data_port");
-    if (p != 0u) g_tun_port_ftpdata = p;
-    /* 数据口随配置走：resolver 是回调，读不到配置，只能在装配层灌进去。
-     * 0 表示"用默认"，由 iv_tunnel_render 兜到 IV_TUNNEL_FTP_DATA_DEF。 */
-    s_tunnel_resolver.ftp_data_port = g_tun_port_ftpdata;
-    if (iv_config_get_bool(g_cfg, "sys.tunnel.cam.enable", &bv) == IV_OK)
-        g_tun_cam_enable = (bv != 0);
 
     if (port == 0u)
         port = (uint16_t)IV_TUNNEL_PORT_DEF;
@@ -1127,9 +1067,20 @@ static void tunnel_setup(void)
             IV_LOG_W(APP_MOD, "tunnel: bad path override in environment");
     }
 
-    (void)iv_tunnel_set_resolver(g_tunnel, &s_tunnel_resolver);
     tunnel_apply_cfg();
     g_ctl_ctx.tunnel = g_tunnel;
+
+    /* 认领上一条还开着的通道（BIRD 语义：通道是独立于主控进程的事实，见退出处注释）。
+     * IV_ENOENT ＝ 本来就没开，正常；IV_ESTATE ＝ 标记里的到期时刻已过，restore 顺手
+     * 清了标记 —— 两种情况都不用打 WARN，免得每次开机都刷一条吓人的日志。 */
+    {
+        int rrc = iv_tunnel_restore(g_tunnel, (uint64_t)time(NULL));
+
+        if (rrc == IV_OK) {
+            IV_LOG_I(APP_MOD, "tunnel: adopted an already-open channel (ttl=%us, expire=%llu)",
+                     (unsigned)g_tunnel->ttl_s, (unsigned long long)g_tunnel->expire_s);
+        }
+    }
 
     if (iv_tunnel_caps(g_tunnel) == 0u) {
         IV_LOG_W(APP_MOD, "tunnel: capability unavailable (needs sn + token + frps host) - "

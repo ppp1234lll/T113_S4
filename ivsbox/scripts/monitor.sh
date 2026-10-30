@@ -83,7 +83,8 @@ OTA_REQUEST=$IVSBOX_HOME/ota/request
 # 标记文件由 ivsboxd 的 iv_tunnel 按**有效期**写/清（M8-S8.2）；本脚本只按它起停
 # frpc 进程。**标记是唯一真相**：进程在不在不算数，因为进程崩溃是常态，而"标记没了
 # 进程还在"是绕过有效期闸门的远程入口常开 —— 后者危险得多。
-IVSBOX_TUNNEL_FLAG=${IVSBOX_TUNNEL_FLAG:-/tmp/ivsbox-tunnel.enabled}
+# 路径与 BIRD（GO 版 monitor.sh 的 `FRP_ENABLED`）**同名**：/tmp/frp.enabled。
+IVSBOX_TUNNEL_FLAG=${IVSBOX_TUNNEL_FLAG:-/tmp/frp.enabled}
 TUNNEL_SCRIPT=${TUNNEL_SCRIPT:-$IVSBOX_APP_DIR/scripts/frp.sh}
 # 通道告警节流：frpc 起不来（例如板端根本没装 frpc）时不能每 5 s 刷一条日志。
 TUNNEL_ALERT_GAP=${TUNNEL_ALERT_GAP:-300}
@@ -262,7 +263,7 @@ while true; do
     # 常开，这是安全事故，比失效危险得多；③ 标记在但**已过期** ⇒ 主控不在时
     # `iv_tunnel_tick()` 没人跑，只剩这一层能执行有效期闸门（标记内容就是到期时刻，
     # 由 iv_tunnel_enable 写入；⚠ 本脚本的 $now 是 /proc/uptime，判过期必须用 date）。
-    # "该不该在跑"的最终裁决交给 frp.sh 的 up（它内部同样判过期，幂等）。
+    # "该不该在跑"的最终裁决交给 frp.sh 的 start（它内部同样判过期，幂等）。
     if [ -f "$IVSBOX_TUNNEL_FLAG" ]; then
         tun_exp=$(tr -cd '0-9' < "$IVSBOX_TUNNEL_FLAG" 2>/dev/null)
         tun_now=$(date +%s 2>/dev/null)
@@ -271,11 +272,11 @@ while true; do
         elif ! frpc_alive; then
             tunnel_alert "标记存在但 frpc 不在，拉起"
         fi
-        sh "$TUNNEL_SCRIPT" up >/dev/null 2>&1
+        sh "$TUNNEL_SCRIPT" start >/dev/null 2>&1
     else
         if frpc_alive; then
             tunnel_alert "标记已清除，停掉 frpc（有效期闸门）"
-            sh "$TUNNEL_SCRIPT" down >/dev/null 2>&1
+            sh "$TUNNEL_SCRIPT" stop >/dev/null 2>&1
         fi
     fi
 

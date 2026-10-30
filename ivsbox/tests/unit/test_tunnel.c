@@ -1,38 +1,30 @@
 /*
- * iv_tunnel 单测（libivmodules，功能开发计划 M8-S8.1~S8.3）
+ * test_tunnel —— 受控远程通道（M8-S8.3）
  *
- * ============================ 靶子是什么 ============================
- * 远程通道是"从公网进内网的口子"，它唯一的价值是**该拒的拒得干净**：
- *   - 服务名只认白名单（`web` / `camera:N` / `media:N`），**摄像机 IP 不许进配置**；
- *   - 钥匙派生必须与运维侧（BIRD 运维箱 `GenerateSTCPKey`）**字节级一致**，
- *     否则访问方拿着自己算的钥匙连不上，故障现象会非常像"网络问题"；
- *   - 通道默认关，开了必须能**自己到期关掉**。
- * 所以每组用例都问同一个问题：**这次开启该不该被拒、拒的理由对不对**
- * （架构 §16.2 场景 10：远程代理无法访问白名单之外的 IP 和端口）。
+ * 2026-10-30 起本模块**按 BIRD 运维箱（bird_20260623）逐条对齐**：一条 stcp 代理、
+ * 转发本机 22、密钥 md5(sn+token) 前 8 字节、/etc/frp/frpc.toml、/tmp/frp.enabled。
+ * 所以本文件钉的是"与 BIRD 字节级一致"这件事，不再问"某个服务名该不该放行"：
  *
- * ============================ 覆盖 ============================
- *   t01 服务名白名单：合法三类 + 16 类非法（**含 ip:port / 域名 / URL**）
- *   t02 服务名渲染往返
- *   t03 secretKey 黄金向量（对照 BIRD 公式，含"每服务独立派生"）
- *   t04 toml 渲染逐字钉：stcp / secretKey / localIP / localPort / 多项
- *   t05 非环回目标 ⇒ EHOST（想代理到网内别的机器，这是"禁 ip:port"的硬证据）
- *   t06 渲染拒绝面：身份缺 / 服务端缺 / resolver 缺或拒 / 数量越界 / 缓冲不足
- *   t07 开启：配置文件落盘且权限 0600、标记文件存在且**内容＝到期时刻**、重复开启 ⇒ ESTATE
- *   t08 关闭：标记消失、状态 OFF、会话留档（时长与原因）
- *   t09 到期：tick 自动关、expires 计数、remain_s 递减
- *   t10 有效期：越界 ⇒ EBADARG；0 ⇒ 取默认
- *   t11 能力位：缺任一项 ⇒ 0
- *   t12 invalidate：开启中作废 ⇒ STOP_RECONF
- *   t13 统计：opens / denies / deny_by / uptime_s
- *   t14 参数与 NULL 安全
+ *   t01 secretKey 黄金向量（与 GO 的 GenerateSTCPKey 同一个值）
+ *   t02 frpc.toml 逐字钉（含空行位置，与 GO 的 fmt.Sprintf 产物逐字对比）
+ *   t03 渲染拒绝路径（缺身份 / 缺服务端 / 缓冲不足）
+ *   t04 enable：配置落盘 0600、标记落盘、状态与幂等
+ *   t05 标记内容：ttl=0 写空文件（＝BIRD 的 touch）；ttl>0 写到期时刻
+ *   t06 到期自动关（tick）与"不过期不会自己关"
+ *   t07 身份/服务端变更 ⇒ invalidate（STOP_RECONF）
+ *   t08 caps / stat / last_session
+ *
+ * 反向证伪：把 iv_tunnel.c 里对应实现改坏（localPort 改成 23、secretKey 少取一字节、
+ * 标记不落盘、disable 不删标记），下面必有一条转红。
  */
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
-#include "ivsbox/iv_ret.h"
 #include "ivsbox/iv_tunnel.h"
 
 static int g_fail;
@@ -51,67 +43,21 @@ static void chk(int cond, const char *what)
 #define SN    "A120F"
 #define TOKEN "bird123"
 
-/* 与 BIRD `utils.GenerateSTCPKey` 同源的黄金向量（由 Go 侧公式独立算出）：
- *   md5("A120F" + "bird123")       前 8 字节 = 1239036bac71d702（svc 为空 ⇒ BIRD 原公式）
- *   md5("A120F" + "bird123"+"web")          = 1058c8a5738276aa
- *   md5("A120F" + "bird123"+"camera:2")     = ebcba71b5463cb24
- *   md5("A120F" + "bird123"+"media:0")      = 451846dee3300a33
- *   md5("A120F" + "bird123"+"ftp")          = 2f8940c2063062ed
- *   md5("A120F" + "bird123"+"ftpdata")      = 86b14dcca51266fb */
-#define SEC_PLAIN   "1239036bac71d702"
-#define SEC_WEB     "1058c8a5738276aa"
-#define SEC_CAM2    "ebcba71b5463cb24"
-#define SEC_MEDIA0  "451846dee3300a33"
-#define SEC_FTP     "2f8940c2063062ed"
-#define SEC_FTPDATA "86b14dcca51266fb"
+/* 与 BIRD `utils.GenerateSTCPKey(sn, token)` 同源：
+ *   md5("A120F" + "bird123") 前 8 字节 = 1239036bac71d702
+ * 访问端 connect.bat 用 certutil 算的是同一个值（前 16 位小写 hex）。 */
+#define SEC_BIRD "1239036bac71d702"
 
 static char g_dir[64];   /* 临时目录 */
 static char g_conf[128]; /* <dir>/frpc.toml */
-static char g_flag[128]; /* <dir>/tunnel.enabled */
+static char g_flag[128]; /* <dir>/frp.enabled */
 
-/* resolver：web→127.0.0.1:8080；camera:N→127.0.0.1:8081+N；media:N→127.0.0.1:8090 */
-static int res_ok(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t *port, void *arg)
+static iv_tunnel_reason_t g_why; /* 用例里随手用的出参 */
+
+static int file_exists(const char *path)
 {
-    (void)arg;
-    *ip_be = 0x7F000001u; /* 127.0.0.1（网络序） */
-    if (svc->kind == IV_TUNNEL_SVC_WEB)        { *port = 8080u; return IV_OK; }
-    if (svc->kind == IV_TUNNEL_SVC_CAMERA)     { *port = (uint16_t)(8081u + svc->index); return IV_OK; }
-    if (svc->kind == IV_TUNNEL_SVC_MEDIA)      { *port = 8090u; return IV_OK; }
-    if (svc->kind == IV_TUNNEL_SVC_FTP)        { *port = 21u;   return IV_OK; }
-    return IV_ENOENT;
-}
-
-/* 想直接代理到摄像机 IP —— 必须被拒（EHOST） */
-static int res_camera_ip(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t *port, void *arg)
-{
-    (void)svc; (void)arg;
-    *ip_be = 0xC0A8010Au; /* 192.168.1.10 */
-    *port  = 80u;
-    return IV_OK;
-}
-
-static int res_deny(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t *port, void *arg)
-{
-    (void)svc; (void)ip_be; (void)port; (void)arg;
-    return IV_ENOENT;
-}
-
-static const iv_tunnel_resolver_t RES_OK = { res_ok, NULL, 0u };
-/* 自定义数据口：钉"配了就按配的来"，别退默认 50000 */
-static const iv_tunnel_resolver_t RES_FTP6000 = { res_ok, NULL, 6000u };
-/* 数据口＝控制口：一定是配错了（同一个口既当控制又当数据），必须拒 */
-static const iv_tunnel_resolver_t RES_FTP21 = { res_ok, NULL, 21u };
-static const iv_tunnel_resolver_t RES_IP = { res_camera_ip, NULL, 0u };
-static const iv_tunnel_resolver_t RES_NO = { res_deny, NULL, 0u };
-
-/* 装配好的句柄（临时目录 + 身份 + 服务端 + resolver） */
-static void mk_rig(iv_tunnel_t *t)
-{
-    iv_tunnel_init(t);
-    chk(iv_tunnel_set_identity(t, SN, TOKEN) == IV_OK, "rig: identity");
-    chk(iv_tunnel_set_server(t, "frp.example.com", 7000u) == IV_OK, "rig: server");
-    chk(iv_tunnel_set_resolver(t, &RES_OK) == IV_OK, "rig: resolver");
-    chk(iv_tunnel_set_paths(t, g_conf, g_flag) == IV_OK, "rig: paths");
+    struct stat st;
+    return stat(path, &st) == 0;
 }
 
 static int file_mode_is(const char *path, mode_t want)
@@ -121,465 +67,343 @@ static int file_mode_is(const char *path, mode_t want)
     return (st.st_mode & 0777u) == (want & 0777u);
 }
 
-static int file_exists(const char *path)
+static long read_file(const char *path, char *buf, size_t cap)
 {
-    struct stat st;
-    return stat(path, &st) == 0;
+    int  fd;
+    long n;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    n = (long)read(fd, buf, cap - 1u);
+    (void)close(fd);
+    if (n < 0) return -1;
+    buf[n] = '\0';
+    return n;
+}
+
+/* 装配好的句柄（临时目录 + 身份 + 服务端） */
+static void mk_rig(iv_tunnel_t *t)
+{
+    iv_tunnel_init(t);
+    chk(iv_tunnel_set_identity(t, SN, TOKEN) == IV_OK, "rig: identity");
+    chk(iv_tunnel_set_server(t, "frp.example.com", 7000u) == IV_OK, "rig: server");
+    chk(iv_tunnel_set_paths(t, g_conf, g_flag) == IV_OK, "rig: paths");
 }
 
 /* ---------------------------------------------------------------------------
- * t01 服务名白名单
+ * t01 secretKey 黄金向量
  * ------------------------------------------------------------------------- */
-static void t01_svc_white(void)
-{
-    static const char *const BAD[] = {
-        "", "Web", "WEB", "web:80", "web/", "192.168.1.10", "1.2.3.4:80",
-        "http://192.168.1.10", "camera:", "camera:-1", "camera:06", "camera:6",
-        "camera:1:80", "media:8", "camera:99999", "ssh", "//web", "web ",
-        "ftp:21", "FTP", "sftp", "ftp "
-    };
-    iv_tunnel_svc_t s;
-    size_t          i;
-
-    chk(iv_tunnel_svc_parse("web", 3, &s) == IV_OK && s.kind == IV_TUNNEL_SVC_WEB &&
-        s.index == 0u, "t01: web");
-    chk(iv_tunnel_svc_parse("camera:0", 8, &s) == IV_OK &&
-        s.kind == IV_TUNNEL_SVC_CAMERA && s.index == 0u, "t01: camera:0");
-    chk(iv_tunnel_svc_parse("camera:5", 8, &s) == IV_OK && s.index == 5u, "t01: camera:5");
-    chk(iv_tunnel_svc_parse("media:7", 7, &s) == IV_OK &&
-        s.kind == IV_TUNNEL_SVC_MEDIA && s.index == 7u, "t01: media:7");
-    chk(iv_tunnel_svc_parse("ftp", 3, &s) == IV_OK && s.kind == IV_TUNNEL_SVC_FTP &&
-        s.index == 0u, "t01: ftp");
-    chk(iv_tunnel_svc_parse("camera:6", 8, &s) == IV_ERANGE, "t01: camera idx range");
-    chk(iv_tunnel_svc_parse("media:8", 7, &s) == IV_ERANGE, "t01: media idx range");
-
-    for (i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
-        char msg[128];
-        snprintf(msg, sizeof msg, "t01: reject svc '%s'", BAD[i]);
-        chk(iv_tunnel_svc_parse(BAD[i], strlen(BAD[i]), &s) != IV_OK, msg);
-    }
-    chk(iv_tunnel_svc_parse(NULL, 0, &s) == IV_EINVAL, "t01: NULL svc");
-    chk(iv_tunnel_svc_parse("web", 3, NULL) == IV_EINVAL, "t01: NULL out");
-}
-
-/* ---------------------------------------------------------------------------
- * t02 渲染往返
- * ------------------------------------------------------------------------- */
-static void t02_svc_format(void)
-{
-    iv_tunnel_svc_t s;
-    char            buf[IV_TUNNEL_SVC_MAX];
-
-    s.kind = IV_TUNNEL_SVC_WEB; s.index = 0u;
-    chk(iv_tunnel_svc_format(&s, buf, sizeof buf) == IV_OK && strcmp(buf, "web") == 0,
-        "t02: web roundtrip");
-    s.kind = IV_TUNNEL_SVC_CAMERA; s.index = 3u;
-    chk(iv_tunnel_svc_format(&s, buf, sizeof buf) == IV_OK &&
-        strcmp(buf, "camera:3") == 0, "t02: camera roundtrip");
-    s.kind = IV_TUNNEL_SVC_MEDIA; s.index = 12u;
-    chk(iv_tunnel_svc_format(&s, buf, sizeof buf) == IV_OK &&
-        strcmp(buf, "media:12") == 0, "t02: media roundtrip");
-    s.kind = IV_TUNNEL_SVC_FTP; s.index = 0u;
-    chk(iv_tunnel_svc_format(&s, buf, sizeof buf) == IV_OK &&
-        strcmp(buf, "ftp") == 0, "t02: ftp roundtrip");
-    chk(iv_tunnel_svc_format(&s, buf, 3) != IV_OK && buf[0] == '\0', "t02: cap short");
-}
-
-/* ---------------------------------------------------------------------------
- * t03 secretKey 黄金向量
- * ------------------------------------------------------------------------- */
-static void t03_secret(void)
+static void t01_secret(void)
 {
     char out[IV_TUNNEL_SECRET_MAX];
 
-    /* svc 为空 ⇒ BIRD 原公式（这是"与运维侧字节级一致"的钉子） */
-    chk(iv_tunnel_secret(SN, TOKEN, NULL, out, sizeof out) == IV_OK &&
-        strcmp(out, SEC_PLAIN) == 0, "t03: plain == BIRD formula");
-    chk(iv_tunnel_secret(SN, TOKEN, "", out, sizeof out) == IV_OK &&
-        strcmp(out, SEC_PLAIN) == 0, "t03: empty svc == BIRD formula");
-    chk(iv_tunnel_secret(SN, TOKEN, "web", out, sizeof out) == IV_OK &&
-        strcmp(out, SEC_WEB) == 0, "t03: web");
-    chk(iv_tunnel_secret(SN, TOKEN, "camera:2", out, sizeof out) == IV_OK &&
-        strcmp(out, SEC_CAM2) == 0, "t03: camera:2");
-    chk(iv_tunnel_secret(SN, TOKEN, "media:0", out, sizeof out) == IV_OK &&
-        strcmp(out, SEC_MEDIA0) == 0, "t03: media:0");
-    /* 每服务独立：不同服务必须不同钥匙（否则"授权看 Web"＝授权全部） */
-    chk(strcmp(SEC_WEB, SEC_CAM2) != 0 && strcmp(SEC_WEB, SEC_MEDIA0) != 0,
-        "t03: per-service keys differ");
-    chk(strlen(out) == IV_TUNNEL_SECRET_HEX, "t03: 16 hex chars");
-    chk(iv_tunnel_secret(SN, TOKEN, "web", out, 8) == IV_ERANGE, "t03: cap short");
-    chk(iv_tunnel_secret(NULL, TOKEN, "web", out, sizeof out) == IV_EINVAL, "t03: NULL sn");
+    chk(iv_tunnel_secret(SN, TOKEN, out, sizeof out) == IV_OK &&
+        strcmp(out, SEC_BIRD) == 0, "t01: secret == BIRD GenerateSTCPKey");
+    chk(strlen(out) == IV_TUNNEL_SECRET_HEX, "t01: 16 hex chars");
+    /* 换一个输入就必须换一把钥匙（否则"一把钥匙开所有设备"） */
+    chk(iv_tunnel_secret(SN, "bird124", out, sizeof out) == IV_OK &&
+        strcmp(out, SEC_BIRD) != 0, "t01: different token -> different key");
+    chk(iv_tunnel_secret("A120G", TOKEN, out, sizeof out) == IV_OK &&
+        strcmp(out, SEC_BIRD) != 0, "t01: different sn -> different key");
+    chk(iv_tunnel_secret(SN, TOKEN, out, 8) == IV_ERANGE, "t01: cap short");
+    chk(iv_tunnel_secret(NULL, TOKEN, out, sizeof out) == IV_EINVAL, "t01: NULL sn");
+    chk(iv_tunnel_secret(SN, NULL, out, sizeof out) == IV_EINVAL, "t01: NULL token");
+    chk(iv_tunnel_secret(SN, TOKEN, NULL, sizeof out) == IV_EINVAL, "t01: NULL out");
 }
 
 /* ---------------------------------------------------------------------------
- * t04 toml 渲染逐字钉
+ * t02 frpc.toml 逐字钉（与 GO writeFrpConfig 的产物逐字一致）
  * ------------------------------------------------------------------------- */
-static void t04_render(void)
+static void t02_render(void)
 {
-    static const char *const EXPECT1 =
+    static const char *const EXPECT =
         "serverAddr = \"frp.example.com\"\n"
         "serverPort = 7000\n"
-        "auth.token = \"bird123\"\n"
+        "auth.token = \"" TOKEN "\"\n"
         "\n"
         "[[proxies]]\n"
-        "name = \"A120F-web\"\n"
+        "name = \"" SN "\"\n"
         "type = \"stcp\"\n"
-        "secretKey = \"" SEC_WEB "\"\n"
+        "secretKey = \"" SEC_BIRD "\"\n"
         "localIP = \"127.0.0.1\"\n"
-        "localPort = 8080\n";
-    iv_tunnel_svc_t    svcs[2];
+        "localPort = 22\n";
     iv_tunnel_reason_t why = IV_TUNNEL_ESTATE;
     char               buf[IV_TUNNEL_TXT_MAX];
     size_t             len = 0;
 
-    chk(iv_tunnel_svc_parse("web", 3, &svcs[0]) == IV_OK, "t04: parse web");
-    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_OK, svcs, 1u,
-                         buf, sizeof buf, &len, &why) == IV_OK, "t04: render one");
-    chk(why == IV_TUNNEL_OK, "t04: reason ok");
-    chk(strcmp(buf, EXPECT1) == 0, "t04: exact text (one proxy)");
-    chk(len == strlen(EXPECT1), "t04: out_len");
-
-    /* 两项：摄像机项必须出现自己的钥匙与本地代理端口 */
-    chk(iv_tunnel_svc_parse("camera:2", 8, &svcs[1]) == IV_OK, "t04: parse camera:2");
-    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_OK, svcs, 2u,
-                         buf, sizeof buf, &len, &why) == IV_OK, "t04: render two");
-    chk(strstr(buf, "name = \"A120F-camera:2\"") != NULL, "t04: second proxy name");
-    chk(strstr(buf, "secretKey = \"" SEC_CAM2 "\"") != NULL, "t04: second secret");
-    chk(strstr(buf, "localPort = 8083") != NULL, "t04: second local port");
-    chk(strstr(buf, "type = \"stcp\"") != NULL, "t04: stcp type");
-    /* 摄像机 IP 绝不能出现在配置里 */
-    chk(strstr(buf, "192.168.") == NULL, "t04: no camera ip in config");
-}
-
-/* ---------------------------------------------------------------------------
- * t04b `ftp`：一条服务名 → 两条代理（控制 + 被动数据）
- * 为什么要两条：FTP 的数据连接是另一条 TCP，frp 一条代理只映射一个端口。
- * 反向证伪：只渲染一条 / 数据口不兜默认 50000 / 两条钥匙相同 ⇒ 下面立刻红。
- * ------------------------------------------------------------------------- */
-static void t04b_render_ftp(void)
-{
-    iv_tunnel_svc_t    svc;
-    iv_tunnel_reason_t why = IV_TUNNEL_ESTATE;
-    char               buf[IV_TUNNEL_TXT_MAX];
-    size_t             len = 0;
-
-    chk(iv_tunnel_svc_parse("ftp", 3, &svc) == IV_OK, "t04b: parse ftp");
-    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_OK, &svc, 1u,
-                         buf, sizeof buf, &len, &why) == IV_OK, "t04b: render ftp");
-    chk(why == IV_TUNNEL_OK, "t04b: reason ok");
-    /* 控制条 */
-    chk(strstr(buf, "name = \"A120F-ftp\"") != NULL, "t04b: control proxy name");
-    chk(strstr(buf, "secretKey = \"" SEC_FTP "\"") != NULL, "t04b: control secret");
-    chk(strstr(buf, "localPort = 21\n") != NULL, "t04b: control port 21");
-    /* 数据条：端口固定、钥匙独立 */
-    chk(strstr(buf, "name = \"A120F-ftpdata\"") != NULL, "t04b: data proxy name");
-    chk(strstr(buf, "secretKey = \"" SEC_FTPDATA "\"") != NULL, "t04b: data secret");
-    chk(strstr(buf, "localPort = 50000\n") != NULL, "t04b: data port default 50000");
+    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, buf, sizeof buf, &len,
+                         &why) == IV_OK, "t02: render");
+    chk(why == IV_TUNNEL_OK, "t02: reason ok");
+    chk(strcmp(buf, EXPECT) == 0, "t02: exact text (BIRD-identical)");
+    chk(len == strlen(EXPECT), "t02: out_len");
+    /* 只有一条代理：多了就是又走回"按服务开代理"的老路 */
     {
         const char *q   = buf;
         int         cnt = 0;
         while ((q = strstr(q, "[[proxies]]")) != NULL) { cnt++; q++; }
-        chk(cnt == 2, "t04b: exactly two proxy blocks");
+        chk(cnt == 1, "t02: exactly one proxy");
     }
-    /* 装配层配了数据口 ⇒ 按配的来（别硬编码 50000） */
-    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_FTP6000, &svc, 1u,
-                         buf, sizeof buf, &len, &why) == IV_OK, "t04b: render custom");
-    chk(strstr(buf, "localPort = 6000\n") != NULL, "t04b: data port from resolver");
-    /* 数据口撞控制口 ⇒ 拒 */
-    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_FTP21, &svc, 1u,
-                         buf, sizeof buf, &len, &why) == IV_EINVAL,
-        "t04b: data port == control port rejected");
+    /* 端口必须是 22（BIRD 硬编码），别被改成 web/ftp 的端口 */
+    chk(strstr(buf, "localPort = 22\n") != NULL, "t02: forwards sshd 22");
+    /* 代理名就是 SN 本身（BIRD: name = "%s", deviceSn） */
+    chk(strstr(buf, "name = \"" SN "\"\n") != NULL, "t02: proxy name == SN");
 }
 
 /* ---------------------------------------------------------------------------
- * t05 非环回目标 ⇒ EHOST
+ * t03 渲染拒绝路径
  * ------------------------------------------------------------------------- */
-static void t05_host_gate(void)
+static void t03_render_deny(void)
 {
-    iv_tunnel_svc_t    svc;
     iv_tunnel_reason_t why = IV_TUNNEL_OK;
     char               buf[IV_TUNNEL_TXT_MAX];
+    char               tiny[16];
     size_t             len = 0;
 
-    chk(iv_tunnel_svc_parse("camera:2", 8, &svc) == IV_OK, "t05: parse");
-    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_IP, &svc, 1u,
-                         buf, sizeof buf, &len, &why) == IV_EPROTO &&
-        why == IV_TUNNEL_EHOST, "t05: camera ip rejected (EHOST)");
-    /* 环回但端口 0 也不行 */
-    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_NO, &svc, 1u,
-                         buf, sizeof buf, &len, &why) == IV_ENOENT &&
-        why == IV_TUNNEL_EUNMAPPED, "t05: resolver deny");
+    chk(iv_tunnel_render("", TOKEN, "frp.example.com", 7000u, buf, sizeof buf, &len,
+                         &why) == IV_EPROTO, "t03: empty sn");
+    chk(why == IV_TUNNEL_ENOIDENT, "t03: reason ENOIDENT");
+    chk(iv_tunnel_render(SN, "", "frp.example.com", 7000u, buf, sizeof buf, &len,
+                         &why) == IV_EPROTO, "t03: empty token");
+    chk(iv_tunnel_render(SN, TOKEN, "", 7000u, buf, sizeof buf, &len,
+                         &why) == IV_ENOENT, "t03: empty server");
+    chk(why == IV_TUNNEL_ENOSERVER, "t03: reason ENOSERVER");
+    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 0u, buf, sizeof buf, &len,
+                         &why) == IV_ENOENT, "t03: zero port");
+    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, tiny, sizeof tiny, &len,
+                         &why) == IV_ERANGE, "t03: buffer too small");
+    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, NULL, 0u, &len,
+                         &why) == IV_EINVAL, "t03: NULL out");
 }
 
 /* ---------------------------------------------------------------------------
- * t06 渲染拒绝面
+ * t04 enable：落盘与幂等
  * ------------------------------------------------------------------------- */
-static void t06_render_deny(void)
+static void t04_enable(void)
 {
-    iv_tunnel_svc_t    svc[9];
-    iv_tunnel_reason_t why = IV_TUNNEL_OK;
-    char               buf[IV_TUNNEL_TXT_MAX];
-    char               small[64];
-    size_t             len = 0;
-    unsigned           i;
+    iv_tunnel_t t;
+    char        buf[IV_TUNNEL_TXT_MAX];
 
-    chk(iv_tunnel_svc_parse("web", 3, &svc[0]) == IV_OK, "t06: parse");
-    for (i = 1; i < 9u; i++) svc[i] = svc[0];
-
-    why = IV_TUNNEL_OK;
-    chk(iv_tunnel_render("", TOKEN, "frp.example.com", 7000u, &RES_OK, svc, 1u,
-                         buf, sizeof buf, &len, &why) == IV_EPROTO &&
-        why == IV_TUNNEL_ENOIDENT, "t06: no sn");
-    why = IV_TUNNEL_OK;
-    chk(iv_tunnel_render(SN, "", "frp.example.com", 7000u, &RES_OK, svc, 1u,
-                         buf, sizeof buf, &len, &why) == IV_EPROTO &&
-        why == IV_TUNNEL_ENOIDENT, "t06: no token");
-    why = IV_TUNNEL_OK;
-    chk(iv_tunnel_render(SN, TOKEN, "", 7000u, &RES_OK, svc, 1u,
-                         buf, sizeof buf, &len, &why) == IV_ENOENT &&
-        why == IV_TUNNEL_ENOSERVER, "t06: no server addr");
-    why = IV_TUNNEL_OK;
-    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 0u, &RES_OK, svc, 1u,
-                         buf, sizeof buf, &len, &why) == IV_ENOENT &&
-        why == IV_TUNNEL_ENOSERVER, "t06: no server port");
-    why = IV_TUNNEL_OK;
-    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, NULL, svc, 1u,
-                         buf, sizeof buf, &len, &why) == IV_ENOENT &&
-        why == IV_TUNNEL_EUNMAPPED, "t06: no resolver");
-    why = IV_TUNNEL_OK;
-    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_OK, svc, 0u,
-                         buf, sizeof buf, &len, &why) == IV_EINVAL &&
-        why == IV_TUNNEL_EBADARG, "t06: n = 0");
-    why = IV_TUNNEL_OK;
-    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_OK, svc, 9u,
-                         buf, sizeof buf, &len, &why) == IV_EINVAL &&
-        why == IV_TUNNEL_EBADARG, "t06: n > max");
-    why = IV_TUNNEL_OK;
-    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_OK, svc, 1u,
-                         small, sizeof small, &len, &why) == IV_ERANGE &&
-        why == IV_TUNNEL_EBADARG, "t06: buffer short");
-    chk(iv_tunnel_render(NULL, TOKEN, "x", 7000u, &RES_OK, svc, 1u,
-                         buf, sizeof buf, &len, NULL) == IV_EPROTO, "t06: NULL sn ok with NULL why");
-}
-
-/* ---------------------------------------------------------------------------
- * t07 开启
- * ------------------------------------------------------------------------- */
-static void t07_enable(void)
-{
-    iv_tunnel_t        t;
-    iv_tunnel_svc_t    svc;
-    iv_tunnel_reason_t why = IV_TUNNEL_OK;
-    FILE              *fp;
-    char               line[256];
-    int                found = 0;
-
+    (void)unlink(g_conf);
+    (void)unlink(g_flag);
     mk_rig(&t);
-    chk(iv_tunnel_svc_parse("web", 3, &svc) == IV_OK, "t07: parse");
-    chk(iv_tunnel_state(&t) == IV_TUNNEL_OFF, "t07: default off");
 
-    chk(iv_tunnel_enable(&t, &svc, 1u, 600u, 1000u, &why) == IV_OK &&
-        why == IV_TUNNEL_OK, "t07: enable ok");
-    chk(iv_tunnel_state(&t) == IV_TUNNEL_ON, "t07: state on");
-    chk(file_exists(g_conf), "t07: conf written");
-    chk(file_mode_is(g_conf, 0600u), "t07: conf mode 0600 (secretKey inside)");
-    chk(file_exists(g_flag), "t07: flag file exists");
-    chk(iv_tunnel_remain_s(&t, 1000u) == 600u, "t07: remain");
+    chk(iv_tunnel_state(&t) == IV_TUNNEL_OFF, "t04: starts OFF");
+    chk(iv_tunnel_enable(&t, 0u, 1000u, &g_why) == IV_OK, "t04: enable (no ttl)");
+    chk(g_why == IV_TUNNEL_OK, "t04: reason ok");
+    chk(iv_tunnel_state(&t) == IV_TUNNEL_ON, "t04: state ON");
+    chk(file_exists(g_conf), "t04: frpc.toml written");
+    chk(file_exists(g_flag), "t04: flag written");
+    /* secretKey 在文件里 ⇒ 必须 0600（BIRD 同款） */
+    chk(file_mode_is(g_conf, 0600), "t04: frpc.toml is 0600");
+    chk(read_file(g_conf, buf, sizeof buf) > 0 && strstr(buf, SEC_BIRD) != NULL,
+        "t04: file carries the key");
+    /* 已开启时重复 enable ⇒ ESTATE（要改有效期先 disable） */
+    chk(iv_tunnel_enable(&t, 0u, 1001u, &g_why) == IV_ESTATE, "t04: double enable");
+    chk(g_why == IV_TUNNEL_ESTATE, "t04: reason ESTATE");
+    chk(iv_tunnel_disable(&t, 1100u, IV_TUNNEL_STOP_LOCAL) == IV_OK, "t04: disable");
+    chk(iv_tunnel_state(&t) == IV_TUNNEL_OFF, "t04: state OFF");
+    chk(!file_exists(g_flag), "t04: flag removed");
+    chk(file_exists(g_conf), "t04: config kept for next time");
+    chk(iv_tunnel_disable(&t, 1101u, IV_TUNNEL_STOP_LOCAL) == IV_ESTATE,
+        "t04: double disable");
+    /* 但"未开时 disable" 仍必须把残留标记清掉：内存态与标记可以不同步（进程刚重启、
+     * restore 还没跑），此时平台发 disable 若连文件都不删，回"成功"却关不掉通道。 */
+    {
+        FILE *f = fopen(g_flag, "wb");
 
-    /* 标记内容＝到期时刻（unix 秒）。这是"主控死了脚本也能判过期"的全部依据
-     * （见 scripts/frp.sh 的 flag_expired）：enable(600, now=1000) ⇒ 内容 1600。 */
-    fp = fopen(g_flag, "r");
-    chk(fp != NULL, "t07: open flag");
-    if (fp != NULL) {
-        char fl[64];
-
-        chk(fgets(fl, sizeof fl, fp) != NULL, "t07: flag has one line");
-        chk(strncmp(fl, "1600\n", 5) == 0, "t07: flag carries the expire instant");
-        fclose(fp);
+        chk(f != NULL, "t04: plant a stale flag");
+        if (f != NULL) { fputs("9999999999\n", f); fclose(f); }
+        chk(file_exists(g_flag), "t04: stale flag exists");
+        chk(iv_tunnel_disable(&t, 1102u, IV_TUNNEL_STOP_LOCAL) == IV_ESTATE,
+            "t04: disable while OFF still reports ESTATE");
+        chk(!file_exists(g_flag), "t04: stale flag removed anyway (idempotent stop)");
     }
-
-    /* 配置文件里必须有派生出的钥匙，且不含摄像机地址 */
-    fp = fopen(g_conf, "r");
-    chk(fp != NULL, "t07: open conf");
-    if (fp != NULL) {
-        while (fgets(line, sizeof line, fp) != NULL) {
-            if (strstr(line, SEC_WEB) != NULL) found = 1;
-            chk(strstr(line, "192.168.") == NULL, "t07: no camera ip on disk");
-        }
-        fclose(fp);
-    }
-    chk(found == 1, "t07: secretKey on disk");
-
-    /* 重复开启：要换服务集合必须先关，免得悄悄换掉正在用的通道 */
-    why = IV_TUNNEL_OK;
-    chk(iv_tunnel_enable(&t, &svc, 1u, 600u, 1001u, &why) == IV_ESTATE &&
-        why == IV_TUNNEL_ESTATE, "t07: double enable -> ESTATE");
-
-    /* 有效期越界 */
-    chk(iv_tunnel_disable(&t, 1100u, IV_TUNNEL_STOP_LOCAL) == IV_OK, "t07: disable");
-    why = IV_TUNNEL_OK;
-    chk(iv_tunnel_enable(&t, &svc, 1u, IV_TUNNEL_TTL_MAX + 1u, 1200u, &why) == IV_EINVAL &&
-        why == IV_TUNNEL_EBADARG, "t07: ttl over max");
-    /* ttl=0 ⇒ 取默认 */
-    chk(iv_tunnel_enable(&t, &svc, 1u, 0u, 1200u, &why) == IV_OK, "t07: ttl default");
-    chk(iv_tunnel_remain_s(&t, 1200u) == IV_TUNNEL_TTL_DEF, "t07: ttl default applied");
-    chk(iv_tunnel_disable(&t, 1201u, IV_TUNNEL_STOP_LOCAL) == IV_OK, "t07: disable again");
 }
 
 /* ---------------------------------------------------------------------------
- * t08 关闭与会话留档
+ * t05 标记文件内容：ttl=0 空文件（BIRD 的 touch）；ttl>0 写到期时刻
  * ------------------------------------------------------------------------- */
-static void t08_disable(void)
+static void t05_flag_content(void)
 {
-    iv_tunnel_t           t;
-    iv_tunnel_svc_t       svc;
-    iv_tunnel_session_t   s;
-    iv_tunnel_reason_t    why = IV_TUNNEL_OK;
+    iv_tunnel_t t;
+    char        buf[64];
+    long        n;
 
+    (void)unlink(g_conf);
+    (void)unlink(g_flag);
     mk_rig(&t);
-    chk(iv_tunnel_svc_parse("camera:1", 8, &svc) == IV_OK, "t08: parse");
-    chk(iv_tunnel_enable(&t, &svc, 1u, 300u, 2000u, &why) == IV_OK, "t08: enable");
-    chk(iv_tunnel_disable(&t, 2300u, IV_TUNNEL_STOP_LOCAL) == IV_OK, "t08: disable ok");
-    chk(iv_tunnel_state(&t) == IV_TUNNEL_OFF, "t08: state off");
-    chk(!file_exists(g_flag), "t08: flag removed");
-    chk(file_exists(g_conf), "t08: conf kept (0600)");
 
-    chk(iv_tunnel_last_session(&t, &s) == IV_OK, "t08: session kept");
-    chk(s.open_s == 2000u && s.close_s == 2300u, "t08: session window");
-    chk(s.ttl_s == 300u && s.n_svc == 1u, "t08: session meta");
-    chk(s.svc[0].kind == IV_TUNNEL_SVC_CAMERA && s.svc[0].index == 1u, "t08: session svc");
-    chk(s.stop_reason == IV_TUNNEL_STOP_LOCAL, "t08: stop reason");
+    /* BIRD 语义：没有有效期，标记是空文件，脚本侧判"不过期" */
+    chk(iv_tunnel_enable(&t, 0u, 2000u, &g_why) == IV_OK, "t05: enable no ttl");
+    n = read_file(g_flag, buf, sizeof buf);
+    chk(n == 0, "t05: empty flag == BIRD touch");
+    chk(iv_tunnel_remain_s(&t, 2000u) == 0u, "t05: no remain when no ttl");
+    chk(iv_tunnel_tick(&t, 2000u + 86400u) == 0, "t05: never expires without ttl");
+    chk(iv_tunnel_state(&t) == IV_TUNNEL_ON, "t05: still ON");
+    chk(iv_tunnel_disable(&t, 2001u, IV_TUNNEL_STOP_LOCAL) == IV_OK, "t05: disable");
 
-    /* 未开启就关闭 ⇒ ESTATE */
-    chk(iv_tunnel_disable(&t, 2400u, IV_TUNNEL_STOP_LOCAL) == IV_ESTATE, "t08: disable twice");
+    /* 本工程扩展：显式 TTL ⇒ 标记里写到期时刻，主控崩了脚本侧也能判 */
+    chk(iv_tunnel_enable(&t, 600u, 3000u, &g_why) == IV_OK, "t05: enable ttl");
+    n = read_file(g_flag, buf, sizeof buf);
+    chk(n > 0 && (unsigned long long)atoll(buf) == (unsigned long long)(3000u + 600u),
+        "t05: flag carries expiry epoch");
+    chk(iv_tunnel_remain_s(&t, 3000u) == 600u, "t05: remain_s");
+    chk(iv_tunnel_remain_s(&t, 3599u) == 1u, "t05: remain_s near expiry");
+    chk(iv_tunnel_disable(&t, 3001u, IV_TUNNEL_STOP_LOCAL) == IV_OK, "t05: disable 2");
+
+    /* 超上限一律拒（BIRD 没有 TTL，这层是本工程的护栏） */
+    chk(iv_tunnel_enable(&t, IV_TUNNEL_TTL_MAX + 1u, 3000u, &g_why) == IV_EINVAL,
+        "t05: ttl over max");
+    chk(iv_tunnel_state(&t) == IV_TUNNEL_OFF, "t05: rejected enable leaves state OFF");
+    chk(!file_exists(g_flag), "t05: no flag written on rejection");
 }
 
 /* ---------------------------------------------------------------------------
- * t09 到期自动关
+ * t06 到期自动关
  * ------------------------------------------------------------------------- */
-static void t09_expire(void)
+static void t06_expire(void)
 {
-    iv_tunnel_t        t;
-    iv_tunnel_svc_t    svc;
-    iv_tunnel_stat_t   st;
-    iv_tunnel_reason_t why = IV_TUNNEL_OK;
+    iv_tunnel_t      t;
+    iv_tunnel_stat_t st;
 
+    (void)unlink(g_conf);
+    (void)unlink(g_flag);
     mk_rig(&t);
-    chk(iv_tunnel_svc_parse("web", 3, &svc) == IV_OK, "t09: parse");
-    chk(iv_tunnel_enable(&t, &svc, 1u, 100u, 3000u, &why) == IV_OK, "t09: enable");
 
-    chk(iv_tunnel_tick(&t, 3050u) == 0, "t09: not expired yet");
-    chk(iv_tunnel_remain_s(&t, 3050u) == 50u, "t09: remain 50");
-    chk(iv_tunnel_tick(&t, 3099u) == 0, "t09: boundary not expired");
-    chk(iv_tunnel_tick(&t, 3100u) == 1, "t09: expired at boundary");
-    chk(iv_tunnel_state(&t) == IV_TUNNEL_OFF, "t09: off after expire");
-    chk(!file_exists(g_flag), "t09: flag removed on expire");
-
+    chk(iv_tunnel_enable(&t, 10u, 5000u, &g_why) == IV_OK, "t06: enable 10s");
+    chk(iv_tunnel_tick(&t, 5009u) == 0, "t06: not yet");
+    chk(iv_tunnel_tick(&t, 5010u) == 1, "t06: expires exactly at deadline");
+    chk(iv_tunnel_state(&t) == IV_TUNNEL_OFF, "t06: state OFF after expiry");
+    chk(!file_exists(g_flag), "t06: flag cleared on expiry");
     iv_tunnel_stat(&t, &st);
-    chk(st.expires == 1u, "t09: expires counted");
-    chk(st.uptime_s == 100u, "t09: uptime counted");
-    chk(iv_tunnel_tick(&t, 3200u) == 0, "t09: tick when off is noop");
+    chk(st.expires == 1u, "t06: expires counter");
+    {
+        iv_tunnel_session_t last;
+        chk(iv_tunnel_last_session(&t, &last) == IV_OK, "t06: last session recorded");
+        chk(last.stop_reason == IV_TUNNEL_STOP_EXPIRED, "t06: stop reason expired");
+        chk(last.open_s == 5000u && last.close_s == 5010u, "t06: session window");
+        chk(last.ttl_s == 10u, "t06: session ttl");
+    }
 }
 
 /* ---------------------------------------------------------------------------
- * t10 / t11 能力位与统计
+ * t07 身份/服务端变更 ⇒ 作废在开的会话
  * ------------------------------------------------------------------------- */
-static void t10_caps(void)
+static void t07_invalidate(void)
 {
     iv_tunnel_t t;
 
-    iv_tunnel_init(&t);
-    chk(iv_tunnel_caps(&t) == 0u, "t10: bare handle has no caps");
-    chk(iv_tunnel_set_identity(&t, SN, TOKEN) == IV_OK, "t10: identity");
-    chk(iv_tunnel_caps(&t) == 0u, "t10: still no server");
-    chk(iv_tunnel_set_server(&t, "frp.example.com", 7000u) == IV_OK, "t10: server");
-    chk(iv_tunnel_caps(&t) == 0u, "t10: still no resolver");
-    chk(iv_tunnel_set_resolver(&t, &RES_OK) == IV_OK, "t10: resolver");
-    chk((iv_tunnel_caps(&t) & IV_TUNNEL_CAP_ENABLED) != 0u, "t10: enabled bit");
-    chk((iv_tunnel_caps(&t) & IV_TUNNEL_CAP_WEB) != 0u &&
-        (iv_tunnel_caps(&t) & IV_TUNNEL_CAP_CAMERA) != 0u &&
-        (iv_tunnel_caps(&t) & IV_TUNNEL_CAP_MEDIA) != 0u &&
-        (iv_tunnel_caps(&t) & IV_TUNNEL_CAP_FTP) != 0u, "t10: service bits");
-    /* 解除映射 ⇒ 能力立刻消失（不许声称一个开不起来的能力） */
-    chk(iv_tunnel_set_resolver(&t, NULL) == IV_EINVAL, "t10: resolver cleared");
-    chk(iv_tunnel_caps(&t) == 0u, "t10: caps gone after resolver cleared");
-    /* 身份非法 */
-    chk(iv_tunnel_set_identity(&t, "", TOKEN) == IV_EINVAL, "t10: empty sn rejected");
-    chk(iv_tunnel_set_server(&t, "", 0u) == IV_EINVAL, "t10: empty addr rejected");
-}
-
-static void t11_stat(void)
-{
-    iv_tunnel_t        t;
-    iv_tunnel_svc_t    svc;
-    iv_tunnel_stat_t   st;
-    iv_tunnel_reason_t why = IV_TUNNEL_OK;
-
+    (void)unlink(g_conf);
+    (void)unlink(g_flag);
     mk_rig(&t);
-    chk(iv_tunnel_svc_parse("web", 3, &svc) == IV_OK, "t11: parse");
 
-    /* 一次成功 + 一次被拒（有效期越界） */
-    chk(iv_tunnel_enable(&t, &svc, 1u, 60u, 4000u, &why) == IV_OK, "t11: enable");
-    chk(iv_tunnel_disable(&t, 4030u, IV_TUNNEL_STOP_LOCAL) == IV_OK, "t11: disable");
-    chk(iv_tunnel_enable(&t, &svc, 1u, IV_TUNNEL_TTL_MAX + 1u, 4040u, &why) == IV_EINVAL,
-        "t11: denied");
-    iv_tunnel_stat(&t, &st);
-    chk(st.opens == 1u, "t11: opens");
-    chk(st.denies == 1u, "t11: denies");
-    chk(st.deny_by[IV_TUNNEL_EBADARG] == 1u, "t11: deny_by reason");
-    chk(st.uptime_s == 30u, "t11: uptime");
-
-    /* 缺身份 ⇒ ENOIDENT 计数 */
+    chk(iv_tunnel_invalidate(&t) == IV_OK, "t07: invalidate while OFF is a no-op");
+    chk(iv_tunnel_enable(&t, 0u, 7000u, &g_why) == IV_OK, "t07: enable");
+    chk(iv_tunnel_invalidate(&t) == IV_OK, "t07: invalidate");
+    chk(iv_tunnel_state(&t) == IV_TUNNEL_OFF, "t07: closed");
+    chk(!file_exists(g_flag), "t07: flag cleared so monitor stops frpc");
     {
-        iv_tunnel_t t2;
-        iv_tunnel_init(&t2);
-        chk(iv_tunnel_set_paths(&t2, g_conf, g_flag) == IV_OK, "t11: paths");
-        chk(iv_tunnel_enable(&t2, &svc, 1u, 60u, 4000u, &why) == IV_EPROTO &&
-            why == IV_TUNNEL_ENOIDENT, "t11: no identity denied");
+        iv_tunnel_session_t last;
+        chk(iv_tunnel_last_session(&t, &last) == IV_OK &&
+            last.stop_reason == IV_TUNNEL_STOP_RECONF, "t07: stop reason reconf");
     }
-
-    /* invalidate：开启中作废 ⇒ RECONF 留档 */
-    chk(iv_tunnel_enable(&t, &svc, 1u, 60u, 5000u, &why) == IV_OK, "t11: enable again");
-    chk(iv_tunnel_invalidate(&t) == IV_OK, "t11: invalidate");
-    {
-        iv_tunnel_session_t s;
-        chk(iv_tunnel_last_session(&t, &s) == IV_OK, "t11: session");
-        chk(s.stop_reason == IV_TUNNEL_STOP_RECONF, "t11: reconf reason");
-    }
-    chk(iv_tunnel_state(&t) == IV_TUNNEL_OFF, "t11: off after invalidate");
-    chk(iv_tunnel_invalidate(&t) == IV_OK, "t11: invalidate when off is noop");
-    chk(!file_exists(g_flag), "t11: flag gone");
 }
 
 /* ---------------------------------------------------------------------------
- * t12 参数与 NULL 安全
+ * t08 caps / stat / 拒绝计数
  * ------------------------------------------------------------------------- */
-static void t12_null(void)
+static void t08_caps_stat(void)
 {
-    iv_tunnel_t        t;
-    iv_tunnel_svc_t    svc;
-    iv_tunnel_reason_t why = IV_TUNNEL_EBADARG;
-    iv_tunnel_stat_t   st;
-    iv_tunnel_session_t s;
+    iv_tunnel_t         t;
+    iv_tunnel_stat_t    st;
+    iv_tunnel_session_t last;
+    iv_tunnel_reason_t  why = IV_TUNNEL_OK;
 
-    chk(iv_tunnel_svc_parse("web", 3, &svc) == IV_OK, "t12: parse");
+    (void)unlink(g_conf);
+    (void)unlink(g_flag);
+
+    /* 缺身份 ⇒ 能力位为 0（fail-closed） */
+    iv_tunnel_init(&t);
+    chk(iv_tunnel_caps(&t) == 0u, "t08: no identity -> no caps");
+    chk(iv_tunnel_set_server(&t, "frp.example.com", 7000u) == IV_OK, "t08: server");
+    chk(iv_tunnel_caps(&t) == 0u, "t08: still no caps without identity");
+    chk(iv_tunnel_enable(&t, 0u, 9000u, &why) == IV_EPROTO, "t08: enable denied");
+    chk(why == IV_TUNNEL_ENOIDENT, "t08: reason ENOIDENT");
+    iv_tunnel_stat(&t, &st);
+    chk(st.denies == 1u && st.deny_by[IV_TUNNEL_ENOIDENT] == 1u, "t08: deny counted");
+    chk(iv_tunnel_last_session(&t, &last) == IV_ENOENT, "t08: no session yet");
+
     mk_rig(&t);
+    chk((iv_tunnel_caps(&t) & IV_TUNNEL_CAP_ENABLED) != 0u, "t08: enabled bit");
+    chk((iv_tunnel_caps(&t) & IV_TUNNEL_CAP_SSH) != 0u, "t08: ssh bit");
+    chk(iv_tunnel_enable(&t, 0u, 9001u, &why) == IV_OK, "t08: enable");
+    chk((iv_tunnel_caps(&t) & IV_TUNNEL_CAP_ENABLED) != 0u, "t08: enabled while ON");
+    chk(iv_tunnel_disable(&t, 9500u, IV_TUNNEL_STOP_LOCAL) == IV_OK, "t08: disable");
+    iv_tunnel_stat(&t, &st);
+    chk(st.opens == 1u && st.uptime_s == 499u, "t08: opens / uptime");
+    chk(iv_tunnel_last_session(&t, &last) == IV_OK &&
+        last.stop_reason == IV_TUNNEL_STOP_LOCAL, "t08: last session local");
+    /* 未开启时 remain 恒 0（前端据此显示"关"） */
+    chk(iv_tunnel_remain_s(&t, 9500u) == 0u, "t08: remain 0 when OFF");
+    chk(iv_tunnel_state(NULL) == IV_TUNNEL_OFF, "t08: NULL handle is OFF");
+    chk(iv_tunnel_caps(NULL) == 0u, "t08: NULL handle has no caps");
+}
 
-    /* 参数非法时**不改** why（调用方的旧值不该被踩） */
-    chk(iv_tunnel_enable(NULL, &svc, 1u, 60u, 1u, &why) == IV_EINVAL, "t12: NULL handle");
-    chk(why == IV_TUNNEL_EBADARG, "t12: why untouched");
+/* ---------------------------------------------------------------------------
+ * t09 认领已开的通道（进程重启后 state 归零，但标记与 frpc 还在）
+ *
+ * BIRD 里通道独立于 Go 进程：重启 Go 服务不断线。本工程的 state 是内存态，重启后
+ * 必须由 restore() 从标记文件认领回来，否则 status 会谎报 on=false、tick 也不判过期。
+ * ------------------------------------------------------------------------- */
+static void t09_restore(void)
+{
+    iv_tunnel_t t;
+    FILE       *f;
 
-    chk(iv_tunnel_disable(NULL, 1u, IV_TUNNEL_STOP_LOCAL) == IV_EINVAL, "t12: disable NULL");
-    chk(iv_tunnel_tick(NULL, 1u) == IV_EINVAL, "t12: tick NULL");
-    chk(iv_tunnel_state(NULL) == IV_TUNNEL_OFF, "t12: state NULL");
-    chk(iv_tunnel_remain_s(NULL, 1u) == 0u, "t12: remain NULL");
-    chk(iv_tunnel_last_session(NULL, &s) == IV_EINVAL, "t12: session NULL");
-    iv_tunnel_stat(NULL, &st);     /* 不崩 */
-    iv_tunnel_init(NULL);          /* 不崩 */
-    chk(iv_tunnel_last_session(&t, &s) == IV_ENOENT, "t12: no session yet");
-    chk(strcmp(iv_tunnel_reason_name(IV_TUNNEL_EHOST), "EHOST") == 0, "t12: reason name");
-    chk(strcmp(iv_tunnel_reason_name((iv_tunnel_reason_t)99), "UNKNOWN") == 0,
-        "t12: unknown reason name");
+    (void)unlink(g_conf);
+    (void)unlink(g_flag);
+
+    /* ① 没有标记 ⇒ 认领失败，保持 OFF（开机正常路径） */
+    mk_rig(&t);
+    chk(iv_tunnel_restore(&t, 10000u) == IV_ENOENT, "t09: nothing to adopt");
+    chk(iv_tunnel_state(&t) == IV_TUNNEL_OFF, "t09: still OFF");
+
+    /* ② 标记是空文件（BIRD 的 touch）⇒ 认领为 ON 且不过期 */
+    f = fopen(g_flag, "wb");
+    chk(f != NULL, "t09: plant empty flag");
+    if (f != NULL) fclose(f);
+    mk_rig(&t);
+    chk(iv_tunnel_restore(&t, 10000u) == IV_OK, "t09: adopt empty flag");
+    chk(iv_tunnel_state(&t) == IV_TUNNEL_ON, "t09: state ON after adopt");
+    chk(t.ttl_s == 0u && t.expire_s == 0u, "t09: adopted as no-expiry");
+    chk(t.local_port == 22u, "t09: adopted channel is ssh");
+    chk(iv_tunnel_remain_s(&t, 99999u) == 0u, "t09: no remain when no expiry");
+    chk(iv_tunnel_tick(&t, 99999u) == 0, "t09: adopted channel never expires");
+    /* 已 ON 时重复认领 ⇒ ESTATE（不重复计 opens） */
+    chk(iv_tunnel_restore(&t, 10001u) == IV_ESTATE, "t09: double adopt is ESTATE");
+
+    /* ③ 标记里是未到的到期时刻 ⇒ 认领并带上剩余时间 */
+    (void)iv_tunnel_disable(&t, 10002u, IV_TUNNEL_STOP_LOCAL);
+    f = fopen(g_flag, "wb");
+    chk(f != NULL, "t09: plant expiry flag");
+    if (f != NULL) { fputs("10600\n", f); fclose(f); }
+    mk_rig(&t);
+    chk(iv_tunnel_restore(&t, 10000u) == IV_OK, "t09: adopt with expiry");
+    chk(t.expire_s == 10600u, "t09: expiry adopted");
+    chk(t.ttl_s == 600u, "t09: ttl derived from expiry");
+    chk(iv_tunnel_remain_s(&t, 10300u) == 300u, "t09: remain counts down");
+    chk(iv_tunnel_tick(&t, 10600u) == 1, "t09: adopted channel expires on time");
+    chk(iv_tunnel_state(&t) == IV_TUNNEL_OFF, "t09: OFF after expiry");
+    chk(!file_exists(g_flag), "t09: expired flag cleared");
+
+    /* ④ 标记里是已过的到期时刻 ⇒ 不认领，顺手清标记 */
+    f = fopen(g_flag, "wb");
+    chk(f != NULL, "t09: plant stale expiry");
+    if (f != NULL) { fputs("5000\n", f); fclose(f); }
+    mk_rig(&t);
+    chk(iv_tunnel_restore(&t, 10000u) == IV_ESTATE, "t09: stale expiry rejected");
+    chk(iv_tunnel_state(&t) == IV_TUNNEL_OFF, "t09: stays OFF");
+    chk(!file_exists(g_flag), "t09: stale flag cleaned up");
 }
 
 /* ---------------------------------------------------------------------------
@@ -594,21 +418,17 @@ int main(void)
         return 1;
     }
     snprintf(g_conf, sizeof g_conf, "%s/frpc.toml", g_dir);
-    snprintf(g_flag, sizeof g_flag, "%s/tunnel.enabled", g_dir);
+    snprintf(g_flag, sizeof g_flag, "%s/frp.enabled", g_dir);
 
-    t01_svc_white();
-    t02_svc_format();
-    t03_secret();
-    t04_render();
-    t04b_render_ftp();
-    t05_host_gate();
-    t06_render_deny();
-    t07_enable();
-    t08_disable();
-    t09_expire();
-    t10_caps();
-    t11_stat();
-    t12_null();
+    t01_secret();
+    t02_render();
+    t03_render_deny();
+    t04_enable();
+    t05_flag_content();
+    t06_expire();
+    t07_invalidate();
+    t08_caps_stat();
+    t09_restore();
 
     (void)unlink(g_conf);
     (void)unlink(g_flag);
@@ -618,6 +438,8 @@ int main(void)
         fprintf(stderr, "test_tunnel: %d failures\n", g_fail);
         return 1;
     }
-    printf("test_tunnel passed\n");
+    printf("test_tunnel passed (BIRD secret golden, toml byte-exact, deny paths, "
+           "0600 atomic write/idempotent, flag empty-when-no-ttl, ttl expire, "
+           "invalidate, caps/stat, adopt-on-restart)\n");
     return 0;
 }

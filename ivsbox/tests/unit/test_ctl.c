@@ -52,27 +52,11 @@ static void noop_sink(int level, const char *module, const char *line, void *use
     (void)user;
 }
 
-/* ---- c2x 通道假 resolver（M8-S8.3）：与 main.c 的装配同构，目标一律环回 ---- */
-static int fake_resolve(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t *port,
-                        void *arg)
-{
-    (void)arg;
-    if (svc == NULL || ip_be == NULL || port == NULL)
-        return IV_EINVAL;
-    *ip_be = 0x7f000001u; /* 127.0.0.1（与 test_tunnel 的 rig 同约定，勿 htonl） */
-    switch (svc->kind) {
-    case IV_TUNNEL_SVC_WEB:    *port = 80u;    return IV_OK;
-    case IV_TUNNEL_SVC_MEDIA:  *port = 18000u; return IV_OK;
-    case IV_TUNNEL_SVC_CAMERA: return IV_ENOENT; /* 本用例不开摄像机代理 ⇒ 不可达 */
-    default:                   return IV_EINVAL;
-    }
-}
-
-static const iv_tunnel_resolver_t s_resolver = { fake_resolve, NULL, 0u };
-static char        g_tdir[160];
-static char        g_tconf[220];
-static char        g_tflag[220];
 static iv_tunnel_t g_tun;
+/* 隧道落点（临时目录）：配置文件与标记文件都放这里，绝不碰 /etc/frp 与 /tmp。 */
+static char g_tdir[256];
+static char g_tconf[512];
+static char g_tflag[512];
 
 /* 调一次 ctl；成功时返回解析后的 JSON（调用方负责 put），否则 NULL。 */
 static json_object *call(const iv_ctl_ctx_t *ctx, const char *req, int *rc_out,
@@ -298,7 +282,6 @@ int main(void)
     chk(iv_tunnel_set_identity(&g_tun, "TESTSN01", "test-token") == IV_OK, "c2x: identity");
     chk(iv_tunnel_set_server(&g_tun, "10.9.9.9", 0) == IV_OK, "c2x: server (port defaults)");
     chk(iv_tunnel_set_paths(&g_tun, g_tconf, g_tflag) == IV_OK, "c2x: paths");
-    chk(iv_tunnel_set_resolver(&g_tun, &s_resolver) == IV_OK, "c2x: resolver");
     ctx.tunnel = &g_tun;
 
     /* ---------------- c01 方法表 ---------------- */
@@ -1092,7 +1075,7 @@ int main(void)
             chk(0, "c18: on field missing");
         if (d != NULL && json_object_object_get_ex(d, "enabled", &v))
             chk(json_object_get_boolean(v) == 1,
-                "c18: capability enabled (identity+server+resolver all present)");
+                "c18: capability enabled (identity + server present)");
         else
             chk(0, "c18: enabled field missing");
     }
@@ -1101,67 +1084,91 @@ int main(void)
     if (j != NULL)
         json_object_put(j);
 
-    /* ---------------- c19 开通道：参数形态 ---------------- */
-    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{}}", &rc, raw, sizeof(raw));
-    chk(rc == IV_OK && j != NULL && joerr(j) == IV_EINVAL, "c19a: missing svcs rejected");
+    /* ---------------- c19 有效期：越界当场拒（BIRD 没有 TTL，这是本工程的护栏） ---- */
+    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{\"ttl\":86401}}", &rc, raw,
+             sizeof(raw));
+    chk(rc == IV_OK && j != NULL && joerr(j) == IV_ERANGE, "c19a: ttl over max rejected");
     if (j != NULL)
         json_object_put(j);
-    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{\"svcs\":[\"192.168.1.10\"]}}", &rc,
-             raw, sizeof(raw));
-    chk(rc == IV_OK && j != NULL && joerr(j) == IV_EINVAL,
-        "c19b: an ip address is not a service name");
-    if (j != NULL)
-        json_object_put(j);
-    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{\"svcs\":[\"camera:9\"]}}", &rc,
-             raw, sizeof(raw));
-    chk(rc == IV_OK && j != NULL && joerr(j) == IV_EINVAL, "c19c: camera index out of range");
-    if (j != NULL)
-        json_object_put(j);
-    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{\"svcs\":[\"web\",\"web\"]}}", &rc,
-             raw, sizeof(raw));
-    chk(rc == IV_OK && j != NULL && joerr(j) == IV_EINVAL, "c19d: duplicate services rejected");
+    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{\"ttl\":-5}}", &rc, raw, sizeof(raw));
+    chk(rc == IV_OK && j != NULL && joerr(j) == IV_ERANGE, "c19b: negative ttl rejected");
     if (j != NULL)
         json_object_put(j);
 
-    /* ---------------- c20 开通道：web（配置落盘 + 标记出现） ---------------- */
-    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{\"svcs\":[\"web\"]}}", &rc, raw,
-             sizeof(raw));
-    chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c20a: web accepted");
+    /* ---------------- c20 不带 ttl ⇒ 不过期（＝BIRD 的 debug.mode 开关） ---------- */
+    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{}}", &rc, raw, sizeof(raw));
+    chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c20a: enable without ttl accepted");
     {
         json_object *d = (j != NULL) ? jodata(j) : NULL;
         json_object *v = NULL;
+        json_object *sv = NULL;
 
         if (d != NULL && json_object_object_get_ex(d, "on", &v))
             chk(json_object_get_boolean(v) == 1, "c20a: reports on");
         else
             chk(0, "c20a: on field missing");
+        if (d != NULL && json_object_object_get_ex(d, "ttl_s", &v))
+            chk(json_object_get_int(v) == 0, "c20a: ttl_s 0 means never expires");
+        else
+            chk(0, "c20a: ttl_s field missing");
+        /* 通道只有一条代理：回包里的服务集合固定 ["ssh"] */
+        if (d != NULL && json_object_object_get_ex(d, "svcs", &sv) && sv != NULL)
+            chk(json_object_array_length(sv) == 1, "c20a: exactly one service (ssh)");
+        else
+            chk(0, "c20a: svcs array missing");
     }
     if (j != NULL)
         json_object_put(j);
     chk(access(g_tflag, F_OK) == 0, "c20b: flag file created");
     chk(access(g_tconf, F_OK) == 0, "c20b: frpc.toml created");
+    {
+        /* 配置内容必须与 BIRD 逐字同构：一条 stcp、转发 22、钥匙 16 位 */
+        char   txt[1024];
+        long   n;
+        FILE  *f = fopen(g_tconf, "rb");
+
+        chk(f != NULL, "c20b: conf readable");
+        if (f != NULL) {
+            n = (long)fread(txt, 1u, sizeof txt - 1u, f);
+            if (n < 0) n = 0;
+            txt[n] = '\0';
+            (void)fclose(f);
+            chk(strstr(txt, "type = \"stcp\"") != NULL, "c20b: stcp proxy");
+            chk(strstr(txt, "localPort = 22") != NULL, "c20b: forwards sshd 22");
+            chk(strstr(txt, "name = \"TESTSN01\"") != NULL, "c20b: proxy name == SN");
+        }
+    }
     j = call(&ctx, "{\"m\":\"tunnel.status\"}", &rc, raw, sizeof(raw));
     chk(rc == IV_OK && j != NULL && strstr(raw, "\"on\":true") != NULL, "c20c: status on");
     if (j != NULL)
         json_object_put(j);
 
     /* ---------------- c21 重复开启 ⇒ ESTATE ---------------- */
-    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{\"svcs\":[\"web\"]}}", &rc, raw,
-             sizeof(raw));
+    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{}}", &rc, raw, sizeof(raw));
     chk(rc == IV_OK && j != NULL && joerr(j) == IV_ESTATE, "c21: double enable is ESTATE");
     if (j != NULL)
         json_object_put(j);
 
-    /* ---------------- c22 摄像机代理未接 ⇒ 不可达（不是崩溃） ---------------- */
+    /* ---------------- c22 关闭清标记；再开可带 ttl ---------------- */
     j = call(&ctx, "{\"m\":\"tunnel.disable\"}", &rc, raw, sizeof(raw));
     chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c22a: disable while on");
     if (j != NULL)
         json_object_put(j);
-    chk(access(g_tflag, F_OK) != 0, "c22a: flag removed");
-    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{\"svcs\":[\"camera:0\"]}}", &rc, raw,
-             sizeof(raw));
-    chk(rc == IV_OK && j != NULL && joerr(j) == IV_ENOENT,
-        "c22b: camera proxy not wired => unmapped (IV_ENOENT)");
+    chk(access(g_tflag, F_OK) != 0, "c22a: flag removed (monitor stops frpc)");
+    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{\"ttl\":60}}", &rc, raw, sizeof(raw));
+    chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c22b: enable with ttl accepted");
+    if (j != NULL) {
+        json_object *d = jodata(j);
+        json_object *v = NULL;
+
+        if (d != NULL && json_object_object_get_ex(d, "remain_s", &v))
+            chk(json_object_get_int(v) > 0, "c22b: remain_s > 0 with ttl");
+        else
+            chk(0, "c22b: remain_s missing");
+        json_object_put(j);
+    }
+    j = call(&ctx, "{\"m\":\"tunnel.disable\"}", &rc, raw, sizeof(raw));
+    chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c22c: closed again");
     if (j != NULL)
         json_object_put(j);
 
@@ -1172,16 +1179,16 @@ int main(void)
     if (j != NULL)
         json_object_put(j);
 
-    /* ---------------- c24 media:N 也可开 ---------------- */
-    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{\"svcs\":[\"media:0\",\"web\"]}}", &rc,
-             raw, sizeof(raw));
-    chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c24: media+web accepted");
+    /* ---------------- c24 老客户端仍带 svcs：忽略但不得报错 ---------------- */
+    j = call(&ctx, "{\"m\":\"tunnel.enable\",\"p\":{\"svcs\":[\"web\",\"camera:0\"]}}",
+             &rc, raw, sizeof(raw));
+    chk(rc == IV_OK && jobool(j, "ok", 0) == 1, "c24: legacy svcs ignored, not rejected");
     if (j != NULL) {
         json_object *d = jodata(j);
         json_object *sv = NULL;
 
         if (d != NULL && json_object_object_get_ex(d, "svcs", &sv) && sv != NULL)
-            chk(json_object_array_length(sv) == 2, "c24: two services rendered");
+            chk(json_object_array_length(sv) == 1, "c24: still one service (ssh)");
         else
             chk(0, "c24: svcs array missing");
         json_object_put(j);
@@ -1267,7 +1274,7 @@ int main(void)
     /* ---------------- 收尾（规则 6） ---------------- */
     iv_config_close(cfg);
     {
-        char p[220];
+        char p[sizeof(g_tdir) + 32];
 
         (void)snprintf(p, sizeof(p), "%s/ivsbox.json", g_dir);
         (void)unlink(p);

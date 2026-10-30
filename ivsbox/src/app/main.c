@@ -102,6 +102,8 @@ static iv_timer_t  *g_tunnel_timer;
 static uint16_t     g_tun_port_web   = 80u;
 static uint16_t     g_tun_port_media = 18000u;
 static uint16_t     g_tun_port_cam   = 8081u;
+static uint16_t     g_tun_port_ftp   = 21u;      /* vsftpd 控制口 */
+static uint16_t     g_tun_port_ftpdata = IV_TUNNEL_FTP_DATA_DEF; /* 被动模式数据口 */
 static int          g_tun_cam_enable;
 
 static void tunnel_apply_cfg(void); /* 配置热更新回调要用 */
@@ -961,6 +963,11 @@ static int tunnel_resolve(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t 
     case IV_TUNNEL_SVC_MEDIA:
         *port = g_tun_port_media;
         return IV_OK;
+    case IV_TUNNEL_SVC_FTP:
+        /* 本机 vsftpd：控制口 21。数据口不走这里，由 resolver 的 ftp_data_port
+         * 单独给（`ftp` 一条服务名要渲染两条代理，见 iv_tunnel_render）。 */
+        *port = g_tun_port_ftp;
+        return IV_OK;
     case IV_TUNNEL_SVC_CAMERA:
         /* S8.5 落地前本机没有这个监听口。报"不可达"（EUNMAPPED 的语义）比把它映射到
          * 一个没人听的端口好：后者会让 frpc 起得来、连得上、但一访问就断，
@@ -978,7 +985,8 @@ static int tunnel_resolve(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t 
     }
 }
 
-static const iv_tunnel_resolver_t s_tunnel_resolver = { tunnel_resolve, NULL };
+/* 非 const：`ftp` 的数据口要随配置热更新（见 tunnel_apply_cfg）。 */
+static iv_tunnel_resolver_t s_tunnel_resolver = { tunnel_resolve, NULL, 0u };
 
 /* 读令牌：取文件第一行、去掉 CR/LF（平台下发多半带换行），其余忽略。
  * 文件不在/为空**不算错误**：出厂未下发令牌的设备本来就该开不了通道。 */
@@ -1064,6 +1072,13 @@ static void tunnel_apply_cfg(void)
     if (p != 0u) g_tun_port_media = p;
     p = cfg_port("sys.tunnel.cam.port");
     if (p != 0u) g_tun_port_cam = p;
+    p = cfg_port("sys.tunnel.ftp.port");
+    if (p != 0u) g_tun_port_ftp = p;
+    p = cfg_port("sys.tunnel.ftp.data_port");
+    if (p != 0u) g_tun_port_ftpdata = p;
+    /* 数据口随配置走：resolver 是回调，读不到配置，只能在装配层灌进去。
+     * 0 表示"用默认"，由 iv_tunnel_render 兜到 IV_TUNNEL_FTP_DATA_DEF。 */
+    s_tunnel_resolver.ftp_data_port = g_tun_port_ftpdata;
     if (iv_config_get_bool(g_cfg, "sys.tunnel.cam.enable", &bv) == IV_OK)
         g_tun_cam_enable = (bv != 0);
 

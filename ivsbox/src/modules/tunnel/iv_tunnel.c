@@ -148,6 +148,11 @@ int iv_tunnel_svc_parse(const char *s, size_t len, iv_tunnel_svc_t *out)
         out->index = 0u;
         return IV_OK;
     }
+    if (len == 3u && memcmp(s, "ftp", 3u) == 0) {
+        out->kind = IV_TUNNEL_SVC_FTP;
+        out->index = 0u;
+        return IV_OK;
+    }
     if (len > 7u && memcmp(s, "camera:", 7u) == 0) {
         unsigned idx = 0;
         int rc = parse_index(s + 7, len - 7u, IV_TUNNEL_CAM_MAX, &idx);
@@ -177,6 +182,10 @@ int iv_tunnel_svc_format(const iv_tunnel_svc_t *svc, char *out, size_t cap)
     case IV_TUNNEL_SVC_WEB:
         if (cap < 4u) return IV_ERANGE;
         memcpy(out, "web", 4u);
+        return IV_OK;
+    case IV_TUNNEL_SVC_FTP:
+        if (cap < 4u) return IV_ERANGE;
+        memcpy(out, "ftp", 4u);
         return IV_OK;
     case IV_TUNNEL_SVC_CAMERA:
     case IV_TUNNEL_SVC_MEDIA: {
@@ -237,6 +246,33 @@ static int is_loopback(uint32_t ip_be)
     return ((ip_be >> 24) & 0xffu) == 0x7fu;
 }
 
+/* 追加一条 stcp 代理块。`tag` 同时决定代理名后缀（`<sn>-<tag>`）与 secretKey 的
+ * `svc` 输入 —— 两者必须同源，否则访问端算不出同一把钥匙。
+ * 返回 0＝成功、-1＝钥匙派生/命名失败（身份问题）、-2＝输出缓冲不足。 */
+static int emit_proxy(char *out, size_t cap, size_t *pos,
+                      const char *sn, const char *token, const char *tag,
+                      uint32_t ip_be, uint16_t port)
+{
+    char name[IV_TUNNEL_NAME_MAX];
+    char secret[IV_TUNNEL_SECRET_MAX];
+    int  w;
+
+    if (iv_tunnel_secret(sn, token, tag, secret, sizeof secret) != IV_OK) return -1;
+    w = snprintf(name, sizeof name, "%s-%s", sn, tag);
+    if (w < 0 || (size_t)w >= sizeof name) return -1;
+
+    if (app(out, cap, pos, "\n[[proxies]]\n") != 0 ||
+        app(out, cap, pos, "name = \"%s\"\n", name) != 0 ||
+        app(out, cap, pos, "type = \"stcp\"\n") != 0 ||
+        app(out, cap, pos, "secretKey = \"%s\"\n", secret) != 0 ||
+        app(out, cap, pos, "localIP = \"%u.%u.%u.%u\"\n",
+            (unsigned)((ip_be >> 24) & 0xffu), (unsigned)((ip_be >> 16) & 0xffu),
+            (unsigned)((ip_be >> 8) & 0xffu), (unsigned)(ip_be & 0xffu)) != 0 ||
+        app(out, cap, pos, "localPort = %u\n", (unsigned)port) != 0)
+        return -2;
+    return 0;
+}
+
 int iv_tunnel_render(const char *sn, const char *token, const char *server_addr,
                      uint16_t server_port, const iv_tunnel_resolver_t *resolver,
                      const iv_tunnel_svc_t *svcs, unsigned n,
@@ -245,6 +281,7 @@ int iv_tunnel_render(const char *sn, const char *token, const char *server_addr,
 {
     size_t   pos = 0;
     unsigned i;
+    unsigned total = 0; /* 实际代理条数（`ftp` 一条服务名占两条） */
 
     if (out == NULL || cap == 0u || out_len == NULL || svcs == NULL) {
         if (why != NULL) *why = IV_TUNNEL_EBADARG;
@@ -277,11 +314,10 @@ int iv_tunnel_render(const char *sn, const char *token, const char *server_addr,
 
     for (i = 0; i < n; i++) {
         char     sname[IV_TUNNEL_SVC_MAX];
-        char     name[IV_TUNNEL_NAME_MAX];
-        char     secret[IV_TUNNEL_SECRET_MAX];
         uint32_t ip_be = 0;
         uint16_t port = 0;
         int      rc;
+        int      w;
 
         if (iv_tunnel_svc_format(&svcs[i], sname, sizeof sname) != IV_OK) {
             if (why != NULL) *why = IV_TUNNEL_EBADARG;
@@ -298,21 +334,35 @@ int iv_tunnel_render(const char *sn, const char *token, const char *server_addr,
             if (why != NULL) *why = IV_TUNNEL_EHOST;
             return IV_EPROTO;
         }
-        if (iv_tunnel_secret(sn, token, sname, secret, sizeof secret) != IV_OK) {
-            if (why != NULL) *why = IV_TUNNEL_ENOIDENT;
-            return IV_EFAIL;
+        if (total + ((svcs[i].kind == IV_TUNNEL_SVC_FTP) ? 2u : 1u) > IV_TUNNEL_PROXIES_MAX) {
+            if (why != NULL) *why = IV_TUNNEL_EBADARG;
+            return IV_EINVAL;
         }
-        snprintf(name, sizeof name, "%s-%s", sn, sname);
 
-        if (app(out, cap, &pos, "\n[[proxies]]\n") != 0 ||
-            app(out, cap, &pos, "name = \"%s\"\n", name) != 0 ||
-            app(out, cap, &pos, "type = \"stcp\"\n") != 0 ||
-            app(out, cap, &pos, "secretKey = \"%s\"\n", secret) != 0 ||
-            app(out, cap, &pos, "localIP = \"%u.%u.%u.%u\"\n",
-                (unsigned)((ip_be >> 24) & 0xffu), (unsigned)((ip_be >> 16) & 0xffu),
-                (unsigned)((ip_be >> 8) & 0xffu), (unsigned)(ip_be & 0xffu)) != 0 ||
-            app(out, cap, &pos, "localPort = %u\n", (unsigned)port) != 0)
+        if ((w = emit_proxy(out, cap, &pos, sn, token, sname, ip_be, port)) != 0) {
+            if (why != NULL) *why = (w == -1) ? IV_TUNNEL_ENOIDENT : IV_TUNNEL_EBADARG;
+            if (w == -1) return IV_EFAIL;
             goto overflow;
+        }
+        total++;
+
+        /* `ftp` 再加一条：被动模式的数据连接是**另一条 TCP**，frp 一条代理只映射
+         * 一个端口。数据端口固定（vsftpd 的 pasv_min/max_port），否则访问端没法预置。 */
+        if (svcs[i].kind == IV_TUNNEL_SVC_FTP) {
+            uint16_t dport = (resolver->ftp_data_port != 0u)
+                                 ? resolver->ftp_data_port
+                                 : (uint16_t)IV_TUNNEL_FTP_DATA_DEF;
+            if (dport == 0u || dport == port) {
+                if (why != NULL) *why = IV_TUNNEL_EBADARG;
+                return IV_EINVAL;
+            }
+            if ((w = emit_proxy(out, cap, &pos, sn, token, "ftpdata", ip_be, dport)) != 0) {
+                if (why != NULL) *why = (w == -1) ? IV_TUNNEL_ENOIDENT : IV_TUNNEL_EBADARG;
+                if (w == -1) return IV_EFAIL;
+                goto overflow;
+            }
+            total++;
+        }
     }
 
     out[cap - 1u] = '\0';
@@ -604,7 +654,7 @@ uint32_t iv_tunnel_caps(const iv_tunnel_t *t)
     if (t->resolver == NULL) return 0u;
     if (t->conf_path[0] == '\0' || t->flag_path[0] == '\0') return 0u;
     return IV_TUNNEL_CAP_WEB | IV_TUNNEL_CAP_CAMERA | IV_TUNNEL_CAP_MEDIA |
-           IV_TUNNEL_CAP_ENABLED;
+           IV_TUNNEL_CAP_FTP | IV_TUNNEL_CAP_ENABLED;
 }
 
 void iv_tunnel_stat(const iv_tunnel_t *t, iv_tunnel_stat_t *out)

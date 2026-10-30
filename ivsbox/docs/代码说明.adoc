@@ -11482,3 +11482,46 @@ grep 'ws closed' /mnt/UDISK/log/<日期>/<小时>.log
 * 一路摄像机同时只该有一条直播 WS（页面切码流时会先断开旧的）。代理层不做限制：
   多开几条就是在 24 个槽位里各占一条，内存与带宽都按真实用量走。
 * 中继连接**不参与 `--media-bps` 限速**：限速是给录像下载的，给直播加限速就是自己造卡顿。
+
+== 2026-10-30 10:47 受控通道新增 `ftp`：一条服务名、两条代理
+
+=== 为什么要有它
+现场要"把 SD 卡里的录像/抓拍到本地"，原来只有 `/media` 这条 HTTP 路：
+它是本工程自己写的（`iv_web` 的静态分流），默认被 `--media-bps 262144` 限速到
+256 KiB/s，一段 15 分钟录像要好几分钟。而设备镜像本身自带 vsftpd
+（`/etc/init.d/S70vsftpd`，3.0.3，监听 `0.0.0.0:21`）—— 参考项目 `bird_20260623`
+也是靠这个取文件（它的 frp 只开一条 stcp 转发 `localPort = 22`，FTP 不在 Go 代码里，
+是镜像自带服务）。所以正解是把 **FTP 接进受控通道**，而不是另造一套下载协议。
+
+=== 一条服务名为什么渲染两条代理
+FTP 一次传输会开**两条 TCP**：控制连接（21）＋ 被动模式的数据连接。frp 的
+`[[proxies]]` 一条只能映射一个 `localPort`，所以：
+
+```
+name = "<sn>-ftp"      localPort = 21      secretKey = MD5(sn+token+"ftp")
+name = "<sn>-ftpdata"  localPort = 50000   secretKey = MD5(sn+token+"ftpdata")
+```
+
+数据口必须**固定**（设备侧 `pasv_min_port = pasv_max_port = 50000`），否则没法提前
+写进 frpc.toml 与访问端 visitor；端口由 `resolver.ftp_data_port` 注入（配置键
+`sys.tunnel.ftp.data_port`），`0` 表示取 `IV_TUNNEL_FTP_DATA_DEF`。数据口与控制口
+相同一律拒（同一条服务名两条代理撞同一个口，必然是配错）。
+
+`IV_TUNNEL_PROXIES_MAX` 仍是 8，但计数按**实际代理条数**走：`ftp` 占两格，
+所以"8 条服务名里带 ftp"会被判 `EBADARG` —— 这是有意的，配置读出来就该是能用的。
+
+=== 访问端必须改写 PASV 地址
+设备的 PASV 回包给的是它**自己**的地址（经隧道时是 127.0.0.1，局域网时是
+192.168.1.x）。`ftplib` 不实现 EPSV，只会照回包直连 ⇒ 局域网测试全绿、远程一传
+文件就卡死。`_deploy/sdftp.py` 里覆写 `makepasv()` 改成"控制连接的主机 + 服务器
+给的数据端口"，前提是访问端 visitor 把 `ftpdata` 绑在**与设备数据口相同的端口号**上。
+
+=== 设备侧前提（不是本工程代码，但缺了 FTP 就是连不上）
+* `/etc/passwd` 要有 `ftp` 用户（uid/gid 21）—— 否则 vsftpd 3.0.3 的 secure chroot
+  建不起来，任何连接都回 `500 OOPS: cannot locate user specified in 'ftp_username':ftp`；
+* `/var/run/vsftpd/empty` 存在且 0555；
+* `local_root=/` + `chroot_local_user=YES` ⇒ FTP 根就是设备根，`/mnt/sdcard` 直接可达；
+* `pasv_min_port` / `pasv_max_port` 必须与 `sys.tunnel.ftp.data_port` 同值。
+
+这些是**镜像级**改动（`/etc` 在 rw ext4 上，重启保留；重新烧写会丢），
+落盘脚本见 `_deploy/ftp_fix.sh`。

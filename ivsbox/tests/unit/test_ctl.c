@@ -68,7 +68,7 @@ static int fake_resolve(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t *p
     }
 }
 
-static const iv_tunnel_resolver_t s_resolver = { fake_resolve, NULL };
+static const iv_tunnel_resolver_t s_resolver = { fake_resolve, NULL, 0u };
 static char        g_tdir[160];
 static char        g_tconf[220];
 static char        g_tflag[220];

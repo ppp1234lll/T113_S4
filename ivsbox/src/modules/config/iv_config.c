@@ -187,6 +187,11 @@ static const cfg_default_t s_defaults[] = {
           8081, 1, 65535),
     D_BOOL(IV_CFG_CLS_SYS, "sys.tunnel.cam.enable",
           "摄像机受控代理可用（S8.5 落地前恒 false ⇒ `camera:N` 一律判不可达）", "false"),
+    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.ftp.port",
+          "本机 FTP 控制端口（`ftp` 的代理目标；vsftpd 控制口）", 21, 1, 65535),
+    D_INT(IV_CFG_CLS_SYS, "sys.tunnel.ftp.data_port",
+          "本机 FTP 被动数据端口（`ftp` 的第二条代理目标；须与 vsftpd 的 "
+          "pasv_min_port/pasv_max_port 同值）", 50000, 1, 65535),
 
     /* ---- net. 网络配置（架构 §10.2；原 net.wan.* 六项已删，网口由 sys.transport.mode 隐含） ---- */
     D_STR(IV_CFG_CLS_NET, "net.ip", "本机 IP 地址（空＝由 DHCP 分配）", "", NULL),

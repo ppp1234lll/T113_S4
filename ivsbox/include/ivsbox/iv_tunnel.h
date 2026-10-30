@@ -30,13 +30,16 @@
  *   最该钉死的是"哪些服务能被代理、钥匙怎么派生、文件怎么落盘、到期会不会自己关"。
  *
  * ============================ 服务名白名单（架构 §9.4「禁止任意 ip:port」） ============================
- * 只接受 `web` / `camera:<id>` / `media:<id>`，由**注入式 resolver** 映射成本机代理
+ * 只接受 `web` / `camera:<id>` / `media:<id>` / `ftp`，由**注入式 resolver** 映射成本机代理
  * 入口。frp 的 `localIP` 只可能是本机可达地址，因此本模块**硬性要求 resolver 给出的
  * 目标必须是环回地址（127.0.0.0/8）**：
  *   - `web`      → 本机 Web 服务端口（ivsbox-web）；
  *   - `camera:N` → 本机**摄像机受控代理**端口（S8.5：ivsbox-web 按设备档案把请求转发
  *                  到摄像机，摄像机凭据只留在设备侧、绝不下发给浏览器）；
- *   - `media:N`  → 本机媒体读取端口。
+ *   - `media:N`  → 本机媒体读取端口；
+ *   - `ftp`      → 本机 vsftpd：控制口（resolver 给）+ 被动数据口（`ftp_data_port`）。
+ *                  **一条服务名渲染两条 stcp 代理**（`<sn>-ftp` / `<sn>-ftpdata`）——
+ *                  FTP 的数据连接是另一条 TCP，一条 frp 代理转不了两个端口。
  * 也就是说：**摄像机 IP 从不出现在通道配置里** —— 想访问摄像机只能过设备上的受控
  * 代理，这正是 §9.4 白名单想要的结果。非环回目标一律拒（`EHOST`）。
  *
@@ -113,8 +116,14 @@ extern "C" {
 typedef enum {
     IV_TUNNEL_SVC_WEB = 0,    /* 本机 Web（`web`） */
     IV_TUNNEL_SVC_CAMERA = 1, /* 摄像机受控代理（`camera:<id>`） */
-    IV_TUNNEL_SVC_MEDIA = 2   /* 本机媒体读取（`media:<id>`） */
+    IV_TUNNEL_SVC_MEDIA = 2,  /* 本机媒体读取（`media:<id>`） */
+    IV_TUNNEL_SVC_FTP = 3     /* 文件下载（`ftp`）—— **一条服务名、两条代理** */
 } iv_tunnel_svc_kind_t;
+
+/* `ftp` 的被动模式数据端口默认值。必须与设备侧 vsftpd 的
+ * `pasv_min_port` / `pasv_max_port` 同值：frp 一条代理只映射一个端口，数据端口
+ * 只能**先钉死**再写进 frpc.toml 与访问端 visitor —— 端口随机就没法预置。 */
+#define IV_TUNNEL_FTP_DATA_DEF 50000u
 
 typedef struct {
     iv_tunnel_svc_kind_t kind;
@@ -134,6 +143,10 @@ typedef struct {
 typedef struct {
     int (*resolve)(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t *port, void *arg);
     void *arg;
+    /* 仅 `ftp` 用：被动模式的数据端口。0 ⇒ 取 IV_TUNNEL_FTP_DATA_DEF。
+     * 放在这里而不是再加一个 resolver 回调：FTP 的数据口是本机固定监听，
+     * 与"服务名→入口"的映射无关，装配层从配置读一次即可。 */
+    uint16_t ftp_data_port;
 } iv_tunnel_resolver_t;
 
 /* ---------------------------------------------------------------------------
@@ -161,7 +174,8 @@ const char *iv_tunnel_stop_reason_name(int r);
  * ------------------------------------------------------------------------- */
 
 /*
- * 解析服务名。合法：`web`；`camera:N`（十进制、无前导零、< 6）；`media:N`（< 8）。
+ * 解析服务名。合法：`web`；`camera:N`（十进制、无前导零、< 6）；`media:N`（< 8）；
+ * `ftp`（无下标，`ftp:21` 是非法形态）。
  * 非法（`ip:port`、域名、URL、`web:80`、`camera:`、`camera:06`、`camera:6`…）：
  * IV_EINVAL 形态不符 / IV_ERANGE 下标越界。
  */
@@ -307,6 +321,7 @@ uint32_t iv_tunnel_remain_s(const iv_tunnel_t *t, uint64_t now_s);
 #define IV_TUNNEL_CAP_WEB     (1u << 0)
 #define IV_TUNNEL_CAP_CAMERA  (1u << 1)
 #define IV_TUNNEL_CAP_MEDIA   (1u << 2)
+#define IV_TUNNEL_CAP_FTP     (1u << 3)
 #define IV_TUNNEL_CAP_ENABLED (1u << 31)
 uint32_t iv_tunnel_caps(const iv_tunnel_t *t);
 

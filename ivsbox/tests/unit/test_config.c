@@ -178,8 +178,8 @@ static iv_config_t *reopen_cfg(void)
  * 无相机时默认项共 14+11+5+18+20+5+4+5 = 82 项。
  * （sys 13 = debug.mode/reboot.hour/report.interval_s/transport.mode/sample.period_ms
  *   ＋ device.model（E3 应答的 mod，2026-10-20 加）
- *   共 6 ＋ M8-S8.3 的 sys.tunnel.* 7（server.host/port、ttl_s、web/media/cam 三端口、
- *   cam.enable）；camera 18 = camera.search/detect.mode/detect.rtt_ms/rec.hold_ms/rec.debounce_ms
+ *   共 6 ＋ M8-S8.3 的 sys.tunnel.* 9（server.host/port、ttl_s、web/media/cam 三端口、
+ *   cam.enable、ftp.port/ftp.data_port）；camera 18 = camera.search/detect.mode/detect.rtt_ms/rec.hold_ms/rec.debounce_ms
  *   共 5 ＋ SNMP 目标参数 4 ＋
  *   SNMP OID 槽位 9；switch 20 = switch.ip/vendor/model 共 3 ＋ SNMP 目标参数 5 ＋
  *   SNMP OID 槽位 12。camera.ch 是变长数组，此处不计。）
@@ -206,9 +206,9 @@ static void case_defaults_startup(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c1: stat");
     chk(st.loaded == 0, "c1: loaded == 0 (started from built-in defaults)");
-    chk(st.items == 104u, "c1: 104 non-array defaults materialised");
+    chk(st.items == 106u, "c1: 106 non-array defaults materialised");
     chk(st.from_file == 0u, "c1: nothing came from the file");
-    chk(st.from_default == 104u, "c1: everything came from defaults");
+    chk(st.from_default == 106u, "c1: everything came from defaults");
     chk(st.invalid == 0u, "c1: a missing file is NOT an invalid value");
     chk(st.version == 0u, "c1: version is 0 when there is no file");
     chk(st.dirty == 0, "c1: not dirty right after open");
@@ -574,9 +574,9 @@ static void case_fill_and_origin(void)
         return;
 
     chk(iv_config_stat(c, &st) == IV_OK, "c5: stat");
-    chk(st.items == 104u, "c5: all non-array defaults are materialised");
+    chk(st.items == 106u, "c5: all non-array defaults are materialised");
     chk(st.from_file == 1u, "c5: exactly one key came from the file");
-    chk(st.from_default == 103u, "c5: a hundred and three were filled from defaults");
+    chk(st.from_default == 105u, "c5: a hundred and five were filled from defaults");
     chk(st.invalid == 0u, "c5: a MISSING key is not an INVALID key");
     chk(st.loaded == 1, "c5: the file itself loaded fine");
 
@@ -617,7 +617,7 @@ static void case_parent_scalar_rejected(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c6: stat");
     chk(st.invalid == 1u, "c6: the scalar that shadows a subtree is counted as invalid");
-    chk(st.items == 104u, "c6: the whole non-array default set is still there");
+    chk(st.items == 106u, "c6: the whole non-array default set is still there");
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && s[0] == '\0',
         "c6: net.* is usable again (defaulted empty)");
     chk(iv_config_get_int(c, "net", &iv) == IV_ENOENT, "c6: the offending key itself is gone");
@@ -640,7 +640,7 @@ static void case_atomic_replace(void)
         "{\"_meta\":{\"version\":2},\"net\":{\"ip\":\"10.0.0.1\"}}\n";
     char         pf[200];
     char         tmpf[200];
-    char         buf[2048];
+    char         buf[8192]; /* 默认项已过 2 KB，`read_file()` 静默截断 ⇒ 给小了会假红 */
     char         oldbuf[1024];
     iv_config_t *c;
     int          old_fd;
@@ -1013,7 +1013,7 @@ static void case_array_support(void)
                     strcmp(s, "7") == 0,
                 "c10: the 8th element is reachable");
             chk(iv_config_stat(cx, &st8) == IV_OK, "c10: stat on the eight-camera config");
-            chk(st8.items == 104u + 64u,
+            chk(st8.items == 106u + 64u,
                 "c10: 8 slots x 8 fields + 100 base == 164 items (fits ITEMS_MAX 192)");
             iv_config_close(cx);
         }
@@ -1091,7 +1091,7 @@ static void case_comment_roundtrip(void)
     chk(iv_config_stat(c, &st) == IV_OK, "c11: stat after round-trip");
     chk(st.loaded == 1, "c11: the rendered file parses back cleanly");
     chk(st.invalid == 0u, "c11: no value was rejected on the round-trip");
-    chk(st.items == 112u, "c11: 104 base keys plus one 8-field camera survived");
+    chk(st.items == 114u, "c11: 106 base keys plus one 8-field camera survived");
 
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "172.16.0.9") == 0,
         "c11: the string survived");

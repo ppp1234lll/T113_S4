@@ -55,11 +55,15 @@ static void chk(int cond, const char *what)
  *   md5("A120F" + "bird123")       前 8 字节 = 1239036bac71d702（svc 为空 ⇒ BIRD 原公式）
  *   md5("A120F" + "bird123"+"web")          = 1058c8a5738276aa
  *   md5("A120F" + "bird123"+"camera:2")     = ebcba71b5463cb24
- *   md5("A120F" + "bird123"+"media:0")      = 451846dee3300a33 */
+ *   md5("A120F" + "bird123"+"media:0")      = 451846dee3300a33
+ *   md5("A120F" + "bird123"+"ftp")          = 2f8940c2063062ed
+ *   md5("A120F" + "bird123"+"ftpdata")      = 86b14dcca51266fb */
 #define SEC_PLAIN   "1239036bac71d702"
 #define SEC_WEB     "1058c8a5738276aa"
 #define SEC_CAM2    "ebcba71b5463cb24"
 #define SEC_MEDIA0  "451846dee3300a33"
+#define SEC_FTP     "2f8940c2063062ed"
+#define SEC_FTPDATA "86b14dcca51266fb"
 
 static char g_dir[64];   /* 临时目录 */
 static char g_conf[128]; /* <dir>/frpc.toml */
@@ -73,6 +77,7 @@ static int res_ok(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t *port, v
     if (svc->kind == IV_TUNNEL_SVC_WEB)        { *port = 8080u; return IV_OK; }
     if (svc->kind == IV_TUNNEL_SVC_CAMERA)     { *port = (uint16_t)(8081u + svc->index); return IV_OK; }
     if (svc->kind == IV_TUNNEL_SVC_MEDIA)      { *port = 8090u; return IV_OK; }
+    if (svc->kind == IV_TUNNEL_SVC_FTP)        { *port = 21u;   return IV_OK; }
     return IV_ENOENT;
 }
 
@@ -91,9 +96,13 @@ static int res_deny(const iv_tunnel_svc_t *svc, uint32_t *ip_be, uint16_t *port,
     return IV_ENOENT;
 }
 
-static const iv_tunnel_resolver_t RES_OK = { res_ok, NULL };
-static const iv_tunnel_resolver_t RES_IP = { res_camera_ip, NULL };
-static const iv_tunnel_resolver_t RES_NO = { res_deny, NULL };
+static const iv_tunnel_resolver_t RES_OK = { res_ok, NULL, 0u };
+/* 自定义数据口：钉"配了就按配的来"，别退默认 50000 */
+static const iv_tunnel_resolver_t RES_FTP6000 = { res_ok, NULL, 6000u };
+/* 数据口＝控制口：一定是配错了（同一个口既当控制又当数据），必须拒 */
+static const iv_tunnel_resolver_t RES_FTP21 = { res_ok, NULL, 21u };
+static const iv_tunnel_resolver_t RES_IP = { res_camera_ip, NULL, 0u };
+static const iv_tunnel_resolver_t RES_NO = { res_deny, NULL, 0u };
 
 /* 装配好的句柄（临时目录 + 身份 + 服务端 + resolver） */
 static void mk_rig(iv_tunnel_t *t)
@@ -126,7 +135,8 @@ static void t01_svc_white(void)
     static const char *const BAD[] = {
         "", "Web", "WEB", "web:80", "web/", "192.168.1.10", "1.2.3.4:80",
         "http://192.168.1.10", "camera:", "camera:-1", "camera:06", "camera:6",
-        "camera:1:80", "media:8", "camera:99999", "ssh", "//web", "web "
+        "camera:1:80", "media:8", "camera:99999", "ssh", "//web", "web ",
+        "ftp:21", "FTP", "sftp", "ftp "
     };
     iv_tunnel_svc_t s;
     size_t          i;
@@ -138,6 +148,8 @@ static void t01_svc_white(void)
     chk(iv_tunnel_svc_parse("camera:5", 8, &s) == IV_OK && s.index == 5u, "t01: camera:5");
     chk(iv_tunnel_svc_parse("media:7", 7, &s) == IV_OK &&
         s.kind == IV_TUNNEL_SVC_MEDIA && s.index == 7u, "t01: media:7");
+    chk(iv_tunnel_svc_parse("ftp", 3, &s) == IV_OK && s.kind == IV_TUNNEL_SVC_FTP &&
+        s.index == 0u, "t01: ftp");
     chk(iv_tunnel_svc_parse("camera:6", 8, &s) == IV_ERANGE, "t01: camera idx range");
     chk(iv_tunnel_svc_parse("media:8", 7, &s) == IV_ERANGE, "t01: media idx range");
 
@@ -167,6 +179,9 @@ static void t02_svc_format(void)
     s.kind = IV_TUNNEL_SVC_MEDIA; s.index = 12u;
     chk(iv_tunnel_svc_format(&s, buf, sizeof buf) == IV_OK &&
         strcmp(buf, "media:12") == 0, "t02: media roundtrip");
+    s.kind = IV_TUNNEL_SVC_FTP; s.index = 0u;
+    chk(iv_tunnel_svc_format(&s, buf, sizeof buf) == IV_OK &&
+        strcmp(buf, "ftp") == 0, "t02: ftp roundtrip");
     chk(iv_tunnel_svc_format(&s, buf, 3) != IV_OK && buf[0] == '\0', "t02: cap short");
 }
 
@@ -234,6 +249,46 @@ static void t04_render(void)
     chk(strstr(buf, "type = \"stcp\"") != NULL, "t04: stcp type");
     /* 摄像机 IP 绝不能出现在配置里 */
     chk(strstr(buf, "192.168.") == NULL, "t04: no camera ip in config");
+}
+
+/* ---------------------------------------------------------------------------
+ * t04b `ftp`：一条服务名 → 两条代理（控制 + 被动数据）
+ * 为什么要两条：FTP 的数据连接是另一条 TCP，frp 一条代理只映射一个端口。
+ * 反向证伪：只渲染一条 / 数据口不兜默认 50000 / 两条钥匙相同 ⇒ 下面立刻红。
+ * ------------------------------------------------------------------------- */
+static void t04b_render_ftp(void)
+{
+    iv_tunnel_svc_t    svc;
+    iv_tunnel_reason_t why = IV_TUNNEL_ESTATE;
+    char               buf[IV_TUNNEL_TXT_MAX];
+    size_t             len = 0;
+
+    chk(iv_tunnel_svc_parse("ftp", 3, &svc) == IV_OK, "t04b: parse ftp");
+    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_OK, &svc, 1u,
+                         buf, sizeof buf, &len, &why) == IV_OK, "t04b: render ftp");
+    chk(why == IV_TUNNEL_OK, "t04b: reason ok");
+    /* 控制条 */
+    chk(strstr(buf, "name = \"A120F-ftp\"") != NULL, "t04b: control proxy name");
+    chk(strstr(buf, "secretKey = \"" SEC_FTP "\"") != NULL, "t04b: control secret");
+    chk(strstr(buf, "localPort = 21\n") != NULL, "t04b: control port 21");
+    /* 数据条：端口固定、钥匙独立 */
+    chk(strstr(buf, "name = \"A120F-ftpdata\"") != NULL, "t04b: data proxy name");
+    chk(strstr(buf, "secretKey = \"" SEC_FTPDATA "\"") != NULL, "t04b: data secret");
+    chk(strstr(buf, "localPort = 50000\n") != NULL, "t04b: data port default 50000");
+    {
+        const char *q   = buf;
+        int         cnt = 0;
+        while ((q = strstr(q, "[[proxies]]")) != NULL) { cnt++; q++; }
+        chk(cnt == 2, "t04b: exactly two proxy blocks");
+    }
+    /* 装配层配了数据口 ⇒ 按配的来（别硬编码 50000） */
+    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_FTP6000, &svc, 1u,
+                         buf, sizeof buf, &len, &why) == IV_OK, "t04b: render custom");
+    chk(strstr(buf, "localPort = 6000\n") != NULL, "t04b: data port from resolver");
+    /* 数据口撞控制口 ⇒ 拒 */
+    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, &RES_FTP21, &svc, 1u,
+                         buf, sizeof buf, &len, &why) == IV_EINVAL,
+        "t04b: data port == control port rejected");
 }
 
 /* ---------------------------------------------------------------------------
@@ -443,7 +498,8 @@ static void t10_caps(void)
     chk((iv_tunnel_caps(&t) & IV_TUNNEL_CAP_ENABLED) != 0u, "t10: enabled bit");
     chk((iv_tunnel_caps(&t) & IV_TUNNEL_CAP_WEB) != 0u &&
         (iv_tunnel_caps(&t) & IV_TUNNEL_CAP_CAMERA) != 0u &&
-        (iv_tunnel_caps(&t) & IV_TUNNEL_CAP_MEDIA) != 0u, "t10: service bits");
+        (iv_tunnel_caps(&t) & IV_TUNNEL_CAP_MEDIA) != 0u &&
+        (iv_tunnel_caps(&t) & IV_TUNNEL_CAP_FTP) != 0u, "t10: service bits");
     /* 解除映射 ⇒ 能力立刻消失（不许声称一个开不起来的能力） */
     chk(iv_tunnel_set_resolver(&t, NULL) == IV_EINVAL, "t10: resolver cleared");
     chk(iv_tunnel_caps(&t) == 0u, "t10: caps gone after resolver cleared");
@@ -544,6 +600,7 @@ int main(void)
     t02_svc_format();
     t03_secret();
     t04_render();
+    t04b_render_ftp();
     t05_host_gate();
     t06_render_deny();
     t07_enable();

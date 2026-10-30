@@ -156,7 +156,7 @@ static void net_add(uint32_t *tab, int *n, uint32_t code)
     tab[(*n)++] = code;
 }
 
-void iv_fault_apply_net(iv_fault_t *f, int mn_primary, int mn_backup,
+void iv_fault_apply_net(iv_fault_t *f, int mn1, int mn2,
                         const int *cns, int cns_n, int lan_link)
 {
     uint32_t tmp[IV_FAULT_MAX];
@@ -169,20 +169,29 @@ void iv_fault_apply_net(iv_fault_t *f, int mn_primary, int mn_backup,
      * `lan_link < 0` = 未绑接口/还没收到 netlink 事件 ⇒ 不置码（否则开机即误报）。 */
     if (lan_link == 0) net_add(tmp, &n, IV_FAULT_NET_LAN_PORT);
 
-    /* 主网1（有线）：3（网线断开）不置主网码 —— 由上面的 LAN 口码表达同一条
-     * 物理事实，两个码只会让平台多出一条不相干的条目。 */
-    if (mn_primary == 2)
+    /* 主网1（`probe.target1` 的 ping 结论）：2 故障 / 4 延时 / 5 丢包 —— 与参考固件
+     * `det.c:det_set_main_network_status()` 的三个 `Error_Set()` 一一对应。
+     * 3（网线断开）不置主网码：那是 LAN 口载波掉，由上面的 `NET_LAN_PORT` 表达
+     * 同一条物理事实，两个码只会让平台多出一条不相干的条目。生产方
+     * （`iv_agent.c:tgt_fault_state()`）只把"检测 IP 的 3＝延时"翻成 4，
+     * 所以这里收到 3 只可能是网线断开。 */
+    if (mn1 == 2)
         net_add(tmp, &n, IV_FAULT_NET_MAIN_FAULT);
-    else if (mn_primary == 4)
+    else if (mn1 == 4)
         net_add(tmp, &n, IV_FAULT_NET_MAIN_DELAY);
+    else if (mn1 == 5)
+        net_add(tmp, &n, IV_FAULT_NET_MAIN_LOSS);
 
-    /* 主网2（4G）：没有网线这一说，3 与 2 同等对待 */
-    if (mn_backup == 2 || mn_backup == 3)
+    /* 主网2（`probe.target2`）：没有"网线断开"这一态，3 与 2 同等对待 */
+    if (mn2 == 2 || mn2 == 3)
         net_add(tmp, &n, IV_FAULT_NET_MAIN2_FAULT);
-    else if (mn_backup == 4)
+    else if (mn2 == 4)
         net_add(tmp, &n, IV_FAULT_NET_MAIN2_DELAY);
+    else if (mn2 == 5)
+        net_add(tmp, &n, IV_FAULT_NET_MAIN2_LOSS);
 
-    /* 摄像机 1..6：状态码 2 故障 / 4 延时；5（丢包）不上报，0（无 IP）/1 不置码 */
+    /* 摄像机 1..6：2 故障 / 4 延时 / 5 丢包（参考固件 `det_set_camera_status()`
+     * 三个 `Error_Set()`）；0（无 IP）/1 不置码。 */
     if (cns != NULL) {
         if (cns_n > IV_FAULT_MAX) cns_n = IV_FAULT_MAX;
         for (i = 0; i < cns_n; i++) {
@@ -190,6 +199,8 @@ void iv_fault_apply_net(iv_fault_t *f, int mn_primary, int mn_backup,
                 net_add(tmp, &n, IV_FAULT_NET_CAM_FAULT(i + 1));
             else if (cns[i] == 4)
                 net_add(tmp, &n, IV_FAULT_NET_CAM_DELAY(i + 1));
+            else if (cns[i] == 5)
+                net_add(tmp, &n, IV_FAULT_NET_CAM_LOSS(i + 1));
         }
     }
 

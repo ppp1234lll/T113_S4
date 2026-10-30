@@ -1223,10 +1223,11 @@ int iv_report_build_seg(const iv_status_t *st, const iv_report_env_t *env,
     APPEND(out, cap, n, "CP=&&");
 
     /* ---- 数据区：**逐字段对齐参考实现 `com.c:com_report_normally_function()`**
-     * 的拼接顺序与"无条件拼接"语义（2026-10-20 复核）：DT CNS MN V A APOWER
-     * AKW H T P DS RELAY CHV CHA POWER ELEC CSQ MIU (LAT/LNG) ERR。
+     * 的拼接顺序与"无条件拼接"语义（2026-10-30 全文复核）：DT CNS MN V A APOWER
+     * AKW H T P DS RELAY CHV CHA POWER ELEC CSQ (LAT/LNG) ERR。
      * 字段名一律发：取到值就填数、取不到留空（`V=;`）—— 参考实现对每个字段都
-     * `sprintf` 一次，读不到就拼出空值，因此它的字段表**恒长**；我们照此办理。 */
+     * `sprintf` 一次，读不到就拼出空值，因此它的字段表**恒长**；我们照此办理。
+     * 参考实现里**没有** `MIU`（漏电只出现在 0xE1 的配置应答里），别再加回来。 */
     APPEND(out, cap, n, "DT=%s;", dt14);
 
     APPEND(out, cap, n, "CNS=%d,%d,%d,%d,%d,%d;",
@@ -1265,11 +1266,14 @@ int iv_report_build_seg(const iv_status_t *st, const iv_report_env_t *env,
               d != NULL ? d->ELEC[1] : 0.0,
               d != NULL ? d->ELEC[2] : 0.0);
 
-    /* CSQ 紧接 ELEC（参考实现位置）；没取到信号强度就发空值，不发 -1 */
+    /* CSQ 紧接 ELEC（参考实现位置）；没取到信号强度就发空值，不发 -1
+     * （参考实现恒发 `CSQ=%d`，取不到就是 0；我们发空值而非编 0，见上文口径）。
+     *
+     * ⚠ 这里**没有** `MIU=`：漏电值只在参考实现的 0xE1 配置应答里（`"miu"` 键，
+     * 那是阈值），正常上报段里根本没有这个字段。2026-10-30 复核
+     * `com_report_normally_function()` 全文后删掉了原先那个占位 `MIU=;` ——
+     * 多一个参考固件没有的键，平台按字段表解析时就会错位/多出一条空项。 */
     APPEND_I1("CSQ", e->csq >= 0, e->csq);
-    /* MIU（漏电）：参考实现在 CSQ 之后**无条件**发 `MIU=%d;`。我们没有取值
-     * 来源（见遗留项"MIU 取值来源"），所以只发键名占位，绝不编一个 0 出去。 */
-    APPEND(out, cap, n, "MIU=;");
 
     if (e->have_loc)
         APPEND(out, cap, n, "LAT=%.6f;LNG=%.6f;", e->lat, e->lng);

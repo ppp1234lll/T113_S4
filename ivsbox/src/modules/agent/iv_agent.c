@@ -51,6 +51,8 @@ static void thresh_drive(iv_agent_t *a, uint64_t now_ms);
 static void env_feed(iv_agent_t *a, uint64_t now_ms);
 static void on_query_ipc(const iv_proto_frame_t *f, void *arg);
 static void on_query_snmp(const iv_proto_frame_t *f, void *arg);
+static void on_query_ping(const iv_proto_frame_t *f, void *arg);
+static void ping_reply_tick(iv_agent_t *a, uint64_t now_ms);
 static int  agent_send_power(const void *data, uint16_t len, void *arg);
 static void on_camdet_change(int ch, iv_camdet_status_t old_st,
                              iv_camdet_status_t new_st, void *arg);
@@ -664,6 +666,9 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
      * 与 0xE1~0xE3/E2 那批"读上报链"的默认路由（iv_report 内注册）互不重叠。 */
     (void)iv_proto_route(&a->rp.pf, IV_PROTO_CMD_QUERY_IPC_IP, on_query_ipc, a);
     (void)iv_proto_route(&a->rp.pf, IV_PROTO_CMD_QUERY_SNMP, on_query_snmp, a);
+    /* 0xE8「查询 PING 信息」（2026-10-29 补）：此前这条**根本没注册** ⇒ 平台点
+     * 「查询PING」落默认分支回 0x74，测试计划的 N-06 一直是"未实现"。 */
+    (void)iv_proto_route(&a->rp.pf, IV_PROTO_CMD_QUERY_PING, on_query_ping, a);
 
     /* ---- 5. 摄像机网络状态探测（S4.1）＋ 自愈（S4.4）＋ 0xA5 路由 ----
      * **这三项都不依赖 Reactor**：camdet 是相位机、recovery 是纯逻辑，两者都只由
@@ -1092,6 +1097,7 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
     if (iv_device_is_open(&a->dev))
         (void)iv_device_tick(&a->dev, now_ms);
     ipc_reply_tick(a, now_ms); /* 0xE4 的延迟清单：相位机 DONE 时补那一帧 */
+    ping_reply_tick(a, now_ms); /* 0xE8 的即席探测：一轮跑完补 st/dt 那一帧 */
     env_feed(a, now_ms);
     (void)iv_recovery_tick(&a->rec, now_ms);
     storage_drive(a, now_ms); /* M6-S6.5：SD 水位闸门（先于 rec_drive，同拍生效） */
@@ -1156,6 +1162,11 @@ void iv_agent_close(iv_agent_t *a)
     iv_netmgr_init(&a->nm);  /* netmgr 无 close：init 复位 */
     if (a->pb.started)
         (void)iv_probe_stop(&a->pb);
+    /* E8 的即席引擎也要收尾：它是第二个 `iv_probe` 实例，正在跑时可能持有 raw
+     * socket —— 不清掉就是一次 fd 泄漏（每来一次 E8 漏一个）。 */
+    if (a->ping.started)
+        (void)iv_probe_stop(&a->ping);
+    a->ping_state = 0u;
     if (iv_netlink_fd(&a->nl) >= 0)
         (void)iv_netlink_close(&a->nl);
 
@@ -1320,26 +1331,129 @@ static int mn_state_of(const iv_agent_t *a, int w)
     return iv_netmgr_wan_is_up(&a->nm, (iv_wan_t)w) ? 1 : 2;
 }
 
+/* 一个探测项的「最近一轮」四态（**只这一处判定**，显示与故障码共用）：
+ *   0 未知（没建项 / 第一轮 4 个包还没攒满）
+ *   1 通      全响应且平均 RTT ≤ `probe.timeout_ms`
+ *   2 不通    4 包全无响应
+ *   3 延时    全响应且平均 RTT > 门限
+ *   4 丢包    4 个包里只回了部分
+ *
+ * 为什么不沿用 `iv_probe_state()`：那是"要不要切链路"用的，要过 fail_n/ok_n 迟滞、
+ * DEGRADED 的门限是 **16 窗**平均 —— 现场问的是"这个 IP 此刻通不通、多快"，
+ * 等迟滞攒满 3 次失败才显示"不通"就晚了；16 窗平均又会把刚发生的一次丢包摊平。
+ * `round_seq == 0` 一律"未知"：拿半轮数据下结论正是"刚开机就报故障"的来源。 */
+static uint8_t round_state_of(const iv_agent_t *a, int idx)
+{
+    iv_probe_stat_t s;
+
+    if (a == NULL || idx < 0)
+        return 0u;
+    if (iv_probe_stat_get(&a->pb, idx, &s) != IV_OK)
+        return 0u;
+    if (s.round_seq == 0u)
+        return 0u;
+    if (s.round_ok == 0u)
+        return 2u;
+    if (s.round_lost != 0u)
+        return 4u;
+    if (a->cfg.probe_delay_ms != 0u && s.round_avg_rtt_ms > a->cfg.probe_delay_ms)
+        return 3u;
+    return 1u;
+}
+
+/* 「主网检测 IP i」→ **参考固件的 `MN` 状态编码**（`det.h:NET_STATUS_E` ＋
+ * `com_report_get_main_network_status()`）：
+ *   0 无IP / 1 正常 / 2 故障 / 4 延时 / 5 丢包     —— 四态判定只有这五种落点
+ *
+ * 延时必须映射成 **4** 而不是原样 3：在这套编码里 3 是"网线断开"，与"通但慢"
+ * 是两回事，混用会让平台把一条慢链路显示成"网线被拔"。
+ * 返回值同时被两处消费：上报帧 `MN=`（`tgt_mn_state()`）与故障码（`fault_feed()`）。
+ *
+ * `tgt_probe_idx[i] < 0` 有两种成因，处理不同：
+ *   ① 这一路**没配**（`probe.targetN == 0`）⇒ 返回 0，不置码（指令表虽有
+ *      "主网N IP未配置"码，但按现行口径不报，避免出厂未配就报故障）；
+ *   ② 因为**与平台地址相同被跳过**（见 `agent_probe_build()`）⇒ 借有线那一路的
+ *      统计。同一个目标、同一个出口，结论必然一样；不借的话，现场把主网检测 IP
+ *      填成平台地址（最常见的配法）时这一路**永远不会报故障**。 */
+static int tgt_fault_state(const iv_agent_t *a, int i)
+{
+    int     idx;
+    uint8_t st;
+
+    if (a == NULL || i < 0 || i >= (int)IV_AGENT_TGT_N)
+        return 0;
+    idx = a->tgt_probe_idx[i];
+    if (idx < 0 && a->cfg.probe_target_be[i] != 0u &&
+        a->cfg.probe_target_be[i] == a->probe_dst_be[IV_WAN_WIRED])
+        idx = a->wan_probe_idx[IV_WAN_WIRED];
+    st = round_state_of(a, idx);
+    switch (st) {
+    case 2u:
+        return 2; /* 不通 → 主网N故障 */
+    case 3u:
+        return 4; /* 延时 → 主网N延时告警 */
+    case 4u:
+        return 5; /* 丢包 → 本模块不置码 */
+    case 1u:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* 「主网检测 IP i」→ 上报帧 `MN=` 的两位数字（**参考固件口径**，
+ * `com.c:com_report_get_main_network_status(0/1)`，取值表原文：
+ *   0 无IP / 1 网络正常 / 2 网络故障 / 3 网线断开 / 4 延时 / 5 丢包）：
+ *
+ * 与 `tgt_fault_state()` 只差一条 —— **主网1 有"网线断开 ⇒ 3"**：参考固件在
+ * 载波 down 时直接给 3，连 ping 结论都不看（`det_get_main_network_status()`
+ * 根本不取值）；主网2 没有网线这回事。
+ *
+ * 故障码**不走**这里那条 3：拔网线时 ping 必然也不通，参考固件的 `det.c` 照样会
+ * 置 `NET_MAIN_FAULT`（它只看 ping 结论），所以"MN=3 ＋ 主网1故障码"并存正是它的
+ * 行为，别为了好看把故障码也一并吃掉。 */
+static int tgt_mn_state(const iv_agent_t *a, int i)
+{
+    if (a == NULL || i < 0 || i >= (int)IV_AGENT_TGT_N)
+        return 0;
+    if (i == 0 && a->wan_ifindex[IV_WAN_WIRED] != 0 &&
+        a->wan_link_up[IV_WAN_WIRED] == 0u)
+        return 3;
+    return tgt_fault_state(a, i);
+}
+
 /* 故障码（上报帧 `ERR=` 段）的两半合并，详见 iv_fault.h 的分工表：
  *
  *   电量 / 传感器 ← 采集板 `0xE1` 应答的 `ERR` 键（镜像原文，已由 iv_status 清洗）
- *   网络         ← 本层掌握的四个事实：主网1/主网2 状态、六路摄像机状态、有线载波
+ *   网络         ← 本层掌握的事实：**两个「主网检测 IP」的结论**、六路摄像机状态、
+ *                  有线载波
+ *
+ * **「主网1 / 主网2」＝配置里的两个「主网检测 IP」（`probe.target1/2`）**。依据是
+ * 指令表 0xF8「配置主网检测 IP」原文 ——"前四个字节为主网1IP、后四个字节为主网2IP"，
+ * 以及正常上报 `MN` 的取值表（`0=未指定IP 1=正常 2=断开 3=网线断开(只第一路)
+ * 4=延时`）。**不是** 4G / 有线那两条上行链路 —— `IV_WAN_*` 是本机自己的概念，
+ * 只用于切链路和界面显示，与平台的主网编号无关。
+ *
+ * 2026-10-30 更正：此前这一层按 `mn_state_of()`（有线 / 4G）映射主网1 / 主网2，
+ * 于是现场两个检测 IP 都不通时只上报了"主网1故障" —— 因为 4G 那条链路是好的。
+ * 现在改按两个检测 IP 的四态判，与指令表的编号一致。
  *
  * 为什么在这里而不是在 iv_report 里：`iv_report` 只有镜像与 env，看不到
- * `mn_state_of()` 的判定过程（它连 `iv_probe`/`iv_netmgr` 都不认识），也算不出
+ * `round_state_of()` 的判定过程（它连 `iv_probe` 都不认识），也算不出
  * "载波是否已知"。装配层是唯一同时握着这两边事实的地方。
- *
- * `mnv[]` 按 `iv_wan_t` 下标（0=usb0/4G、1=eth0/有线），与 `mn_state_of()` 同序；
- * 故障码里"主网1"给有线、"主网2"给 4G —— **按角色分，不按 MN 槽位顺序分**
- * （`env.mn[0]` 是 4G、`mn[1]` 是有线，那个顺序是历史实现，见 test_agent_mn）。
- * 即：4G 是备份链路，它断了报主网2，别把 4G 的故障写成"主网1 故障"。
  */
-static void fault_feed(iv_agent_t *a, const int *mnv, uint64_t now_ms,
-                       iv_report_env_t *env)
+static void fault_feed(iv_agent_t *a, uint64_t now_ms, iv_report_env_t *env)
 {
     int lan = -1;
     int cns[IV_CAMDET_CH_N];
     int cns_n = 0;
+    int tgt[2] = {0, 0};
+    int i;
+
+    /* 主网1 = 检测 IP 1、主网2 = 检测 IP 2（编号与 `probe.target1/2` 一一对应）。
+     * 状态 0（没配 / 第一轮还没攒满）不置码 —— 拿半轮数据报故障，就是开机误报。 */
+    for (i = 0; i < (int)IV_AGENT_TGT_N && i < 2; i++)
+        tgt[i] = tgt_fault_state(a, i);
 
     if (iv_camdet_is_open(&a->cd) && iv_camdet_cns(&a->cd, cns) == IV_OK)
         cns_n = (int)IV_CAMDET_CH_N;
@@ -1355,8 +1469,7 @@ static void fault_feed(iv_agent_t *a, const int *mnv, uint64_t now_ms,
                                (a->rp.st.valid.ERR != 0u) ? a->rp.st.data.ERR
                                                           : NULL,
                                now_ms);
-    iv_fault_apply_net(&a->flt, mnv[IV_WAN_WIRED], mnv[IV_WAN_WIRELESS], cns,
-                       cns_n, lan);
+    iv_fault_apply_net(&a->flt, tgt[0], tgt[1], cns, cns_n, lan);
     env->err = (iv_fault_format(&a->flt, a->err_buf, sizeof(a->err_buf)) == IV_OK)
                    ? a->err_buf
                    : NULL;
@@ -1366,19 +1479,19 @@ static void fault_feed(iv_agent_t *a, const int *mnv, uint64_t now_ms,
  * ＋ ERR（故障码，见 `fault_feed()`）。前两个只改自己的字段，其余外部事实
  * （CSQ/定位）原样保留；ERR 是本层**整体重算**的（每次都由当前事实推出，不累加）。
  *
- * MN **同时带出 S4.4 的主网故障沿**：判据用 `iv_netmgr_wan_is_up()` 的**迟滞结论**
- * （连续 fail_n 次失败才判死），**不是**裸 `iv_probe_state()` —— 后者单次探测超时
- * 就会把主网电切掉。该出口是 S4.4 唯一缺的那一环（iv_report_env_t::mn[] 的生产者）。
- * 未绑定接口的那一路按 MN=0（未指定 IP）上报，且不参与故障沿。 */
+ * **MN = 两个「主网检测 IP」的结论**（`probe.target1/2`，由 `tgt_mn_state()` 给），
+ * 与参考固件 `com_report_normally_function()` 里的
+ * `MN=%d,%d`, `com_report_get_main_network_status(0/1)` 逐字对齐。
+ * 2026-10-30 更正：此前这里灌的是 4G / 有线两条**链路**的状态 —— 与平台的主网编号
+ * 无关，现场两个检测 IP 都不通时平台却看到"MN=3,x"（网线断开）。
+ *
+ * 链路状态（4G/有线）仍由 `mn_state_of()` 算，但只喂**自愈故障沿**，不再上报。 */
 static void env_feed(iv_agent_t *a, uint64_t now_ms)
 {
     iv_report_env_t env;
-    int             mnv[IV_WAN_N];
     int             i;
 
     env = a->rp.env;
-    for (i = 0; i < (int)IV_WAN_N; i++)
-        mnv[i] = 0;
 
     if (iv_camdet_is_open(&a->cd)) {
         int cns[IV_CAMDET_CH_N];
@@ -1398,23 +1511,26 @@ static void env_feed(iv_agent_t *a, uint64_t now_ms)
     env.csq = (a->cell.snap.csq >= 0 && a->cell.snap.csq <= 31) ? a->cell.snap.csq
                                                                 : -1;
 
+    /* 主网1 / 主网2 = 检测 IP 1 / 检测 IP 2（不是 4G / 有线）。 */
+    for (i = 0; i < (int)IV_REPORT_MN_N && i < (int)IV_AGENT_TGT_N; i++)
+        env.mn[i] = tgt_mn_state(a, i);
+
+    /* 自愈故障沿**仍按链路**（`mn_state_of()` 读的是 `iv_netmgr` 的迟滞结论，
+     * 与上面上报的 MN 不同源，别合并）：只有"原来能上网 → 现在不能"才算故障。
+     *   3（网线断开）**算** —— 那是真的上不了网，该断继电器重启现场设备；
+     *   4（延时严重）**不算** —— 延时只是慢，链路还在，重启只会把现场
+     *     多断一次（用户口径："延时严重"不等于"断开"）。
+     * 原先只认 `1 → 2`，于是"网线被拔"永远触发不了自愈（这一路一直报 3）。 */
     for (i = 0; i < (int)IV_RECOVERY_MASTER_N && i < (int)IV_WAN_N; i++) {
         int st = mn_state_of(a, i);
 
-        env.mn[i] = st;
-        mnv[i] = st;
-        /* 故障沿：只有"原来能上网 → 现在不能"才算故障。
-         *   3（网线断开）**算** —— 那是真的上不了网，该断继电器重启现场设备；
-         *   4（延时严重）**不算** —— 延时只是慢，链路还在，重启只会把现场
-         *     多断一次（用户口径："延时严重"不等于"断开"）。
-         * 原先只认 `1 → 2`，于是"网线被拔"永远触发不了自愈（这一路一直报 3）。 */
         if ((a->mn_last[i] == 1u || a->mn_last[i] == 4u) && (st == 2 || st == 3))
             iv_recovery_on_master_change(&a->rec, i, IV_RECOVERY_NORMAL,
                                          IV_RECOVERY_FAULT, now_ms);
         a->mn_last[i] = (uint8_t)st;
     }
 
-    fault_feed(a, mnv, now_ms, &env);
+    fault_feed(a, now_ms, &env);
 
     iv_report_set_env(&a->rp, &env);
 }
@@ -1477,11 +1593,450 @@ static void on_query_snmp(const iv_proto_frame_t *f, void *arg)
             which = IV_AGENT_SNMP_SW;
     }
     rc = iv_agent_snmp_start(a, which, a->now_ms);
+    /* 采集在慢任务池里跑（一路最多 9 槽 × 1.5 s × 2 次），**同步等不起** ⇒ 先回
+     * ACK，把"欠平台一条 JSON"记下来，由 `on_snmp_done()` 采完当场发。
+     * `IV_EBUSY`（上一轮还在飞）也记：那一轮采完就是最新结果，同样答这次请求。 */
+    if (rc == IV_OK || rc == IV_EBUSY) {
+        a->snmp_pending[which] = 1u;
+        (void)snprintf(a->snmp_qn[which], sizeof a->snmp_qn[which], "%08u%09u",
+                       (unsigned)f->qn1, (unsigned)f->qn2);
+    }
     (void)iv_proto_ack(&a->rp.pf, f->cmd,
-                       (rc == IV_OK) ? IV_PROTO_ACK_OK : IV_PROTO_ERR_EXEC);
+                       (rc == IV_OK || rc == IV_EBUSY) ? IV_PROTO_ACK_OK
+                                                       : IV_PROTO_ERR_EXEC);
     IV_LOG_I(AG_MOD, "platform 0xE7 snmp query target=%s(sel=%u) -> rc=%d",
              iv_agent_snmp_target_name(which),
              (unsigned)((f->data != NULL && f->len >= 1u) ? f->data[0] : 0u), rc);
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台 0xE8「查询 PING 信息」
+ *
+ * 帧的语义（指令表原样）：请求带 4 字节 IP，设备对**这个 IP** 跑一轮，回
+ * `st1..st4` / `dt1..dt4`。所以它不是"把你的探测结果给我"，而是"帮我 ping 一下"。
+ *
+ * 三种做法都比过：
+ *   ① 复用主探测表 —— 目标来自配置，平台给什么 IP 都要先改配置，还得烧一轮
+ *      netmgr 的迟滞判据 ⇒ 一次查询变成一次链路决策，否决；
+ *   ② 自己写一套 ICMP 收发 —— 与 `iv_probe` 重复，且"按出口绑定发包 / 回包按
+ *      入口网卡认领"那两套 2026-10-29 刚修好的坑要再踩一遍，否决；
+ *   ③ **同一个 `iv_probe` 的第二个实例**，只在被查询时开、跑完就停 —— 本实现。
+ *
+ * 判据仍只有一份：`iv_probe_stat_t::round_st/round_dt`，与主探测、摄像机探测
+ * 完全同源（`round_push()` 一处结算）。
+ * ------------------------------------------------------------------------- */
+
+/* E8 一轮的节拍：4 包 × 300 ms ≈ 1.2 s。为什么不是主探测的 2.5 s/包：平台那侧
+ * 是同步等待，几十秒的应答没人会等；而 300 ms 对局域网/专线都足够。 */
+#define IV_AGENT_PING_PKT_MS      300u
+/* 等一轮的总时限。超了就回"全 0"（＝4 个包都没通），别让平台干等：
+ * 4 × 300 ms = 1.2 s，留 3 倍余量覆盖 ICMP 建 socket / 重传抖动。 */
+#define IV_AGENT_PING_WAIT_MS     4000u
+
+int iv_agent_build_ping_json(const iv_agent_t *a, const char *qn,
+                             const iv_probe_stat_t *st, char *out, size_t cap)
+{
+    int  n = 0;
+    int  i;
+    char crc2[3];
+    uint16_t devtype;
+    uint32_t devid;
+
+    if (a == NULL || out == NULL || cap < 64u)
+        return IV_EINVAL;
+
+    /* 签名口径与 E1/E3/E4 同一套（`iv_report_query_crc()`）：devtype/devid 取本层
+     * 身份，**不另抄一份写死的值** —— 抄了迟早与 E3 漂移，平台判签名错。 */
+    devtype = a->rp.pf.id.devtype;
+    devid   = a->rp.pf.id.devid;
+
+    (void)snprintf(crc2, sizeof crc2, "%02x",
+                   (unsigned)iv_report_query_crc(devtype, devid,
+                                                 IV_PROTO_CMD_QUERY_PING));
+
+    n = snprintf(out, cap,
+                 "{\"code\":0,\"data\":{\"qn\":\"%s\",\"ver\":\"%02x\","
+                 "\"devtype\":\"%04x\",\"tid\":\"%x\",\"cmd\":\"%02X\"",
+                 (qn != NULL && qn[0] != '\0') ? qn : "0",
+                 (unsigned)IV_PROTO_VER, (unsigned)devtype, (unsigned)devid,
+                 (unsigned)IV_PROTO_CMD_QUERY_PING);
+    if (n < 0 || (size_t)n >= cap)
+        return IV_ERANGE;
+
+    for (i = 0; i < (int)IV_PROBE_ROUND_SAMPLES; i++) {
+        /* 没有结算过任何一轮（st == NULL / round_seq == 0）⇒ 按"这一轮全失败"
+         * 输出。平台侧语义就是 4 个包都没通，与"没数据"在协议上没有区别；
+         * 而我们**绝不**拿 0 假装成功 —— 那会让平台的"网络正常"是假的。 */
+        unsigned stv = 0u;
+        uint32_t dtv = 0u;
+
+        if (st != NULL && st->round_seq != 0u) {
+            /* `st != 0` 归一成 1：`round_st` 只该是 0/1，但它是 `uint8_t`，
+             * 上游将来若写进别的值，平台那侧会按"非 1"当失败、却仍照抄 dt。 */
+            stv = (st->round_st[i] != 0u) ? 1u : 0u;
+            /* 失败包的 dt **恒 0**（协议原文"失败时为 0"）。这一步是冗余的：
+             * `round_push()` 已经按失败存 0 —— 但这里再判一次的成本是零，而漏掉
+             * 它的后果是平台看到"通了但 0 ms"这种不存在的状态，现场会去查一个
+             * 根本不存在的网络问题。 */
+            dtv = (stv != 0u) ? st->round_dt[i] : 0u;
+        }
+        {
+            int k = snprintf(out + n, cap - (size_t)n,
+                             ",\"st%d\":\"%u\",\"dt%d\":\"%u\"", i + 1, stv,
+                             i + 1, (unsigned)dtv);
+
+            if (k < 0 || (size_t)k >= cap - (size_t)n)
+                return IV_ERANGE;
+            n += k;
+        }
+    }
+    {
+        int k = snprintf(out + n, cap - (size_t)n, ",\"crc\":\"%s\"}}", crc2);
+
+        if (k < 0 || (size_t)k >= cap - (size_t)n)
+            return IV_ERANGE;
+        n += k;
+    }
+    return n;
+}
+
+static void ping_engine_stop(iv_agent_t *a)
+{
+    if (a == NULL)
+        return;
+    (void)iv_probe_stop(&a->ping);
+    a->ping_state = 0u;
+}
+
+/* 启动一轮即席探测。**已有请求在飞就先停掉**：平台连点两次，答最新那次的 IP。 */
+static int ping_engine_start(iv_agent_t *a, uint32_t ip_be, uint64_t now_ms)
+{
+    iv_probe_cfg_t pc;
+
+    if (a == NULL || ip_be == 0u)
+        return IV_EINVAL;
+    ping_engine_stop(a);
+
+    iv_probe_cfg_default(&pc);
+    pc.interval_ms = IV_AGENT_PING_PKT_MS;
+    /* 等回包必须 < 单包间隔（`iv_probe_retune` 的硬约束），留 100 ms 给抖动。 */
+    pc.timeout_ms  = IV_AGENT_PING_PKT_MS - 100u;
+    pc.fail_n      = 1u;  /* 一轮就出结论，不要迟滞 */
+    pc.ok_n        = 1u;
+    pc.degrade_rtt_ms = 0u; /* 不判延时：E8 只报原始值，判据在平台侧 */
+    if (iv_probe_init(&a->ping, &pc) != IV_OK)
+        return IV_ESTATE;
+    if (iv_probe_add_icmp(&a->ping, ip_be, 0 /* 不绑出口：由内核按路由选 */,
+                          "e8") != IV_OK)
+        return IV_ESTATE;
+    if (iv_probe_start(&a->ping, now_ms) != IV_OK)
+        return IV_ESTATE;
+    a->ping_dst_be      = ip_be;
+    a->ping_deadline_ms = now_ms + (uint64_t)IV_AGENT_PING_WAIT_MS;
+    a->ping_state       = 1u;
+    return IV_OK;
+}
+
+/* 每拍推进：先排空回包（RTT 分辨率＝排空粒度），再判"跑完没有"，最后发帧。
+ * 三步分开写是为了让"这一拍刚攒满一轮"不会因为后面的 send 失败而丢掉结果。 */
+static void ping_reply_tick(iv_agent_t *a, uint64_t now_ms)
+{
+    iv_probe_stat_t st;
+    char            json[IV_AGENT_IPC_JSON_MAX];
+    int             n;
+    int             fd_n;
+    int             i;
+
+    if (a == NULL || a->ping_state == 0u)
+        return;
+
+    if (a->ping_state == 1u) {
+        fd_n = iv_probe_fd_count(&a->ping);
+        for (i = 0; i < fd_n; i++) {
+            int fd = iv_probe_fd_at(&a->ping, i);
+
+            if (fd < 0)
+                continue;
+            (void)iv_probe_on_readable(&a->ping, fd, now_ms);
+        }
+        (void)iv_probe_tick(&a->ping, now_ms);
+
+        (void)iv_probe_stat_get(&a->ping, 0, &st);
+        if (st.round_seq != 0u) {
+            a->ping_state = 2u; /* 有了完整一轮 ⇒ 下一段发帧 */
+        } else if (now_ms >= a->ping_deadline_ms) {
+            /* 超时：引擎可能连 socket 都没建起来（无 CAP_NET_RAW）。回全 0 而不是
+             * 不回复 —— 平台侧"没反应"和"4 个包都不通"是两个不同的告警。 */
+            a->ping_timeouts++;
+            a->ping_state = 2u;
+            IV_LOG_W(AG_MOD, "E8 ping round not finished in %u ms, replying all-fail",
+                     (unsigned)IV_AGENT_PING_WAIT_MS);
+        } else {
+            return; /* 还没跑完，下一拍继续 */
+        }
+    }
+
+    /* state == 2：拼帧并发送。`iv_probe_stat_get` 失败当"全 0"处理（引擎都没了）。 */
+    if (iv_probe_stat_get(&a->ping, 0, &st) != IV_OK)
+        memset(&st, 0, sizeof st);
+    n = iv_agent_build_ping_json(a, a->ping_qn, &st, json, sizeof json);
+    if (n <= 0) {
+        IV_LOG_W(AG_MOD, "E8 json build failed (%d), reply skipped", n);
+    } else if (iv_proto_send_json(&a->rp.pf, json, (size_t)n) == IV_OK) {
+        a->ping_runs++;
+        IV_LOG_I(AG_MOD, "E8 reply: %s", json);
+    } else {
+        IV_LOG_W(AG_MOD, "E8 reply send failed (link down?), dropped");
+    }
+    ping_engine_stop(a);
+}
+
+int iv_agent_ping_state(const iv_agent_t *a)
+{
+    return (a == NULL) ? 0 : (int)a->ping_state;
+}
+
+/* 平台 0xE8（查询 PING 信息）：解析 4 字节 IP → 起一轮即席探测 → 先回 ACK，
+ * 结果由 `ping_reply_tick()` 在跑完后补一帧 JSON（与 0xE4 同一套两段式）。 */
+static void on_query_ping(const iv_proto_frame_t *f, void *arg)
+{
+    iv_agent_t *a = (iv_agent_t *)arg;
+    uint32_t    ip = 0u;
+    char        ipbuf[INET_ADDRSTRLEN];
+    int         rc;
+
+    if (f == NULL || a == NULL)
+        return;
+    /* 4 字节 IP：**按内存原样存**（本工程 `ip_be` 的统一约定，见 `ipv4_dotted()`），
+     * 不做 `>>24` 那种手工拆字节 —— 小端机上那样会得到反序地址。 */
+    if (f->data != NULL && f->len >= 4u)
+        memcpy(&ip, f->data, 4u);
+    if (ip == 0u) {
+        (void)iv_proto_ack(&a->rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        IV_LOG_W(AG_MOD, "E8 ping query without target IP (len=%u), ack 0x74",
+                 (unsigned)f->len);
+        return;
+    }
+    /* QN 与 E3/E4 同构，应答原样回填（平台靠它把应答对到请求上）。 */
+    (void)snprintf(a->ping_qn, sizeof a->ping_qn, "%08u%09u",
+                   (unsigned)f->qn1, (unsigned)f->qn2);
+    rc = ping_engine_start(a, ip, a->now_ms);
+    (void)iv_proto_ack(&a->rp.pf, f->cmd,
+                       (rc == IV_OK) ? IV_PROTO_ACK_OK : IV_PROTO_ERR_EXEC);
+    IV_LOG_I(AG_MOD, "platform 0xE8 ping %s -> rc=%d",
+             ipv4_dotted(ip, ipbuf, sizeof ipbuf), rc);
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台 0xE7「查询 SNMP 信息」的应答体
+ *
+ * 数据来源**只有一处**：`a->snmp_job[which].slot[]`（慢池采完、`on_snmp_done`
+ * 落好的结果表），与 Web/ctl 读的是同一份 —— 否则平台和页面会各说一套。
+ * ------------------------------------------------------------------------- */
+
+/* 槽位名 → 结果。名字比对收在这里：槽位表按 which 分两套，散着写迟早有一处
+ * 拿错（`==_CAM` 而 `_CAM` 是 0 这种错法已经踩过一次）。 */
+static const iv_agent_snmp_slot_t *snmp_slot_of(const iv_agent_t *a, int which,
+                                                const char *name)
+{
+    const char *const *names;
+    int                n;
+    int                i;
+
+    if (a == NULL || name == NULL)
+        return NULL;
+    if (which < 0 || which >= IV_AGENT_SNMP_TARGET_N)
+        return NULL;
+    names = (which == IV_AGENT_SNMP_SW) ? iv_snmp_sw_slots : iv_snmp_cam_slots;
+    n     = (which == IV_AGENT_SNMP_SW) ? IV_SNMP_SW_SLOT_N : IV_SNMP_CAM_SLOT_N;
+    if (n > a->snmp_job[which].n_slot)
+        n = a->snmp_job[which].n_slot;
+    for (i = 0; i < n; i++) {
+        if (strcmp(names[i], name) == 0)
+            return &a->snmp_job[which].slot[i];
+    }
+    return NULL;
+}
+
+/* 取该槽位的第一个值成文本：OCTET STRING 用 `str`，数值型用 `num`；
+ * **无值给空串**（不拿 0 冒充）。 */
+static void snmp_val_text(const iv_agent_t *a, int which, const char *name,
+                          char *out, size_t cap)
+{
+    const iv_agent_snmp_slot_t *s;
+
+    if (out == NULL || cap == 0u)
+        return;
+    out[0] = '\0';
+    s      = snmp_slot_of(a, which, name);
+    if (s == NULL || s->n_rows <= 0 || !iv_snmp_value_valid(s->row[0].type))
+        return;
+    if (s->row[0].str[0] != '\0')
+        (void)snprintf(out, cap, "%s", s->row[0].str);
+    else
+        (void)snprintf(out, cap, "%lld", (long long)s->row[0].num);
+}
+
+/* 前置声明：转义器的实现放在下面（它同时被 `snmp_val_json()` 用），
+ * 而 `snmp_val_list()` 在它之前就要用。 */
+static void json_put_escaped(char *out, size_t cap, const char *src);
+
+/* 表列 → 逗号分隔（交换机 `port` / `poe` 那种形状）。只取数值行，行数超上限
+ * 就截断 —— 平台侧这两个字段是给页面画端口图的，长度没有协议上限，但板端
+ * 缓冲有；宁可少画几个端口，也不许把缓冲写穿。 */
+static void snmp_val_list(const iv_agent_t *a, int which, const char *name,
+                          char *out, size_t cap, int max_items)
+{
+    const iv_agent_snmp_slot_t *s;
+    size_t                      n = 0;
+    int                         i;
+
+    if (out == NULL || cap == 0u)
+        return;
+    out[0] = '\0';
+    s      = snmp_slot_of(a, which, name);
+    if (s == NULL)
+        return;
+    for (i = 0; i < s->n_rows && i < max_items; i++) {
+        char     one[IV_SNMP_STR_MAX];
+        char     esc[IV_SNMP_STR_MAX * 2];
+        int      k;
+
+        if (!iv_snmp_value_valid(s->row[i].type))
+            continue;
+        if (s->row[i].str[0] != '\0')
+            (void)snprintf(one, sizeof one, "%s", s->row[i].str);
+        else
+            (void)snprintf(one, sizeof one, "%lld", (long long)s->row[i].num);
+        /* 表里的值也可能是字符串型（LLDP 的端口描述就是）⇒ 同样过白名单，
+         * 否则一个引号就能让整条 E7 解析失败。 */
+        json_put_escaped(esc, sizeof esc, one);
+        k = snprintf(out + n, cap - n, "%s%s", (n != 0u) ? "," : "", esc);
+        if (k < 0 || (size_t)k >= cap - n)
+            return; /* 写不下就停在这一项之前，保持已拼部分是完整序列 */
+        n += (size_t)k;
+    }
+}
+
+/* 把任意 SNMP 文本安全地放进 JSON 字符串里。
+ *
+ * SNMP 的 `sysDescr` / `sysName` 是**设备给的任意字节流**：可以有引号、反斜杠、
+ * 控制字符、非 UTF-8。直接 `%s` 塞进去会造出非法 JSON，平台整条解析失败 ——
+ * 表现是"E7 偶尔没反应"，而且只在某台交换机上复现。做法＝白名单：可打印 ASCII
+ * 原样；`"` / `\` 加反斜杠转义；其余（含控制字符、0x80 以上的字节）一律换成 '.'。
+ * 丢几个汉字换"JSON 永远合法"，这笔账在运维链路上是划算的。 */
+static void json_put_escaped(char *out, size_t cap, const char *src)
+{
+    size_t n = 0u;
+
+    if (out == NULL || cap == 0u)
+        return;
+    out[0] = '\0';
+    if (src == NULL)
+        return;
+    for (; *src != '\0' && n + 2u < cap; src++) {
+        unsigned char c = (unsigned char)*src;
+
+        if (c == '"' || c == '\\') {
+            out[n++] = '\\';
+            out[n++] = (char)c;
+        } else if (c >= 0x20u && c <= 0x7Eu) {
+            out[n++] = (char)c;
+        } else {
+            out[n++] = '.';
+        }
+    }
+    out[n] = '\0';
+}
+
+/* 取该槽位并**转义**后放进 JSON 字符串（`model`/`sid` 这类直接进 JSON 的字段
+ * 一律走这里）。两步分开是因为转义会加长（`"` → `\"`），缓冲要留余量。 */
+static void snmp_val_json(const iv_agent_t *a, int which, const char *name,
+                          char *out, size_t cap)
+{
+    char raw[IV_SNMP_STR_MAX];
+
+    if (out == NULL || cap == 0u)
+        return;
+    out[0] = '\0';
+    snmp_val_text(a, which, name, raw, sizeof raw);
+    json_put_escaped(out, cap, raw);
+}
+
+int iv_agent_build_snmp_json(const iv_agent_t *a, int which, const char *qn,
+                             char *out, size_t cap)
+{
+    char     brand[64];
+    char     model[128];
+    char     sid[128];
+    char     cpu[32];
+    char     mem[32];
+    char     rate[32];
+    char     mac[64];
+    char     port[256];
+    char     poe[256];
+    char     crc2[3];
+    uint16_t devtype;
+    uint32_t devid;
+    int      n;
+
+    if (a == NULL || out == NULL || cap < 96u)
+        return IV_EINVAL;
+    if (which < 0 || which >= IV_AGENT_SNMP_TARGET_N)
+        return IV_EINVAL;
+
+    devtype = a->rp.pf.id.devtype;
+    devid   = a->rp.pf.id.devid;
+    (void)snprintf(crc2, sizeof crc2, "%02x",
+                   (unsigned)iv_report_query_crc(devtype, devid,
+                                                 IV_PROTO_CMD_QUERY_SNMP));
+
+    /* 品牌来自装配层按 `camera.ch.N.vendor` 填进来的展示名（不参与选 OID）。 */
+    json_put_escaped(brand, sizeof brand, a->cfg.snmp[which].brand);
+
+    if (which == IV_AGENT_SNMP_SW) {
+        snmp_val_json(a, which, "sysDescr", model, sizeof model);
+        snmp_val_list(a, which, "ifOperStatus", port, sizeof port,
+                      IV_AGENT_SNMP_ROWS_MAX);
+        /* POE 没有对应槽位（标准 MIB 里也没有可移植的口径）⇒ 空串，按指令表
+         * "不存在直接返回空字符串"。**不填假的 1,1,1…**：那会让平台以为
+         * 每个口都在供电。 */
+        (void)snprintf(poe, sizeof poe, "%s", "");
+        n = snprintf(out, cap,
+                     "{\"code\":0,\"data\":{\"qn\":\"%s\",\"ver\":\"%02x\","
+                     "\"devtype\":\"%04x\",\"tid\":\"%x\",\"cmd\":\"%02X\","
+                     "\"num\":\"%d\",\"brand\":\"%s\",\"model\":\"%s\","
+                     "\"port\":\"%s\",\"poe\":\"%s\",\"crc\":\"%s\"}}",
+                     (qn != NULL && qn[0] != '\0') ? qn : "0",
+                     (unsigned)IV_PROTO_VER, (unsigned)devtype, (unsigned)devid,
+                     (unsigned)IV_PROTO_CMD_QUERY_SNMP, which + 1, brand, model,
+                     port, poe, crc2);
+    } else {
+        snmp_val_json(a, which, "sysDescr", model, sizeof model);
+        snmp_val_json(a, which, "serialNumber", sid, sizeof sid);
+        /* cpuPercent / memUsed 是数值型（INTEGER），走 snmp_val_text 后仍只有数字，
+         * 但统一过一遍转义没有代价，也免得将来换成字符串型 OID 时漏掉。 */
+        snmp_val_json(a, which, "cpuPercent", cpu, sizeof cpu);
+        snmp_val_json(a, which, "memUsed", mem, sizeof mem);
+        /* `rate`（实时码流）与 `mac` 在摄像机的 SNMP 槽位表里**没有对应项**：
+         * 码流要走 RTSP/私有协议，MAC 要走 ARP 表。两者都空串登记在案，
+         * 不编一个数字上去。 */
+        (void)snprintf(rate, sizeof rate, "%s", "");
+        (void)snprintf(mac, sizeof mac, "%s", "");
+        n = snprintf(out, cap,
+                     "{\"code\":0,\"data\":{\"qn\":\"%s\",\"ver\":\"%02x\","
+                     "\"devtype\":\"%04x\",\"tid\":\"%x\",\"cmd\":\"%02X\","
+                     "\"num\":\"%d\",\"brand\":\"%s\",\"model\":\"%s\","
+                     "\"sid\":\"%s\",\"cpu\":\"%s\",\"mem\":\"%s\","
+                     "\"rate\":\"%s\",\"mac\":\"%s\",\"crc\":\"%s\"}}",
+                     (qn != NULL && qn[0] != '\0') ? qn : "0",
+                     (unsigned)IV_PROTO_VER, (unsigned)devtype, (unsigned)devid,
+                     (unsigned)IV_PROTO_CMD_QUERY_SNMP, which + 1, brand, model,
+                     sid, cpu, mem, rate, mac, crc2);
+    }
+    if (n < 0 || (size_t)n >= cap)
+        return IV_ERANGE;
+    return n;
 }
 
 /* S4.2 发现回调：每新增/更新一条档案调一次（worker/装配层同线程，无阻塞动作）。 */
@@ -1624,6 +2179,27 @@ static void on_snmp_done(uint64_t id, int rc, const void *result,
     a->snmp_runs++;
     IV_LOG_I(AG_MOD, "snmp collect done: target=%d rc=%d slots=%d",
              jb->which, rc, jb->n_slot);
+
+    /* 平台 0xE7 欠的那条 JSON：采完当场发（2026-10-29 补）。
+     * 此前这条命令只回 ACK 0x01，平台点「查询SNMP」永远等不到内容 —— 测试计划
+     * N-05 的"应答 JSON 尚未实现"就是这个。发失败即清标志并留痕：链路不在 UP
+     * 时再存着只会在下一次采集时发一条更旧的结果，比不发更糟。 */
+    if (a->snmp_pending[jb->which] != 0u) {
+        char json[IV_AGENT_IPC_JSON_MAX];
+        int  n;
+
+        a->snmp_pending[jb->which] = 0u;
+        n = iv_agent_build_snmp_json(a, jb->which,
+                                     a->snmp_qn[jb->which], json, sizeof json);
+        if (n <= 0) {
+            IV_LOG_W(AG_MOD, "E7 json build failed (%d), reply skipped", n);
+        } else if (iv_proto_send_json(&a->rp.pf, json, (size_t)n) == IV_OK) {
+            a->snmp_replies++;
+            IV_LOG_I(AG_MOD, "E7 reply: %s", json);
+        } else {
+            IV_LOG_W(AG_MOD, "E7 reply send failed (link down?), dropped");
+        }
+    }
 }
 
 /* 阈值下发（0xF1）的重试驱动：把已登记的那份 JSON 交给 iv_report，发出去就清账。
@@ -1695,6 +2271,19 @@ static void on_probe_drain_timer(void *arg)
      * 在 1 ms 以内"要解决的就是这件事。 */
     if (iv_camdet_is_open(&a->cd))
         (void)iv_camdet_drain(&a->cd, now);
+    /* E8 的即席引擎同样要在密节拍上排空：平台的 E8 问的就是"这一路多少毫秒"，
+     * 按 200 ms 才读一次回包，局域网 0.5 ms 会被记成 200 ms（R-02 同一个坑）。 */
+    if (a->ping.started) {
+        int n = iv_probe_fd_count(&a->ping);
+        int i;
+
+        for (i = 0; i < n; i++) {
+            int fd = iv_probe_fd_at(&a->ping, i);
+
+            if (fd >= 0)
+                (void)iv_probe_on_readable(&a->ping, fd, now);
+        }
+    }
     if (a->r != NULL)
         a->pb_drain_timer =
             iv_timer_add(a->r, IV_AGENT_PROBE_DRAIN_MS, on_probe_drain_timer, a);
@@ -2598,45 +3187,17 @@ uint8_t iv_agent_mn(const iv_agent_t *a, int w)
     return a->mn_last[w];
 }
 
-/* 「主网检测 IP」的显示用结论（契约见 `iv_agent.h`）。与 `iv_agent_mn()` 无关：
- * 这两项只回答"这个地址通不通"，不参与切链路、不进上报、不触发故障码。 */
+/* 「主网检测 IP」的四态结论（契约见 `iv_agent.h`）。判定本体在 `round_state_of()`，
+ * 这里只做下标解析 —— **界面与上报的故障码必须同源**，否则就会出现"界面上两个
+ * 检测 IP 都不通、上报里只有主网1故障"这种自相矛盾（2026-10-30 现场现象）。
+ *
+ * 仍然**不参与切链路**：切链路看 `iv_netmgr` 的迟滞结论（`mn_state_of()`），
+ * 这两项只回答"这个地址此刻通不通"。 */
 uint8_t iv_agent_target_state(const iv_agent_t *a, int i)
 {
-    iv_probe_stat_t s;
-    int             idx;
-
     if (a == NULL || i < 0 || i >= (int)IV_AGENT_TGT_N)
         return 0u;
-    idx = a->tgt_probe_idx[i];
-    if (idx < 0)
-        return 0u;
-    if (iv_probe_stat_get(&a->pb, idx, &s) != IV_OK)
-        return 0u;
-
-    /* 四态判定**只看最近一轮的 4 个包**（2026-10-29 用户口径：
-     * "每 ping 一次发 4 个包，判断是否全部响应，算 4 个包的平均响应时间"）。
-     *
-     *   全无响应              → 2 不通
-     *   部分响应              → 4 丢包
-     *   全响应 且 平均 > 门限 → 3 延时
-     *   全响应 且 平均 ≤ 门限 → 1 通
-     *
-     * 为什么不沿用 `iv_probe_state()`：那是给"要不要切链路"用的，要经过
-     * fail_n/ok_n 迟滞，且 DEGRADED 的门限是 **16 窗**平均 —— 现场问的是
-     * "这台 IP 现在通不通、多快"，等迟滞攒满 3 次失败再显示"不通"就晚了；
-     * 而 16 窗平均会把刚发生的一次丢包摊平掉。
-     *
-     * `round_seq == 0`（第一轮还没攒满 4 个包）一律报"未知"：拿半轮数据下结论
-     * 正是"刚开机就显示故障"的来源。 */
-    if (s.round_seq == 0u)
-        return 0u;
-    if (s.round_ok == 0u)
-        return 2u;
-    if (s.round_lost != 0u)
-        return 4u;
-    if (a->cfg.probe_delay_ms != 0u && s.round_avg_rtt_ms > a->cfg.probe_delay_ms)
-        return 3u;
-    return 1u;
+    return round_state_of(a, a->tgt_probe_idx[i]);
 }
 
 int iv_agent_target_ip(const iv_agent_t *a, int i, char *buf, size_t cap)

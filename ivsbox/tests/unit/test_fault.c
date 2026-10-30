@@ -11,9 +11,9 @@
  *   f07 数量字段与实际码数不符 ⇒ 照码处理 ＋ board_mismatch++
  *   f08 整体替换：再收到一次（含空串）就按新值重建，不是累加
  *   f09 码数超上限 ⇒ 收满 32 条 ＋ board_overflow++
- *   f10 网络码映射：主网1 故障/延时、主网2 故障/延时、主网1 网线断开只报 LAN 口
+ *   f10 网络码映射：主网1 故障/延时/丢包、主网2 故障/延时/丢包、主网1 网线断开只报 LAN 口
  *   f11 载波未知（负数）不报 LAN 口故障 —— 开机误报的防线
- *   f12 摄像机 2⇒故障 4⇒延时 5（丢包）不置码 0（无 IP）不置码，序号 1 基
+ *   f12 摄像机 2⇒故障 4⇒延时 5⇒丢包（三条都置码）0（无 IP）不置码，序号 1 基
  *   f13 合并：board ∪ net 去重 ＋ 升序（同一组故障每次拼出来一样）
  *   f14 cap 不够返回 IV_ERANGE（不写半截）
  *   f15 NULL 入参安全
@@ -196,7 +196,13 @@ static void f10_main_net(void)
     chk(!iv_fault_has(&f, IV_FAULT_NET_MAIN_FAULT),
         "f10 mn1=3 does NOT also raise MAIN_FAULT");
 
-    /* 主网2（4G）：2/3 都是故障，4 是延时 */
+    /* 主网1 丢包（5）⇒ NET_MAIN_LOSS：参考固件 `det_set_main_network_status()`
+     * 对 `NET_STATUS_LOSS` 是 `Error_Set(NET_MAIN_LOSS)`（2026-10-30 对齐） */
+    iv_fault_apply_net(&f, 5, 1, NULL, 0, 1);
+    chk(iv_fault_has(&f, IV_FAULT_NET_MAIN_LOSS), "f10 mn1=5 -> MAIN_LOSS");
+    chk(strcmp(fmt(&f, s, sizeof s), "1,20800000") == 0, "f10 loss output");
+
+    /* 主网2（`probe.target2`）：2/3 都是故障，4 延时，5 丢包 */
     iv_fault_apply_net(&f, 1, 2, NULL, 0, 1);
     chk(iv_fault_has(&f, IV_FAULT_NET_MAIN2_FAULT), "f10 mn2=2 -> MAIN2_FAULT");
     iv_fault_apply_net(&f, 1, 3, NULL, 0, 1);
@@ -204,6 +210,8 @@ static void f10_main_net(void)
     iv_fault_apply_net(&f, 1, 4, NULL, 0, 1);
     chk(iv_fault_has(&f, IV_FAULT_NET_MAIN2_DELAY), "f10 mn2=4 -> MAIN2_DELAY");
     chk(!iv_fault_has(&f, IV_FAULT_NET_MAIN2_FAULT), "f10 delay replaces fault");
+    iv_fault_apply_net(&f, 1, 5, NULL, 0, 1);
+    chk(iv_fault_has(&f, IV_FAULT_NET_MAIN2_LOSS), "f10 mn2=5 -> MAIN2_LOSS");
 
     /* 全正常 ⇒ 空表 */
     iv_fault_apply_net(&f, 1, 1, NULL, 0, 1);
@@ -234,13 +242,14 @@ static void f12_cameras(void)
     iv_fault_init(&f);
     cns[0] = 2; /* 摄像机1 故障 */
     cns[2] = 4; /* 摄像机3 延时 */
-    cns[4] = 5; /* 摄像机5 丢包：只检测不上报 */
+    cns[4] = 5; /* 摄像机5 丢包：参考固件 det_set_camera_status() 也置码 */
     iv_fault_apply_net(&f, 1, 1, cns, 6, 1);
     chk(iv_fault_has(&f, IV_FAULT_NET_CAM_FAULT(1)), "f12 ch0(1) fault -> 20410000");
     chk(iv_fault_has(&f, IV_FAULT_NET_CAM_DELAY(3)), "f12 ch2(3) delay -> 20730000");
-    chk(!iv_fault_has(&f, IV_FAULT_NET_CAM_LOSS(5)), "f12 ch4(5) loss -> no code");
-    chk(iv_fault_count(&f) == 2, "f12 exactly two codes");
-    chk(strcmp(fmt(&f, s, sizeof s), "2,20410000,20730000") == 0, "f12 output");
+    chk(iv_fault_has(&f, IV_FAULT_NET_CAM_LOSS(5)), "f12 ch4(5) loss -> 20A50000");
+    chk(iv_fault_count(&f) == 3, "f12 exactly three codes");
+    chk(strcmp(fmt(&f, s, sizeof s), "3,20410000,20730000,20A50000") == 0,
+        "f12 output");
 
     /* 无 IP（0）与正常（1）都不置码 */
     for (i = 0; i < 6; i++) cns[i] = (i == 1) ? 0 : 1;

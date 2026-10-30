@@ -49,28 +49,34 @@
  * "上次的值"冒充现在的值。
  *
  * ============================ 网络码怎么判（对齐参考实现 det.c / alarm.c） ============================
- * 输入全在装配层手上，本模块只做"状态码 → 故障码"的纯映射：
+ * 输入全在装配层手上，本模块只做"状态码 → 故障码"的纯映射。状态码与参考固件
+ * `det.h:NET_STATUS_E` ＋ `com.c:com_report_get_main_network_status()` 同一套：
+ *     0 无IP / 1 正常 / 2 故障 / 3 网线断开 / 4 延时 / 5 丢包
  *
- *   状态码（与 `iv_report_env_t::mn` / `iv_camdet_status_t` 同一套编码）
- *     0 未指定 IP / 1 正常 / 2 故障 / 3 网线断开 / 4 延时 / 5 丢包
+ *   **「主网1 / 主网2」＝配置里的两个「主网检测 IP」（`probe.target1/2`）** ——
+ *   依据：指令表 0xF8"前四个字节为主网1IP、后四个字节为主网2IP"，以及正常上报
+ *   `MN` 的取值表。**不是** 4G / 有线那两条上行链路（那是本机的 `IV_WAN_*`，
+ *   只用于切链路与界面显示）。2026-10-30 更正：此前按有线/4G 映射，导致两个
+ *   检测 IP 都不通时只上报了"主网1故障"。
  *
- *   主网1（有线 eth0）
- *     2 ⇒ `NET_MAIN_FAULT`      4 ⇒ `NET_MAIN_DELAY`
+ *   主网1（`probe.target1`，`det_set_main_network_status()`）
+ *     2 ⇒ `NET_MAIN_FAULT`   4 ⇒ `NET_MAIN_DELAY`   5 ⇒ `NET_MAIN_LOSS`
+ *     0 ⇒ 不置码（参考实现把 `NET_MAIN_IP_UNCONFIG` 那行**注释掉**了，照抄）
  *     3 ⇒ **不置主网码** —— 那是"网线被拔"，由 `NET_LAN_PORT` 表达（同一条物理
- *         事实报两个码只会让平台多出一条不相干的条目）。参考实现的主网状态来自
- *         ping，本来就没有"网线断开"这一态；这一态是本板 `mn_state_of()` 新增的。
- *     0/1/5 ⇒ 不置码（丢包只检测不上报，参考实现 2026-09 改口径后即如此）
+ *         事实报两个码只会让平台多出一条不相干的条目）。生产方（`iv_agent.c` 的
+ *         `tgt_fault_state()`）已把"检测 IP 的 3＝延时"翻成 4，所以这里收到 3
+ *         只可能是"网线断开"这一种。
  *
- *   主网2（4G / usb0，没有网线这一说）
- *     2 或 3 ⇒ `NET_MAIN2_FAULT`     4 ⇒ `NET_MAIN2_DELAY`
+ *   主网2（`probe.target2`，`det_set_main_network_sub_status()`）
+ *     2 或 3 ⇒ `NET_MAIN2_FAULT`    4 ⇒ `NET_MAIN2_DELAY`    5 ⇒ `NET_MAIN2_LOSS`
  *
- *   LAN 口（运维网口，同样是有线 eth0）
+ *   LAN 口（运维网口，同样是有线 eth0，`alarm.c:alarm_net_collection_param()`）
  *     载波 down ⇒ `NET_LAN_PORT`；**载波未知（未绑接口）时不置码** ——
  *     开机头几拍还没收到 netlink 事件就报"LAN 口故障"是纯误报。
  *
- *   摄像机 1..6（0 基下标 0..5）
- *     2 ⇒ `NET_CAREMA<n>_FAULT`      4 ⇒ `NET_CAREMA<n>_DELAY`
- *     5 ⇒ 不置码（同上：丢包不上报）；0/1 ⇒ 不置码
+ *   摄像机 1..6（0 基下标 0..5，`det_set_camera_status()`）
+ *     2 ⇒ `NET_CAREMA<n>_FAULT`   4 ⇒ `NET_CAREMA<n>_DELAY`   5 ⇒ `NET_CAREMA<n>_LOSS`
+ *     0/1 ⇒ 不置码（参考实现里摄像机没有"无 IP"码）
  *     ⚠ 参考实现的码名是 `CAREMA`（拼写如此），码值才是契约，名字照抄以便对照。
  *
  * ============================ 输出格式 ============================
@@ -132,10 +138,12 @@ extern "C" {
 #define IV_FAULT_NET_MAIN2_FAULT   (IV_FAULT_TYPE_NET | (3u << 20)) /* 主网2 故障 */
 #define IV_FAULT_NET_MAIN_DELAY    (IV_FAULT_TYPE_NET | (5u << 20)) /* 主网1 延时告警 */
 #define IV_FAULT_NET_MAIN2_DELAY   (IV_FAULT_TYPE_NET | (6u << 20)) /* 主网2 延时告警 */
-#define IV_FAULT_NET_MAIN_LOSS     (IV_FAULT_TYPE_NET | (8u << 20)) /* 主网1 丢包（不置码，留表） */
-#define IV_FAULT_NET_MAIN2_LOSS    (IV_FAULT_TYPE_NET | (9u << 20)) /* 主网2 丢包（同上） */
-#define IV_FAULT_NET_MAIN_NOIP     (IV_FAULT_TYPE_NET | (11u << 20)) /* 主网1 IP 未配置（同上） */
-#define IV_FAULT_NET_MAIN2_NOIP    (IV_FAULT_TYPE_NET | (12u << 20)) /* 主网2 IP 未配置（同上） */
+#define IV_FAULT_NET_MAIN_LOSS     (IV_FAULT_TYPE_NET | (8u << 20)) /* 主网1 丢包告警 */
+#define IV_FAULT_NET_MAIN2_LOSS    (IV_FAULT_TYPE_NET | (9u << 20)) /* 主网2 丢包告警 */
+/* IP 未配置：码值留表，**不置码** —— 参考实现 `det.c` 里对应的 `Error_Set()`
+ * 那两行是注释掉的（`// case NET_STATUS_NO_IP: ...`），出厂没配 IP 不该报故障。 */
+#define IV_FAULT_NET_MAIN_NOIP     (IV_FAULT_TYPE_NET | (11u << 20)) /* 主网1 IP 未配置 */
+#define IV_FAULT_NET_MAIN2_NOIP    (IV_FAULT_TYPE_NET | (12u << 20)) /* 主网2 IP 未配置 */
 
 /* 摄像机：`n` 为 1..6（与 `camera.ch.N` 的 N 同口径），逐路相差 `1 << 16` */
 #define IV_FAULT_NET_CAM_FAULT(n) \
@@ -193,8 +201,8 @@ int iv_fault_apply_board(iv_fault_t *f, const char *err_field, uint64_t now_ms);
 /*
  * 按主板掌握的网络事实**重算** `f->net[]`（整体替换，不是增量）。
  *
- *   mn_primary ：主网1（有线 eth0）状态码 0/1/2/3/4/5
- *   mn_backup  ：主网2（4G usb0）状态码，同上
+ *   mn1        ：主网1（`probe.target1` 的 ping 结论）状态码 0/1/2/3/4/5
+ *   mn2        ：主网2（`probe.target2` 的 ping 结论）状态码，同上
  *   cns        ：六路摄像机状态码（0 基，0/1/2/4/5），NULL ⇒ 一路都不判
  *   cns_n      ：`cns` 有效长度（> IV_FAULT_MAX 按上限截断）
  *   lan_link   ：运维网口（eth0）载波：1 有 / 0 无 / **负数 = 未知**
@@ -203,7 +211,7 @@ int iv_fault_apply_board(iv_fault_t *f, const char *err_field, uint64_t now_ms);
  * 判定表见文件头。任何输入都不产生"猜"出来的码：状态码不在表内即不置码。
  * `f == NULL` 返回 IV_EINVAL，否则 IV_OK。
  */
-void iv_fault_apply_net(iv_fault_t *f, int mn_primary, int mn_backup,
+void iv_fault_apply_net(iv_fault_t *f, int mn1, int mn2,
                         const int *cns, int cns_n, int lan_link);
 
 /*

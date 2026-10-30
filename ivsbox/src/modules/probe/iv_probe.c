@@ -271,6 +271,13 @@ static void recompute(iv_probe_t *p, iv_probe_item_t *it)
  * 会得出"延时正常"的荒谬结论）。 */
 static void round_push(iv_probe_item_t *it, int ok, uint32_t rtt)
 {
+    /* 逐包明细：先落进行中的那组，攒满一轮才整体搬到 `round_*`（见头文件）。
+     * `rtt` 只在成功时有意义，失败一律存 0 —— 与平台指令表「失败时为 0」一致，
+     * 也避免把"上包的 RTT"误当成"本次失败的耗时"。 */
+    if (it->rnd_n < IV_PROBE_ROUND_SAMPLES) {
+        it->rnd_st[it->rnd_n] = (uint8_t)(ok ? 1u : 0u);
+        it->rnd_dt[it->rnd_n] = ok ? rtt : 0u;
+    }
     it->rnd_n++;
     if (ok) {
         it->rnd_ok++;
@@ -281,6 +288,12 @@ static void round_push(iv_probe_item_t *it, int ok, uint32_t rtt)
     it->round_ok         = it->rnd_ok;
     it->round_lost       = it->rnd_n - it->rnd_ok;
     it->round_avg_rtt_ms = (it->rnd_ok != 0u) ? (it->rnd_rtt_sum / it->rnd_ok) : 0u;
+    for (uint32_t i = 0; i < IV_PROBE_ROUND_SAMPLES; i++) {
+        it->round_st[i] = it->rnd_st[i];
+        it->round_dt[i] = it->rnd_dt[i];
+        it->rnd_st[i]   = 0u;
+        it->rnd_dt[i]   = 0u;
+    }
     it->round_seq++;
     it->rnd_n       = 0u;
     it->rnd_ok      = 0u;
@@ -1214,6 +1227,10 @@ int iv_probe_stat_get(const iv_probe_t *p, int idx, iv_probe_stat_t *out)
     out->round_lost       = it->round_lost;
     out->round_avg_rtt_ms = it->round_avg_rtt_ms;
     out->round_seq        = it->round_seq;
+    for (uint32_t i = 0; i < IV_PROBE_ROUND_SAMPLES; i++) {
+        out->round_st[i] = it->round_st[i];
+        out->round_dt[i] = it->round_dt[i];
+    }
     return IV_OK;
 }
 

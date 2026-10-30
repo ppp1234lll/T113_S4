@@ -1012,8 +1012,156 @@ def main():
                 ctl('config.apply', {'ver': cls_ver('elec' if k.startswith('elec.') else 'sensor'),
                                      'items': {k: src[k]}})
 
-        # ---- 收尾：把动过的键按**原值**还原 ----
-        print('Z 收尾：还原现场配置')
+        # ---- C36 0xF1 配置服务器地址（2026-10-29 补） ----
+        print('C36 0xF1 配置服务器地址：同值 all## 走 unchanged，异常载荷回 0x74')
+        net0 = cls_items('net')
+        w_h = net0.get('net.server.wired.host')
+        w_p = int(net0.get('net.server.wired.port') or 0)
+        x_h = net0.get('net.server.wireless.host')
+        x_p = int(net0.get('net.server.wireless.port') or 0)
+        same = 'all##%s:%d,%s:%d' % (w_h, w_p, x_h, x_p)
+        start = len(logtext())
+        plat.clear()
+        plat.send(build_downlink(0xF1, same.encode()))
+        f = plat.wait(0xF1, kind='bin')
+        chk(f is not None and f['code'] == 0x01,
+            'C36a 同值 all## ⇒ ack=0x01（**本次修的**：原来走默认分支回 0x74）')
+        chk(wait_log(r'0xF1 server addr unchanged', start=start) is not None,
+            'C36b 走的是 unchanged 分支（不写盘、不拆链路）')
+        net1 = cls_items('net')
+        chk((net1.get('net.server.wired.host'), int(net1.get('net.server.wired.port') or 0))
+            == (w_h, w_p), 'C36c 同值下发后地址没被改坏')
+
+        print('C36d 同一串按 hex 编码下发也要认（指令表没说清是 ASCII 还是 hex）')
+        start = len(logtext())
+        plat.clear()
+        plat.send(build_downlink(0xF1, same.encode().hex().encode()))
+        f = plat.wait(0xF1, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'C36d hex 形态 ⇒ ack=0x01')
+        chk(wait_log(r'0xF1 server addr unchanged', start=start) is not None,
+            'C36e hex 解出来是同一串（同值早返回，没写盘）')
+
+        print('C36f 未知前缀 / 缺 ## / 端口非法 ⇒ 一律 0x74，且不碰配置')
+        for bad, tag in ((b'bogus##1.2.3.4:80', 'C36f1 未知前缀'),
+                         (b'all192.168.0.1:80', 'C36f2 缺 ## 分隔'),
+                         (b'all##192.168.0.1:0', 'C36f3 端口 0'),
+                         (b'all##192.168.0.1', 'C36f4 缺端口')):
+            plat.clear()
+            plat.send(build_downlink(0xF1, bad))
+            f = plat.wait(0xF1, kind='bin')
+            chk(f is not None and f['code'] == 0x74, tag + ' ⇒ ack=0x74')
+        net2 = cls_items('net')
+        chk(net2.get('net.server.wired.host') == w_h,
+            'C36g 四条非法载荷都没把地址改坏（%r）' % net2.get('net.server.wired.host'))
+
+        # ---- C37 0xA2 配置摄像机 ONVIF 账号（2026-10-29 补） ----
+        print('C37 0xA2 ONVIF 账号：<接口位置> <用户名> <密码> ⇒ 落 camera.ch.<n-1>.*')
+        u0 = (orig['camera'].get('camera.ch.5.user') or '')
+        p0 = (orig['camera'].get('camera.ch.5.pass') or '')
+        start = len(logtext())
+        plat.clear()
+        plat.send(build_downlink(0xA2, b'6 tester T3stpw'))
+        f = plat.wait(0xA2, kind='bin')
+        chk(f is not None and f['code'] == 0x01,
+            'C37a ⇒ ack=0x01（**本次修的**：原来走默认分支回 0x74）')
+        cam1 = cls_items('camera')
+        chk((cam1.get('camera.ch.5.user') == 'tester' and
+             cam1.get('camera.ch.5.pass') == 'T3stpw'),
+            'C37b 接口位置 6 ⇒ camera.ch.5（0 基，差一即写到隔壁通道）实际 user=%r'
+            % cam1.get('camera.ch.5.user'))
+        chk(wait_log(r'platform set ch6 onvif account', start=start) is not None,
+            'C37c 日志记了 ch6（且**不含密码**）')
+        chk('T3stpw' not in logtext()[start:],
+            'C37d 日志里没有明文密码')
+
+        print('C37e 同值重发 ⇒ unchanged；字段不足 / 通道越界 ⇒ 0x74')
+        start = len(logtext())
+        plat.clear()
+        plat.send(build_downlink(0xA2, b'6 tester T3stpw'))
+        f = plat.wait(0xA2, kind='bin')
+        chk(f is not None and f['code'] == 0x01, 'C37e 同值 ⇒ ack=0x01')
+        chk(wait_log(r'0xA2 ch6 onvif account unchanged', start=start) is not None,
+            'C37f 走的是 unchanged 分支')
+        for bad, tag in ((b'6 tester', 'C37g1 只有两段'),
+                         (b'7 tester T3stpw', 'C37g2 通道 7 越界'),
+                         (b'0 tester T3stpw', 'C37g3 通道 0 越界'),
+                         (b'6 tester T3st pw', 'C37g4 密码带空格 ⇒ 切成 4 段')):
+            plat.clear()
+            plat.send(build_downlink(0xA2, bad))
+            f = plat.wait(0xA2, kind='bin')
+            chk(f is not None and f['code'] == 0x74, tag + ' ⇒ ack=0x74')
+
+        # 还原这一路的账号（别指望末尾批量还原：它只覆盖 camera.ch.*.ip）
+        ctl('config.apply', {'ver': cls_ver('camera'),
+                             'items': {'camera.ch.5.user': u0,
+                                       'camera.ch.5.pass': p0}})
+
+        # ---- C38 主网1/主网2 故障码必须按「主网检测 IP 1/2」判（2026-10-30 更正）----
+        # 现场现象：界面上两个检测 IP 都不通，平台上只出现「主网1故障」。
+        # 根因是故障码当时按 4G/有线两条上行链路映射，**不是**按两个检测 IP。
+        # 这里把两个检测 IP 都指到 TEST-NET-1（192.0.2.0/24，保证不可达），
+        # 等一轮 4 包结算，再让设备立即上报，检查 ERR 里**两个码都在**。
+        print('C38 两个主网检测 IP 都不通 ⇒ ERR 里必须同时有主网1故障和主网2故障')
+        pr0 = orig['probe']
+        apply_cls('probe', {'probe.target1': '192.0.2.1',
+                            'probe.target2': '192.0.2.2',
+                            'probe.interval_ms': 2000})
+        # **必须等一轮打满**：改完配置那一刻设备会立刻催报一帧，而两个新探测项
+        # 的"一轮 4 个包"还没结算（`round_seq == 0` ⇒ 状态 0 ＝未判定）⇒ 那一帧的
+        # ERR 里一条主网码都不会有。2026-10-30 就因为"抓到第一帧 ERR 就判"而假红：
+        # 日志里 apply 与 report#3 落在同一秒。这里改成"等到两个码都出现或超时"，
+        # 并且用最后一帧（不是第一帧）做判据。
+        err = None
+        t_end = time.time() + 25.0
+        while time.time() < t_end:
+            plat.clear()
+            plat.send(build_downlink(0xE2))
+            time.sleep(3.0)
+            got = None
+            with plat.lock:
+                for _ts, rec in plat.frames:
+                    # 上报帧是**文本帧**（`##V=..;..ERR=..;##`），不是二进制帧 ——
+                    # 所以不能按 kind=='bin' 过滤（第一版就这么写了，于是"永远抓不到"）
+                    if b'ERR=' in rec['data']:
+                        got = rec['data']
+            if got is not None:
+                err = got
+                if b'20200000' in got and b'20300000' in got:
+                    break
+        if err is None:
+            chk(False, 'C38a 没抓到带 ERR= 的上报帧（无法判定，按失败处理）')
+        else:
+            chk(b'20200000' in err,
+                'C38a ERR 含 20200000（主网1故障）实际 %r'
+                % err[err.find(b'ERR='):err.find(b'ERR=') + 48])
+            chk(b'20300000' in err,
+                'C38b ERR 含 20300000（主网2故障）—— **本次修的**：原来只有主网1')
+            # 上报字段 `MN=` 也必须是这两个检测 IP 的状态（0 无IP/1 正常/2 故障/
+            # 3 网线断开/4 延时/5 丢包），**不是** 4G / 有线两条链路的状态。
+            # 两个检测 IP 都不可达 ⇒ `MN=2,2`。
+            chk(b'MN=2,2' in err,
+                'C38d MN=2,2（两位＝两个检测 IP 的状态，不是 4G/有线）实际 %r'
+                % err[err.find(b'MN='):err.find(b'MN=') + 12])
+        # 把两个检测 IP 改回来并确认故障码消失（否则是"报了不撤"的另一种坏）
+        apply_cls('probe', {'probe.target1': pr0.get('probe.target1'),
+                            'probe.target2': pr0.get('probe.target2'),
+                            'probe.interval_ms': int(pr0.get('probe.interval_ms') or 10000)})
+        time.sleep(6.0)
+        plat.clear()
+        plat.send(build_downlink(0xE2))
+        time.sleep(2.5)
+        with plat.lock:
+            for _ts, rec in plat.frames:
+                if b'ERR=' in rec['data']:
+                    err = rec['data']
+                    break
+        chk(err is not None and b'20300000' not in err,
+            'C38c 检测 IP 改回可达地址后，主网2故障码被撤掉（ERR 整体重算）')
+        chk(err is not None and b'MN=2,2' not in err,
+            'C38e 检测 IP 改回可达后 MN 不再是 2,2（字段跟着事实走，不是钉死的）')
+
+
+
         keep = ('net.ip', 'net.mask', 'net.gateway',
                 'net.server.wired.host', 'net.server.wired.port',
                 'net.server.wired.host_bak', 'net.server.wired.port_bak',

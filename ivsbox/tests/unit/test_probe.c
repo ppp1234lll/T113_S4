@@ -1093,6 +1093,38 @@ static void c18_round_stats(void)
         "c18 a fresh round resets the counters");
     chk(st.round_avg_rtt_ms == 40u, "c18 fresh round average");
 
+    /* 逐包明细（2026-10-29 加，平台 0xE8 的数据来源）：平台问的是"第几个包通没通、
+     * 各多少毫秒"，聚合量答不了。这一轮 4 成、每包 40 ms。 */
+    chk(st.round_st[0] == 1u && st.round_st[1] == 1u && st.round_st[2] == 1u &&
+            st.round_st[3] == 1u,
+        "c18 per-packet status kept for all four packets");
+    chk(st.round_dt[0] == 40u && st.round_dt[1] == 40u && st.round_dt[2] == 40u &&
+            st.round_dt[3] == 40u,
+        "c18 per-packet RTT kept for all four packets");
+
+    /* 混包序：第 2 个失败 ⇒ st2=0 且 dt2**必须是 0**（不是"上包的 30"）。
+     * 这条是 0xE8 最容易写错的地方：失败包没有 RTT，拿 0 冒充成功或留着上包的值
+     * 都会让平台看到"通了但 0 ms"这种不存在的状态。 */
+    (void)iv_probe_note_result(&p, i, 1, 11, 8100u);
+    (void)iv_probe_note_result(&p, i, 0, 0, 8200u);
+    (void)iv_probe_note_result(&p, i, 1, 33, 8300u);
+    (void)iv_probe_note_result(&p, i, 1, 44, 8400u);
+    (void)iv_probe_stat_get(&p, i, &st);
+    chk(st.round_st[0] == 1 && st.round_st[1] == 0 && st.round_st[2] == 1 &&
+            st.round_st[3] == 1,
+        "c18 per-packet status follows arrival order");
+    chk(st.round_dt[0] == 11u && st.round_dt[1] == 0u && st.round_dt[2] == 33u &&
+            st.round_dt[3] == 44u,
+        "c18 a lost packet reports dt=0 instead of the previous RTT");
+
+    /* 半轮不得覆盖已结算的那一轮：平台来查时正好跑在半轮上，看到的必须是
+     * **上一个完整轮**（稳定、可复现），而不是三新一旧的拼接。 */
+    (void)iv_probe_note_result(&p, i, 0, 0, 8500u);
+    (void)iv_probe_note_result(&p, i, 0, 0, 8600u);
+    (void)iv_probe_stat_get(&p, i, &st);
+    chk(st.round_st[0] == 1 && st.round_st[1] == 0 && st.round_dt[2] == 33u,
+        "c18 a half-finished round does not touch the settled one");
+
     (void)iv_probe_stop(&p);
 }
 

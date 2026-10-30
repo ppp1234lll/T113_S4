@@ -112,7 +112,7 @@ int main(void)
             "CHA=0.00,0.00,0.00;"
             "POWER=0.00,0.00,0.00;"
             "ELEC=0.00,0.00,0.00;"
-            "CSQ=;MIU=;ERR=0;&&";
+            "CSQ=;ERR=0;&&";
         int n;
 
         fill_mirror(&st);
@@ -190,7 +190,7 @@ int main(void)
         chk(strstr(seg, "RELAY=,,;") != NULL, "c02 RELAY keeps 3 empty slots");
         chk(strstr(seg, "APOWER=;") != NULL, "c02 APOWER empty");
         chk(strstr(seg, "CSQ=;") != NULL, "c02 CSQ empty (unknown)");
-        chk(strstr(seg, "MIU=;") != NULL, "c02 MIU slot always present");
+        chk(strstr(seg, "MIU=") == NULL, "c02 no MIU key (reference report has none)");
         chk(strstr(seg, "LAT=") == NULL, "c02 LAT omitted (no fix)");
         chk(strstr(seg, "ERR=0;") != NULL, "c02 ERR=0 when healthy");
         /* 空值 ≠ 0：不能把"没取到"写成 0 */
@@ -250,8 +250,9 @@ int main(void)
         chk(strstr(seg, "QN=0;TID=101;VER=11;DEVTYPE=0a00;CP=&&DT=") == seg,
             "c05 NULL st keeps header");
         chk(strstr(seg, "CSQ=;") != NULL, "c05 NULL env -> empty CSQ slot");
-        chk(strstr(seg, "MIU=;") != NULL && strstr(seg, "ERR=0;") != NULL,
-            "c05 MIU/ERR slots always present");
+        chk(strstr(seg, "CSQ=;") != NULL && strstr(seg, "ERR=0;") != NULL,
+            "c05 CSQ/ERR slots always present");
+        chk(strstr(seg, "MIU") == NULL, "c05 no MIU key");
 
         chk(iv_report_build_seg(&st, NULL, 0u, 1u, NULL, seg, sizeof(seg)) == IV_EINVAL,
             "c05 NULL dt EINVAL");

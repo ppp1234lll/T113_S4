@@ -171,6 +171,16 @@ typedef struct {
     uint32_t          round_lost;        /* 最近一轮失败包数 */
     uint32_t          round_avg_rtt_ms;  /* 最近一轮成功包的平均 RTT；全失败为 0 */
     uint32_t          round_seq;         /* 已结算轮数，0=还没跑完第一轮 */
+
+    /* ---- 最近一轮的**逐包**明细（2026-10-29 加，平台 0xE8 的落点）----
+     *
+     * 上面四个字段只给聚合量，答不了「第 3 个包通没通、多少毫秒」。平台指令表
+     * 「查询PING信息」要求的正是逐包的 `st1..st4` / `dt1..dt4`，语义：
+     *   `st[i]` = 1 成功 / 0 失败；`dt[i]` = 该包 RTT(ms)，**失败为 0**
+     *   （"失败时为 0" 是表里写死的，不是我们省略）。
+     * 顺序＝包在一轮内的到达顺序（第 1 个发的在第 0 槽）。 */
+    uint8_t           round_st[IV_PROBE_ROUND_SAMPLES];
+    uint32_t          round_dt[IV_PROBE_ROUND_SAMPLES];
 } iv_probe_stat_t;
 
 /* ---------------------------------------------------------------------------
@@ -267,10 +277,17 @@ typedef struct {
     uint32_t          rnd_n;
     uint32_t          rnd_ok;
     uint32_t          rnd_rtt_sum;
+    /* 进行中一轮的逐包明细；结算时整体搬到 `round_st/round_dt`。
+     * 不直接写 `round_*`：平台 0xE8 来查时如果正好跑在半轮上，看到的是**上一个
+     * 完整轮**（稳定、可复现），而不是三行新一行旧的拼接。 */
+    uint8_t           rnd_st[IV_PROBE_ROUND_SAMPLES];
+    uint32_t          rnd_dt[IV_PROBE_ROUND_SAMPLES];
     uint32_t          round_ok;
     uint32_t          round_lost;
     uint32_t          round_avg_rtt_ms;
     uint32_t          round_seq;
+    uint8_t           round_st[IV_PROBE_ROUND_SAMPLES];
+    uint32_t          round_dt[IV_PROBE_ROUND_SAMPLES];
 } iv_probe_item_t;
 
 struct iv_probe {

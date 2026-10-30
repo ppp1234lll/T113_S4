@@ -275,6 +275,11 @@ typedef struct {
     uint32_t max_rows;   /* 表列 GETNEXT 上限；0 → 64 */
     int      n_oid;      /* 有效槽位数 0..IV_AGENT_SNMP_SLOT_MAX */
     char     oid[IV_AGENT_SNMP_SLOT_MAX][IV_SNMP_OID_STR_MAX];
+    /* 品牌展示名（`"Hikvision"` / `"Dahua"` / `"Uniview"` / 交换机型号）。
+     * 只给平台 0xE7 应答的 `brand` 字段用（指令表里是 string）。
+     * **不参与选 OID**：OID 已经由装配层按 `camera.ch.N.vendor` 选好表填进 `oid[]`，
+     * 这里再选一次就会出现"两份选择、两种结果"。取不到就空串（宁缺勿编）。 */
+    char     brand[16];
 } iv_agent_snmp_cfg_t;
 
 /* 一条取值（比 iv_snmp_value_t 少一个 OID 文本字段——槽位自带 OID） */
@@ -560,12 +565,38 @@ typedef struct {
     uint8_t      ipc_pending;
     uint64_t     ipc_deadline_ms;
     char         ipc_qn[32];   /* 请求里的 QN（`%08u%09u`），应答原样回填 */
+
+    /* 平台 `0xE8`「查询 PING 信息」的即席探测（2026-10-29 加）。
+     *
+     * 为什么另开一个引擎而不是在主探测表里加一项：平台的 E8 带 4 字节 IP，
+     * 问的是"**你现在帮我 ping 一下这个地址**，把 4 个包的结果给我"，目标随
+     * 每次请求变、生命周期只有一轮；而主探测表是配置驱动、长期驻留、还带着
+     * netmgr 的迟滞判据。混在一起就会把平台的一次性查询变成"改我的探测配置"。
+     * 引擎本身仍是同一个 `iv_probe`（复用 ICMP 实现与出口绑定），只是独立实例。
+     *
+     * 代价：多约 2 KB 结构体（`IV_PROBE_MAX_ITEMS` 项）。板端 `g_agent` 是全局，
+     * 单测里 `iv_agent_t` 早已在栈上放了 35 KB，加这 2 KB 不影响既有用法。 */
+    iv_probe_t   ping;         /* E8 专用引擎；只在 ping_state != 0 时有内容 */
+    uint8_t      ping_state;   /* 0 空闲 / 1 在跑 / 2 结果待发（各占一拍的解耦） */
+    uint32_t     ping_dst_be;  /* 本次要探的 IPv4（网络序原样）；0 = 没有请求 */
+    uint64_t     ping_deadline_ms; /* 超出这个时刻还没跑完一轮 ⇒ 回全 0，别让平台干等 */
+    char         ping_qn[32];  /* 该次请求的 QN，应答原样回填 */
+    uint64_t     ping_runs;    /* 累计应答过的 E8 次数（诊断） */
+    uint64_t     ping_timeouts;/* 累计超时次数（诊断：现场"总是 0"先看这里） */
     uint8_t      snmp_state[IV_AGENT_SNMP_TARGET_N]; /* 0 空闲 / 1 在飞 / 2 就绪 */
     uint8_t      snmp_stale[IV_AGENT_SNMP_TARGET_N]; /* 1 = 配置换了但作业正在飞，
                                                       * 等它落地后由 start 重装 */
     uint32_t     snmp_reqid[IV_AGENT_SNMP_TARGET_N]; /* request-id 递增种子 */
     uint64_t     snmp_runs;           /* 累计完成的采集轮数 */
     uint64_t     snmp_slot_noval;     /* 累计"该项无值"（无应答/异常值）槽位次数 */
+    /* 平台 0xE7 的**延迟应答**（2026-10-29 加）：收到请求先回 ACK 0x01，真正的
+     * 采集结果要等慢池那一轮跑完（一路 9 个槽位、每个最多 1.5 s × 2 次重试），
+     * 所以按路记"还欠平台一条 JSON"＋该次请求的 QN。与 0xE4 的两段式同一套路，
+     * 区别是这里按目标路各记一份（平台可以连查多路）。
+     * 采完由 `on_snmp_done()` 当场发；发失败即丢弃并留痕（链路不在 UP，再等也没用）。 */
+    uint8_t      snmp_pending[IV_AGENT_SNMP_TARGET_N];
+    char         snmp_qn[IV_AGENT_SNMP_TARGET_N][32];
+    uint64_t     snmp_replies;        /* 累计应答过的 E7 次数（诊断） */
 
     /* 阈值下发（`0xF1`）的待发项。`elec.*`/`sensor.*` 改完只是"想让它生效"，
      * 真正发帧会被 `IV_EBUSY`（同 cmd 在飞，通常是 30 s 一次的 0xE1 轮询）挡回，
@@ -959,20 +990,21 @@ int iv_agent_record_held_off(const iv_agent_t *a);
  * 就是上报数据段 `MN=` 字段的生产者（见 iv_report.h 的 env.mn[]）。 */
 uint8_t           iv_agent_mn(const iv_agent_t *a, int w);
 
-/* 「主网检测 IP」（`probe.target1/2`）的探测结论，**仅供界面显示**：
+/* 「主网检测 IP」（`probe.target1/2`）的探测结论 —— **界面显示与上报故障码同源**：
  *   0 未知（没配 / 第一轮 4 个包还没攒满 / 没建成项）
  *   1 通      —— 4 包全响应，平均 RTT ≤ `probe.timeout_ms`
- *   2 不通    —— 4 包全无响应
- *   3 延时    —— 4 包全响应，平均 RTT > `probe.timeout_ms`
- *   4 丢包    —— 4 包里只回了部分
+ *   2 不通    —— 4 包全无响应           ⇒ 上报 `主网N故障`（0x20N00000）
+ *   3 延时    —— 4 包全响应，平均 RTT > 门限 ⇒ 上报 `主网N延时告警`
+ *   4 丢包    —— 4 包里只回了部分       ⇒ 不置码（现行口径：丢包只检测不上报）
  * 越界或没建项一律返回 0。
  *
- * ⚠ 与 `iv_agent_mn()` 是两件事：`mn` 判的是"这条链路能不能到平台"（参与切链路
- * 与上报），这里判的是"这个检测 IP 通不通"（纯显示）。别拿它去做决策。
+ * ⚠ **`主网1/主网2` 就是这两个检测 IP**（指令表 0xF8：前 4 字节＝主网1IP、后 4 字节
+ * ＝主网2IP）。它们**不表示** 4G / 有线那两条上行链路 —— `IV_WAN_*` 只用于切链路
+ * 和界面显示，与平台的主网编号无关（2026-10-30 更正）。
  *
- * ⚠ 判定粒度＝**一轮 4 个包**（`IV_PROBE_ROUND_SAMPLES`），不走 `iv_probe_state()`
- *   的 fail_n/ok_n 迟滞与 16 窗平均 —— 界面要的是"此刻通不通、多快"，等迟滞攒满
- *   3 次失败才显示"不通"就晚了（见 `iv_agent.c` 该函数的实现注释）。 */
+ * ⚠ 仍**不参与切链路**：切链路看 `iv_netmgr` 的迟滞结论（`iv_agent_mn()`），
+ *   这里判的是"这个地址此刻通不通"，粒度＝一轮 4 个包，不走 fail_n/ok_n 迟滞与
+ *   16 窗平均 —— 等迟滞攒满 3 次失败才显示"不通"就晚了。 */
 uint8_t iv_agent_target_state(const iv_agent_t *a, int i);
 
 /* 第 i 个检测 IP 的点分串（网络序原样转文本）。没配返回 0，配了写进 buf 返回 1。
@@ -1021,6 +1053,32 @@ int iv_agent_build_ipc_json(const iv_agent_t *a, const char *qn, char *out,
 #define IV_AGENT_IPC_JSON_MAX 2048
 
 /* ---------------------------------------------------------------------------
+ * 平台 0xE8「查询 PING 信息」
+ *
+ * 指令表（`指令-通用版 20260623.xlsx` → 查询指令）给死的形状：
+ *   请求：len=4，content = 目标 IPv4 的 4 个字节
+ *   应答：`##{"code":0,"data":{...,"cmd":"E8","st1":"1","dt1":"20",…,"st4":"0","dt4":"0","crc":"…"}}##`
+ *         其中 `st[i]`＝1 成功 / 0 失败，`dt[i]`＝该包 RTT(ms)，**失败为 0**。
+ *
+ * 实现口径（与主探测引擎完全一致，不另起一套判据）：
+ *   - 一次 E8 = 用同一个 `iv_probe` 引擎对该 IP 跑**恰好一轮**（`IV_PROBE_ROUND_SAMPLES`
+ *     个包），跑完立刻回帧并关引擎；不常驻、不写配置、不影响 netmgr。
+ *   - 只读**已结算**的那一轮（`round_seq >= 1`）。半轮的数据不回，宁等一拍。
+ *   - `dt` 的取整方式与上报帧里 RTT 一致（毫秒，向下取整）：ICC 这边量到的分辨率
+ *     就是 1 ms（排空节拍），换算成小数只会让平台看到假的精度。
+ * ------------------------------------------------------------------------- */
+
+/* 拼 E8 应答 JSON（**纯函数**：只读 `a` 的身份与 `st`，不碰 socket、不改状态，
+ * 单测可直接喂一份 `iv_probe_stat_t`）。`st` 为 NULL 或 `round_seq == 0` 时按
+ * "一轮全失败"输出（st 全 0、dt 全 0）—— 平台侧语义就是"这 4 个包都没通"。
+ * 返回写入长度；cap 不够返回 IV_ERANGE（宁可不发，也不发半截 JSON）。 */
+int iv_agent_build_ping_json(const iv_agent_t *a, const char *qn,
+                             const iv_probe_stat_t *st, char *out, size_t cap);
+
+/* E8 引擎状态：0 空闲 / 1 在跑 / 2 结果待发。越界或 NULL 返回 0。 */
+int iv_agent_ping_state(const iv_agent_t *a);
+
+/* ---------------------------------------------------------------------------
  * S4.3 SNMP 采集（慢任务池内执行）
  * ------------------------------------------------------------------------- */
 
@@ -1046,6 +1104,23 @@ int iv_agent_snmp_state(const iv_agent_t *a, int which);
 int iv_agent_snmp_get(const iv_agent_t *a, int which, int i,
                       const char **slot_name, const char **oid, int *n_rows,
                       iv_agent_snmp_row_t *rows, int rowcap);
+
+/* ---------------------------------------------------------------------------
+ * 平台 0xE7「查询 SNMP 信息」的应答体
+ *
+ * 指令表给死的形状（摄像机 / 交换机两套字段，同一个 cmd）：
+ *   摄像机：`{"code":0,"data":{…,"num":"2","brand":"Dahua","model":"…","sid":"",
+ *            "cpu":"21","mem":"","rate":"","mac":"…","crc":"…"}}`
+ *   交换机：`{"code":0,"data":{…,"num":"7","brand":"ONV","model":"…",
+ *            "port":"1,1,1,1,1,2,2,2,1,2","poe":"…","crc":"…"}}`
+ *
+ * 取值**只从已采到的结果表来**（`iv_agent_snmp_get()` 的同一份数据）：
+ * 没有值的字段输出空串 —— 指令表明确允许（"不存在直接返回空字符串即可"），
+ * 而**绝不拿 0 / 默认值顶上**（"CPU 0%" 与"没采到"在现场是两个结论）。
+ * 越界 / NULL 返回 IV_EINVAL；cap 不够返回 IV_ERANGE（整条不发）。
+ * ------------------------------------------------------------------------- */
+int iv_agent_build_snmp_json(const iv_agent_t *a, int which, const char *qn,
+                             char *out, size_t cap);
 
 /* ---------------------------------------------------------------------------
  * S2.5 GPS / NMEA

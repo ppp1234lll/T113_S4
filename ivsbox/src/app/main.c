@@ -1328,7 +1328,10 @@ static int query_cfg_json(char *out, size_t cap, void *arg)
     /* 参考实现的 `local->ip/nm/gw` 是 lwIP 的**本机网卡**（有线口），对应本板 eth0。 */
     if_facts("eth0", ip, mask, gw, mac);
 
-    cj_str(&j, "tn", ""); /* 本板无"设备名称"配置项，宁缺不编 */
+    /* 设备名称（E1 的 `tn`）：2026-10-29 起有写入口了 —— 平台 0xA3 / Web 配置页
+     * 都写 `sys.device.name`。此前的空串注释（"本板无设备名称配置项"）在当时是真的，
+     * 现在键有了、写入口也有了，再送空串就是"设置了却不体现"。 */
+    cj_str(&j, "tn", cfg_str("sys.device.name"));
     cj_str(&j, "tsn", g_tsn);
     cj_str(&j, "isi", endpoint_of("net.server.wired.host",
                                   "net.server.wired.port", ep, sizeof(ep)));
@@ -1499,6 +1502,25 @@ static const char *snmp_brand_seg(const char *vendor)
     return "hik";
 }
 
+/* `camera.ch.N.vendor` → 平台 0xE7 应答里的品牌展示名（`brand` 字段）。
+ * 与 `snmp_brand_seg()` **同源判定**：段名认不出就回落 `hik`，这里也一样回
+ * `Hikvision` —— 两者必须一起漂移，否则会出现"用海康的 OID 表采、报大华的名字"。
+ * 空 vendor 是"没配"，不是"海康"⇒ 空串（宁缺勿编）。 */
+static const char *snmp_brand_label(const char *vendor)
+{
+    if (vendor == NULL || vendor[0] == '\0')
+        return "";
+    if (strcmp(vendor, "dahua") == 0)
+        return "Dahua";
+    if (strcmp(vendor, "uniview") == 0)
+        return "Uniview";
+    if (strcmp(vendor, "hik") == 0)
+        return "Hikvision";
+    /* 其它品牌走 `snmp_brand_seg()` 的海康表（那是 OID 的回退），但**名字照实
+     * 回空**：表是海康的不代表摄像机是海康的。 */
+    return "";
+}
+
 static void cfg_snmp_target(iv_agent_snmp_cfg_t *sc, const char *pfx,
                             const char *oid_pfx,
                             const char *const *slots, int n_slot,
@@ -1572,10 +1594,17 @@ static void cfg_snmp_targets(iv_agent_snmp_cfg_t *sc)
                        snmp_brand_seg(v));
         cfg_snmp_target(&sc[i], "camera.snmp", oid_pfx, iv_snmp_cam_slots,
                         (int)IV_SNMP_CAM_SLOT_N, cfg_ip_be(ipk));
+        /* 平台 0xE7 应答的 `brand`（**只用于展示**，不参与选 OID —— 表已经按
+         * `snmp_brand_seg()` 选好了）。认不出就空串：指令表允许"不存在直接返回
+         * 空字符串"，编一个品牌名上去只会让现场照着错的牌子排查。 */
+        (void)snprintf(sc[i].brand, sizeof(sc[i].brand), "%s",
+                       snmp_brand_label(v));
     }
     cfg_snmp_target(&sc[IV_AGENT_SNMP_SW], "switch.snmp", "switch.snmp.oid",
                     iv_snmp_sw_slots, (int)IV_SNMP_SW_SLOT_N,
                     cfg_ip_be("switch.ip"));
+    /* 交换机没有品牌/型号配置键（现场也不填），`brand` 留空串；型号由
+     * `sysDescr` 采回来填 `model`。 */
 }
 
 /* ---------------------------------------------------------------------------
@@ -2273,6 +2302,711 @@ static void on_plat_net_timeout(const iv_proto_frame_t *f, void *arg)
     IV_LOG_I(APP_MOD, "platform set wired net delay threshold -> %d ms (saved + applied)",
              ms);
     (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台下行 0xF1「配置服务器 IP（域名）、端口」（2026-10-29 补）
+ *
+ * 载荷是**变长字符串**（指令表 len 0x00-0xFF），指令表给了两种形态：
+ *   `all##192.168.0.1:52369,abc.fnwlw.net:52369`  内网、外网同时配
+ *   `update##192.168.0.100:54333`                 程序更新服务器
+ * 落点：`all` 的第一段 → `net.server.wired.*`（内网）、第二段 →
+ * `net.server.wireless.*`（外网）；`update` → `net.server.upgrade.*`。
+ * 只给一段的 `all`（现场常见）两套一起写 —— 设备只有一个平台目标。
+ *
+ * **编码两种都收**：指令表同一份表里，0xF1 的备注写"转化为 16 进制"、0xA6 却真是
+ * 纯二进制载荷，无法据此断言。判据取"载荷里有没有 `:`" —— 十六进制数字集合里没有
+ * 冒号，所以带冒号的必然是原始 ASCII；不带冒号且全为十六进制数字、长度为偶数时才
+ * 按 hex 解码。两种形态都能用，且不会把 ASCII 误判成 hex。
+ *
+ * 生效路径**不在这里重写**：写 `net.server.*` 后由 `iv_config_save()` 派发的
+ * `IV_CFG_CLS_NET` 通知走到 `on_cfg_committed()` → `agent_sync_server_cfg(1)`
+ * （重取地址、刷新出口绑定、断开重连）。这段是 2026-10-19 就验过的唯一通路，
+ * 这里**不再自己调一次**，否则同一条命令会拆两次链路。
+ * ------------------------------------------------------------------------- */
+
+/* 主机名字符白名单：域名/点分 IP 只该有这些。**不用 `gethostbyname()` 预解析**
+ * —— 现场域名可能一时解析不出来（DNS 未就绪），但那不代表配置非法。 */
+static int host_char_ok(unsigned char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') || c == '.' || c == '-' || c == '_';
+}
+
+/* `host:port` → 拆开。成功 0，失败 -1（调用方据此回 0x74）。 */
+static int split_host_port(const char *s, size_t n, char *host, size_t hcap,
+                           int *port)
+{
+    size_t      i;
+    size_t      colon = (size_t)-1;
+    size_t      hl;
+    unsigned long v = 0ul;
+
+    for (i = 0; i < n; i++) {
+        if (s[i] == ':') {
+            colon = i; /* 取**最后**一个冒号：域名里不会有，但 IPv6 字面量会有 */
+        }
+    }
+    if (colon == (size_t)-1 || colon == 0u || colon + 1u >= n)
+        return -1;
+    hl = colon;
+    if (hl + 1u > hcap)
+        return -1;
+    for (i = 0; i < hl; i++) {
+        if (!host_char_ok((unsigned char)s[i]))
+            return -1;
+    }
+    memcpy(host, s, hl);
+    host[hl] = '\0';
+    for (i = colon + 1u; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9')
+            return -1;
+        v = v * 10ul + (unsigned long)(s[i] - '0');
+        if (v > 65535ul)
+            return -1;
+    }
+    if (v == 0ul)
+        return -1; /* 端口 0 等于没配，按非法处理，不静默写进去 */
+    *port = (int)v;
+    return 0;
+}
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* 载荷 → 可打印文本（原始 ASCII 或 hex 编码两种形态），末尾补 NUL。
+ * 返回文本长度，失败 -1。 */
+static int f1_payload_text(const uint8_t *d, size_t n, char *out, size_t cap)
+{
+    size_t i;
+    int    has_colon = 0;
+    int    all_hex   = (n != 0u) && ((n % 2u) == 0u);
+
+    for (i = 0; i < n; i++) {
+        if (d[i] == ':')
+            has_colon = 1;
+        if (hexval((int)d[i]) < 0)
+            all_hex = 0;
+    }
+    if (has_colon) {
+        if (n + 1u > cap)
+            return -1;
+        memcpy(out, d, n);
+        out[n] = '\0';
+        return (int)n;
+    }
+    if (!all_hex) {
+        /* 没有冒号、又不是纯 hex：可能是不带端口的裸地址或空载荷 ⇒ 交给上层拒。
+         * 原样拷出来，让日志里能看到平台到底发了什么。 */
+        if (n + 1u > cap)
+            return -1;
+        memcpy(out, d, n);
+        out[n] = '\0';
+        return (int)n;
+    }
+    if (n / 2u + 1u > cap)
+        return -1;
+    for (i = 0; i < n; i += 2u) {
+        int hi = hexval((int)d[i]);
+        int lo = hexval((int)d[i + 1u]);
+        int c  = (hi << 4) | lo;
+
+        if (c == 0 || c < 0x20 || c > 0x7E)
+            return -1; /* 解码出控制字符 ⇒ 说明"这不是我猜的那种 hex" */
+        out[i / 2u] = (char)c;
+    }
+    out[n / 2u] = '\0';
+    return (int)(n / 2u);
+}
+
+/* 0xF1 的三个落点：内网 / 外网 / 升级服务器。*/
+static const char *const g_srv_host_key[3] = {
+    "net.server.wired.host", "net.server.wireless.host", "net.server.upgrade.host"
+};
+static const char *const g_srv_port_key[3] = {
+    "net.server.wired.port", "net.server.wireless.port", "net.server.upgrade.port"
+};
+
+static void on_plat_server(const iv_proto_frame_t *f, void *arg)
+{
+    char        txt[160];
+    char        newhost[3][64];
+    int         newport[3];
+    int         want[3];
+    char        oldhost[3][64];
+    int64_t     oldport[3];
+    const char *cur = NULL;
+    char       *rest;
+    size_t      rl;
+    int         tlen;
+    int         i;
+    int         same = 1;
+    int         rc;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+    if (f->data == NULL || f->len == 0u || f->len > 255u) {
+        IV_LOG_W(APP_MOD, "0xF1 payload empty/oversize (%u bytes), ack 0x74",
+                 (unsigned)f->len);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    tlen = f1_payload_text(f->data, (size_t)f->len, txt, sizeof txt);
+    if (tlen <= 0) {
+        IV_LOG_W(APP_MOD, "0xF1 payload not decodable (%u bytes), ack 0x74",
+                 (unsigned)f->len);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    for (i = 0; i < 3; i++) {
+        want[i]     = 0;
+        newhost[i][0] = '\0';
+        newport[i]  = 0;
+        oldhost[i][0] = '\0';
+        oldport[i]  = -1;
+    }
+
+    rest = strstr(txt, "##");
+    if (rest == NULL) {
+        IV_LOG_W(APP_MOD, "0xF1 missing '##' separator: \"%s\", ack 0x74", txt);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    *rest   = '\0';
+    rest   += 2;
+    rl      = strlen(rest);
+    if (rl == 0u) {
+        IV_LOG_W(APP_MOD, "0xF1 scope \"%s\" has empty body, ack 0x74", txt);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    if (strcmp(txt, "all") == 0) {
+        /* 逗号分隔，最多两段；只给一段就内外网同值。 */
+        char *comma = strchr(rest, ',');
+
+        if (comma != NULL)
+            *comma++ = '\0';
+        if (split_host_port(rest, strlen(rest), newhost[0], sizeof newhost[0],
+                            &newport[0]) != 0) {
+            IV_LOG_W(APP_MOD, "0xF1 bad inner server \"%s\", ack 0x74", rest);
+            (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+            return;
+        }
+        want[0] = 1;
+        if (comma != NULL && *comma != '\0') {
+            if (split_host_port(comma, strlen(comma), newhost[1],
+                                sizeof newhost[1], &newport[1]) != 0) {
+                IV_LOG_W(APP_MOD, "0xF1 bad outer server \"%s\", ack 0x74", comma);
+                (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+                return;
+            }
+            want[1] = 1;
+        } else {
+            (void)snprintf(newhost[1], sizeof newhost[1], "%s", newhost[0]);
+            newport[1] = newport[0];
+            want[1]    = 1;
+            IV_LOG_I(APP_MOD,
+                     "0xF1 only one address given, inner and outer share %s:%d",
+                     newhost[0], newport[0]);
+        }
+    } else if (strcmp(txt, "update") == 0) {
+        if (split_host_port(rest, rl, newhost[2], sizeof newhost[2],
+                            &newport[2]) != 0) {
+            IV_LOG_W(APP_MOD, "0xF1 bad update server \"%s\", ack 0x74", rest);
+            (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+            return;
+        }
+        want[2] = 1;
+    } else {
+        /* 只认指令表列出的两种前缀。别自创 `inner##`/`outer##` ——
+         * 平台没发过的东西，猜错了就是一次静默的错配置。 */
+        IV_LOG_W(APP_MOD, "0xF1 unknown scope \"%s\" (only all/update), ack 0x74",
+                 txt);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    /* 同值早返回：不写盘、不重连（重连一次就是一次平台断链，不能白拆）。 */
+    for (i = 0; i < 3; i++) {
+        if (!want[i])
+            continue;
+        if (iv_config_get_str(g_cfg, g_srv_host_key[i], &cur) == IV_OK &&
+            cur != NULL)
+            (void)snprintf(oldhost[i], sizeof oldhost[i], "%s", cur);
+        (void)iv_config_get_int(g_cfg, g_srv_port_key[i], &oldport[i]);
+        if (strcmp(oldhost[i], newhost[i]) != 0 ||
+            oldport[i] != (int64_t)newport[i])
+            same = 0;
+    }
+    if (same) {
+        IV_LOG_I(APP_MOD,
+                 "0xF1 server addr unchanged (all/update as given), ack 0x01, "
+                 "link untouched");
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+
+    for (i = 0; i < 3; i++) {
+        if (!want[i])
+            continue;
+        rc = iv_config_set_str(g_cfg, g_srv_host_key[i], newhost[i]);
+        if (rc == IV_OK)
+            rc = iv_config_set_int(g_cfg, g_srv_port_key[i], (int64_t)newport[i]);
+        if (rc != IV_OK) {
+            IV_LOG_W(APP_MOD, "0xF1 set %s rejected (%d), ack 0x74",
+                     g_srv_host_key[i], rc);
+            goto rollback;
+        }
+    }
+    rc = iv_config_save(g_cfg, NULL, 0);
+    if (rc != IV_OK) {
+        IV_LOG_W(APP_MOD, "0xF1 save failed (%d), rolled back, ack 0x74", rc);
+        goto rollback;
+    }
+    for (i = 0; i < 3; i++) {
+        if (want[i])
+            IV_LOG_I(APP_MOD, "platform set %s -> %s:%d (saved)", g_srv_host_key[i],
+                     newhost[i], newport[i]);
+    }
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+    return;
+
+rollback:
+    for (i = 0; i < 3; i++) {
+        if (!want[i])
+            continue;
+        (void)iv_config_set_str(g_cfg, g_srv_host_key[i], oldhost[i]);
+        if (oldport[i] >= 0)
+            (void)iv_config_set_int(g_cfg, g_srv_port_key[i], oldport[i]);
+    }
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台下行 0xF2「配置 PING 的间隔时间」（2026-10-29 补）
+ *
+ * 载荷 **3 字节**（指令表「配置指令」原样）：
+ *   `[0..1]` 每轮间隔（秒，大端），`[2]` 检测下一个设备的间隔（秒）。
+ * 参考实现 `com_set_next_ping_time()` 读法一致：`time = buff[0]<<8|buff[1]`、
+ * `time_dev = buff[2]`，且 **time == 0 回 0x74**。
+ *
+ * 落地口径：
+ *   - 前两字节 → `probe.interval_ms`（×1000）。这就是"每轮多久跑一次"，
+ *     与 `probe_cfg_of()` 的"轮间隔 ÷ 4 ＝ 单包间隔"同一套换算，改一个参数
+ *     主网探测与摄像机探测一起变（2026-10-29 用户口径）。
+ *   - 第三个字节 **本机型不单独生效**：一轮 4 个包之间的间隔是焊死在
+ *     "轮间隔 ÷ 4"上的（同一份换算）。若按平台的 `time_dev` 单独设包间隔，
+ *     一圈就不再等于 `interval_ms`，"每轮 10 s"的现场口径会失效。所以这里
+ *     **不落它、也不假装落了** —— 日志写明，ACK 仍然回 0x01（轮间隔确实生效了）。
+ *
+ * 越界/为 0 如实回 0x74：不 clamp（悄悄改成 2 s 会让平台以为它设的生效了）。
+ * ------------------------------------------------------------------------- */
+static void on_plat_ping_interval(const iv_proto_frame_t *f, void *arg)
+{
+    int64_t  cur = -1;
+    int64_t  pv  = 0;
+    uint32_t sec;
+    uint32_t ms;
+    uint32_t d_s;
+    uint32_t d_ms = 0u;
+    uint32_t f_n  = 0u;
+    int      rc;
+    int      prc;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+    if (f->data == NULL || f->len < 3u) {
+        IV_LOG_W(APP_MOD, "0xF2 payload short (%u bytes, need 3), ack 0x74",
+                 (unsigned)f->len);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    sec  = ((uint32_t)f->data[0] << 8) | (uint32_t)f->data[1];
+    d_s  = (uint32_t)f->data[2];
+    if (sec == 0u) {
+        /* 参考实现同样把 0 当非法：0 秒轮间隔＝不停地 ping，会把链路打满。 */
+        IV_LOG_W(APP_MOD, "0xF2 interval=0 rejected, ack 0x74");
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    ms = sec * 1000u;
+    if (iv_config_get_int(g_cfg, "probe.interval_ms", &cur) == IV_OK &&
+        cur == (int64_t)ms) {
+        IV_LOG_I(APP_MOD,
+                 "0xF2 interval=%us unchanged, ack 0x01 (next-dev gap %us not used)",
+                 (unsigned)sec, (unsigned)d_s);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+    /* 2..600 秒是配置层的边界（2000..600000 ms）。出去就如实拒绝。 */
+    rc = iv_config_set_int(g_cfg, "probe.interval_ms", (int64_t)ms);
+    if (rc != IV_OK) {
+        IV_LOG_W(APP_MOD,
+                 "0xF2 interval=%us (%u ms) rejected by config (%d, range 2..600 s), "
+                 "ack 0x74",
+                 (unsigned)sec, (unsigned)ms, rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    rc = iv_config_save(g_cfg, NULL, 0);
+    if (rc != IV_OK) {
+        if (cur > 0)
+            (void)iv_config_set_int(g_cfg, "probe.interval_ms", cur);
+        IV_LOG_W(APP_MOD, "0xF2 save failed (%d), rolled back, ack 0x74", rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    /* 热更：延时门限/失败次数按配置现值传（口径同 0xFE，别把它们清成 0）。 */
+    if (iv_config_get_int(g_cfg, "probe.timeout_ms", &pv) == IV_OK && pv > 0)
+        d_ms = (uint32_t)pv;
+    if (iv_config_get_int(g_cfg, "probe.max_fail", &pv) == IV_OK && pv > 0)
+        f_n = (uint32_t)pv;
+    prc = iv_agent_reload_probe(&g_agent, cfg_ip_be("probe.target1"),
+                                cfg_ip_be("probe.target2"), ms, d_ms, f_n,
+                                iv_clock_monotonic_ms());
+    if (prc != IV_OK) {
+        IV_LOG_E(APP_MOD, "0xF2 saved but probe reload failed (%d), ack 0x74", prc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    IV_LOG_I(APP_MOD,
+             "platform set ping interval -> %u s (%u ms), next-dev gap %u s not used "
+             "(packet gap is interval/4)",
+             (unsigned)sec, (unsigned)ms, (unsigned)d_s);
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台下行 0xA3「设置设备名称」（2026-10-29 补）
+ *
+ * 载荷：设备名字符串（指令表只写"0x0000~0xFFFF"，参考实现
+ * `com_set_device_name_function()` 是 `strlen(buff->buff)` 后整段拷进
+ * `param->name`，**空串回 0x74**）。所以按"到缓冲尾为止都是名字"处理，
+ * 不假设末尾有 NUL（平台的 C 字符串一定带，但长度字段才是权威）。
+ *
+ * 落点 `sys.device.name`：这个键本来就在默认值表里，只是**一直没有写入口**
+ * （`query_cfg_json()` 至今把 E1 的 `tn` 写死成空串，注释还写着"本板无设备名称
+ * 配置项"—— 那是当时的实情，现在不成立了）。本函数是它的第一个写入口，
+ * 同时把 E1 的 `tn` 接上真值，否则"设置了却没地方体现"。
+ *
+ * 长度上限 63：配置层的字符串上限远大于此，但设备名是给平台列表显示的一行文本，
+ * 超长会被平台截断，不如在这里就挡住并说明（回 0x74，不静默截断）。
+ * ------------------------------------------------------------------------- */
+static void on_plat_dev_name(const iv_proto_frame_t *f, void *arg)
+{
+    char        name[64];
+    char        old[64];
+    const char *cur = NULL;
+    size_t      n;
+    int         rc;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+    if (f->data == NULL || f->len == 0u) {
+        IV_LOG_W(APP_MOD, "0xA3 payload empty, ack 0x74");
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    if (f->len >= (uint16_t)sizeof name) {
+        IV_LOG_W(APP_MOD, "0xA3 name too long (%u bytes, max %u), ack 0x74",
+                 (unsigned)f->len, (unsigned)sizeof(name) - 1u);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    /* 参考实现用 `strlen()`：平台的帧里带 NUL 时以它为准；不带就吃满长度。 */
+    n = strnlen((const char *)f->data, (size_t)f->len);
+    memcpy(name, f->data, n);
+    name[n] = '\0';
+    /* 全空白视同没给名字（现场误点"配置"会发一堆空格） */
+    {
+        size_t i;
+        int    has = 0;
+
+        for (i = 0; i < n; i++) {
+            if (name[i] != ' ' && name[i] != '\t') {
+                has = 1;
+                break;
+            }
+        }
+        if (!has) {
+            IV_LOG_W(APP_MOD, "0xA3 blank name rejected, ack 0x74");
+            (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+            return;
+        }
+    }
+    /* 字符白名单：这个名字会被塞进 0xE1 应答的 JSON（`"tn":"…"`），而装配层的
+     * `cj_str()` **不做转义** —— 名字里带一个双引号就能让平台整条 JSON 解析失败
+     * （现场表现是"查询配置突然全空"，而且只在这台改过名之后）。控制字符同理。
+     * 中文（>=0x80）允许：平台侧本来就是 UTF-8，`"` 与 `\` 才是会破结构的两个。
+     * 拒绝而不是"悄悄替换"：静默改名比失败更难查。 */
+    {
+        size_t i;
+
+        for (i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)name[i];
+
+            if (c < 0x20u || c == '"' || c == '\\') {
+                IV_LOG_W(APP_MOD,
+                         "0xA3 name contains forbidden byte 0x%02X at %u, ack 0x74",
+                         (unsigned)c, (unsigned)i);
+                (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+                return;
+            }
+        }
+    }
+    old[0] = '\0';
+    if (iv_config_get_str(g_cfg, "sys.device.name", &cur) == IV_OK && cur != NULL)
+        (void)snprintf(old, sizeof old, "%s", cur);
+    if (strcmp(old, name) == 0) {
+        IV_LOG_I(APP_MOD, "0xA3 name unchanged (\"%s\"), ack 0x01", name);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+    rc = iv_config_set_str(g_cfg, "sys.device.name", name);
+    if (rc != IV_OK) {
+        IV_LOG_W(APP_MOD, "0xA3 name rejected by config (%d), ack 0x74", rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    rc = iv_config_save(g_cfg, NULL, 0);
+    if (rc != IV_OK) {
+        (void)iv_config_set_str(g_cfg, "sys.device.name", old);
+        IV_LOG_W(APP_MOD, "0xA3 save failed (%d), rolled back, ack 0x74", rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    IV_LOG_I(APP_MOD, "platform set device name: \"%s\" -> \"%s\" (saved)", old,
+             name);
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台下行 0xA2「配置摄像机 ONVIF 账号」（2026-10-29 补）
+ *
+ * 载荷：`<接口位置> <用户名> <密码>`，**英文空格分隔**（指令表原例 `1 admin 12345`），
+ * 三段的顺序就是平台页面上的三个输入框，没有键名可依。
+ *
+ * 落点 `camera.ch.<接口位置-1>.user` / `.pass`：配置里的 `camera.ch.N` 是 **0 基**
+ * （`camera.ch.1.user` 的描述是"第 2 路用户名"），而平台这侧是 **1 基**（1~6，
+ * 与 0xF7 的"摄像机编号 1-6"同一口径）。换算只在这一处做。
+ *
+ * 这个键的消费者是 Web/前端：录像源与拉流地址按 `camera.ch.N.user/pass` 拼 RTSP URL
+ * （`camUrlOf()`）。所以写进去立刻能在页面上看到，不需要"热更"什么模块。
+ *
+ * 空格容忍：**连续空格当一处分隔**（现场手工下发常带）。密码里**不能有空格**
+ * —— 协议本身没有转义，允许空格就再也分不清第 2 段到哪儿结束。
+ * ------------------------------------------------------------------------- */
+static void on_plat_onvif_acc(const iv_proto_frame_t *f, void *arg)
+{
+    char        buf[160];
+    char       *tok[3];
+    char       *p;
+    size_t      n;
+    size_t      len;
+    int         ntok = 0;
+    int         pos;
+    int         ch;
+    char        kuser[32];
+    char        kpass[32];
+    char        olduser[64];
+    char        oldpass[64];
+    const char *cur = NULL;
+    int         rc;
+
+    (void)arg;
+    if (f == NULL || g_cfg == NULL)
+        return;
+    if (f->data == NULL || f->len == 0u) {
+        IV_LOG_W(APP_MOD, "0xA2 payload empty, ack 0x74");
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    if (f->len >= (uint16_t)sizeof buf) {
+        IV_LOG_W(APP_MOD, "0xA2 payload too long (%u bytes, max %u), ack 0x74",
+                 (unsigned)f->len, (unsigned)sizeof(buf) - 1u);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    n = strnlen((const char *)f->data, (size_t)f->len);
+    memcpy(buf, f->data, n);
+    buf[n] = '\0';
+
+    /* 切成 3 段（跳过连续空格；段内不许再出现空格，密码因此天然被挡住）。 */
+    p = buf;
+    while (*p != '\0' && ntok < 3) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p == '\0')
+            break;
+        tok[ntok++] = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t')
+            p++;
+        if (*p != '\0')
+            *p++ = '\0';
+    }
+    if (ntok != 3) {
+        IV_LOG_W(APP_MOD, "0xA2 need \"<pos> <user> <pass>\", got %d field(s), ack 0x74",
+                 ntok);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    /* 第 4 段一律拒：协议没有任何转义手段，密码里带空格就再也分不出边界。
+     * 静默把 `T3st` 当密码、把后面的 `pw` 丢掉，会让平台显示"成功"而密码少一截
+     * —— 那种错现场要对着摄像机抓包才能看出来。宁可明确失败。 */
+    {
+        const char *tail = p;
+
+        while (*tail == ' ' || *tail == '\t')
+            tail++;
+        if (*tail != '\0') {
+            IV_LOG_W(APP_MOD,
+                     "0xA2 more than 3 fields (password must not contain space), "
+                     "ack 0x74");
+            (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+            return;
+        }
+    }
+
+    /* 接口位置：只接受 1~6 的十进制单/双位数字。0 基/1 基搞反会写到隔壁通道上，
+     * 所以这里**不猜**，范围外一律拒。 */
+    len = strlen(tok[0]);
+    if (len == 0u || len > 2u) {
+        IV_LOG_W(APP_MOD, "0xA2 bad channel \"%s\", ack 0x74", tok[0]);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    pos = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (tok[0][i] < '0' || tok[0][i] > '9') {
+            IV_LOG_W(APP_MOD, "0xA2 bad channel \"%s\", ack 0x74", tok[0]);
+            (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+            return;
+        }
+        pos = pos * 10 + (tok[0][i] - '0');
+    }
+    if (pos < 1 || pos > IV_CAMDET_CH_N) {
+        IV_LOG_W(APP_MOD, "0xA2 channel %d out of range 1..%d, ack 0x74", pos,
+                 IV_CAMDET_CH_N);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    ch = pos - 1;
+
+    /* 字符白名单：账号密码最终进 JSON（Web 下发/回显）与 RTSP URL，控制字符与
+     * 空白都会把结构弄坏。中文允许（有些现场用中文账号）。 */
+    for (int t = 1; t < 3; t++) {
+        for (size_t i = 0; tok[t][i] != '\0'; i++) {
+            unsigned char c = (unsigned char)tok[t][i];
+
+            if (c < 0x20u || c == 0x7Fu || c == ' ') {
+                IV_LOG_W(APP_MOD,
+                         "0xA2 field %d has forbidden byte 0x%02X at %u, ack 0x74",
+                         t, (unsigned)c, (unsigned)i);
+                (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+                return;
+            }
+        }
+    }
+    if (strlen(tok[1]) > 31u || strlen(tok[2]) > 63u) {
+        IV_LOG_W(APP_MOD, "0xA2 user/pass too long (%u/%u), ack 0x74",
+                 (unsigned)strlen(tok[1]), (unsigned)strlen(tok[2]));
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+
+    (void)snprintf(kuser, sizeof kuser, "camera.ch.%d.user", ch);
+    (void)snprintf(kpass, sizeof kpass, "camera.ch.%d.pass", ch);
+    olduser[0] = '\0';
+    oldpass[0] = '\0';
+    if (iv_config_get_str(g_cfg, kuser, &cur) == IV_OK && cur != NULL)
+        (void)snprintf(olduser, sizeof olduser, "%s", cur);
+    if (iv_config_get_str(g_cfg, kpass, &cur) == IV_OK && cur != NULL)
+        (void)snprintf(oldpass, sizeof oldpass, "%s", cur);
+    if (strcmp(olduser, tok[1]) == 0 && strcmp(oldpass, tok[2]) == 0) {
+        IV_LOG_I(APP_MOD, "0xA2 ch%d onvif account unchanged, ack 0x01", pos);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+        return;
+    }
+
+    rc = iv_config_set_str(g_cfg, kuser, tok[1]);
+    if (rc == IV_OK)
+        rc = iv_config_set_str(g_cfg, kpass, tok[2]);
+    if (rc != IV_OK) {
+        IV_LOG_W(APP_MOD, "0xA2 ch%d rejected by config (%d), ack 0x74", pos, rc);
+        (void)iv_config_set_str(g_cfg, kuser, olduser);
+        (void)iv_config_set_str(g_cfg, kpass, oldpass);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    rc = iv_config_save(g_cfg, NULL, 0);
+    if (rc != IV_OK) {
+        (void)iv_config_set_str(g_cfg, kuser, olduser);
+        (void)iv_config_set_str(g_cfg, kpass, oldpass);
+        IV_LOG_W(APP_MOD, "0xA2 save failed (%d), rolled back, ack 0x74", rc);
+        (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ERR_EXEC);
+        return;
+    }
+    /* 密码**不打日志**（板端日志会长期留档、还会被上行取走）。 */
+    IV_LOG_I(APP_MOD, "platform set ch%d onvif account: user \"%s\" (%s), saved",
+             pos, tok[1], (olduser[0] != '\0') ? "replaced" : "was empty");
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台下行 0xD9「设备重启」（2026-10-29 补）
+ *
+ * 载荷 1 字节（指令表：`len=0x01`，`content=0x00`）。参考实现的语义同样是
+ * "重启整机"（`CR_POWER_RESETART` → `app_set_sys_opeare_function()`）。
+ *
+ * **为什么不在 handler 里直接 `reboot()`**：`ctl_do_reboot()` 会同步 `sync()` 再
+ * `reboot(2)`，进程当场消失 —— 而此刻 ACK 还没被传输层泵出去。平台的表现会是
+ * "命令超时、设备还重启了"，现场无法判断到底是哪条指令把它弄重启的。
+ * 所以先回 ACK，再用**一次性定时器**延迟 2 s 真正重启（与 0xF4 改 IP 的
+ * `on_local_net_apply_timer` 同一套手法：这类"会把自己弄没"的动作一律延迟执行）。
+ *
+ * `g_reactor == NULL`（单测 / 无 Reactor 装配）时**不重启**，只打日志：
+ * 那条路径上没有任何东西能把 ACK 送出去，重启等于凭空吞掉一条命令。
+ * ------------------------------------------------------------------------- */
+static void on_plat_reboot_timer(void *arg)
+{
+    (void)arg;
+    IV_LOG_W(APP_MOD, "0xD9 reboot now (sync + reboot from the platform request)");
+    if (ctl_do_reboot(NULL) != IV_OK)
+        IV_LOG_E(APP_MOD, "0xD9 reboot(2) failed; device stays up");
+}
+
+static void on_plat_reboot(const iv_proto_frame_t *f, void *arg)
+{
+    (void)arg;
+    if (f == NULL)
+        return;
+    /* 载荷容错：参考实现读 `buff[0]`，但平台给 1 字节 0x00；**缺载荷也照样重启**
+     * —— 这条命令的语义不含参数，为"少一个 0 字节"而拒绝执行只会让现场以为
+     * 设备不听指挥。只在长度异常时留一条日志。 */
+    if (f->data == NULL || f->len != 1u)
+        IV_LOG_W(APP_MOD, "0xD9 payload len=%u (expected 1), executing anyway",
+                 (unsigned)f->len);
+    (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
+    if (g_reactor == NULL) {
+        IV_LOG_W(APP_MOD, "0xD9 reboot skipped: no reactor (would swallow the ACK)");
+        return;
+    }
+    if (iv_timer_add(g_reactor, 2000u, on_plat_reboot_timer, NULL) == NULL)
+        IV_LOG_E(APP_MOD, "0xD9 cannot arm the reboot timer; device stays up");
+    else
+        IV_LOG_I(APP_MOD, "0xD9 reboot scheduled in 2000 ms (ACK sent first)");
 }
 
 /* ---------------------------------------------------------------------------
@@ -3115,6 +3849,10 @@ static int agent_setup(void)
      * （2026-10-26 补；此前落默认分支回 0x74，平台点「配置IP和网关」一直失败）。 */
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_LOCAL_NET,
                          on_plat_local_net, NULL);
+    /* 平台下行 0xF1「配置服务器 IP（域名）、端口」：`all##…` 写内外网、`update##…`
+     * 写升级服务器。此前未注册 ⇒ 走默认分支回 0x74，平台改服务器地址一直失败。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_SERVER, on_plat_server,
+                         NULL);
     /* 平台下行 0xF8「主网检测 IP」：8 B → `probe.target1/2` ＋ 立刻热更。
      * 数据我们本来就有（`probe.*` 五键已接好），此前只是没人把它翻译过去
      * （2026-10-26 补；此前落默认分支回 0x74，平台点「配置主网检测IP」一直失败）。 */
@@ -3166,6 +3904,22 @@ static int agent_setup(void)
      * （2026-10-27 13:53:17 真帧取证后补）。 */
     (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CTL_OUT_PWR,
                          on_plat_relay, NULL);
+    /* 平台下行 0xF2「配置 PING 的间隔时间」：3 B（轮间隔秒 ÷2 ＋ 逐设备间隔 1 B）。
+     * 此前未注册 ⇒ 平台点「配置PING间隔」回 0x74（2026-10-29 补）。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_PING_INTV,
+                         on_plat_ping_interval, NULL);
+    /* 平台下行 0xA3「设置设备名称」：字符串 → `sys.device.name`，同时让 E1 的
+     * `tn` 有真值（此前 tn 恒空串）。此前未注册 ⇒ 回 0x74（2026-10-29 补）。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_DEV_NAME,
+                         on_plat_dev_name, NULL);
+    /* 平台下行 0xA2「配置摄像机 ONVIF 账号」：`<接口位置> <用户名> <密码>` →
+     * `camera.ch.<n-1>.user/.pass`（前端拼 RTSP 地址用）。此前未注册（2026-10-29 补）。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CFG_ONVIF_ACC,
+                         on_plat_onvif_acc, NULL);
+    /* 平台下行 0xD9「设备重启」：先 ACK，2 s 后 sync + reboot(2)。
+     * 此前未注册 ⇒ 平台点「重启设备」回 0x74、设备纹丝不动（2026-10-29 补）。 */
+    (void)iv_proto_route(&g_agent.rp.pf, IV_PROTO_CMD_CTL_REBOOT,
+                         on_plat_reboot, NULL);
     return 0;
 }
 

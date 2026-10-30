@@ -16,6 +16,7 @@
  *   c04d 采集板 0xC2 事件 → **同一拍**催 0xE1 → 全量回来后才组包，走正常上报报文；
  *   c04e 事件撞上"0xE1 还在飞" → 补报按 IV_REPORT_POLL_RETRY_MS 重试，不退回 30 s；
  *   c04f 事件催的 0xE1 **超窗无应答 → 迟到应答**（现场实测晚 13 s）仍要落地补报；
+ *   c04g 组帧前重算 env：事件那一帧必须带事件之后的 ERR（漏水现场 2026-10-30）；
  *   c02c 采集板 0xC1 箱门开启 → 同上（顺带验门开钩子经 cfg 装配链挂上）；
  *   c05 平台断开 → 上报入队积压（不丢）；
  *   c06 平台恢复 → 欠包按序补发（CSQ 11/12/13 的到达顺序即序号顺序）、队列清空；
@@ -287,6 +288,21 @@ static int seg_csq(const char *seg, size_t seg_len)
     return -1;
 }
 
+/* c04g 用的「组帧前重算 env」钩子。计数恒加，只有 `g_er_on` 时才真的改内容，
+ * 这样后续用例的 env 不受影响。 */
+static int         g_er_calls;
+static int         g_er_on;
+static const char *g_er_err;
+
+static void test_env_refresh(void *arg)
+{
+    iv_report_t *rp = arg;
+
+    g_er_calls++;
+    if (g_er_on && rp != NULL)
+        rp->env.err = g_er_err;
+}
+
 /* ---------------------------------------------------------------------------
  * 主流程
  * ------------------------------------------------------------------------- */
@@ -514,6 +530,61 @@ int main(void)
                 }
             }
         }
+    }
+
+    /* ---- c04g 组帧前重算 env：事件那一帧必须带**事件发生之后**的 ERR ----
+     *
+     * 现场症状（2026-10-30）：采集板 `0xC2 {"WATER":1}` 到了、`0xE1` 里也确实出现
+     * `0x30600000`、上报帧也进了 socket —— 但那一帧的 `ERR=` 还是事件之前的两条，
+     * 用户看到的就是"触发了漏水，设备不上报"。
+     *
+     * 根因：`ERR`/`MN`/`CNS` 来自装配层定时注入的 `rp->env`（200 ms/1 s），而事件
+     * 链是**同步**的（`0xC2` → 催 `0xE1` → 镜像落地 → 当场组帧），定时注入永远晚一步。
+     * 修法＝`iv_report_set_env_refresh()`：组帧前回装配层要一次最新的 env。
+     *
+     * 这里用一个测试钩子等价于 `env_feed()`，断言帧里出现钩子写进去的那条码；
+     * 再用"摘掉钩子"的反向证伪证明这条码确实只可能来自钩子。 */
+    {
+        char        rx[4096];
+        size_t      rn   = 0u;
+        const char *seg  = NULL;
+        size_t      sl   = 0u;
+
+        iv_report_set_env_refresh(&rp, test_env_refresh, &rp);
+        g_er_on    = 1;
+        g_er_err   = "3,30500000,30600000,30700000";
+        g_er_calls = 0;
+
+        chk(iv_report_trigger(&rp, g_now) == IV_OK, "c04g trigger ok");
+        for (i = 0; i < 50 && iv_report_queue_count(&rp) > 0u; i++)
+            pump(&rp, master, 1);
+        chk(iv_report_queue_count(&rp) == 0u, "c04g item acked out of queue");
+
+        rn = drain(cs, rx, sizeof rx, 1000);
+        (void)next_report_frame(rx, rn, 0u, &seg, &sl);
+        chk(g_er_calls == 1, "c04g env refresh called exactly once per report");
+        if (seg != NULL)
+            fprintf(stderr, "  c04g DEBUG seg=%s\n", seg);
+        chk(seg != NULL && strstr(seg, "ERR=3,30500000,30600000,30700000;") != NULL,
+            "c04g report carries the leak code computed at send time");
+
+        /* 反向证伪：摘掉钩子后同样的触发就只剩 env 里的旧值（没有 30600000）。
+         * 这一段红了说明上面那条断言是被别的东西满足的（例如镜像里本来就有码）。 */
+        iv_report_set_env_refresh(&rp, NULL, NULL);
+        g_er_on = 0;
+        rp.env.err = "2,30500000,30700000";
+
+        chk(iv_report_trigger(&rp, g_now) == IV_OK, "c04g trigger (no hook) ok");
+        for (i = 0; i < 50 && iv_report_queue_count(&rp) > 0u; i++)
+            pump(&rp, master, 1);
+        rn = drain(cs, rx, sizeof rx, 1000);
+        (void)next_report_frame(rx, rn, 0u, &seg, &sl);
+        chk(seg != NULL && strstr(seg, "ERR=2,30500000,30700000;") != NULL &&
+                strstr(seg, "30600000") == NULL,
+            "c04g without the hook the frame keeps the stale ERR (negative control)");
+
+        /* 收干净并把 env 复位成 c04 那一份，别把 ERR 留给后续用例 */
+        rp.env.err = NULL;
     }
 
     /* ---- c02c M4-S4.5：0xC1 箱门开启 → DS=2 ＋ 门开钩子 ＋「立刻取全量再上报」 ----
@@ -1000,10 +1071,11 @@ int main(void)
             pump(&rp, master, 1);
         }
         chk(iv_report_queue_count(&rp) == 3u, "c05 3 items queued while down");
-        /* 10：c04 1 + c02c 1（门开事件补报）+ c04b 1（动作后补报）
-         *    + c04c 1（采集板自己改继电器）+ c04d 1（0xC2 事件补报）
-         *    + c04e 1（撞在飞后仍补报）+ c04f 1（迟到应答补报）+ 这里 3 */
-        chk(iv_report_reports(&rp) == 10u, "c05 total reports=10");
+        /* 12：c04 1 + c04g 2（组帧前重算 env ＋ 反向证伪各一帧）+ c02c 1（门开事件补报）
+         *    + c04b 1（动作后补报）+ c04c 1（采集板自己改继电器）
+         *    + c04d 1（0xC2 事件补报）+ c04e 1（撞在飞后仍补报）
+         *    + c04f 1（迟到应答补报）+ 这里 3 */
+        chk(iv_report_reports(&rp) == 12u, "c05 total reports=12");
         chk(iv_report_queue_full(&rp) == 0u, "c05 nothing dropped");
     }
 

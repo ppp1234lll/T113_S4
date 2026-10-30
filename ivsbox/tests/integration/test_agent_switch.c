@@ -677,7 +677,6 @@ static int scenario(void)
     uint16_t        port   = 0;
     uint16_t        port2  = 0;
     iv_agent_cfg_t  cfg;
-    iv_report_env_t env;
     iv_db_t        *tdb = NULL;
     iv_store_t     *tstore = NULL;
     char            dbdir[128] = "";
@@ -942,9 +941,11 @@ static int scenario(void)
     if (cs >= 0)
         (void)fcntl(cs, F_SETFL, O_NONBLOCK);
 
-    memset(&env, 0, sizeof env);
-    env.csq = 9;
-    iv_report_set_env(&g_agent.rp, &env);
+    /* CSQ 的来源改成**直接改蜂窝快照**：上报层现在组帧前会回头重算 env
+     * （`iv_report_set_env_refresh()` → `env_feed()`，见 2026-10-30 漏水现场），
+     * 直接 `iv_report_set_env()` 注入会被覆盖成模组真实值（模组没开 ⇒ -1 ⇒
+     * 帧里根本没有 `CSQ=`）。改快照反而更接近生产路径。 */
+    g_agent.cell.snap.csq = 9;
     chk(iv_report_trigger(&g_agent.rp, g_now) == IV_OK, "k03 trigger accepted");
     chk(iv_report_queue_count(&g_agent.rp) == 1u, "k03 item queued");
     chk(wait_queue_empty(60), "k03 item acked out of queue");
@@ -1043,9 +1044,7 @@ static int scenario(void)
     chk(iv_transport_state(&g_agent.rp.tr) != IV_TRANSPORT_UP,
         "k05 transport left UP after platform closed");
     for (i = 11; i <= 12; i++) {
-        memset(&env, 0, sizeof env);
-        env.csq = i;
-        iv_report_set_env(&g_agent.rp, &env);
+        g_agent.cell.snap.csq = i;
         chk(iv_report_trigger(&g_agent.rp, g_now) == IV_OK, "k05 trigger while platform down");
         g_now += STEP_MS;
         (void)iv_agent_step(&g_agent, g_now);

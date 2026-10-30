@@ -687,6 +687,22 @@ static int rep_send_report(iv_report_t *rp)
     int      n;
     int      rc;
 
+    /* **先按当前事实重算 env，再组帧**（2026-10-30）。
+     *
+     * 事件的链路是同步的：`0xC2` 到达 → 催 `0xE1` → 应答落地刷新镜像 →
+     * `rep_apply_query()` 里**当场**调本函数，全程在同一次 `step()` 内。
+     * 装配层的定时 `env_feed()`（200 ms/1 s）这时还没轮到，`rp->env` 里
+     * 是事件**之前**的 `ERR`/`MN`/`CNS` —— 于是"触发漏水"那一帧里没有漏水码，
+     * 要等下一次上报（默认 300 s，或下一个事件）才出现。
+     *
+     * 放在这里而不是放在 `rep_apply_query()` 里：周期上报、E2 立即上报、
+     * 继电器变化补报都要吃同一条不变量 —— **帧内容 = 发送瞬间的事实**。 */
+    if (rp->env_refresh != NULL && rp->env_refreshing == 0u) {
+        rp->env_refreshing = 1u;
+        rp->env_refresh(rp->env_refresh_arg);
+        rp->env_refreshing = 0u;
+    }
+
     now_dt14(dt, sizeof(dt));
     n = iv_report_build_seg(&rp->st, &rp->env, rp->pf.id.devtype,
                             rp->pf.id.devid, dt, seg, sizeof(seg));
@@ -1438,4 +1454,12 @@ void iv_report_set_env(iv_report_t *rp, const iv_report_env_t *env)
         return;
     }
     rp->env = *env;
+}
+
+void iv_report_set_env_refresh(iv_report_t *rp, void (*fn)(void *arg), void *arg)
+{
+    if (rp == NULL)
+        return;
+    rp->env_refresh     = fn;
+    rp->env_refresh_arg = (fn != NULL) ? arg : NULL;
 }

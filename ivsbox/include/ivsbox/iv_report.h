@@ -224,6 +224,23 @@ typedef struct {
 
     iv_report_env_t env; /* 由装配层注入的非采集板事实 */
 
+    /* 「组帧前按**当前**事实重算 env」的回调（装配层在 open 后注册，
+     * 见 `iv_report_set_env_refresh()`）。为什么需要它 ——
+     *
+     * `env` 只由装配层定时注入（`env_feed()`，200 ms/1 s 各一处），而**事件触发的
+     * 上报是同步发生的**：采集板 `0xC2` 一到，本层当场催 `0xE1` → 应答落地 →
+     * 刷新镜像 → 立刻组帧。这一整串都在**同一次** `iv_report_step()` 里跑完，
+     * 装配层的下一次 `env_feed()` 还没轮到 ⇒ 那一帧带的是**事件之前**的 `ERR`/`MN`/`CNS`。
+     *
+     * 后果（2026-10-30 现场实证）：触发漏水 → 采集板 `ERR` 里出现 `0x30600000`
+     * → 立马上报的那一帧 `ERR=` 里**没有**它；它要等下一次上报才出现，而事件上报
+     * 恰恰是"平台看告警的那一帧"。用户看到的就是"触发了漏水，设备没上报"。
+     *
+     * 有了这个回调，组帧一律以"**发送瞬间**的事实"为准，与谁先谁后无关。 */
+    void (*env_refresh)(void *arg);
+    void         *env_refresh_arg;
+    uint8_t       env_refreshing; /* 防重入（回调内部若又触发上报，不再递归刷新） */
+
     iv_reactor_t *r;          /* NULL = 由调用方驱动 step() */
     int           serial_fd;  /* <0 = 未打开 */
     iv_event_t   *serial_ev;
@@ -570,6 +587,20 @@ void iv_report_feed_platform(iv_report_t *rp, const uint8_t *buf, size_t len);
 
 /* 设置/更新注入的环境事实。 */
 void iv_report_set_env(iv_report_t *rp, const iv_report_env_t *env);
+
+/*
+ * 注册「组帧前重算 env」的回调（装配层给：内部就是再跑一遍 `env_feed()`）。
+ *
+ * **必须注册**，否则事件触发的上报会带上一拍的旧 `ERR`/`MN`/`CNS`：
+ * 采集板 `0xC2` 事件的链路是"催 `0xE1` → 镜像落地 → **同一次 step 内**立刻组帧"，
+ * 装配层的定时 `env_feed()` 永远晚一步。详见 `iv_report_t.env_refresh` 的注释与
+ * 2026-10-30 的漏水现场（触发漏水，事件那一帧里没有 `0x30600000`）。
+ *
+ * 回调内只能做纯计算 + `iv_report_set_env()`，**不得**回调本层的
+ * `iv_report_trigger()`（会重入组帧；本层有 `env_refreshing` 兜底，但别依赖它）。
+ * fn 为 NULL = 摘掉回调（回到"只认定时注入"的老行为，仅测试用）。
+ */
+void iv_report_set_env_refresh(iv_report_t *rp, void (*fn)(void *arg), void *arg);
 
 #ifdef __cplusplus
 }

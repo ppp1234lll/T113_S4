@@ -9223,7 +9223,89 @@ if (cmd == IV_FRAME_CMD_DOOR || cmd == IV_FRAME_CMD_EVENT) {   /* 0xC1 / 0xC2 */
 * 抓拍目录固定 `IV_MEDIA_SNAP_DIR_DEFAULT`（`/mnt/sdcard/snap`）；`media_snap_dir` 仍是
   死配置（装配层从不填），改它需要同时改 `ctx->media_root` 的映射，本轮不动。
 
+== 2026-10-30 10:35 上报帧内容按「发送瞬间」的事实生成（漏水现场那一帧为什么没码）
+
+=== 现象
+
+用户报「我触发了漏水故障，设备为什么不上报」。板端日志里设备**其实报了**：
+
+----
+10:11:49 board up cmd 0xC2 (38 B): {"key":"mcuEvent","value":{"WATER":1}}
+10:11:49 board event 0xC2 -> poll 0xE1 + report after poll
+10:11:49 E1 from board (402 B): {... "ERR":"3,30700000,30500000,30600000"}
+10:11:49 report #4 DT=20261030101149 seg=291 frame=301 m=85ba8c18
+10:11:49 queue item written: seq=4 left=1        <- 已写进 socket
+----
+
+`0xE1` 里漏水码 `0x30600000` 明明在，`report #4` 也确实发出了 —— 但那一帧的 `ERR=`
+里**没有它**。
+
+=== 原因
+
+`ERR` / `MN` / `CNS` 三个字段都不是 `iv_report` 自己算的，来自装配层注入的
+`iv_report_t.env`：
+
+* `env_feed()` 在 `on_pb_timer`（200 ms）与 `on_nm_timer`（1 s）里跑，算完
+  `iv_report_set_env()` 落进 `rp->env`；
+* 而事件链是**同步**的：`0xC2` 到达 → `on_link_upstream()` 催 `0xE1` 并打
+  `want_report` → 同一次 `iv_report_step()` 里应答落地、`iv_status_handle_query()`
+  刷新镜像 → `rep_apply_query()` 当场 `iv_report_trigger()` 组帧。
+
+两条路不同步 ⇒ **事件那一帧拿的是事件之前的那份 env**。漏水码只能等下一次上报
+（默认 300 s，或下一个事件）才出现，而平台正是拿"事件那一帧"给用户看告警的。
+
+=== 改法
+
+把「**帧内容 = 发送瞬间的事实**」做成不变量，而不是在各个调用点分别打补丁：
+
+[source,c]
+----
+static int rep_send_report(iv_report_t *rp)
+{
+    /* 先按当前事实重算 env，再组帧 */
+    if (rp->env_refresh != NULL && rp->env_refreshing == 0u) {
+        rp->env_refreshing = 1u;
+        rp->env_refresh(rp->env_refresh_arg);
+        rp->env_refreshing = 0u;
+    }
+    ...
+}
+----
+
+装配层 `iv_agent_open()` 在 `iv_report_open()` 之后注册钩子：
+`iv_report_set_env_refresh(&a->rp, env_refresh_cb, a)`，而 `env_refresh_cb()` 就是
+"再跑一遍 `env_feed()`"。这样**周期上报 / E2 立即上报 / 继电器补报 / 事件补报**
+四条入口自动都吃到同一条不变量。
+
+为什么放在 `rep_send_report()` 而不是 `rep_apply_query()` 里：后者只覆盖事件那一条
+路径，而"组帧前重算是正确的"对每一条路径都成立。
+
+副作用：`env_feed()` 里的动作全是**沿触发**（`a->mn_last[]` 记忆、`want_report`
+只置位），多调一次不会多报一帧、也不会多断一次继电器；`fault_feed()` 是纯查表
+拼串（无 I/O、无 malloc），每帧多一次可忽略。
+
+=== 验证
+
+* `test_e2e_report` 新增 **c04g**：装一个测试钩子（等价于 `env_feed()`）写进
+  `ERR=3,30500000,30600000,30700000`，触发上报后断言平台收到的那一帧里就是这串、
+  且钩子恰好被调 1 次；
+* **反向证伪**：`iv_report_set_env_refresh(&rp, NULL, NULL)` 摘掉钩子、把
+  `rp->env.err` 置成不含漏水码的旧值，同一触发 ⇒ 帧里回到 `ERR=2,30500000,30700000;`
+  且**没有** `30600000`。这一步是为了证明前一条断言确实由钩子满足，而不是镜像里
+  本来就有码；
+* `test_agent_switch` k03/k06 跟着改：它们原来直接 `iv_report_set_env()` 注入
+  `CSQ=9/11/12`，改完会被重算覆盖（模组没开 ⇒ csq=99 ⇒ 帧里没有 `CSQ=`），改为
+  直接改源头 `g_agent.cell.snap.csq` —— 反而更接近生产路径。
+
+=== 附：采集板侧的水浸是电平判据
+
+`APP/DRIVER/src/key.c` 里 `WATER_KEY` = **PC7、高有效**；`Task/src/alarm.c` 每轮采一次
+`key_s[WATER_KEY]`，非 0 就 `Error_Set(SENSOR_WATER_LEAK)`、回 0 就 `Error_Clear()`。
+现场那三十几秒是 1/0 抖动（10:11:49~10:12:47 往返十几次），所以**松手之后平台照样会
+收到"恢复"** —— 那是采集板固件的行为，不是主板丢报。
+
 == 2026-10-28 18:29 0xE1 超时无应答 → 迟到应答仍落地补报（现场 42 s 延迟的真因）
+
 
 === 干了什么事
 

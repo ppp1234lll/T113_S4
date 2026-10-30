@@ -49,6 +49,11 @@ static void probe_drive(iv_agent_t *a, uint64_t now_ms);
 static void netmgr_feed(iv_agent_t *a, uint64_t now_ms);
 static void thresh_drive(iv_agent_t *a, uint64_t now_ms);
 static void env_feed(iv_agent_t *a, uint64_t now_ms);
+
+/* `iv_report` 组帧前的钩子：把 env 按**此刻**的事实重算一遍（定义在 env_feed 之后，
+ * 这里先声明；实现见 `env_refresh_cb()` 的注释）。 */
+static void env_refresh_cb(void *arg);
+
 static void on_query_ipc(const iv_proto_frame_t *f, void *arg);
 static void on_query_snmp(const iv_proto_frame_t *f, void *arg);
 static void on_query_ping(const iv_proto_frame_t *f, void *arg);
@@ -563,6 +568,10 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
         IV_LOG_E(AG_MOD, "report open failed: %d", arc);
         return arc;
     }
+
+    /* 上报层组帧前回头要一次 env（见 `env_refresh_cb()`）：没有这一步，
+     * 采集板事件那一帧带的是**事件之前**的 ERR/MN/CNS。 */
+    iv_report_set_env_refresh(&a->rp, env_refresh_cb, a);
 
     /* ---- 2. netlink（拿不到 socket 不致命：LINK 层降级为不驱动）---- */
     if (iv_netlink_init(&a->nl, on_nl_evt, a) != IV_OK) {
@@ -1533,6 +1542,34 @@ static void env_feed(iv_agent_t *a, uint64_t now_ms)
     fault_feed(a, now_ms, &env);
 
     iv_report_set_env(&a->rp, &env);
+}
+
+/* 上报层组帧前的回调：**再算一遍 env**，保证帧内容 = 发送瞬间的事实。
+ *
+ * 为什么非要有它 —— 事件上报是**同步**链路：
+ *   `iv_report_step()` 读到采集板 `0xC2`（漏水/门磁/过压…）
+ *   → `on_link_upstream()` 催 `0xE1` 并打 `want_report`
+ *   → 同一次 step 里 `0xE1` 应答落地、`iv_status_handle_query()` 刷新镜像
+ *   → `rep_apply_query()` 当场 `iv_report_trigger()` 组帧。
+ * 而 `env`（`ERR` / `MN` / `CNS` 的来源）只由定时器里的 `env_feed()` 注入
+ * （`on_pb_timer` 200 ms / `on_nm_timer` 1 s），这两拍之间可能夹着整个事件。
+ * 于是**事件那一帧带的是事件之前的 `ERR`**，漏水码要等下一次上报才出现 ——
+ * 而平台正是拿"事件那一帧"给用户看告警的。
+ *
+ * 2026-10-30 现场实证：10:11:49 采集板 `0xC2 {"WATER":1}`、同一秒 `0xE1` 里已是
+ * `ERR=3,30500000,30600000,30700000`、`report #4` 也已写进 socket —— 但那一帧的
+ * `ERR=` 还是旧的两条（用户："我触发了漏水故障，设备为什么不上报"）。
+ *
+ * 代价：每帧多一次 `fault_feed()`（纯查表拼串，无 I/O、无 malloc）。
+ * `env_feed()` 里那几个副作用都是**沿触发**（`mn_last[]` 记忆、`want_report` 置位
+ * 只置一次），重复调用不会多报，也不会多断一次继电器。 */
+static void env_refresh_cb(void *arg)
+{
+    iv_agent_t *a = arg;
+
+    if (a == NULL || !a->opened)
+        return;
+    env_feed(a, a->now_ms);
 }
 
 /* 平台 0xE4（搜索摄像机信息）：重开一轮多品牌发现，与现网"摄像机搜索"按钮等价。

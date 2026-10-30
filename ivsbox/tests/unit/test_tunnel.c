@@ -284,6 +284,9 @@ static void t06_expire(void)
         chk(last.open_s == 5000u && last.close_s == 5010u, "t06: session window");
         chk(last.ttl_s == 10u, "t06: session ttl");
     }
+    /* 关掉后句柄上不该再残留有效期（否则 status 会显示"已关、ttl=10s"，读的人会
+     * 以为还剩 10 秒），但**留档**里的 ttl 必须保住（上面那条）。 */
+    chk(t.ttl_s == 0u && t.expire_s == 0u, "t06: no stale ttl on the handle");
 }
 
 /* ---------------------------------------------------------------------------

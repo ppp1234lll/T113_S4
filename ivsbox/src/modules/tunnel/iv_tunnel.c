@@ -345,6 +345,9 @@ static void session_close(iv_tunnel_t *t, uint64_t now_s, iv_tunnel_stop_reason_
     if (now_s > t->open_s) t->stat.uptime_s += (now_s - t->open_s);
     t->state    = IV_TUNNEL_OFF;
     t->expire_s = 0u;
+    /* 关掉之后不该再残留有效期：留着它会让 `tunnel.status` 显示"通道已关、ttl=60s"，
+     * 读的人会以为"还剩 60 秒有效期"，而实际是"上一次开的时候用过 60 秒"。 */
+    t->ttl_s    = 0u;
 }
 
 int iv_tunnel_enable(iv_tunnel_t *t, uint32_t ttl_s, uint64_t now_s,

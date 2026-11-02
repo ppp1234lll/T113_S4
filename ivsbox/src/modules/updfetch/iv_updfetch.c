@@ -709,6 +709,17 @@ int iv_updfetch_init(iv_updfetch_t *u, const iv_updfetch_cfg_t *cfg)
                  (cfg->hw_name != NULL && cfg->hw_name[0] != '\0')
                      ? cfg->hw_name
                      : IV_UPDFETCH_HW_DEFAULT);
+        /* 现场/工装临时对另一套目录命名用（`/opt/ivsbox/scripts/monitor.sh` 与
+         * init 脚注里都可 export）。别名优先于编译期默认、但**不覆盖显式配置**：
+         * 有了 `cfg->hw_name` 就以它为准，环境变量只是"没配时的手动挡"。 */
+        {
+            const char *env_hw = getenv("IVSBOX_OTA_HW");
+
+            if (env_hw != NULL && env_hw[0] != '\0' && name_ok(env_hw)) {
+                copy_str(u->hw, sizeof u->hw, env_hw);
+                IV_LOG_I(UF_MOD, "hw name overridden by IVSBOX_OTA_HW: %s", u->hw);
+            }
+        }
         copy_str(u->ver, sizeof u->ver, cfg->ver_str);
         copy_str(u->root, sizeof u->root,
                  (cfg->data_root != NULL && cfg->data_root[0] != '\0')
@@ -816,6 +827,220 @@ static void name_from_url(iv_updfetch_t *u)
     copy_str(u->name, sizeof u->name, p + 1);
 }
 
+/* ---------------------------------------------------------------------------
+ * 目录列表模式（`info.txt` 不存在时）
+ * -------------------------------------------------------------------------
+ * 发布侧只往目录里放**一个**包（2026-11-02 用户口径："必须是单个文件，压缩包也行，
+ * 不要让我放多个文件，文件名必须带版本号"），于是没有 `info.txt` 可选。此时
+ * `GET /<硬件名>/info.txt` 回 404，就退回去读 nginx/busybox httpd 的 autoindex，
+ * 从 `href="…"` 里挑 `.pkg`，取文件名中 M.m.p 最大的那个。
+ *
+ * 三条纪律：
+ *   - **info.txt 优先**：只要目录里有 info.txt 就走单片机那套原路；列表只是
+ *     "没有 info.txt"时的退化路径，不是替代品（发布侧哪天补上 info.txt 也不用改代码）。
+ *   - **只信文件名里的版本**，不信目录里的时间戳：时间会随上传方式乱、也能被
+ *     `touch` 改；版本号是发布的人手写的，且与包清单里的版本必须一致 ——
+ *     不一致由 `iv_ota` 在装盘时拒，**本模块不替它判**。
+ *   - **只认 `.pkg`**：别把目录里的 `info.txt`、说明文档、旧 `.bin` 当包拉下来。
+ */
+
+/* 文件名里的 M.m.p：`FN_RZTY_PY-1.0.1.20261103.pkg` ⇒ `1.0.1`。
+ * 第四段（日期）**故意不取**：包清单的版本口径就是三段，日期只是给人看的。 */
+static int ver_from_name(const char *name, iv_ota_ver_t *out)
+{
+    const char *p = name;
+
+    if (name == NULL || out == NULL)
+        return IV_EINVAL;
+    while (*p != '\0') {
+        if (*p >= '0' && *p <= '9') {
+            char        tmp[24];
+            size_t      n = 0u;
+            int         dots = 0;
+            const char *q = p;
+
+            while (*q != '\0' && n + 1u < sizeof tmp) {
+                if (*q >= '0' && *q <= '9') {
+                    tmp[n++] = *q++;
+                } else if (*q == '.' && dots < 2) {
+                    tmp[n++] = *q++;
+                    dots++;
+                } else {
+                    break;
+                }
+            }
+            tmp[n] = '\0';
+            if (dots == 2 && iv_ota_ver_parse(tmp, n, out) == IV_OK)
+                return IV_OK;
+        }
+        p++;
+    }
+    return IV_ENOENT;
+}
+
+/* 只收 `.pkg`（大小写不敏感），且先过 `name_ok()` 那道词法关（`..`/空格/百分号全拒） */
+static int pkg_name_ok(const char *n)
+{
+    const size_t sl = sizeof IV_UPDFETCH_PKG_SUFFIX - 1u;
+    size_t       len;
+    size_t       i;
+
+    if (!name_ok(n))
+        return 0;
+    len = strlen(n);
+    if (len <= sl)
+        return 0;
+    for (i = 0u; i < sl; i++) {
+        char a = n[len - sl + i];
+
+        if (a >= 'A' && a <= 'Z')
+            a = (char)(a - 'A' + 'a');
+        if (a != IV_UPDFETCH_PKG_SUFFIX[i])
+            return 0;
+    }
+    return 1;
+}
+
+/* 取下一个 `href="…"`。只认双引号这一种写法：nginx/busybox httpd 都是它，
+ * 再兼容单引号/无引号等于给自己加两条永远走不到的分支。 */
+static const char *next_href(const char *p, char *out, size_t cap)
+{
+    const char *a;
+    const char *b;
+    size_t      n;
+
+    a = strstr(p, "href=\"");
+    if (a == NULL)
+        return NULL;
+    a += 6;
+    b = strchr(a, '"');
+    if (b == NULL)
+        return NULL;
+    n = (size_t)(b - a);
+    if (n == 0u || n >= cap)
+        return b; /* 空的/装不下的跳过：截断的名字只会装错文件，不如不要 */
+    memcpy(out, a, n);
+    out[n] = '\0';
+    return b;
+}
+
+/* 本机"现在的版本"（M.m.p）：编译期版本串与**已装发行版目录名**取大者。
+ * 为什么不能只看编译期版本：包里的二进制可能就是设备正在跑的那个构建
+ * （本次两边都是 `1.0.0.20261102`），只看它会把同一个包反复当新版本下载。
+ * 为什么不用 `pending.json` 里的版本：安装失败/回滚之后它仍记着那个失败的版本，
+ * 用户修好环境再点一次升级会被判"已是最新"、永远重试不了 —— 所以看 `current`
+ * 指向的发行版目录名（`iv_upd_status()` 的 `current_dir`）。 */
+static iv_ota_ver_t local_ver_of(const iv_updfetch_t *u)
+{
+    iv_upd_cfg_t    uc;
+    iv_upd_status_t st;
+    iv_ota_ver_t    v;
+    iv_ota_ver_t    t;
+
+    memset(&v, 0, sizeof v);
+    (void)ver_from_name(u->ver, &v); /* ver_str 形如 "1.0.0.20261102" ⇒ 取前 3 段 */
+    iv_upd_cfg_default(&uc);
+    uc.data_root = u->root;
+    iv_upd_status(&uc, &st);
+    if (st.current_dir[0] != '\0' &&
+        iv_ota_ver_parse(st.current_dir, strlen(st.current_dir), &t) == IV_OK &&
+        iv_ota_ver_cmp(t, v) > 0) {
+        v = t;
+    }
+    return v;
+}
+
+/* 读目录列表，挑出文件名版本最大的 `.pkg`；成功时把**只含路径**的 URL 写到 url_out */
+static int fetch_listing(iv_updfetch_t *u, char *url_out, size_t url_cap,
+                         char *name_out, size_t name_cap, iv_ota_ver_t *ver_out)
+{
+    char         path[IV_UPDFETCH_PATH_MAX];
+    char         name[IV_UPDFETCH_NAME_MAX];
+    char         best[IV_UPDFETCH_NAME_MAX];
+    size_t       pos = 0u;
+    long         got = 0;
+    long         want;
+    const char  *p;
+    iv_ota_ver_t bv;
+    int          have = 0;
+    int          rc;
+
+    /* **换一条新连接**：上一条收到的是 404，body 没读走（`fetch_info()` 直接返回
+     * 了），留在 socket 里的字节会被当成下一个应答的头 —— keep-alive 复用会
+     * 解析出乱码。多一次握手，只在退化路径上付。 */
+    u->need_reconnect = 1;
+
+    path[0] = '\0';
+    append_str(path, sizeof path, &pos, "/");
+    append_str(path, sizeof path, &pos, u->hw);
+    append_str(path, sizeof path, &pos, "/");
+
+    rc = http_get(u, u->host, u->port, path);
+    if (rc != IV_OK)
+        return rc;
+    if (u->status != 200) {
+        IV_LOG_W(UF_MOD, "GET %s -> HTTP %d", path, u->status);
+        return IV_EPROTO;
+    }
+    if (u->body_len <= 0) {
+        IV_LOG_W(UF_MOD, "GET %s: empty listing", path);
+        return IV_EPROTO;
+    }
+    /* 列表页远小于 4 KiB（几十个条目也就几百字节）。**超过就截断解析**：
+     * 截断最多漏掉排在后面的包，不会把某个名字读错。 */
+    want = (u->body_len < (long)(sizeof u->buf - 1u)) ? u->body_len
+                                                     : (long)(sizeof u->buf - 1u);
+    while (got < want) {
+        long n = recv_some(u, u->buf + got, (size_t)want - (size_t)got);
+
+        if (n == 0) {
+            IV_LOG_W(UF_MOD, "GET %s: short listing (%ld/%ld)", path, got, want);
+            return IV_ECONN;
+        }
+        if (n < 0)
+            return (n == UF_R_TIMEOUT) ? IV_ETIMEDOUT : IV_ECONN;
+        got += n;
+    }
+    u->buf[want] = '\0';
+    if (u->body_len > want) {
+        IV_LOG_W(UF_MOD, "GET %s: listing truncated at %ld B, later entries ignored",
+                 path, want);
+    }
+
+    memset(&bv, 0, sizeof bv);
+    p = (const char *)u->buf;
+    while ((p = next_href(p, name, sizeof name)) != NULL) {
+        iv_ota_ver_t v;
+
+        if (!pkg_name_ok(name))
+            continue;
+        if (ver_from_name(name, &v) != IV_OK) {
+            IV_LOG_W(UF_MOD, "%s: no M.m.p in file name, skipped", name);
+            continue;
+        }
+        if (!have || iv_ota_ver_cmp(v, bv) > 0) {
+            bv   = v;
+            have = 1;
+            copy_str(best, sizeof best, name);
+        }
+    }
+    if (!have) {
+        IV_LOG_W(UF_MOD, "GET %s: no *%s in listing", path, IV_UPDFETCH_PKG_SUFFIX);
+        return IV_ENOENT;
+    }
+
+    /* **只给路径**（不带 host）⇒ `parse_url()` 走它"只给路径"那条分支、沿用升级
+     * 服务器那一对 host/port，免得发布侧在列表里写死 IP、日后换服务器还要重发。 */
+    pos = 0u;
+    url_out[0] = '\0';
+    append_str(url_out, url_cap, &pos, path);
+    append_str(url_out, url_cap, &pos, best);
+    copy_str(name_out, name_cap, best);
+    *ver_out = bv;
+    IV_LOG_I(UF_MOD, "listing picked %s", best);
+    return IV_OK;
+}
+
 int iv_updfetch_run(iv_updfetch_t *u)
 {
     char   dir[IV_UPDFETCH_PATH_MAX];
@@ -846,25 +1071,54 @@ int iv_updfetch_run(iv_updfetch_t *u)
         goto OUT;
     }
 
-    /* 1. info.txt */
+    /* 1. 先问"有没有新版本"：参考固件（也就是"单片机的逻辑"）是
+     *    `GET /<硬件名>/info.txt`，见 `General_Version/main/APP/Update/src/update_http.c`。 */
     rc = fetch_info(u, url, sizeof url);
-    if (rc != IV_OK)
-        goto OUT;
-    copy_str(u->st.info_version, sizeof u->st.info_version, u->info_version);
-    copy_str(u->st.url, sizeof u->st.url, url);
+    if (rc == IV_EPROTO && u->status == 404) {
+        /* 目录里只放了一个包、没有 info.txt ⇒ 404 ⇒ 退回读目录列表（见上面的注释） */
+        iv_ota_ver_t rv;
+        iv_ota_ver_t lv;
+        char         sv[16];
 
-    /* 2. 版本比对：参考实现把版本串拼成 `<硬件名>-<软件版本>` 与 info.txt 比 */
-    want_ver[0] = '\0';
-    append_str(want_ver, sizeof want_ver, &pos, u->hw);
-    append_str(want_ver, sizeof want_ver, &pos, "-");
-    append_str(want_ver, sizeof want_ver, &pos, u->ver);
-    if (strcmp(want_ver, u->info_version) == 0) {
-        IV_LOG_I(UF_MOD, "already latest (%s), nothing to do", want_ver);
-        u->st.same++;
-        rc = IV_UPDFETCH_SAME;
+        IV_LOG_I(UF_MOD, "no /%s/info.txt (HTTP 404), fall back to directory listing",
+                 u->hw);
+        rc = fetch_listing(u, url, sizeof url, u->name, sizeof u->name, &rv);
+        if (rc != IV_OK)
+            goto OUT;
+        u->st.listing++;
+        iv_ota_ver_format(rv, u->st.info_version, sizeof u->st.info_version);
+        copy_str(u->st.url, sizeof u->st.url, url);
+
+        lv = local_ver_of(u);
+        iv_ota_ver_format(lv, sv, sizeof sv);
+        if (iv_ota_ver_cmp(rv, lv) <= 0) {
+            IV_LOG_I(UF_MOD, "already latest (local %s >= %s), nothing to do", sv,
+                     u->st.info_version);
+            u->st.same++;
+            rc = IV_UPDFETCH_SAME;
+            goto OUT;
+        }
+        IV_LOG_I(UF_MOD, "update available (listing): %s -> %s", sv, u->st.info_version);
+    } else if (rc != IV_OK) {
         goto OUT;
+    } else {
+        copy_str(u->st.info_version, sizeof u->st.info_version, u->info_version);
+        copy_str(u->st.url, sizeof u->st.url, url);
+
+        /* 2. 版本比对（info.txt 模式）：参考实现把版本串拼成 `<硬件名>-<软件版本>`
+         *    与 info.txt 比，**只比相等、不比大小**（口径与它保持一致）。 */
+        want_ver[0] = '\0';
+        append_str(want_ver, sizeof want_ver, &pos, u->hw);
+        append_str(want_ver, sizeof want_ver, &pos, "-");
+        append_str(want_ver, sizeof want_ver, &pos, u->ver);
+        if (strcmp(want_ver, u->info_version) == 0) {
+            IV_LOG_I(UF_MOD, "already latest (%s), nothing to do", want_ver);
+            u->st.same++;
+            rc = IV_UPDFETCH_SAME;
+            goto OUT;
+        }
+        IV_LOG_I(UF_MOD, "update available: %s -> %s", want_ver, u->info_version);
     }
-    IV_LOG_I(UF_MOD, "update available: %s -> %s", want_ver, u->info_version);
 
     /* 3. URL 拆解 → 下载（先 .part） */
     rc = parse_url(u, url);

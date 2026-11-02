@@ -6,6 +6,8 @@
  * 不是"平台把固件推下来"，而是**让设备自己去升级服务器取**：
  *
  *   1. `GET /<硬件名>/info.txt` → JSON `{"version":"<硬件名>-<软件版本>","url":"http://…"}`
+ *      **没有 info.txt（404）⇒ 退回读目录列表**（autoindex 里挑文件名版本最大的
+ *      `*.pkg`，见"目录列表模式"）—— 发布侧只放一个包时走这条；
  *   2. 版本与本机一致 ⇒ 什么都不做（参考实现**连应答都不发**，本工程由 `iv_agent`
  *      回一帧"已是最新"的结果帧，见那边的注释）
  *   3. `GET <url>` 整包流式下载（**纯 HTTP，不套任何私有分帧格式**）
@@ -63,16 +65,22 @@ extern "C" {
 #endif
 
 /* ---- 默认值 ---- */
-/* 硬件名：info.txt 的路径段与版本号前缀都用它（参考 `HARD_NO_STR "FN-YJTY-PY-8"`）。
- * 与 `IV_UPD_DEV_MODEL_DEFAULT` 同口径（"IVSBOX-T113"），发布侧要按它建目录；
- * 装配层可用环境变量 `IVSBOX_OTA_HW` 覆盖（工装/现场临时对另一套命名时用）。 */
-#define IV_UPDFETCH_HW_DEFAULT "IVSBOX-T113"
+/* 硬件名：`/<硬件名>/` 的路径段，也是 info.txt 里 version 的前缀
+ * （参考 `HARD_NO_STR "FN-YJTY-PY-8"`）。
+ * **2026-11-02：发布侧给本产品的目录是 `FN_RZTY_PY`**（`/FN_RZTY_PY/` 里直接放包，
+ * 没有 info.txt，见下面"目录列表模式"）。它与型号 `IV_UPD_DEV_MODEL_DEFAULT`
+ * （"IVSBOX-T113"）**不是一回事**：型号不符 ⇒ `model-mismatch` 拒包；
+ * 硬件名不符 ⇒ 只是 404 / 取不到列表。两者写错的表现完全不同，别混。
+ * 现场/工装要临时对另一套命名，用环境变量 `IVSBOX_OTA_HW` 覆盖（`init` 时读一次）。 */
+#define IV_UPDFETCH_HW_DEFAULT "FN_RZTY_PY"
 /* 单次下载上限：T113 的应用包按 rootfs 1.5 GiB 双版本受控，64 MiB 已远超实际；
  * 超过就判 ERANGE（宁可拒绝，也不要把 UDISK 写满 —— 写满会连配置与日志一起废）。
  * 边下边计数，**不等服务器报长度**：先落半截再判超限也算拒绝。 */
 #define IV_UPDFETCH_MAX_BYTES_DEFAULT (64u * 1024u * 1024u)
 #define IV_UPDFETCH_NAME_DEFAULT "ivsbox.pkg"
 #define IV_UPDFETCH_DOWNLOAD_SUBDIR "download"
+/* 目录列表模式认的包后缀（大小写不敏感）。只在没有 info.txt 时用得上。 */
+#define IV_UPDFETCH_PKG_SUFFIX ".pkg"
 
 /* 版本号相同：**不是错误**，调用方按"已是最新"处理 */
 #define IV_UPDFETCH_SAME 1
@@ -112,11 +120,12 @@ typedef struct {
     uint64_t ok;         /* 下载完成次数 */
     uint64_t same;       /* "已是最新"次数 */
     uint64_t fail;       /* 失败次数 */
+    uint64_t listing;    /* 走"目录列表"而非 info.txt 的次数（退化路径用量） */
     uint64_t bytes;      /* 累计落盘字节数 */
     int      last_rc;    /* 最近一次 `iv_updfetch_run()` 返回码 */
     int      last_http;  /* 最近一次 HTTP 状态码（0 = 没连上/没应答） */
     uint32_t last_bytes; /* 最近一次落盘字节数 */
-    char     info_version[IV_UPDFETCH_VER_MAX]; /* info.txt 里读到的版本串 */
+    char     info_version[IV_UPDFETCH_VER_MAX]; /* info.txt／列表里读到的版本串 */
     char     url[IV_UPDFETCH_URL_MAX];          /* info.txt 里读到的包 URL */
     char     file[IV_UPDFETCH_NAME_MAX];        /* 最近一次落盘文件名 */
 } iv_updfetch_stats_t;

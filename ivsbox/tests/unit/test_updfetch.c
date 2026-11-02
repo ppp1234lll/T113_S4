@@ -22,11 +22,20 @@
  *   p04 超上限：包比 max_bytes 大 ⇒ `IV_ERANGE`，且**在超限那一刻就中止**（不留半截）。
  *   p05 info.txt 异常：缺 `url` ⇒ `IV_EPROTO`；url 是 https ⇒ `IV_ENOTSUP`。
  *   p06 边角：info.txt 404 ⇒ `IV_EPROTO`；端口 1 ⇒ `IV_ECONN`；空 host / close 后 ⇒ `IV_EINVAL`。
+ *   p07 目录列表模式：没有 info.txt（404）⇒ 读 autoindex，按文件名里的 M.m.p 取最大
+ *       （0.9.9/1.0.1/1.0.9 ⇒ 1.0.9），`notes.txt` 与 `*.tar.gz` 跳过；
+ *       顺带验编译期默认硬件名 ⇒ 请求的是 `/<默认硬件名>/`。
+ *   p08 列表里的版本不比本机新 ⇒ `IV_UPDFETCH_SAME`，零包请求。
+ *   p09 列表里一个 `.pkg` 都没有 ⇒ `IV_ENOENT`，什么都不拉。
  *
  * ============================ 反向证伪（改完必须能看到红） ============================
  *   F1 把 `recv_some()` 里"先吐 hdr 残留"那段删掉 ⇒ p01 逐字节比对红（数据错位）；
  *   F2 把 Content-Length 对账（`total != body_len`）注释掉 ⇒ p03 红（短包被当成功）；
- *   F3 把超限判断从循环内挪到循环后 ⇒ p04 红（半截包已经落盘）。
+ *   F3 把超限判断从循环内挪到循环后 ⇒ p04 红（半截包已经落盘）；
+ *   F4 去掉 `fetch_listing()` 开头那句 `need_reconnect = 1` ⇒ p07 红（404 的 body
+ *      没读走就复用连接，下一份应答的头从 body 中间开始解析）；
+ *   F5 挑"第一个"而不是"最大" ⇒ p07 红（会挑到 0.9.9）；
+ *   F6 去掉 `.pkg` 后缀过滤 ⇒ p07/p09 红（把 notes.txt / .tar.gz 当包）。
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
@@ -69,7 +78,8 @@ static void chk(int cond, const char *what)
 #define SRV_SHORT 1  /* 报 Content-Length = len，实际只发一半就关连接 */
 #define SRV_NOURL 2  /* info.txt 里没有 "url" 字段 */
 #define SRV_HTTPS 3  /* info.txt 里的 url 是 https:// */
-#define SRV_NOINFO 4 /* info.txt 回 404 */
+#define SRV_NOINFO 4 /* info.txt 回 404，目录也 404 */
+#define SRV_DIR 5    /* info.txt 回 404，但 `/<hw>/` 能列（目录列表模式） */
 
 typedef struct {
     int         listen_fd;
@@ -80,10 +90,13 @@ typedef struct {
     unsigned reqs;
     unsigned info_reqs;
     unsigned pkg_reqs;
+    unsigned dir_reqs;
 
     int      mode;
     char     version[64];  /* info.txt 里的 version */
     char     url_path[96]; /* 包里文件的路径段（/pkg/...） */
+    char     dir_html[1024];      /* SRV_DIR：`/<hw>/` 返回的 autoindex */
+    char     last_dir_path[96];   /* 最近一次被当成"目录"的请求路径 */
     unsigned char buf[SRV_BUF_MAX];
     size_t   len;
 } srv_t;
@@ -129,6 +142,28 @@ static int srv_read_req(int fd, char *hdr, size_t cap)
         if (strstr(hdr, "\r\n\r\n") != NULL)
             return 0;
     }
+}
+
+/* 请求行里的路径段：`GET /FN_RZTY_PY/ HTTP/1.1` ⇒ `/FN_RZTY_PY/`。
+ * 只给目录列表模式用（判断"是不是以 `/` 结尾"），不做 URL 解码。 */
+static int hdr_path(const char *hdr, char *out, size_t cap)
+{
+    const char *a = strchr(hdr, ' ');
+    const char *b;
+    size_t      n;
+
+    if (a == NULL)
+        return -1;
+    a++;
+    b = strchr(a, ' ');
+    if (b == NULL)
+        return -1;
+    n = (size_t)(b - a);
+    if (n == 0u || n >= cap)
+        return -1;
+    memcpy(out, a, n);
+    out[n] = '\0';
+    return 0;
 }
 
 /* `clen` 与 `blen` 分开：头里要报 Content-Length（文件大小），body 可以**少发**
@@ -196,6 +231,18 @@ static void *srv_thread(void *arg)
                 int  n;
 
                 s->info_reqs++;
+                if (s->mode == SRV_DIR) {
+                    /* **404 的 body 必须比头缓冲大**：真 nginx 的错误页有几百字节，
+                     * 一旦"头 ＋ 一部分 body"一次 recv 没读完，剩下的字节就留在 socket
+                     * 里；复用连接的下一个应答会从 body 中间开始解析。body 只有 4 字节
+                     * 时它们正好被同一次 recv 一起读走，这条坑测不出来（第一版就是
+                     * 这样把 F4 放过去的）。 */
+                    char big[1200];
+
+                    memset(big, 'x', sizeof big);
+                    srv_send(fd, 404, "", big, sizeof big, sizeof big);
+                    continue;
+                }
                 if (s->mode == SRV_NOINFO) {
                     srv_send(fd, 404, "", "nope", 4u, 4u);
                     continue;
@@ -216,8 +263,32 @@ static void *srv_thread(void *arg)
                 continue;
             }
 
+            /* 目录列表（SRV_DIR）：请求行里的路径以 '/' 结尾就当目录，回 autoindex。
+             * 真 nginx/busybox httpd 也是这个判据（`/x` 会 301 到 `/x/`）。
+             * **只有真目录请求才记 `last_dir_path`**：包的请求也带 `/<hw>/` 前缀，
+             * 拿它记会把断言骗过去（第一版就是这么红的）。 */
+            if (s->mode == SRV_DIR) {
+                char rp[96];
+
+                if (hdr_path(hdr, rp, sizeof rp) == 0) {
+                    size_t hl = strlen(rp);
+
+                    if (hl > 0u && rp[hl - 1u] == '/') {
+                        (void)snprintf(s->last_dir_path, sizeof s->last_dir_path, "%s", rp);
+                        s->dir_reqs++;
+                        srv_send(fd, 200, "Content-Type: text/html\r\n", s->dir_html,
+                                 strlen(s->dir_html), strlen(s->dir_html));
+                        continue;
+                    }
+                }
+            }
+
             /* 包本体：只有 200 整包一种形态 */
             s->pkg_reqs++;
+            if (s->mode == SRV_NOINFO) {
+                srv_send(fd, 404, "", "nope", 4u, 4u); /* 连目录都不给 ⇒ 取不到任何东西 */
+                continue;
+            }
             if (s->mode == SRV_SHORT) {
                 srv_send(fd, 200, "Content-Type: application/octet-stream\r\n", s->buf,
                          s->len / 2u, s->len); /* 少发一半 */
@@ -434,6 +505,73 @@ int main(void)
     cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p05 init (https)");
     chk(iv_updfetch_run(&g_uf) == IV_ENOTSUP, "p05 https url -> IV_ENOTSUP");
+    iv_updfetch_close(&g_uf);
+    srv.mode = SRV_OK;
+
+    /* ---- p07：目录列表模式（没有 info.txt，目录里有多个包） ----
+     * 发布侧只放一个包 ⇒ info.txt 404 ⇒ 退回读 autoindex，按**文件名里的 M.m.p**
+     * 取最大：0.9.9 / 1.0.1 / 1.0.9 里选 1.0.9；`notes.txt` 与 `2.0.0.tar.gz` 必须跳过。 */
+    srv.mode = SRV_DIR;
+    (void)snprintf(srv.dir_html, sizeof srv.dir_html,
+                   "<html><body><pre>"
+                   "<a href=\"../\">../</a>\n"
+                   "<a href=\"FN_RZTY_PY-0.9.9.pkg\">FN_RZTY_PY-0.9.9.pkg</a>\n"
+                   "<a href=\"notes.txt\">notes.txt</a>\n"
+                   "<a href=\"FN_RZTY_PY-1.0.1.20261103.pkg\">"
+                   "FN_RZTY_PY-1.0.1.20261103.pkg</a>\n"
+                   "<a href=\"FN_RZTY_PY-2.0.0.tar.gz\">FN_RZTY_PY-2.0.0.tar.gz</a>\n"
+                   "<a href=\"FN_RZTY_PY-1.0.9.pkg\">FN_RZTY_PY-1.0.9.pkg</a>\n"
+                   "</pre></body></html>");
+    srv.pkg_reqs = 0u;
+    srv.dir_reqs = 0u;
+    cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
+    cfg.hw_name = NULL; /* **不设硬件名** ⇒ 顺带验编译期默认值（发布侧那个目录名） */
+    chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p07 init (listing)");
+    rc = iv_updfetch_run(&g_uf);
+    if (rc != IV_OK) {
+        iv_updfetch_stats(&g_uf, &st);
+        fprintf(stderr, "  p07 rc=%d http=%d\n", rc, st.last_http);
+    }
+    chk(rc == IV_OK, "p07 listing -> IV_OK");
+    iv_updfetch_stats(&g_uf, &st);
+    chk(st.listing == 1u, "p07 counted as a listing run");
+    chk(strcmp(st.info_version, "1.0.9") == 0, "p07 picked the max version 1.0.9");
+    chk(strcmp(st.file, "FN_RZTY_PY-1.0.9.pkg") == 0, "p07 file name came from listing");
+    chk(srv.dir_reqs == 1u && srv.pkg_reqs == 1u, "p07 1 dir + 1 package request");
+    chk(strcmp(srv.last_dir_path, "/FN_RZTY_PY/") == 0,
+        "p07 default hw name lists /FN_RZTY_PY/");
+    {
+        char lp[256];
+
+        (void)snprintf(lp, sizeof lp, "%s/ota/download/FN_RZTY_PY-1.0.9.pkg", g_root);
+        n = slurp(lp, got, sizeof got);
+        chk(n == sizeof pkg, "p07 downloaded size == 2500");
+        chk(n == sizeof pkg && memcmp(got, pkg, sizeof pkg) == 0,
+            "p07 downloaded bytes identical");
+    }
+    iv_updfetch_close(&g_uf);
+
+    /* ---- p08：列表里的版本不比本机新 ⇒ SAME，且**一个包请求都不发** ---- */
+    (void)snprintf(srv.dir_html, sizeof srv.dir_html,
+                   "<a href=\"FN_RZTY_PY-1.0.0.pkg\">FN_RZTY_PY-1.0.0.pkg</a>");
+    before_pkg = srv.pkg_reqs;
+    cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
+    cfg.hw_name = NULL;
+    chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p08 init (listing, up to date)");
+    chk(iv_updfetch_run(&g_uf) == IV_UPDFETCH_SAME, "p08 listing same version -> SAME");
+    chk(srv.pkg_reqs == before_pkg, "p08 no package request when up to date");
+    iv_updfetch_close(&g_uf);
+
+    /* ---- p09：列表里没有 `.pkg`（只有别的文件）⇒ ENOENT，别把错的东西拉下来 ---- */
+    (void)snprintf(srv.dir_html, sizeof srv.dir_html,
+                   "<a href=\"../\">../</a><a href=\"notes.txt\">notes.txt</a>"
+                   "<a href=\"FN_RZTY_PY-2.0.0.tar.gz\">FN_RZTY_PY-2.0.0.tar.gz</a>");
+    before_pkg = srv.pkg_reqs;
+    cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
+    cfg.hw_name = NULL;
+    chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p09 init (no pkg in listing)");
+    chk(iv_updfetch_run(&g_uf) == IV_ENOENT, "p09 listing without .pkg -> IV_ENOENT");
+    chk(srv.pkg_reqs == before_pkg, "p09 nothing downloaded");
     iv_updfetch_close(&g_uf);
     srv.mode = SRV_OK;
 

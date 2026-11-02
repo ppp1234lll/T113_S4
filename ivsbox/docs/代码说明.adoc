@@ -11757,3 +11757,195 @@ if (rc == IV_OK) {
 `tu=20/hu=10` 这类"风扇启停"语义的阈值放到 30 ℃/20 %RH 的现场，温度高/湿度高会
 **常驻不恢复**（采集板判据 `T>=tu`、`H>=hu`）。这是阈值取值问题，不是上报问题：
 要把上限调到现场值之上（如温度 45、湿度 85）才会只在真超限时出现。
+
+== 2026-11-02 09:14 SNMP 查询结果的入口（卡序 ＋ 采集前置条件）
+
+=== 平台/用户到底该在哪里看
+
+SNMP 的查询结果**只有一处**：Web 左侧「SNMP」页最上面的「采集结果」卡 ——
+下拉选目标（6 路摄像机 ＋ 交换机），点「发起采集」，约 2~3 秒后出表
+（列：槽位 / OID / 行数 / 取值）。结果同时也落在 `control.db` 的 `snmp_latest`
+（主键 `target+slot`，最近值语义），但**没有**第二个界面读它；平台侧则只能在收到
+`0xE7` 应答 JSON 的那一刻看到。
+
+=== 现场为什么"配了却没有值"
+
+板端实测（2026-11-02，未改任何配置）：
+
+* `/api/snmp?which=cam0..cam5|switch`：七个目标全部 `state=0`（空闲）、`n_rows=0`；
+* `POST /api/snmp/run`：`HTTP 409 {"ok":false,"e":-7,"msg":"disabled"}`；
+* `/api/config?cls=camera`：`camera.snmp.enable=false`；`cls=switch`：`switch.snmp.enable=false`、`switch.ip=""`。
+
+⇒ 填了 OID 和团体字，**采集开关还是出厂默认的"停用"**。`iv_agent_snmp_start()`
+的第二道守卫就是 `!sc->enable || sc->ip_be == 0u || n_slot <= 0`，一项不满足就直接
+`IV_ESTATE`，慢池里那轮作业根本不会发出去。所以界面上一直是「尚无采集结果」，
+看着像"功能没做"。
+
+=== 两处界面修正
+
+. *卡序*：`采集结果` 原先排在「摄像机 OID（按品牌）」与「交换机 OID」两张网格**之后**
+  （4 个连接参数 ＋ 39 个 OID 输入框），现场滚不到。现已移到 SNMP 页**页首**：
+  配置是"配一次就不动"，结果是"天天要看"，顺序按使用频次排。
+. *采集前置条件*：卡里新增一行，读 `camera.snmp.enable` ＋ `camera.ch.N.ip`
+  （交换机读 `switch.snmp.enable` ＋ `switch.ip`）。缺项时红字**指名配置键**并说去哪改；
+  齐备时灰字回 `采集条件就绪：<键> = <IP>`。切换目标时随之重读。
+
+刻意**没有**把「发起采集」置灰：`disabled / noip / noid / nopool / busy` 五种拒法
+后端都会给中文说明（`snmp_deny_msg()` ＋ 前端 `SNMP_RUN_ERR`），前端预判只能靠猜
+（配置可能在别处被改），猜错就成了"按钮按不动但没解释"。
+
+卡顶的说明同时改成说清语义：SNMP 是**按需**采集 —— 只有点「发起采集」或平台下发
+`0xE7` 才会去读一次，没有周期轮询。
+
+=== 验证
+
+* `ui_snmp_page.mjs` **36 条**全绿（原 31 ＋ 新增 5）：`s02e` 钉卡序、`s10a..d` 钉"缺项指名 / 齐备回 IP / 切目标重读"。
+* 反向证伪：`snmpResultCard()` 挪回页尾 ⇒ `s02e` 红；把 `on` 写死 `true` ⇒ `s10a`/`s10b` 红；还原复绿。
+* 全部 14 个前端用例回归通过；`node --check web/static/app.js` 通过。
+* 上板 `8f110510`（旧 `1932d3ae`），磁盘 md5 与 `wget` 取回一致。
+
+== 2026-11-02 10:02 平台「设备 SNMP 信息」品牌/型号"暂无数据"
+
+=== 现象与真实来源
+
+平台点「执行实时查询」后，`设备 SNMP 信息` 里 序列号 / CPU使用率 / 内存使用率 有值，
+品牌 / 型号 / 实时码流 / mac地址 显示"暂无数据"。
+
+`0xE7` 应答体是 `iv_agent_build_snmp_json()` 拼的（摄像机 7 个字段）：
+`brand`←装配层 `camera.ch.N.vendor`、`model`←`sysDescr`、`sid`←`serialNumber`、
+`cpu`←`cpuPercent`、`mem`←`memUsed`、`rate`/`mac`←**恒空串**（槽位表里没有这两项）。
+
+板端实测（`/api/snmp?which=cam0`，192.168.1.200 海康 DS-2DC4425DW-D）：
+
+[cols="1,1,3"]
+|===
+|槽位 |n_rows |说明
+
+|sysDescr |0 |标准 MIB-II `.1.3.6.1.2.1.1.1.0`
+|sysUpTime |0 |`.1.3.6.1.2.1.1.3.0`
+|sysName |1 |`.39165.1.6.0` → `Hikvision`
+|deviceType |1 |`.39165.1.1.0` → **DS-2DC4425DW-D（真型号）**
+|softVersion |1 |`V5.9.2 build 250819`
+|serialNumber |1 |`.39165.1.5.0` → `88`
+|cpuPercent |1 |`.39165.1.7.0` → `19 PERCENT`
+|memUsed |1 |`.39165.1.11.0` → `72 PERCENT`
+|===
+
+用板端 python 直发一个 SNMP GET（varbind 必须带 `05 00` 的 NULL 值，漏了摄像机会
+静默丢弃，症状是"超时"而不是"报错"）确认：这台 IPC 对 `.1.3.6.1.2.1.1.1.0` 回的是
+**noSuchObject**（`80 00`），整棵树只实现了私有 `.39165.*` 分支。
+⇒ `model` 从 `sysDescr` 取，永远是空。
+
+=== 两个根因
+
+. **`model` 取错槽位**：真型号在 `deviceType`。改法：摄像机先取 `deviceType`，
+  空则回落 `sysDescr`。大华/宇视的私有节点出厂留空 ⇒ 自动回落，三套表都对。
+  交换机仍取 `sysDescr`（交换机的 sysDescr 本身就是型号串）。
+. **`brand` 被热更清空（真 bug）**：`snmp_cfg_norm()` 漏拷 `brand`，而
+  `iv_agent_reload_snmp()` 是 `a->cfg.snmp[t] = newn` **整块覆盖** ⇒ 任何一次 SNMP
+  配置提交都把品牌清成空串。现场日志对得上：开机后正常，`09:39:01 snmp cam0
+  reloaded`（用户在 Web 上动过 SNMP 参数）之后平台「品牌」变"暂无数据"。
+  改法：`snmp_cfg_norm()` 末尾补拷 `brand`。
+
+=== 顺带修掉一处没报出来的错位
+
+09:14 那版前端「采集前置条件」里把 `cam0` 的 IP 键写成 `camera.ch.1.ip`（1 基），
+而装配层 `cfg_snmp_targets()` 是 **0 基**（`cam0` ↔ `camera.ch.0.ip`）。
+界面上"第 1 路"会显示第 2 路的地址 —— 看着对、值是别人的。已改为 `camera.ch.N.ip`。
+
+=== 验证
+
+* `test_agent_snmpjson` 新增 **s06**：sysDescr 无值 ＋ deviceType 有值 ⇒ `model`
+  必须是 `DS-2DC4425DW-D`；`brand` 在 `iv_agent_reload_snmp()` 之后必须还在。
+* 反向证伪：摘掉 `snmp_cfg_norm()` 的 brand 行 ⇒ 后两条红；`deviceType` 换成
+  `sysDescr` ⇒ 第一条红；还原复绿。
+* VM 门禁：`make test` 51、`asan`/`tsan` 干净、`itest` 17 无 FAIL、`make arm` 零告警、
+  `make analyze`（清 `build/analyze` 重跑）0 条 `warning:`/`error:`。
+* 板端 `881a9479`：`snmp.run which=cam0` 通过，8 槽位值不变。
+
+=== 遗留
+
+`rate`（实时码流）与 `mac` 无槽位，恒空 ⇒ 平台这两行仍是"暂无数据"。填它们要另找
+数据源（码流靠 RTSP 采样、MAC 靠 SADP/ONVIF 档案或 ARP 表），未做。
+
+== 2026-11-02 11:29 交换机 SNMP 槽位收敛 ＋ POE 状态
+
+=== 用户口径
+
+「交换机 SNMP 中的这几项不需要，增加 poe 状态」。红框圈掉的 4 项：入丢弃、出丢弃、
+LLDP 邻居名、LLDP 邻居端口。要加的：POE 状态。
+
+=== 为什么要加 POE 槽位
+
+平台 `0xE7` 的交换机应答体本来是：
+
+[source,json]
+----
+{"code":0,"data":{…,"num":"7","brand":"…","model":"…","port":"1,1,2,1","poe":"","crc":"…"}}
+----
+
+`poe` **一直是写死的空串** —— 原实现的注释是"POE 没有对应槽位（标准 MIB 里也没有
+可移植的口径）"。后果是平台「POE 状态」永远"暂无数据"，而现场确实想看哪个口在供电。
+
+现在给它一个可配置槽位：`poeStatus`，出厂默认
+`1.3.6.1.2.1.105.1.1.1.6`（POWER-ETHERNET-MIB `pethPsePortDetectionStatus`）。
+取值 1=disabled / 2=searching / 3=deliveringPower / 4=fault，按端口一列、GETNEXT
+展开。应答侧与 `port` **同形**（按端口顺序的逗号表）：
+
+[source,c]
+----
+snmp_val_list(a, which, "poeStatus", poe, sizeof poe, IV_AGENT_SNMP_ROWS_MAX);
+----
+
+非 PoE 交换机对 `.1.3.6.1.2.1.105` 子树回 noSuchObject ⇒ 槽位无值 ⇒ 空串。
+**依旧不填假的 1,1,1…**：那会让平台以为每个口都在供电。
+
+=== 槽位表怎么改的
+
+`iv_snmp_sw_slots[]` 12 → 9：
+
+[cols="1,3"]
+|===
+|动作 |槽位
+
+|删 |`ifInDiscards` / `ifOutDiscards` / `lldpRemSysName` / `lldpRemPortId`
+|加 |`poeStatus`（**末位**）
+|===
+
+[WARNING]
+====
+**前 8 项位置不许动。** `snmp_latest` 的主键是 `target+slot`（名字来自本表位置），
+现场已存的 OID 配置也是按位置对。挪一格就是"换了 OID 还看不出来"——排查时最费时间的
+那种错。
+====
+
+同一条链上还有三处要跟着改，漏一处就"半改"：
+
+. `iv_config.c` 的默认值表（删 4 条 `D_STR`、加 `poeStatus`）；
+. `iv_agent_build_snmp_json()` 交换机分支的 `poe`；
+. 前端 `SNMP_SW_FIELD`（界面渲染完全由这张表驱动，不看配置返回）。
+
+=== 验证
+
+* `test_agent_snmpjson` s03 新增：`poeStatus` 三行 `2,3,2` ⇒ `"poe":"2,3,2"`。
+  反向证伪：`poe` 改回写死空串 ⇒ 该条红。
+* `test_config` **两头都钉**：`poeStatus` 必须有出厂默认；删掉的 4 个键必须
+  `IV_ENOENT`（只从界面隐藏不够，遗留键会跟着 `config.all` 导出、被当"有效配置"写回）。
+  默认项总数 99 → 96（删 4 加 1），连带 c1/c5/c6/c10/c11 的硬编码计数一起改。
+* `ui_snmp_page.mjs` s07c/s07d/s07e：POE 输入框在、键名对、默认 OID 对、
+  删掉的 4 项不再渲染。
+* VM 门禁：`make test` 51、`asan`/`tsan` 干净、`itest` 17 无 FAIL、`make arm` 零告警、
+  `make analyze` 0 条 `warning:`/`error:`。
+* 板端 `111e2a3f`（`app.js` `2d73fce1`）：`/api/snmp?which=switch` 回 9 槽、
+  末位 `poeStatus`；`/api/config?cls=switch` 里 `poeStatus` 有默认值。
+
+=== 遗留
+
+* 板端 `ivsbox.json` 里仍留着被删的 4 个键。它们是死键（装配层不读、界面不渲染），
+  只是让 `cls=switch` 多 4 项。没当场清是因为手改 `ivsbox.json` 会破 `_meta.crc`；
+  恢复出厂/重建配置时自然消失。
+* 交换机 `switch.ip` 为空、`switch.snmp.enable=0` ⇒ POE 要等现场填地址、打开采集
+  开关才能采到值。
+
+
+

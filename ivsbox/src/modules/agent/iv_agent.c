@@ -508,6 +508,14 @@ static void snmp_cfg_norm(iv_agent_snmp_cfg_t *d, const iv_agent_snmp_cfg_t *s)
         d->n_oid = (int)IV_AGENT_SNMP_SLOT_MAX;
     for (k = 0; k < d->n_oid; k++)
         (void)snprintf(d->oid[k], sizeof(d->oid[k]), "%s", s->oid[k]);
+    /* `brand` 是**平台 0xE7 应答**的展示名（`camera.ch.N.vendor` → "Hikvision"）。
+     * 这里必须拷：`iv_agent_reload_snmp()` 拿 norm 过的 `newn` **整块覆盖**
+     * `a->cfg.snmp[t]`（`a->cfg.snmp[t] = newn`），漏拷就等于"改一次 SNMP 配置，
+     * 品牌变空串"。
+     * 2026-11-02 现场就是这个现象：开机后平台「品牌」有值，用户在 Web 上动了一次
+     * SNMP 参数（09:39:01 `snmp cam0 reloaded`）之后，平台「设备 SNMP 信息」里
+     * 品牌变成"暂无数据"，而 `camera.ch.0.vendor` 明明是 `hik`。 */
+    (void)snprintf(d->brand, sizeof(d->brand), "%s", s->brand);
 }
 
 int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
@@ -2035,10 +2043,13 @@ int iv_agent_build_snmp_json(const iv_agent_t *a, int which, const char *qn,
         snmp_val_json(a, which, "sysDescr", model, sizeof model);
         snmp_val_list(a, which, "ifOperStatus", port, sizeof port,
                       IV_AGENT_SNMP_ROWS_MAX);
-        /* POE 没有对应槽位（标准 MIB 里也没有可移植的口径）⇒ 空串，按指令表
-         * "不存在直接返回空字符串"。**不填假的 1,1,1…**：那会让平台以为
-         * 每个口都在供电。 */
-        (void)snprintf(poe, sizeof poe, "%s", "");
+        /* POE 供电状态：2026-11-02 起有了槽位（`poeStatus`＝POWER-ETHERNET-MIB 的
+         * `pethPsePortDetectionStatus`），与 `port` **同形**：按端口顺序的逗号表。
+         * 没配 OID、或交换机不实现 `.1.3.6.1.2.1.105` 子树 ⇒ 槽位无值 ⇒ 空串
+         * （指令表允许"不存在直接返回空字符串"）。**仍然不填假的 1,1,1…**：
+         * 那会让平台以为每个口都在供电。 */
+        snmp_val_list(a, which, "poeStatus", poe, sizeof poe,
+                      IV_AGENT_SNMP_ROWS_MAX);
         n = snprintf(out, cap,
                      "{\"code\":0,\"data\":{\"qn\":\"%s\",\"ver\":\"%02x\","
                      "\"devtype\":\"%04x\",\"tid\":\"%x\",\"cmd\":\"%02X\","
@@ -2049,7 +2060,16 @@ int iv_agent_build_snmp_json(const iv_agent_t *a, int which, const char *qn,
                      (unsigned)IV_PROTO_CMD_QUERY_SNMP, which + 1, brand, model,
                      port, poe, crc2);
     } else {
-        snmp_val_json(a, which, "sysDescr", model, sizeof model);
+        /* 型号：**先 `deviceType`，空则回落 `sysDescr`**（2026-11-02 现场口径）。
+         * 海康这套表里 `sysDescr` 用的是标准 MIB-II `.1.3.6.1.2.1.1.1.0`，而现场
+         * 那台 IPC（192.168.1.200 / DS-2DC4425DW-D）对它回的是 `noSuchObject`
+         * （实测 `80 00`，`sysUpTime` 同样空）—— 整棵树只实现了私有 39165 分支。
+         * 结果平台「型号」永远是"暂无数据"，而真正的型号一直躺在 `deviceType`
+         * （`.39165.1.1.0` → `DS-2DC4425DW-D`）里没人用。
+         * 大华/宇视的私有节点出厂留空 ⇒ 自动回落到 `sysDescr`，三套表都对。 */
+        snmp_val_json(a, which, "deviceType", model, sizeof model);
+        if (model[0] == '\0')
+            snmp_val_json(a, which, "sysDescr", model, sizeof model);
         snmp_val_json(a, which, "serialNumber", sid, sizeof sid);
         /* cpuPercent / memUsed 是数值型（INTEGER），走 snmp_val_text 后仍只有数字，
          * 但统一过一遍转义没有代价，也免得将来换成字符串型 OID 时漏掉。 */

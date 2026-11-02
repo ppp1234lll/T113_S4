@@ -123,11 +123,10 @@ const configItems = {
     'switch.snmp.oid.ifAdminStatus': '1.3.6.1.2.1.2.2.1.7',
     'switch.snmp.oid.ifOperStatus': '1.3.6.1.2.1.2.2.1.8',
     'switch.snmp.oid.ifInOctets': '1.3.6.1.2.1.2.2.1.10',
-    'switch.snmp.oid.ifInDiscards': '1.3.6.1.2.1.2.2.1.13',
     'switch.snmp.oid.ifOutOctets': '1.3.6.1.2.1.2.2.1.16',
-    'switch.snmp.oid.ifOutDiscards': '1.3.6.1.2.1.2.2.1.19',
-    'switch.snmp.oid.lldpRemSysName': '1.0.8802.1.1.2.1.4.1.1.9',
-    'switch.snmp.oid.lldpRemPortId': '1.0.8802.1.1.2.1.4.1.1.7'
+    /* 2026-11-02：ifInDiscards / ifOutDiscards / lldpRemSysName / lldpRemPortId
+     * 已从槽位表删除，新增 poeStatus（平台 0xE7 的 `poe` 字段靠它）。 */
+    'switch.snmp.oid.poeStatus': '1.3.6.1.2.1.105.1.1.1.6'
 };
 
 window.fetch = function (u, o) {
@@ -235,6 +234,16 @@ const main = async () => {
     chk(byText(content, 'h3', '摄像机 OID（按品牌）') !== null, 's02b: 摄像机 OID 卡');
     chk(byText(content, 'h3', '交换机 OID') !== null, 's02c: 交换机 OID 卡');
     chk(byText(content, 'h3', '采集结果') !== null, 's02d: 采集结果卡');
+    /* 2026-10-30：结果卡原先排在两张 OID 网格（4＋39 个输入框）之后，现场滚不到，
+     * 用户连着两次问"配置完 SNMP 在哪看结果"。这里钉住顺序，别再被挪回去。 */
+    {
+        const h3s = Array.prototype.map.call(content.querySelectorAll('h3'),
+            (e) => e.textContent.trim());
+
+        chk(h3s.indexOf('采集结果') >= 0 &&
+                h3s.indexOf('采集结果') < h3s.indexOf('摄像机 OID（按品牌）'),
+            's02e: 采集结果卡排在 OID 配置卡之前，实得 ' + JSON.stringify(h3s));
+    }
 
     console.log('s03 品牌 tab：海康默认展开，大华/宇视收起');
     chk(panel('hik') !== null && panel('dahua') !== null && panel('uniview') !== null,
@@ -304,6 +313,24 @@ const main = async () => {
     chk(swOper && swOper.value === '1.3.6.1.2.1.2.2.1.8',
         's07b: 表列 OID 不带末尾 .0（走 GETNEXT）');
 
+    /* 2026-11-02 用户口径：「交换机 SNMP 中这几项不需要，增加 poe 状态」。
+     * 删掉的 4 项如果还留在界面上，现场会白填一通（后端槽位表里已经没有它们，
+     * 填了也不采、还占一屏）；poe 没有输入框则 0xE7 的 `poe` 永远空串。 */
+    const poeInp = inputByLabel(content, 'POE 供电状态 OID（表列）');
+
+    chk(poeInp !== null && poeInp.dataset.key === 'switch.snmp.oid.poeStatus',
+        's07c: 交换机页有「POE 供电状态 OID」，键名 switch.snmp.oid.poeStatus，实得 ' +
+            (poeInp && poeInp.dataset.key));
+    chk(poeInp && poeInp.value === '1.3.6.1.2.1.105.1.1.1.6',
+        's07d: POE 默认 OID 是 pethPsePortDetectionStatus（表列）');
+    {
+        const gone = ['入丢弃 OID（表列）', '出丢弃 OID（表列）',
+            'LLDP 邻居名 OID（表列）', 'LLDP 邻居端口 OID（表列）'];
+        const left = gone.filter((t) => inputByLabel(content, t) !== null);
+
+        chk(left.length === 0, 's07e: 删掉的 4 项不再渲染，实剩 ' + JSON.stringify(left));
+    }
+
     console.log('s08 按路采集：选第 3 路就采 cam2');
     const sel = content.querySelector('select');
 
@@ -356,6 +383,25 @@ const main = async () => {
     chk(/没配 IP/.test(txt) && txt.indexOf('noip') < 0,
         's09d: noip 翻成「没配 IP」且不出现裸标记，实得 ' + JSON.stringify(txt));
 
+    snmpRunDeny = null;
+
+    /* 2026-10-30：把"能不能采"摆在卡里。板端实测 `camera.snmp.enable=false`
+     * ⇒ `snmp.run` 回 `e:-7 msg:"disabled"`，结果表永远是「尚无采集结果」，
+     * 用户看到的就是"配好了却什么都没查到"。这里钉住两条：
+     *   ① 开关关着时界面直接说出来，并**指名配置键**（不然用户不知道去改哪里）；
+     *   ② 条件齐了也要回一句就绪 + 目标 IP（否则"没有红字"不等于"能采"）。 */
+    console.log('s10 采集前置条件：开关/IP 缺哪一项当场指名');
+    chk(/采集开关没开/.test(content.textContent),
+        's10a: camera.snmp.enable=false 时结果卡里直接说开关没开');
+    chk(/camera\.snmp\.enable/.test(content.textContent),
+        's10b: 顺带指名是哪个配置键（不是泛泛一句"条件不满足"）');
+
+    sel.value = 'switch';
+    sel.dispatchEvent(new window.Event('change'));
+    await sleep(80);
+    chk(/采集条件就绪/.test(content.textContent) && /192\.168\.1\.1/.test(content.textContent),
+        's10c: 交换机开关已开＋有 IP 时回「采集条件就绪」并带上目标 IP');
+    chk(snmpGets.indexOf('switch') >= 0, 's10d: 切目标时结果按 which=switch 重读');
     snmpRunDeny = null;
 };
 

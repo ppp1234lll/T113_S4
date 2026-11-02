@@ -101,11 +101,15 @@ extern "C" {
  * ------------------------------------------------------------------------- */
 #define IV_SNMP_SLOT_NAME_MAX 32u /* ≥ IV_CFG_SEG_MAX(32)，含结尾 NUL */
 #define IV_SNMP_CAM_SLOT_N    9u  /* 摄像机 OID 槽位数 */
-#define IV_SNMP_SW_SLOT_N     12u /* 交换机 OID 槽位数 */
+/* 交换机 OID 槽位数：**9**（2026-11-02 用户口径）。
+ * 原 12 条里删掉 4 项：`ifInDiscards` / `ifOutDiscards` / `lldpRemSysName` /
+ * `lldpRemPortId`（现场不看丢包与 LLDP 邻居），并补上 1 项 `poeStatus`
+ * （平台 0xE7 的 `poe` 字段原来恒空串 ⇒ 页面 POE 状态永远"暂无数据"）。 */
+#define IV_SNMP_SW_SLOT_N     9u
 
 /* 摄像机槽位（厂家中立；标量以 `.0` 结尾走 GET，否则按表列 GETNEXT）。 */
 extern const char *const iv_snmp_cam_slots[IV_SNMP_CAM_SLOT_N];
-/* 交换机槽位（前 2 条为标量，其余 IF-MIB / LLDP 表列，走 GETNEXT）。 */
+/* 交换机槽位（前 2 条为标量，其余 IF-MIB / POWER-ETHERNET-MIB 表列，走 GETNEXT）。 */
 extern const char *const iv_snmp_sw_slots[IV_SNMP_SW_SLOT_N];
 
 /* ---------------------------------------------------------------------------

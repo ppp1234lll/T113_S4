@@ -448,8 +448,8 @@ static const cfg_default_t s_defaults[] = {
     D_STR(IV_CFG_CLS_SWITCH, "switch.ip", "交换机 IP", "", NULL),
     D_STR(IV_CFG_CLS_SWITCH, "switch.vendor", "交换机品牌", "", NULL),
     D_STR(IV_CFG_CLS_SWITCH, "switch.model", "交换机型号", "", NULL),
-    /* M4-S4.3 SNMP 采集：目标参数 5 条 ＋ OID 槽位 12 条。
-     * 槽位名沿用标准 MIB 对象名（IF-MIB / LLDP-MIB），便于对照厂家文档。
+    /* M4-S4.3 SNMP 采集：目标参数 5 条 ＋ OID 槽位 **9** 条（2026-11-02 由 12 条收敛）。
+     * 槽位名沿用标准 MIB 对象名（IF-MIB / POWER-ETHERNET-MIB），便于对照厂家文档。
      * **值里不带末尾 `.0` 的即"表列"**⇒按端口号 GETNEXT 遍历展开（第 3 条起）。
      * ⚠ 团体字同 camera.snmp.community：F8 未实现，暂落普通配置（已知欠账）。 */
     D_BOOL(IV_CFG_CLS_SWITCH, "switch.snmp.enable", "交换机 SNMP 采集开关", "false"),
@@ -475,18 +475,17 @@ static const cfg_default_t s_defaults[] = {
           "SNMP 槽位 ifOperStatus＝端口物理态（integer 1=up/2=down，表列）", "1.3.6.1.2.1.2.2.1.8", NULL),
     D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.ifInOctets",
           "SNMP 槽位 ifInOctets＝端口入字节（counter，表列）", "1.3.6.1.2.1.2.2.1.10", NULL),
-    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.ifInDiscards",
-          "SNMP 槽位 ifInDiscards＝端口入丢弃（counter，表列）", "1.3.6.1.2.1.2.2.1.13", NULL),
     D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.ifOutOctets",
           "SNMP 槽位 ifOutOctets＝端口出字节（counter，表列）", "1.3.6.1.2.1.2.2.1.16", NULL),
-    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.ifOutDiscards",
-          "SNMP 槽位 ifOutDiscards＝端口出丢弃（counter，表列）", "1.3.6.1.2.1.2.2.1.19", NULL),
-    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.lldpRemSysName",
-          "SNMP 槽位 lldpRemSysName＝LLDP 邻居系统名（string，表列）",
-          "1.0.8802.1.1.2.1.4.1.1.9", NULL),
-    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.lldpRemPortId",
-          "SNMP 槽位 lldpRemPortId＝LLDP 邻居端口 ID（string，表列）",
-          "1.0.8802.1.1.2.1.4.1.1.7", NULL),
+    /* 2026-11-02 用户口径：删掉 ifInDiscards / ifOutDiscards / lldpRemSysName /
+     * lldpRemPortId（现场不看丢包与 LLDP 邻居），补 poeStatus。
+     * `poeStatus` 是平台 0xE7 应答 `poe` 字段的唯一来源：POWER-ETHERNET-MIB 的
+     * `pethPsePortDetectionStatus`（按端口一列，GETNEXT 展开）。取值
+     * 1=disabled / 2=searching / 3=deliveringPower / 4=fault / 5=…，与 `port`
+     * 一样按端口顺序拼成逗号表。非 PoE 交换机对该子树回 noSuchObject ⇒ 空串。 */
+    D_STR(IV_CFG_CLS_SWITCH, "switch.snmp.oid.poeStatus",
+          "SNMP 槽位 poeStatus＝端口 POE 供电状态（integer 1=关/2=检测/3=供电/4=故障，表列）",
+          "1.3.6.1.2.1.105.1.1.1.6", NULL),
 
     /* ---- elec. 电阈值（小数；数值待产品参数冻结，暂给 0.0＝未配置） ---- */
     D_DBL(IV_CFG_CLS_ELEC, "elec.volt_high", "电压上限（V）", 0.0, 0.0, 1.0e6),

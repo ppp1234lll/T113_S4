@@ -28,8 +28,13 @@ const char *const iv_snmp_cam_slots[IV_SNMP_CAM_SLOT_N] = {
 
 const char *const iv_snmp_sw_slots[IV_SNMP_SW_SLOT_N] = {
     "sysDescr",     "sysUpTime",     "ifDescr",       "ifSpeed",
-    "ifAdminStatus","ifOperStatus",  "ifInOctets",    "ifInDiscards",
-    "ifOutOctets",  "ifOutDiscards", "lldpRemSysName","lldpRemPortId",
+    "ifAdminStatus","ifOperStatus",  "ifInOctets",    "ifOutOctets",
+    /* 2026-11-02：删 ifInDiscards / ifOutDiscards / lldpRemSysName /
+     * lldpRemPortId（现场不看），补 poeStatus —— 它是平台 0xE7 应答里
+     * `poe` 字段的唯一来源（POWER-ETHERNET-MIB 的端口供电状态，表列）。
+     * 顺序＝落库槽位名，前 8 项**不许动位置**：`snmp_latest` 的主键、
+     * 现场已存的 OID 配置都按位置对，挪一格就是"换了 OID 还看不出来"。 */
+    "poeStatus",
 };
 
 /* ---------------------------------------------------------------------------

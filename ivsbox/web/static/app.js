@@ -1998,6 +1998,11 @@
     ['memUsed', '内存使用率 OID']
   ];
 
+  /* 交换机 OID 槽位（2026-11-02 用户口径：红框圈的 4 项不要，补 POE 状态）。
+   * 删：ifInDiscards / ifOutDiscards / lldpRemSysName / lldpRemPortId；
+   * 加：poeStatus —— 平台 0xE7 应答的 `poe` 字段就靠它，原先恒空串 ⇒
+   *     平台「POE 状态」永远是"暂无数据"。
+   * 与后端 `iv_snmp_sw_slots[]` **同名同序**：顺序只影响落库槽位名，键名才对得上。 */
   var SNMP_SW_FIELD = [
     ['sysDescr', '系统描述 OID'],
     ['sysUpTime', '运行时长 OID'],
@@ -2006,11 +2011,8 @@
     ['ifAdminStatus', '管理状态 OID（表列）'],
     ['ifOperStatus', '运行状态 OID（表列）'],
     ['ifInOctets', '入字节数 OID（表列）'],
-    ['ifInDiscards', '入丢弃 OID（表列）'],
     ['ifOutOctets', '出字节数 OID（表列）'],
-    ['ifOutDiscards', '出丢弃 OID（表列）'],
-    ['lldpRemSysName', 'LLDP 邻居名 OID（表列）'],
-    ['lldpRemPortId', 'LLDP 邻居端口 OID（表列）']
+    ['poeStatus', 'POE 供电状态 OID（表列）']
   ];
 
   /* 采集目标：6 路摄像机 ＋ 交换机（与后端 `IV_AGENT_SNMP_TARGET_N` 同一套名字，
@@ -2183,13 +2185,25 @@
 
   /* 采集结果（7 个目标共一张卡，用下拉选目标）。
    * 原先摄像机页与交换机页各挂一张 `snmpCard(which)`，扩到 6 路后要么每页挂 6 张、
-   * 要么就得在摄像机页里再选一次路号 —— 集中到 SNMP 页一张卡更省事。 */
+   * 要么就得在摄像机页里再选一次路号 —— 集中到 SNMP 页一张卡更省事。
+   *
+   * 2026-10-30 用户连着两次问「配置 SNMP 后在哪查看查询信息」，两处界面问题：
+   *   ① 这张卡原先排在两张 OID 网格**之后**（4 个连接参数 ＋ 39 个 OID 输入框），
+   *      现场根本滚不到 —— 已挪到 SNMP 页**页首**（`pageSnmp()`）。
+   *   ② 卡里原先只说"点完 2~3 秒回读"，却不显示**能不能采**。出厂
+   *      `camera.snmp.enable` / `switch.snmp.enable` 都是 false（板端实测
+   *      `snmp.run` 回 `e:-7 msg:"disabled"`），`switch.ip` 还是空串 ⇒ 只填 OID
+   *      不打开关，结果表永远是「尚无采集结果」，看着就像"功能没做"。
+   *      现在把前置条件摆在按钮下面，缺哪一项直接指名配置键。
+   *      **不把按钮置灰**：`disabled/noip/noid/nopool/busy` 五种拒法后端都会说，
+   *      前端预判只能猜（配置可能在别处被改），猜错就成了"按钮按不动但没解释"。 */
   function snmpResultCard() {
     var card = el('div', 'card');
     card.appendChild(el('h3', null, '采集结果'));
     card.appendChild(el('p', 'hint',
-      '采集是阻塞式 UDP 事务，落在慢任务池里跑，点完约 2~3 秒回读结果。' +
-      '目标没配 IP 或没开采集开关时会直接显示「未采集」—— 那不是失败。'));
+      'SNMP 是**按需**采集，不是周期性跑的：只有在这里点「发起采集」（或平台下发 ' +
+      '0xE7 查询）才会去读一次。采集是阻塞式 UDP 事务、落在慢任务池里跑，' +
+      '点完约 2~3 秒回读结果。'));
 
     var bar = el('div', 'actions');
     var sel = document.createElement('select');
@@ -2207,8 +2221,49 @@
     bar.appendChild(btn);
     bar.appendChild(rl);
     card.appendChild(bar);
+    /* 采集前置条件：开关（6 路摄像机共用一个 `camera.snmp.enable`）＋ 目标 IP。
+     * 键名来自配置模块，别在这里另编一套名字。 */
+    var gate = el('p', 'hint');
+    card.appendChild(gate);
     var box = el('div');
     card.appendChild(box);
+
+    function gateKeys(t) {
+      var isSw = (t === 'switch');
+      return {
+        cls: isSw ? 'switch' : 'camera',
+        en: isSw ? 'switch.snmp.enable' : 'camera.snmp.enable',
+        /* `cam0` ↔ `camera.ch.0.ip`（键是 **0 基**，与装配层
+         * `cfg_snmp_targets()` 的循环变量 i 一致）。早先这里误写成 `N+1`，
+         * 结果"第 1 路"读到的是第 2 路的 IP —— 界面看着对、地址是别人的。 */
+        ip: isSw ? 'switch.ip' : ('camera.ch.' + Number(t.slice(3)) + '.ip')
+      };
+    }
+
+    function loadGate(t) {
+      var g = gateKeys(t);
+
+      gate.className = 'hint';
+      gate.textContent = '正在核对采集条件…';
+      api('/api/config?cls=' + g.cls).then(function (r) {
+        if (!r.ok || !r.d || !r.d.items) { gate.textContent = ''; return; }
+        var on = !!r.d.items[g.en];
+        var ip = r.d.items[g.ip] || '';
+        var which = (g.cls === 'switch') ? '交换机 OID' : '摄像机 OID（按品牌）';
+        if (!on) {
+          gate.className = 'msg';
+          gate.textContent = '采集开关没开（' + g.en + ' 现在是「已停用」）⇒ ' +
+            '到下面「' + which + '」卡里把它改成「已启用」并保存，再回来点「发起采集」。';
+        } else if (!ip) {
+          gate.className = 'msg';
+          gate.textContent = '这个目标没配 IP（' + g.ip + ' 是空的）⇒ ' +
+            '先填地址并保存，再点「发起采集」。';
+        } else {
+          gate.className = 'hint';
+          gate.textContent = '采集条件就绪：' + g.ip + ' = ' + ip;
+        }
+      });
+    }
 
     function show() {
       box.innerHTML = '读取中…';
@@ -2243,7 +2298,7 @@
       });
     }
 
-    sel.addEventListener('change', show);
+    sel.addEventListener('change', function () { show(); loadGate(sel.value); });
     rl.addEventListener('click', show);
     btn.addEventListener('click', function () {
       api('/api/snmp/run', { method: 'POST', body: { which: sel.value } }).then(function (r) {
@@ -2254,16 +2309,20 @@
     });
 
     show();
+    loadGate(sel.value);
     return card;
   }
 
   /* ==================== SNMP 页 ==================== */
+  /* 卡片顺序：**采集结果在最前**。2026-10-30 之前它排在两张 OID 网格之后，
+   * 用户答"配置完 SNMP 在哪看结果"时找不到（要滚过 4＋39 个输入框）。
+   * 配置是"配一次就不动"的，结果是"天天要看"的，顺序按使用频次排。 */
   function pageSnmp() {
     var root = document.createDocumentFragment();
     root.appendChild(el('h2', 'page-title', 'SNMP'));
+    root.appendChild(snmpResultCard());
     root.appendChild(snmpCamOidCard());
     root.appendChild(snmpSwOidCard());
-    root.appendChild(snmpResultCard());
     return root;
   }
 

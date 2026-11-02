@@ -25,7 +25,9 @@
  *   F1 把"无值"分支改成塞 "0" ⇒ s02b 红；
  *   F2 去掉 `json_put_escaped()` 直接 %s ⇒ s04b 红（JSON 引号计数变奇数）；
  *   F3 `snmp_val_list()` 反向遍历行 ⇒ s03b 红（端口顺序颠倒）；
- *   F4 crc 换成常量 ⇒ s05 红。
+ *   F4 crc 换成常量 ⇒ s05 红；
+ *   F5 `snmp_cfg_norm()` 漏拷 `brand` ⇒ s06 后两条红（2026-11-02 实测就是这个）；
+ *   F6 `model` 只取 `sysDescr`（不回落/不看 `deviceType`）⇒ s06 第一条红。
  */
 #include <stdio.h>
 #include <string.h>
@@ -206,6 +208,26 @@ static void s03_cam_values(void)
         chk(has(buf, "\"model\":\"IPS53108PFMA\""), "s03 switch model from sysDescr");
         chk(!has(buf, "\"sid\""), "s03 switch shape has no sid field");
         chk(!has(buf, "\"cpu\""), "s03 switch shape has no cpu field");
+
+        /* 2026-11-02：`poe` 不再是写死的空串 —— 它有了槽位（`poeStatus`＝
+         * POWER-ETHERNET-MIB `pethPsePortDetectionStatus`），与 `port` 同形：
+         * 按端口顺序的逗号表。没有该子树（非 PoE 交换机）才是空串。 */
+        {
+            iv_agent_snmp_slot_t *p = &a.snmp_job[IV_AGENT_SNMP_SW].slot[8];
+
+            (void)snprintf(p->oid, sizeof p->oid, "%s", "1.3.6.1.2.1.105.1.1.1.6");
+            p->rc     = IV_OK;
+            p->n_rows = 3;
+            for (int i = 0; i < 3; i++) {
+                p->row[i].type   = IV_SNMP_T_INTEGER;
+                p->row[i].num    = (i == 1) ? 3 : 2; /* 第 2 口在供电 */
+                p->row[i].str[0] = '\0';
+            }
+            chk(iv_agent_build_snmp_json(&a, IV_AGENT_SNMP_SW, "1", buf, sizeof buf) > 0,
+                "s03 switch build with poe values");
+            chk(has(buf, "\"poe\":\"2,3,2\""),
+                "s03 poe comes from the poeStatus slot, in port order");
+        }
     }
 }
 
@@ -249,6 +271,44 @@ static void s05_crc(void)
     chk(has(buf, needle), "s05 crc uses iv_report_query_crc with cmd=E7");
 }
 
+/* ---------------- s06 型号的取值槽位 ＋ 品牌不许被热更冲掉 ---------------- */
+static void s06_model_and_brand(void)
+{
+    iv_agent_t          a;
+    iv_agent_snmp_cfg_t traps[IV_AGENT_SNMP_TARGET_N];
+    char                buf[1024];
+    int                 i;
+
+    make_agent(&a, 0x0400u, 0x101u);
+    a.snmp_job[IV_AGENT_SNMP_CAM].n_slot = (int)IV_SNMP_CAM_SLOT_N;
+    (void)snprintf(a.cfg.snmp[IV_AGENT_SNMP_CAM].brand,
+                   sizeof a.cfg.snmp[IV_AGENT_SNMP_CAM].brand, "%s", "Hikvision");
+    /* 现场形态（2026-11-02，192.168.1.200＝DS-2DC4425DW-D）：海康 IPC 对标准
+     * MIB-II 的 `sysDescr` 回 noSuchObject，型号只躺在私有 `deviceType` 里。 */
+    slot_none(&a, IV_AGENT_SNMP_CAM, 0, "1.3.6.1.2.1.1.1.0"); /* sysDescr 无值 */
+    slot_str(&a, IV_AGENT_SNMP_CAM, 3, "1.3.6.1.4.1.39165.1.1.0", "DS-2DC4425DW-D");
+
+    chk(iv_agent_build_snmp_json(&a, IV_AGENT_SNMP_CAM, "1", buf, sizeof buf) > 0,
+        "s06 camera build");
+    chk(has(buf, "\"model\":\"DS-2DC4425DW-D\""),
+        "s06 model falls back to deviceType when sysDescr is noSuchObject");
+    chk(has(buf, "\"brand\":\"Hikvision\""), "s06 brand rendered from the assembly layer");
+
+    /* 热更会**整块覆盖** `a->cfg.snmp[t]`（`a->cfg.snmp[t] = newn`，newn 是
+     * `snmp_cfg_norm()` 的输出）。漏拷 `brand` ⇒ 用户在 Web 上动一次 SNMP 参数，
+     * 平台「品牌」就变成"暂无数据"，而 `camera.ch.N.vendor` 明明是 hik。 */
+    memset(traps, 0, sizeof traps);
+    for (i = 0; i < IV_AGENT_SNMP_TARGET_N; i++)
+        traps[i] = a.cfg.snmp[i];
+    traps[IV_AGENT_SNMP_CAM].enable = 1; /* 只改这一个字段 */
+    chk(iv_agent_reload_snmp(&a, traps) == IV_OK, "s06 reload accepted");
+    chk(strcmp(a.cfg.snmp[IV_AGENT_SNMP_CAM].brand, "Hikvision") == 0,
+        "s06 brand survives a hot reload (snmp_cfg_norm must copy it)");
+    chk(iv_agent_build_snmp_json(&a, IV_AGENT_SNMP_CAM, "1", buf, sizeof buf) > 0 &&
+            has(buf, "\"brand\":\"Hikvision\""),
+        "s06 the reply still carries the brand after a reload");
+}
+
 int main(void)
 {
     s01_guards();
@@ -256,12 +316,13 @@ int main(void)
     s03_cam_values();
     s04_escaping();
     s05_crc();
+    s06_model_and_brand();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_agent_snmpjson FAILED (%d checks)\n", g_fail);
         return 1;
     }
     printf("test_agent_snmpjson passed (guards, empty-not-zero, scalar/table "
-           "rendering, escaping, crc)\n");
+           "rendering, escaping, crc, model source, brand across reload)\n");
     return 0;
 }

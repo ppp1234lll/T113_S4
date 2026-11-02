@@ -206,9 +206,9 @@ static void case_defaults_startup(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c1: stat");
     chk(st.loaded == 0, "c1: loaded == 0 (started from built-in defaults)");
-    chk(st.items == 99u, "c1: 99 non-array defaults materialised");
+    chk(st.items == 96u, "c1: 96 non-array defaults materialised");
     chk(st.from_file == 0u, "c1: nothing came from the file");
-    chk(st.from_default == 99u, "c1: everything came from defaults");
+    chk(st.from_default == 96u, "c1: everything came from defaults");
     chk(st.invalid == 0u, "c1: a missing file is NOT an invalid value");
     chk(st.version == 0u, "c1: version is 0 when there is no file");
     chk(st.dirty == 0, "c1: not dirty right after open");
@@ -574,9 +574,9 @@ static void case_fill_and_origin(void)
         return;
 
     chk(iv_config_stat(c, &st) == IV_OK, "c5: stat");
-    chk(st.items == 99u, "c5: all non-array defaults are materialised");
+    chk(st.items == 96u, "c5: all non-array defaults are materialised");
     chk(st.from_file == 1u, "c5: exactly one key came from the file");
-    chk(st.from_default == 98u, "c5: ninety-eight were filled from defaults");
+    chk(st.from_default == 95u, "c5: ninety-five were filled from defaults");
     chk(st.invalid == 0u, "c5: a MISSING key is not an INVALID key");
     chk(st.loaded == 1, "c5: the file itself loaded fine");
 
@@ -617,7 +617,7 @@ static void case_parent_scalar_rejected(void)
 
     chk(iv_config_stat(c, &st) == IV_OK, "c6: stat");
     chk(st.invalid == 1u, "c6: the scalar that shadows a subtree is counted as invalid");
-    chk(st.items == 99u, "c6: the whole non-array default set is still there");
+    chk(st.items == 96u, "c6: the whole non-array default set is still there");
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && s[0] == '\0',
         "c6: net.* is usable again (defaulted empty)");
     chk(iv_config_get_int(c, "net", &iv) == IV_ENOENT, "c6: the offending key itself is gone");
@@ -1013,8 +1013,8 @@ static void case_array_support(void)
                     strcmp(s, "7") == 0,
                 "c10: the 8th element is reachable");
             chk(iv_config_stat(cx, &st8) == IV_OK, "c10: stat on the eight-camera config");
-            chk(st8.items == 99u + 64u,
-                "c10: 8 slots x 8 fields + 100 base == 164 items (fits ITEMS_MAX 192)");
+            chk(st8.items == 96u + 64u,
+                "c10: 8 slots x 8 fields + 96 base == 160 items (fits ITEMS_MAX 192)");
             iv_config_close(cx);
         }
     }
@@ -1091,7 +1091,7 @@ static void case_comment_roundtrip(void)
     chk(iv_config_stat(c, &st) == IV_OK, "c11: stat after round-trip");
     chk(st.loaded == 1, "c11: the rendered file parses back cleanly");
     chk(st.invalid == 0u, "c11: no value was rejected on the round-trip");
-    chk(st.items == 107u, "c11: 99 base keys plus one 8-field camera survived");
+    chk(st.items == 104u, "c11: 96 base keys plus one 8-field camera survived");
 
     chk(iv_config_get_str(c, "net.ip", &s) == IV_OK && strcmp(s, "172.16.0.9") == 0,
         "c11: the string survived");
@@ -1672,9 +1672,25 @@ static void case_snmp_oid_keys(void)
     chk(iv_config_get_str(c, "switch.snmp.oid.ifOperStatus", &s) == IV_OK &&
             strcmp(s, "1.3.6.1.2.1.2.2.1.8") == 0,
         "c17: switch ifOperStatus default = IF-MIB column (no trailing .0)");
-    chk(iv_config_get_str(c, "switch.snmp.oid.lldpRemPortId", &s) == IV_OK &&
-            strcmp(s, "1.0.8802.1.1.2.1.4.1.1.7") == 0,
-        "c17: switch lldpRemPortId default = LLDP-MIB column");
+    /* 2026-11-02 用户口径：交换机槽位表删掉 4 项、补 poeStatus。这里两头都钉：
+     * ① 增的那项必须有出厂默认（否则现场打开 SNMP 页是个空框，等于没实现）；
+     * ② 删的那 4 项必须**从默认表里彻底消失** —— 只从前端隐藏是不够的，
+     *    遗留键会跟着 `config.all` 导出、被当成"有效配置"再写回去。 */
+    chk(iv_config_get_str(c, "switch.snmp.oid.poeStatus", &s) == IV_OK &&
+            strcmp(s, "1.3.6.1.2.1.105.1.1.1.6") == 0,
+        "c17: switch poeStatus default = POWER-ETHERNET-MIB column");
+    {
+        static const char *const gone[] = {
+            "switch.snmp.oid.ifInDiscards", "switch.snmp.oid.ifOutDiscards",
+            "switch.snmp.oid.lldpRemSysName", "switch.snmp.oid.lldpRemPortId"
+        };
+        int k;
+
+        for (k = 0; k < (int)(sizeof gone / sizeof gone[0]); k++) {
+            chk(iv_config_get_str(c, gone[k], &s) == IV_ENOENT,
+                "c17: the removed switch slot is gone from defaults");
+        }
+    }
     chk(iv_config_get_str(c, "switch.snmp.community", &s) == IV_OK &&
             strcmp(s, "public") == 0,
         "c17: switch.snmp.community default public");

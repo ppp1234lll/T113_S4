@@ -12464,3 +12464,61 @@ adopt 建出 `releases/1.0.4`、比包还大，于是每一处 `install` 都被"
 * 平台端是否在**下次上报**就刷新那两栏，取决于平台实现（设备每帧上报都带 `sv`）。
   若平台只在注册时取一次，则需在平台上重新注册/同步一次才能看到新版本号。
 
+---
+
+== 2026-11-02 18:40 0xB2 日志上报：真服务器的契约已验（deviceSn 不带前导零）
+
+=== 结论先说
+
+**能上传**。设备侧 `iv_logup` 发出去的报文形状，真服务器（`47.104.250.225:18080`）
+全部接受，2370 B / 3 片走完三步并落进对象存储：
+
+[source,text]
+----
+start  -> 200 {"code":200,...,"uploadId":"a2d3c143…"}
+chunk0 -> 200 "分片上传成功"
+chunk1 -> 200 "分片上传成功"
+chunk2 -> 200 "分片上传成功"
+finish -> 200 "https://minio.fnwlwiot.com:18444/fnwlw-01/device-log/B2CC1/device_20261102183142.txt"
+----
+
+=== 唯一踩到的坑：deviceSn 的口径
+
+`start` 的 `deviceSn` 由 `snprintf("%lX", devid)` 得到，**不带前导零**。实测：
+
+[cols="1,3"]
+|===
+| 传的 deviceSn | 服务端应答
+
+| `0B2CC1`（配置/db 里的显示形态）
+| `{"code":500,"msg":"设备不存在：0B2CC1"}`
+
+| `000001`
+| `{"code":500,"msg":"设备不存在：000001"}`
+
+| `3`（参考实现的兜底值）
+| `{"code":500,"msg":"设备不存在：3"}`
+
+| **`B2CC1`**
+| `{"code":200,…"uploadId":"719bd990…"}` ← 只有这个认
+|===
+
+所以"设备不存在"不等于平台没这台设备，**先怀疑 sn 形态**。参考实现
+`Upload/src/upload_http.c:58-68` 也是 `%lX`，两边同口径。
+板端日志会打印实际用的串：`[logup] init: … dev=B2CC1 type=SYSTEM max=1048576`。
+
+=== 报文形状（与服务端对齐的部分，改代码时别动）
+
+* boundary `----FNLOG_UPLOAD_BOUNDARY`；字段顺序 `uploadId → chunkIndex → file`；
+  `file` 段带 `filename="device.txt"` 与 `Content-Type: application/octet-stream`；
+* `finish` **不带 md5**（参考实现的 `finish_md5_enable` 出厂即 DISABLE）；
+* 一次上传 `start + N×chunk + finish` **复用同一条 keep-alive 连接**；
+* 端口 `18080`（`upload_http.h` 头注释写的 `8080` 实测打同一后端，两者都通）。
+
+=== 还没验的一跳
+
+平台点「日志上报」→ 板上 `ivsboxd` 自己跑一次。这一跳除"上传本体"外的部分
+（ACK `0x01`、提交慢任务池、结算清 `busy`）已由 `platcmd_e2e.py` 覆盖；
+上传本体与本次手工验证是同一段 `iv_logup` 代码。
+
+

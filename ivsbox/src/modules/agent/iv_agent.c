@@ -709,6 +709,10 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
         char           sn[16];
 
         iv_logup_cfg_default(&lc);
+        /* deviceSn **不带前导零**：服务端认 `B2CC1`，不认 `0B2CC1` / `000001`
+         * （2026-11-02 真机实测，见修改记录 18:40；配置/db 里显示成六位只是展示口径）。
+         * 若平台以后改成定长补零，这里要跟着改 `%06lX` —— 与参考实现
+         * `Upload/src/upload_http.c:58-68` 的 `snprintf(out,size,"%lX",id)` 同口径。 */
         (void)snprintf(sn, sizeof sn, "%lX", (unsigned long)a->cfg.devid);
         lc.root      = a->cfg.logup_root;
         lc.host      = a->cfg.logup_host;

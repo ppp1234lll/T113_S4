@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ivsbox 项目总结（对照功能清单）· 2026-10-23</title>
+<style>
+:root{
+  --ink:#1f2328; --sub:#5b6570; --line:#d7dee6; --head:#eef3f9; --accent:#0b5cad;
+  --bg:#f5f7fa; --card:#fff; --ok:#1a7f37; --okbg:#e8f5ec; --warn:#9a5b00;
+  --warnbg:#fff4e2; --risk:#a4273a; --riskbg:#fdecef; --idle:#5b6570; --idlebg:#eceff3;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:1140px;margin:0 auto;background:var(--card);padding:34px 38px 56px;
+  box-shadow:0 1px 3px rgba(16,24,40,.06)}
+header{border-bottom:2px solid var(--accent);padding-bottom:16px}
+h1{font-size:22px;margin:0 0 6px;letter-spacing:.2px}
+.sub{color:var(--sub);font-size:12.5px}
+.cards{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 4px}
+.card{flex:1 1 112px;border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:#fbfcfe}
+.card b{display:block;font-size:19px;line-height:1.3;color:var(--accent)}
+.card.g b{color:var(--ok)} .card.w b{color:var(--warn)} .card.r b{color:var(--risk)} .card.i b{color:var(--idle)}
+.card span{color:var(--sub);font-size:11.5px}
+h2{font-size:17px;margin:30px 0 10px;padding-left:9px;border-left:4px solid var(--accent)}
+h3{font-size:14px;margin:18px 0 6px;color:#123}
+table{border-collapse:collapse;width:100%;margin:6px 0 4px;font-size:13px}
+th,td{border:1px solid var(--line);padding:5px 8px;vertical-align:top;text-align:left}
+th{background:var(--head);font-weight:600;white-space:nowrap}
+tbody tr:nth-child(even) td{background:#fbfcfd}
+td.n{text-align:center;color:var(--sub);font-variant-numeric:tabular-nums;width:32px}
+td.k{white-space:nowrap;font-weight:600;color:#123}
+.tag{display:inline-block;padding:0 6px;border-radius:3px;font-size:12px;white-space:nowrap}
+.st-p{background:var(--okbg);color:var(--ok);font-weight:600}
+.st-b{background:var(--warnbg);color:var(--warn);font-weight:600}
+.st-f{background:var(--riskbg);color:var(--risk);font-weight:600}
+.st-i{background:var(--idlebg);color:var(--idle)}
+.note{background:#f8fafc;border-left:3px solid var(--accent);padding:9px 13px;margin:10px 0;font-size:12.5px;color:#334}
+.note.w{border-left-color:var(--warn);background:#fffaf0}
+code{background:#f1f3f6;padding:1px 5px;border-radius:3px;
+  font-family:Consolas,"Courier New",monospace;font-size:12.5px}
+.foot{margin-top:30px;padding-top:12px;border-top:1px solid var(--line);color:var(--sub);font-size:12px}
+@media print{body{background:#fff}.wrap{box-shadow:none;padding:0}h2{page-break-after:avoid}tr{page-break-inside:avoid}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>T113 运维终端（ivsbox）项目总结 · 对照《功能清单》</h1>
+  <div class="sub">
+    基线 <code>main @ 7e4527f</code> · ARM 产物 <code>843d5552…</code>（与板端逐字节一致）· 2026-10-23<br>
+    对照依据：<code>功能清单(2).xlsx</code> Sheet1（35 项功能）· 证据：<code>功能开发计划.md</code>、<code>功能测试计划.html</code>、<code>测试报告-2026-10-22.html</code>、<code>修改记录.md</code>
+  </div>
+</header>
+
+<div class="cards">
+  <div class="card"><b>36</b><span>功能项（清单 35 ＋ 485 透传）</span></div>
+  <div class="card g"><b>23</b><span>已实现</span></div>
+  <div class="card w"><b>9</b><span>部分 / 口径差</span></div>
+  <div class="card i"><b>1</b><span>采集板侧（本机无职责）</span></div>
+  <div class="card i"><b>1</b><span>搁置</span></div>
+  <div class="card r"><b>2</b><span>未实现</span></div>
+</div>
+
+<h2>1. 对照《功能清单》逐项状态</h2>
+<table>
+<thead><tr><th class="n">#</th><th style="width:118px">清单项</th><th>本机实现情况</th><th style="width:110px">状态</th></tr></thead>
+<tbody>
+<tr><td class="n">1</td><td class="k">用电量监测</td><td>采集板 <code>0xE1</code> 取 输入电压 V / 电流 A / 总功率 APOWER / 总用电量 AKW，随上报帧上送 ＋ Web 展示</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">2</td><td class="k">温湿度检测</td><td>H / T 采集、上报、页面展示；温湿度阈值可配并下发</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">3</td><td class="k">输出监测（3 路）</td><td>每路电压/电流/功率/用电量 ＋ 继电器 开/关/重启（<code>relay.set</code>）。<b>路数＝3 路，已确认</b>（清单原文「8 路」为旧规格）</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">4</td><td class="k">断电检测</td><td>采集板提供 设备供电 <code>PA</code> / 输入电压状态 <code>PV</code>，本机状态镜像可读；<b>不在上报帧内</b>，平台看不到</td><td><span class="tag st-b">只本地可读</span></td></tr>
+<tr><td class="n">5</td><td class="k">过压告警</td><td>阈值 <code>elec.volt_high</code> → <code>0xF1</code> 下发；<b>判定在采集板</b>（<code>0xC2</code> 事件本机接收并镜像），本机不产生告警事件上平台</td><td><span class="tag st-b">判定在采集板</span></td></tr>
+<tr><td class="n">6</td><td class="k">欠压告警</td><td>同上（<code>elec.volt_low</code>）</td><td><span class="tag st-b">判定在采集板</span></td></tr>
+<tr><td class="n">7</td><td class="k">过流告警</td><td>同上（<code>elec.over_current</code>）</td><td><span class="tag st-b">判定在采集板</span></td></tr>
+<tr><td class="n">8</td><td class="k">漏电告警</td><td>阈值 <code>elec.leak_current</code> 可下发；上报帧 <code>MIU</code> 无取值来源，实测漏电流值平台看不到</td><td><span class="tag st-b">缺实测值</span></td></tr>
+<tr><td class="n">9</td><td class="k">高温告警（开风扇）</td><td>温度上限阈值可配可下发；<b>本机无风扇硬件</b>，风扇指令（<code>0xC1</code>/<code>0xF6</code>）未实现</td><td><span class="tag st-b">无风扇硬件</span></td></tr>
+<tr><td class="n">10</td><td class="k">低温告警</td><td>阈值可配可下发，判定在采集板</td><td><span class="tag st-b">判定在采集板</span></td></tr>
+<tr><td class="n">11</td><td class="k">湿度过高告警</td><td>阈值可配可下发，判定在采集板</td><td><span class="tag st-b">判定在采集板</span></td></tr>
+<tr><td class="n">12</td><td class="k">箱门打开告警</td><td>门状态 <code>DS</code> 上报 ＋ 开箱触发抓拍（<code>0xC1</code> 事件 → 媒体）</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">13</td><td class="k">漏水告警</td><td><b>由采集板负责</b>（本机无该路输入与判定职责）</td><td><span class="tag st-i">采集板侧</span></td></tr>
+<tr><td class="n">14</td><td class="k">姿态告警</td><td>姿态 <code>P</code> 上报 ＋ 倾斜阈值（<code>sl</code>）下发</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">17</td><td class="k">主网检测</td><td>统一探活引擎（ICMP ＋ 被动 LINK），周期/超时/失败门限全可配并热生效；切换门限 <code>netthr.loss_count</code></td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">18</td><td class="k">摄像机网络检测</td><td>三种方式可选（PING / 端口扫描 / RTSP 取流）＋ 延时判定阈值 ＋ 单路重测 ＋ 开机告警</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">19</td><td class="k">uart 串口</td><td>采集板 <code>ttySAC5</code> 115200 8N1：帧解析 ＋ 可靠层（超时重发）＋ 状态镜像 ＋ GPS 同链路</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">20</td><td class="k">无线传输</td><td>平台协议：上行封帧、心跳免回、QN 回显、持久上报队列、断线重连、出口绑定</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">21</td><td class="k">数据传输（三模式）</td><td>自动 / 仅有线 / 仅无线 ＋ 双 WAN 状态机；默认无线，失败切有线、恢复切回</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">22</td><td class="k">升级</td><td>远程 OTA：包验签 → 分片上传 → 装盘 → 双版本切换 → 就绪标记/超时回滚；Web 与平台两侧入口</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">23</td><td class="k">设备重启（自动）</td><td>摄像机/主网持续故障 → 断该路电源重启；<b>次数与间隔可设</b>（<code>netthr.reboot_max</code> / <code>.reboot_interval_s</code>，热生效）</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">24</td><td class="k">图形管理</td><td>自研 HTTP/1.1 ＋ 11 个页面（总览/网络/4G/定位/控制板/摄像机/设备档案/交换机/媒体/配置/运维）</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">25</td><td class="k">GPS</td><td>经纬度实时读取、定位页展示、随上报帧上送</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">26</td><td class="k">设备 ID、MAC 写入</td><td>组播出厂工装 <code>ivsbox-provision</code>（设备搜索 ＋ ID/MAC/SN 配置）＋ Web 身份配置</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">27</td><td class="k">电磁锁控制</td><td>本机只有箱门状态检测，无锁控执行器与指令</td><td><span class="tag st-f">未实现</span></td></tr>
+<tr><td class="n">28</td><td class="k">摄像机运行状态</td><td>自写 SNMP v2c 客户端，OID 全可配（CPU/内存/码流按摄像机 MIB 填）；两目标独立</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">29</td><td class="k">SNMP 配置</td><td>Web 可配 community / 超时 / 重试 / 每路 OID，改完热生效；平台下行 <code>0xBE</code> 未接</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">30</td><td class="k">交换机</td><td>独立 SNMP 目标（<code>switch.snmp.*</code>），交换机页展示 walk 结果</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">31</td><td class="k">一机一档</td><td>本地发现齐：品牌 / 型号 / IP / MAC / 序列号 / 端口（海康·大华·UNV·ONVIF 四路）；<b>缺 OSD 标注</b>；上传平台 <code>0xE4</code> 只回 ACK 无 JSON</td><td><span class="tag st-b">缺 OSD ＋ 平台 JSON</span></td></tr>
+<tr><td class="n">32</td><td class="k">图片抓取</td><td>箱门开启事件触发抓拍，落 SD 卡，Web 可查看</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">33</td><td class="k">视频存储</td><td>主网断开即 RTSP 拉流录 SD；录像源表可配热生效；SD 卡策略与告警</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">34</td><td class="k">视频读取</td><td>HTTP Range 下载本地录像，支持断点续传</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">35</td><td class="k">摄像机 web</td><td>受控反代 <code>/cam/&lt;N&gt;</code>（专用环回监听，不直连摄像机）</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">36</td><td class="k">运行日志</td><td>按日/小时落盘 UDISK（滚动不写满）＋ Web 在线浏览与下载；平台日志上报 <code>0xB2</code> 未接</td><td><span class="tag st-p">已实现</span></td></tr>
+<tr><td class="n">37</td><td class="k">音频广播</td><td>本机无音频通道与对应硬件；<b>按当前决定暂时搁置</b></td><td><span class="tag st-i">搁置</span></td></tr>
+<tr><td class="n">38</td><td class="k">485 透传<br><span style="font-weight:400;color:#5b6570">（清单外补充）</span></td><td>平台 <code>0xA7</code> 原样下发 485 总线原始字节（参考实现：≤256 B，入队即成功、不回 ACK），配 <code>0xA6</code> 485 数据格式（波特率/数据位/校验/停止位）。<b>目前只有协议命令宏，未接线</b>：本机未开 485 通道（<code>TIOCSRS485</code> 未做），平台下发回 <code>0x74</code></td><td><span class="tag st-f">未实现</span></td></tr>
+</tbody>
+</table>
+
+<div class="note">
+<b>Sheet4「待交接、无完整代码暂无法评估」的 6 项</b> —— 图片抓取、视频存储、视频读取、摄像机 web、运行日志 <b>5 项已由本工程自研落地并在板端验证</b>；仅音频广播仍搁置。
+</div>
+
+<h2>2. 按功能清单逐项测试结果</h2>
+
+<div class="cards">
+  <div class="card g"><b>28</b><span>测试通过</span></div>
+  <div class="card w"><b>3</b><span>部分通过</span></div>
+  <div class="card i"><b>3</b><span>未测（含 2 项未实现）</span></div>
+  <div class="card i"><b>1</b><span>不适用（采集板侧）</span></div>
+  <div class="card i"><b>1</b><span>搁置</span></div>
+</div>
+
+<table>
+<thead><tr><th class="n">#</th><th style="width:118px">清单项</th><th>测试方式与证据</th><th style="width:96px">结论</th></tr></thead>
+<tbody>
+<tr><td class="n">1</td><td class="k">用电量监测</td><td>上报帧字段断言（<code>test_e2e_report</code>）＋ 板端真实链路帧核对（V/A/APOWER/AKW）</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">2</td><td class="k">温湿度检测</td><td>同上（H/T）＋ 页面数据展示（jsdom）</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">3</td><td class="k">输出监测（3 路）</td><td><code>relay.set</code> 单测 ＋ 板端继电器实动 ＋ 三路 CHV/CHA/POWER/ELEC 字段断言</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">4</td><td class="k">断电检测</td><td>状态镜像可读 <code>PA</code>/<code>PV</code>（单测）；上报帧无该字段 ⇒ 平台侧无法验证</td><td><span class="tag st-i">未测</span></td></tr>
+<tr><td class="n">5</td><td class="k">过压告警</td><td>阈值 <code>0xF1</code> 下发：集成 <code>test_agent_board</code> b06b（线上字节、同值不重发、全 0 返 <code>IV_ESTATE</code>）＋ 装配层 <code>thresh_e2e</code> 12 断言</td><td><span class="tag st-p">通过<br><span style="font-weight:400;color:#5b6570">（本机职责）</span></span></td></tr>
+<tr><td class="n">6</td><td class="k">欠压告警</td><td>同 5</td><td><span class="tag st-p">通过（本机职责）</span></td></tr>
+<tr><td class="n">7</td><td class="k">过流告警</td><td>同 5</td><td><span class="tag st-p">通过（本机职责）</span></td></tr>
+<tr><td class="n">8</td><td class="k">漏电告警</td><td>阈值下发通过（同上）；<b>实测值缺口</b>：上报帧 <code>MIU</code> 无来源，无法验证</td><td><span class="tag st-b">部分通过</span></td></tr>
+<tr><td class="n">9</td><td class="k">高温告警（开风扇）</td><td>温度阈值下发通过（同上）；风扇控制无硬件、未实现，无法验证</td><td><span class="tag st-b">部分通过</span></td></tr>
+<tr><td class="n">10</td><td class="k">低温告警</td><td>同 5</td><td><span class="tag st-p">通过（本机职责）</span></td></tr>
+<tr><td class="n">11</td><td class="k">湿度过高告警</td><td>同 5</td><td><span class="tag st-p">通过（本机职责）</span></td></tr>
+<tr><td class="n">12</td><td class="k">箱门打开告警</td><td>门事件 → 状态镜像 ＋ 抓拍回调单测；<code>DS</code> 字段上报断言</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">13</td><td class="k">漏水告警</td><td>不属本机职责，本机无入口</td><td><span class="tag st-i">不适用</span></td></tr>
+<tr><td class="n">14</td><td class="k">姿态告警</td><td><code>P</code> 字段上报断言 ＋ 倾斜阈值下发（同 5）</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">17</td><td class="k">主网检测</td><td>集成 <code>test_agent_switch</code>（9 条曾红，根因 D-01 已修）＋ <code>netthr_e2e</code> 33 断言 ＋ 板端断网/恢复实测</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">18</td><td class="k">摄像机网络检测</td><td>装配层 <code>camtest_e2e</code> 19 断言 ＋ 板端三模式实测（PORT/PING/RTSP 结论值逐个核对）</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">19</td><td class="k">uart 串口</td><td><code>iv_link</code> / <code>iv_status</code> 单测 ＋ 板端 <code>ttySAC5</code> 真实采集板长跑</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">20</td><td class="k">无线传输</td><td><code>test_proto</code> 单测 ＋ <code>test_e2e_report</code> ＋ 板端 22 条平台指令实测、真实平台链路（6013）</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">21</td><td class="k">数据传输（三模式）</td><td><code>test_netmgr</code> 单测 ＋ <code>netthr_e2e</code> ＋ 板端主备切换实测（含此前掉线根因修复后复测）</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">22</td><td class="k">升级</td><td><code>test_upd</code> 15 组 ＋ <code>upgrade-boot.sh</code> 23 项 ＋ 故障注入 13 PASS ＋ <code>ota_install_e2e</code> 13 ＋ 板端真升级（r35→r36）</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">23</td><td class="k">设备重启（自动）</td><td><code>iv_recovery</code> 单测 ＋ <code>test_agent_switch</code> 沿触发 ＋ <code>netthr_e2e</code>（限次/间隔热生效、改无关键不补满 credit）</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">24</td><td class="k">图形管理</td><td>jsdom 6 用例 130 断言 ＋ 真 HTTP e2e 58 断言 ＋ 板端浏览器全页实测</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">25</td><td class="k">GPS</td><td><code>test_agent_gps</code> ＋ 板端串口 GPS 实读（定位页经纬度）</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">26</td><td class="k">设备 ID、MAC 写入</td><td><code>test_prov</code> 单测 ＋ <code>test_prov_e2e</code> 集成 ＋ 板端组播工装双角色实测</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">27</td><td class="k">电磁锁控制</td><td>功能未实现，无对应用例</td><td><span class="tag st-f">未测</span></td></tr>
+<tr><td class="n">28</td><td class="k">摄像机运行状态</td><td><code>test_agent_m4</code> 请求计数（CAM 恰 4 条，未配槽位不发包）＋ 板端 SNMP 实采</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">29</td><td class="k">SNMP 配置</td><td>装配层 <code>hotcfg_e2e</code> 25 断言（OID/community/目标改完即生效；SWITCH 订阅掩码漏项即在此抓出）</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">30</td><td class="k">交换机</td><td><code>test_agent_m4</code>／<code>test_agent_switch</code>（SW 目标 5 条：1 GET ＋ 4 GETNEXT）＋ 板端实采</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">31</td><td class="k">一机一档</td><td>四路发现流程单测 ＋ 板端真实摄像机发现通过；<b>OSD 与 <code>0xE4</code> JSON 未做，无对应用例</b></td><td><span class="tag st-b">部分通过</span></td></tr>
+<tr><td class="n">32</td><td class="k">图片抓取</td><td>箱门事件 → 抓拍回调单测 ＋ 板端事件注入触发落盘</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">33</td><td class="k">视频存储</td><td><code>test_media_e2e</code>／<code>test_cfg_media_e2e</code> ＋ 板端断网录像与 SD 策略实测</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">34</td><td class="k">视频读取</td><td><code>test_web_media_e2e</code>（Range/续传）＋ 板端下载实测</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">35</td><td class="k">摄像机 web</td><td><code>test_web_cam_e2e</code> 受控反代集成用例</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">36</td><td class="k">运行日志</td><td><code>logs_e2e</code> 21 断言 ＋ 板端 24 h 日志落盘检查（按小时切分、不写满、当日 ERROR=0）</td><td><span class="tag st-p">通过</span></td></tr>
+<tr><td class="n">37</td><td class="k">音频广播</td><td>暂时搁置，未测</td><td><span class="tag st-i">搁置</span></td></tr>
+<tr><td class="n">38</td><td class="k">485 透传</td><td>功能未实现，无对应用例；仅在指令对照表里核对过参考实现口径（入队成功不回 ACK、失败回 <code>0x74</code>）</td><td><span class="tag st-f">未测</span></td></tr>
+</tbody>
+</table>
+
+<h3>2.1 全量门禁（与清单项无关的底层保障）</h3>
+<table>
+<thead><tr><th style="width:126px">层级</th><th>覆盖</th><th style="width:150px">结果</th></tr></thead>
+<tbody>
+<tr><td class="k">单元测试</td><td>44 个测试程序（core / hal / 各模块）</td><td><span class="tag st-p">44/44 通过</span></td></tr>
+<tr><td class="k">ASan / TSan</td><td>同一套 44 个程序，内存与竞态检测</td><td><span class="tag st-p">44/44，0 报告</span></td></tr>
+<tr><td class="k">静态分析</td><td><code>-fanalyzer</code> 全量（第三方已剥离）</td><td><span class="tag st-p">68 单元 0 告警</span></td></tr>
+<tr><td class="k">交叉编译</td><td><code>make arm</code>，产物与板端 md5 一致</td><td><span class="tag st-p">0 告警</span></td></tr>
+<tr><td class="k">模糊测试</td><td>3 harness × 10 s（ASan/UBSan）</td><td><span class="tag st-p">0 报告</span></td></tr>
+<tr><td class="k">集成测试</td><td>17 条（真进程、真 UDS、真 TCP）</td><td><span class="tag st-p">16 通过 ＋ 1 SKIP</span></td></tr>
+<tr><td class="k">装配层 e2e</td><td>6 个 Python 用例（阈值/OTA/摄像机/网络门限/平台地址/热生效），127 断言</td><td><span class="tag st-p">全通过</span></td></tr>
+</tbody>
+</table>
+
+<div class="note">
+<b>功能测试报告（2026-10-22）</b>：97 条用例（14 组）→ 53 通过 / 4 失败 / 40 阻塞，新开缺陷 8 条；8 条已全部修复并逐条反向证伪，4 条失败项复测通过。阻塞项均为环境受限（缺外设 / 需断电 / 需现场书面同意 / 卡外部下发）。
+<br><b>缺陷台账</b>：D-01~D-17、R-01~R-08 全部闭环；仅 R-08（一次非预期重启）补了取证、根因待现场复现。
+</div>
+
+<h2>3. 下一步</h2>
+<table>
+<thead><tr><th style="width:44px">序</th><th>事项</th><th style="width:190px">卡点 / 说明</th></tr></thead>
+<tbody>
+<tr><td class="n">1</td><td><b>平台下行指令补齐</b>：<code>0xF8</code> 主网检测 IP、<code>0xA3</code> 设备名称、<code>0xF2</code> PING 间隔、<code>0xBF</code> 网络设备重启次数/时间 —— 前置配置键均已热生效，纯软件可做</td><td>可立即开工；每条配 itest</td></tr>
+<tr><td class="n">2</td><td><b>485 透传</b>（清单外新增）：平台 <code>0xA7</code> 原始字节下发 ＋ <code>0xA6</code> 格式配置。需先定 485 走本机哪路 UART（<code>ttySAC?</code>／方向控制方式），再做通道（<code>TIOCSRS485</code> 或 RTS 手动方向）＋ 透传队列（入队成功不回 ACK，失败回 <code>0x74</code>）＋ 485 侧数据回传通路</td><td>缺硬件接口资料；属新增功能，需产品侧确认目标设备与帧格式</td></tr>
+<tr><td class="n">3</td><td><b>断电检测与漏电值纳入上报帧</b>：把 <code>PA</code>/<code>PV</code>/<code>MIU</code> 落进上行字段（清单第 4、8 项的收口）</td><td>需平台确认字段名与量纲；<code>MIU</code> 目前无取值来源</td></tr>
+<tr><td class="n">4</td><td><b>一机一档补齐</b>：增加 OSD 标注采集 ＋ <code>0xE4</code> 应答 JSON</td><td>卡平台应答 schema（<code>0xE4</code>/<code>0xE7</code> 同缺）</td></tr>
+<tr><td class="n">5</td><td><b>告警上报口径定案</b>：判定已在采集板，若还要求本机产生「告警事件」上平台（平台立即弹窗而非按数值判），需新增本地判定 ＋ 事件上报通道</td><td>需与采集板/平台侧确认，是第 5~11 项的收口</td></tr>
+<tr><td class="n">6</td><td><b>电磁锁控制</b>：清单内唯一未实现的功能项</td><td>缺执行器与协议，需产品侧给方案</td></tr>
+<tr><td class="n">7</td><td><b>危险指令</b>：<code>0xD9</code> 重启、<code>0xD2</code> 清配置、<code>0xF7</code> 摄像机 IP、<code>0xF4</code> 本机 IP、<code>0xF1</code> 服务器地址（现在平台点了回 <code>0x74</code>）</td><td>实现在前；板端验证需现场书面同意</td></tr>
+<tr><td class="n">8</td><td><b>只能现场</b>：M7 真机项（72 h 长稳、掉电回滚、SD 满/拔卡、弱网）、R-08 根因、量产公钥与密钥分离</td><td>仅登记，不推进</td></tr>
+<tr><td class="n">—</td><td><b>音频广播</b>：暂时搁置，暂不排期</td><td><span class="tag st-i">搁置</span></td></tr>
+</tbody>
+</table>
+
+<div class="foot">
+  数据取自仓库内权威文档与当日门禁实跑结果；本文档不含新代码改动。功能清单 Sheet2/Sheet3 为 6–7 月排期表，已逐项落在上述实现中。
+</div>
+
+</div>
+</body>
+</html>

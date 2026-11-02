@@ -252,6 +252,12 @@ typedef struct {
     int         last_hour;
     long        last_off;
     unsigned    sent_chunks;/* 第二遍用：下一个 chunkIndex */
+    /* 跨文件累积缓冲（2026-11-02 真机踩坑后加的）：
+     * 分片必须按**整条字节流**切，不能"每个日志文件各自从新片开始" ——
+     * 每个文件末尾那半片会让实际片数大于 ceil(total/1024)，超出的 chunkIndex
+     * 被服务端直接拒（`分片序号无效，有效范围：0-19`）。详见 span_send()。 */
+    uint8_t     buf[IV_LOGUP_CHUNK_SIZE];
+    size_t      fill;       /* buf 里已攒的字节数 */
 } span_t;
 
 /* 每段回调：path 从 off 起有 len 字节待处理；返回 IV_OK 继续 */
@@ -654,10 +660,39 @@ static int post_chunk(iv_logup_t *u, unsigned index, const void *data, size_t le
  * ------------------------------------------------------------------------- */
 
 /* 第二遍的读文件回调：一个文件段可能跨多片，按 1 KiB 切开逐片发 */
-static int span_send(span_t *s, const char *path, long off, size_t len)
+/* 把攒满（或收尾时不满）的一片发出去。index 严格递增；失败用同一下标重试。 */
+static int span_flush(span_t *s)
 {
     iv_logup_t *u = s->u;
-    int         fd;
+    int         try;
+    int         rc = IV_EPROTO;
+
+    if (s->fill == 0u)
+        return IV_OK;
+    for (try = 0; try < IV_LOGUP_RETRY_MAX; try++) {
+        rc = post_chunk(u, s->sent_chunks, s->buf, s->fill);
+        if (rc == IV_OK)
+            break;
+        u->need_reconnect = 1; /* 下一轮从同一下标重发（幂等） */
+    }
+    if (rc != IV_OK) {
+        /* 失败现场必须留证据：`http=200` 却失败只有两种可能 ——
+         * ① 应答里没有 `"code":200`（业务拒绝）；② body 没读到（头到了、
+         * body 还在路上，被 `resp_complete()` 判成"无 CL = 已收完"）。
+         * 2026-11-02 真机第 1024 片就是这么翻的，当时只有 rc/http，
+         * 看不出是哪一种。这里把 len 与应答原文（含头）一起打出来。 */
+        IV_LOG_W(LU_MOD, "chunk #%u failed: rc=%d http=%d len=%u resp=%s",
+                 s->sent_chunks, rc, u->status, (unsigned)s->fill, u->resp);
+        return (rc == IV_EPROTO) ? IV_EPROTO : IV_ECONN;
+    }
+    s->sent_chunks++;
+    s->fill = 0u;
+    return IV_OK;
+}
+
+static int span_send(span_t *s, const char *path, long off, size_t len)
+{
+    int fd;
 
     fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -669,29 +704,32 @@ static int span_send(span_t *s, const char *path, long off, size_t len)
         return IV_EIO;
     }
     while (len > 0u) {
-        size_t  want = (len > IV_LOGUP_CHUNK_SIZE) ? IV_LOGUP_CHUNK_SIZE : len;
-        ssize_t n    = read(fd, u->chunk, want);
-        int     try;
-        int     rc   = IV_EIO;
+        size_t  room = sizeof s->buf - s->fill;
+        size_t  want = (len > room) ? room : len;
+        ssize_t n    = read(fd, s->buf + s->fill, want);
+        int     rc;
 
         if (n <= 0) {
             (void)close(fd);
             return IV_EIO;
         }
-        for (try = 0; try < IV_LOGUP_RETRY_MAX; try++) {
-            rc = post_chunk(u, s->sent_chunks, u->chunk, (size_t)n);
-            if (rc == IV_OK)
-                break;
-            u->need_reconnect = 1; /* 下一轮从同一下标重发（幂等） */
+        s->fill += (size_t)n;
+        len     -= (size_t)n;
+        /* **攒满一片才发**：分片边界必须落在**整条字节流**上，才与 start 里
+         * 申报的 `totalChunks` 严格一致。早先的写法是"每个日志文件各自按
+         * 1 KiB 切"，每个文件末尾都会留一片不满的（比如 18620 B 切成 18 满片
+         * +188 B），下一个文件又从新片开始 ⇒ 实际片数 > ceil(total/1024)。
+         * 多出来的那个 chunkIndex 会被服务端直接拒：
+         *   `{"code":500,"msg":"分片序号无效，有效范围：0-19"}`
+         * 真机 1 MiB 上传就死在最后这一片（`chunk #1024 failed rc=-21 http=200`），
+         * 前面 1023 片白传。 */
+        if (s->fill == sizeof s->buf) {
+            rc = span_flush(s);
+            if (rc != IV_OK) {
+                (void)close(fd);
+                return rc;
+            }
         }
-        if (rc != IV_OK) {
-            IV_LOG_W(LU_MOD, "chunk #%u failed: rc=%d http=%d", s->sent_chunks, rc,
-                     u->status);
-            (void)close(fd);
-            return (rc == IV_EPROTO) ? IV_EPROTO : IV_ECONN;
-        }
-        s->sent_chunks++;
-        len -= (size_t)n;
     }
     (void)close(fd);
     return IV_OK;
@@ -910,6 +948,16 @@ int iv_logup_run(iv_logup_t *u)
         IV_LOG_W(LU_MOD, "chunks aborted at #%u: rc=%d http=%d", sp.sent_chunks, rc,
                  u->status);
         goto out;
+    }
+    /* 尾片：最后一次攒下的不足 1 KiB 的那一片。少了这一步，服务端收到的
+     * 字节数会少于 start 时的 totalSize，finish 也拼不出完整文件。 */
+    if (sp.fill > 0u) {
+        rc = span_flush(&sp);
+        if (rc != IV_OK) {
+            IV_LOG_W(LU_MOD, "tail chunk #%u failed: rc=%d http=%d", sp.sent_chunks,
+                     rc, u->status);
+            goto out;
+        }
     }
     if (sp.sent_chunks != chunks) {
         /* 文件在传输期间被清理会走到这里：宁可不推进游标，下次重传 */

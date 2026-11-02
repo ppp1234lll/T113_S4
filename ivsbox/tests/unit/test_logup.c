@@ -449,6 +449,52 @@ int main(void)
 
     iv_logup_close(&up);
 
+    /* ---- p06：跨文件的分片必须按**整条字节流**切 ----
+     * 2026-11-02 真机：1 MiB 日志跨很多个文件，旧写法"每个文件各自按 1 KiB 切"
+     * 让每个文件末尾都留半片 ⇒ 实际片数 > ceil(total/1024)，多出来的
+     * chunkIndex 被服务端拒（`分片序号无效，有效范围：0-1023`），前面 1023 片白传。
+     * 这里两个文件各 1500 B：正确 3 片（1024/1024/952），旧写法 4 片。 */
+    {
+        static char a[1501];
+        static char b[1501];
+        char        saved[128];
+
+        memset(a, 'A', 1500);
+        a[1500] = '\0';
+        memset(b, 'B', 1500);
+        b[1500] = '\0';
+
+        /* 换一个干净的 root 与游标：p01~p04 已经把 13 点传过一遍，
+         * 留在同一个 root 里会让"这次到底传了多少"说不清。 */
+        memcpy(saved, g_root, sizeof saved);
+        {
+            size_t n = strlen(saved);
+
+            /* 手工拼，不用 snprintf：`gcc -Werror=format-truncation` 会因为
+             * "最多 128 + 4 字节"报警（哪怕实际用不到）。 */
+            chk(n + 4u < sizeof g_root, "p06 root path fits");
+            memcpy(g_root, saved, n);
+            memcpy(g_root + n, "/p06", 5u);
+        }
+        chk(mkdir(g_root, 0755) == 0, "p06 mkdir root");
+        chk(mk_log("2026-11-02", 14, a, 0) == 0, "p06 make 14.log");
+        chk(mk_log("2026-11-02", 15, b, 0) == 0, "p06 make 15.log");
+
+        srv.data_len = 0u;
+        srv.chunks   = 0u;
+        cfg_of(&cfg, &srv, "127.0.0.1");
+        chk(iv_logup_init(&up, &cfg) == IV_OK, "p06 init");
+        rc = iv_logup_run(&up);
+        chk(rc == IV_OK, "p06 run rc == IV_OK");
+        chk(srv.chunks == 3u, "p06 3000 B across two files -> 3 chunks");
+        chk(srv.data_len == 3000u, "p06 server received exactly 3000 B");
+        chk(srv.data_len == 3000u && memcmp(srv.data, a, 1500) == 0 &&
+                memcmp(srv.data + 1500, b, 1500) == 0,
+            "p06 bytes identical across the file boundary");
+        iv_logup_close(&up);
+        memcpy(g_root, saved, sizeof saved);
+    }
+
     /* ---- p05：空 host ⇒ EINVAL；未 init ⇒ EINVAL ---- */
     cfg_of(&cfg, &srv, "");
     chk(iv_logup_init(&up, &cfg) == IV_OK, "p05 init with empty host is allowed");

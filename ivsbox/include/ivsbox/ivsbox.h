@@ -17,7 +17,7 @@
  * 时直接读这三个宏，包版本与设备自报版本同源，抬一处就够）。 */
 #define IVSBOX_VERSION_MAJOR 1
 #define IVSBOX_VERSION_MINOR 0
-#define IVSBOX_VERSION_PATCH 5
+#define IVSBOX_VERSION_PATCH 6
 
 #ifdef __cplusplus
 extern "C" {

@@ -214,6 +214,9 @@ extern "C" {
 /* 总线节拍：probe 驱动（发探/收结果/超时判定）与 netmgr 驱动（迟滞/回切）。 */
 #define IV_AGENT_PROBE_TICK_MS  200u
 
+/* 0xB3 结果帧里带的版本串/原因串长度（`<版本> <ok|fail>` 写进 `ota/reported`） */
+#define IV_AGENT_OTA_VER_MAX 32u
+#define IV_AGENT_OTA_WHY_MAX 24u
 /* ping 的**轮间隔**默认值（毫秒）与单包间隔下限（2026-10-29 用户口径）。
  *
  * 语义：`probe.interval_ms` 配的是"多久跑一轮"（默认 10 s），**不是**"两个包
@@ -651,6 +654,21 @@ typedef struct {
     uint8_t       updf_state;      /* 1 = 一次拉包在飞（后续 0xB3 回 0x77） */
     uint64_t      updf_runs;       /* 累计受理的 0xB3 次数 */
     uint64_t      updf_busy_acks;  /* 累计因在飞而回 0x77 的次数 */
+
+    /* 0xB3 的**结果帧**（跨重启的通道，见 iv_agent_ota_boot_result 的注释）：
+     * `ota_result`：0 = 无待发 / 1 = 成功（发 0x01）/ 2 = 失败（发 0x00）。
+     * 结果在"重启后新版本真的起来了"或"下载/安装失败"时确定；平台链路没通时
+     * 留在队列里，由 `iv_agent_step()` 与 `on_pb_timer()` 两条驱动路径各自重试
+     * （铁律：两条路径都要挂，只挂一条在板端等于没挂）。 */
+    uint8_t       ota_result;
+    char          ota_result_ver[IV_AGENT_OTA_VER_MAX];
+    char          ota_result_why[IV_AGENT_OTA_WHY_MAX];
+    uint8_t       ota_result_dedup;   /* 1 = 发成功后要写 `ota/reported`（开机判定的结果） */
+    uint64_t      ota_results_sent;   /* 累计真正发出去的结果帧 */
+    uint64_t      ota_result_retries; /* 累计因链路未 UP 而推迟的次数 */
+    /* 下一次检查 `<ota>/report` 的时刻：安装失败由 monitor.sh 写这个文件，而
+     * 那时设备**不重启**（只有安装成功才重启），所以不能只靠开机读一次。 */
+    uint64_t      ota_report_check_ms;
 
     uint64_t     now_ms;
     uint8_t      opened;
@@ -1185,17 +1203,31 @@ int iv_agent_logup_state(const iv_agent_t *a);
 void iv_agent_logup_stats(const iv_agent_t *a, iv_logup_stats_t *out);
 
 /* ---------------------------------------------------------------------------
- * 平台 0xB3「更新系统」（2026-11-02）
+ * 平台 0xB3「更新系统」（2026-11-02，2026-11-02 修改）
  *
  * 协议依据＝参考实现 `General_Version/main/APP/Update/`：**设备自己去升级服务器
- * 取包**（info.txt → 版本比对 → HEAD 取长 → 分块下载），不是平台把固件推下来。
+ * 取包**（info.txt → 版本比对 → 整包 HTTP 下载），不是平台把固件推下来。
  * 这里同样只是**受理 + 丢给慢任务池**，细节见 `iv_updfetch.h`。
  *
- * **与参考实现的一处有意偏差**：参考实现在"下载完成/失败"时才回 0x01/0x00
- * （成功那一次甚至是重启后由 Boot 参数补发的）。本工程改成**受理即回 0x01**，
- * 理由与 0xB2 相同：一个几十 MB 的包在 4G 上要几分钟，平台等不到应答只会显示
- * "指令超时"，现场无法判断到底受理没受理。结果落本机日志与 `events.log`，
- * 平台后续可用 `0xE3` 查版本确认。
+ * 升级流程按**常规 Linux**（用户 2026-11-02 口径：不照单片机那套 1026 帧）：
+ * ```text
+ *   0xB3 到达 → ACK(0x01) 受理              ← 平台立刻知道"收到了"
+ *        ↓ 慢任务池
+ *   GET info.txt → 版本相同 → 结果帧 0x01（已是最新）
+ *                → GET 整包 → .part → request 落盘
+ *        ↓ monitor.sh 拉起 ivsbox-updater install（验签/暂存/切换/重启）
+ *   重启 → 新版本起来（装配成功、写就绪标记）→ 结果帧 0x01
+ *        → 自检超时/回滚                      → 结果帧 0x00
+ *   任何一步失败（下载/落盘/安装）           → 结果帧 0x00
+ * ```
+ * **结果帧是一次独立的上行 `0xB3` 帧（1 字节 0x01/0x00）**，不是对某条请求的应答：
+ * 平台发 0xB3 时先收到 ACK，过一会儿再收到这一帧，据此判定"升级成功/失败"。
+ * 这与参考实现一致（它也是"下载完/重启后补发 0xB3 0x01/0x00"）。
+ *
+ * 为什么结果要跨重启：真正"升级成功"的判据是**新版本能跑起来**，那只有重启后
+ * 才知道。所以成功结果落在 `iv_agent_ota_boot_result()` 里（开机装配完成后调用），
+ * 失败结果由 `on_updf_done()`（下载阶段）或 monitor.sh 写 `<data_root>/ota/report`
+ * （安装阶段）产生。去重用 `<data_root>/ota/reported`，避免每次开机重复上报。
  *
  * 返回：IV_OK 受理（回 0x01）／IV_EBUSY 在飞（回 0x77）／IV_ESTATE 没池或
  * 升级服务器地址未配（回 0x74）。`now_ms` 只用于日志时间线。
@@ -1205,8 +1237,33 @@ int iv_agent_ota_update(iv_agent_t *a, uint64_t now_ms);
 /* 拉包进度：0 空闲 / 1 在飞 */
 int iv_agent_ota_state(const iv_agent_t *a);
 
-/* 统计快照（累计次数、最近 rc/http、最近字节数/模式）。参数非法时清零返回。 */
+/* 统计快照（累计次数、最近 rc/http、最近字节数）。参数非法时清零返回。 */
 void iv_agent_ota_stats(const iv_agent_t *a, iv_updfetch_stats_t *out);
+
+/*
+ * 开机时确定"上一次升级到底成没成"，并把它排进结果帧队列。
+ * **必须在 `app_init()` 成功之后调用**（`main()` 里紧跟就绪标记）：那时
+ * `pending.json` 的语义才是"新版本装配成功"，早于它调用会把"起不来"报成成功。
+ *
+ * 判据（顺序即优先级）：
+ *   1. `<data_root>/ota/report` 存在 ⇒ 失败（monitor 在 install 失败时写的）
+ *   2. `pending.json` 里 state=pending 且 active ⇒ **成功**（本次就是新版本首启）
+ *   3. state=rolled-back ⇒ 失败（自检超时/不可执行，已回滚）
+ *   4. 其它 ⇒ 不上报（没升级过 / 早就确认过）
+ * 同一 `<版本> <结果>` 已在 `ota/reported` 里出现过就不再排（去重）。
+ * 返回：1 排上了 / 0 没有可报的结果 / 负码（IV_EINVAL=参数）。
+ */
+int iv_agent_ota_boot_result(iv_agent_t *a);
+
+/* 待发的结果帧：0 无 / 1 成功 / 2 失败。给 Web、诊断与单测用（只读）。 */
+int iv_agent_ota_result_pending(const iv_agent_t *a);
+
+/*
+ * 把待发的结果帧送出去（链路未 UP 时原地等待，下一拍再试）。`iv_agent_step()` 与
+ * `on_pb_timer()` 两条驱动路径都调它；**单独暴露**是为了让单测能只驱动这一帧
+ * （不必把 probe/netmgr/report 全拉起来）—— 这正是"跨重启那一帧"最容易漏测的地方。
+ */
+void iv_agent_ota_flush(iv_agent_t *a);
 
 /* ---------------------------------------------------------------------------
  * S2.5 GPS / NMEA

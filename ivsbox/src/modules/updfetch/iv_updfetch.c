@@ -2,16 +2,17 @@
  * 平台触发升级的拉包实现（0xB3）—— 契约见 iv_updfetch.h
  *
  * 一句话：`iv_updfetch_run()` 在 worker 线程里
- *   GET info.txt → 比版本 → HEAD 取长度 → （帧模式 or 流模式）下载到 .part
- *   → rename → 写 `<data_root>/ota/request` 交给 monitor.sh。
+ *   GET info.txt → 比版本 → GET 整包（纯 HTTP 流式）→ .part → rename
+ *   → 写 `<data_root>/ota/request` 交给 monitor.sh。
  *
  * 三条必须记住的口径：
  *   1) **应答必须按 Content-Length 读满**再发下一个请求，否则下一应答从上一应答的
  *      残留 body 开始解析（与 `iv_logup` 同一条教训）。头里可能已经带了一段 body，
- *      所以 `recv_body()` 先吐 `hdr` 里的残留再 `recv`。
- *   2) 帧模式（1026 B 一帧）是**参考固件自己的打包格式**，不是 HTTP 约定：
- *      长度不是 1026 的整数倍、或第一帧 CRC 就对不上、或服务端无视 Range 回 200，
- *      都退回流模式重下一次（只试一次）。最终完整性判据是装盘时的 `iv_ota` 验签。
+ *      所以 `recv_some()` 先吐 `hdr` 里的残留再 `recv`。
+ *   2) **不套私有分帧格式**：参考固件的 1026 B 帧（1024 数据 ＋ 2 B CRC）是它刷
+ *      SPI Flash 的产物，与 HTTP 无关。2026-11-02 用户口径「升级不按单片机那套，
+ *      走常规 Linux」⇒ 只保留整包 GET。完整性判据是装盘时 `iv_ota` 的 SHA-256 ＋
+ *      签名（fail-closed），传输层不再重复校验 —— 多一处判据就多一处会误判的地方。
  *   3) 下载落 `.part` 再 `rename`：请求文件指向的路径必须**永远是完整的包**，
  *      否则 monitor.sh 可能在半截文件上启动安装进程。
  */
@@ -21,7 +22,6 @@
 
 #include "ivsbox/iv_updfetch.h"
 
-#include "ivsbox/iv_crc.h"
 #include "ivsbox/iv_log.h"
 #include "ivsbox/iv_ret.h"
 #include "ivsbox/iv_upd.h"
@@ -47,8 +47,9 @@
 #define UF_OTA_SUBDIR "ota"
 #define UF_HDR_END "\r\n\r\n"
 
-/* 内部信号：帧模式不可用，调用方退回流模式重下一次 */
-#define UF_E_FALLBACK (-100)
+/* `recv_some()` 的两个负数：区分"超时"与"断链"，日志与返回码都不一样 */
+#define UF_R_TIMEOUT (-2)
+#define UF_R_ERROR (-1)
 
 /* ---------------------------------------------------------------------------
  * 小工具
@@ -362,48 +363,40 @@ static int read_head(iv_updfetch_t *u)
 }
 
 /*
- * 读 body：先把头里已经带回来的残留吐出来，再 recv 补足。
- * 返回 IV_OK 表示恰好读满 want 字节；不足即错（短应答不能当成功）。
+ * 读一段 body：先把头里已经带回来的残留吐出来，再 recv。
+ *   返回 > 0 读到的字节数；0 = 对端关闭（正常收尾）；
+ *   UF_R_TIMEOUT = 读超时；UF_R_ERROR = 连接错误。
+ * **不能**把"读到多少算多少"当成功 —— 调用方要用 Content-Length 对账。
  */
-static int recv_body(iv_updfetch_t *u, void *dst, size_t want)
+static long recv_some(iv_updfetch_t *u, void *dst, size_t cap)
 {
-    uint8_t *p = dst;
-    size_t   got = 0u;
-
     if (u->body_off < u->hdr_len) {
         size_t avail = u->hdr_len - u->body_off;
 
-        if (avail > want)
-            avail = want;
-        memcpy(p, u->hdr + u->body_off, avail);
+        if (avail > cap)
+            avail = cap;
+        memcpy(dst, u->hdr + u->body_off, avail);
         u->body_off += avail;
-        p += avail;
-        got += avail;
+        return (long)avail;
     }
-    while (got < want) {
-        ssize_t n = recv(u->fd, p, want - got, 0);
+    for (;;) {
+        ssize_t n = recv(u->fd, dst, cap, 0);
 
-        if (n > 0) {
-            p += n;
-            got += (size_t)n;
-            continue;
-        }
+        if (n > 0)
+            return (long)n;
         if (n == 0) {
             u->need_reconnect = 1;
-            return IV_ECONN;
+            return 0;
         }
         if (errno == EINTR)
             continue;
         u->need_reconnect = 1;
-        return IV_ETIMEDOUT;
+        return (errno == EAGAIN || errno == EWOULDBLOCK) ? UF_R_TIMEOUT : UF_R_ERROR;
     }
-    return IV_OK;
 }
 
-/* 发一个请求并读到应答头。range_from >= 0 时带 Range 头。 */
-static int http_request(iv_updfetch_t *u, const char *host, uint16_t port,
-                        const char *method, const char *path, long range_from,
-                        long range_to)
+/* 发一个 GET 并读到应答头 */
+static int http_get(iv_updfetch_t *u, const char *host, uint16_t port, const char *path)
 {
     char   req[384];
     size_t pos = 0u;
@@ -416,28 +409,17 @@ static int http_request(iv_updfetch_t *u, const char *host, uint16_t port,
 
     (void)snprintf(port_str, sizeof port_str, "%u", (unsigned)port);
     req[0] = '\0';
-    append_str(req, sizeof req, &pos, method);
-    append_str(req, sizeof req, &pos, " ");
+    append_str(req, sizeof req, &pos, "GET ");
     append_str(req, sizeof req, &pos, path);
     append_str(req, sizeof req, &pos, " HTTP/1.1\r\nHost: ");
     append_str(req, sizeof req, &pos, host);
     /* 默认端口不带进 Host（与浏览器的规矩一致，也避免某些服务端按
-     * "host:80" 与证书/虚拟主机名不匹配） */
+     * "host:80" 与虚拟主机名不匹配） */
     if (port != 80u) {
         append_str(req, sizeof req, &pos, ":");
         append_str(req, sizeof req, &pos, port_str);
     }
-    append_str(req, sizeof req, &pos, "\r\n");
-    if (range_from >= 0) {
-        /* 48 B：`Range: bytes=<long>-<long>\r\n` 最坏要 39 B，给 24 B 在 ARM 的
-         * `-O2 -Wformat-truncation` 下直接判 error（host 的 -O0 不报，别只看一面）。 */
-        char num[48];
-
-        (void)snprintf(num, sizeof num, "Range: bytes=%ld-%ld\r\n", range_from,
-                       range_to);
-        append_str(req, sizeof req, &pos, num);
-    }
-    append_str(req, sizeof req, &pos, "Connection: keep-alive\r\n\r\n");
+    append_str(req, sizeof req, &pos, "\r\nConnection: keep-alive\r\n\r\n");
 
     u->hdr_len  = 0u;
     u->hdr[0]   = '\0';
@@ -491,9 +473,10 @@ static int info_str(const char *body, const char *key, char *out, size_t cap)
 
 static int fetch_info(iv_updfetch_t *u, char *url_out, size_t url_cap)
 {
-    char path[IV_UPDFETCH_PATH_MAX];
+    char   path[IV_UPDFETCH_PATH_MAX];
     size_t pos = 0u;
     long   clen;
+    long   got = 0;
     int    rc;
 
     path[0] = '\0';
@@ -501,7 +484,7 @@ static int fetch_info(iv_updfetch_t *u, char *url_out, size_t url_cap)
     append_str(path, sizeof path, &pos, u->hw);
     append_str(path, sizeof path, &pos, "/info.txt");
 
-    rc = http_request(u, u->host, u->port, "GET", path, -1, -1);
+    rc = http_get(u, u->host, u->port, path);
     if (rc != IV_OK)
         return rc;
     if (u->status != 200) {
@@ -509,22 +492,30 @@ static int fetch_info(iv_updfetch_t *u, char *url_out, size_t url_cap)
         return IV_EPROTO;
     }
     clen = u->body_len;
-    if (clen <= 0 || (size_t)clen >= sizeof u->win) {
+    if (clen <= 0 || (size_t)clen >= sizeof u->buf) {
         IV_LOG_W(UF_MOD, "info.txt body length %ld out of range", clen);
         return IV_EPROTO;
     }
-    rc = recv_body(u, u->win, (size_t)clen);
-    if (rc != IV_OK)
-        return rc;
-    u->win[clen] = '\0';
+    while (got < clen) {
+        long n = recv_some(u, u->buf + got, (size_t)clen - (size_t)got);
 
-    rc = info_str((const char *)u->win, "version", u->info_version,
+        if (n == 0) {
+            IV_LOG_W(UF_MOD, "info.txt short body (%ld/%ld)", got, clen);
+            return IV_ECONN;
+        }
+        if (n < 0)
+            return (n == UF_R_TIMEOUT) ? IV_ETIMEDOUT : IV_ECONN;
+        got += n;
+    }
+    u->buf[clen] = '\0';
+
+    rc = info_str((const char *)u->buf, "version", u->info_version,
                   sizeof u->info_version);
     if (rc != IV_OK) {
         IV_LOG_W(UF_MOD, "info.txt has no usable \"version\"");
         return IV_EPROTO;
     }
-    rc = info_str((const char *)u->win, "url", url_out, url_cap);
+    rc = info_str((const char *)u->buf, "url", url_out, url_cap);
     if (rc != IV_OK) {
         IV_LOG_W(UF_MOD, "info.txt has no usable \"url\"");
         return IV_EPROTO;
@@ -579,139 +570,109 @@ static int parse_url(iv_updfetch_t *u, const char *url)
     pos = 0u;
     u->url_path[0] = '\0';
     /* 路径原样保留（含可能的查询串）：签名包一般不带 query，但擅自裁剪会
-     * 把带 query 的下载地址裁成 404，而现场只看到"HEAD 失败"。 */
+     * 把带 query 的下载地址裁成 404，而现场只看到"下载失败"。 */
     append_str(u->url_path, sizeof u->url_path, &pos, slash);
     return IV_OK;
 }
 
 /* ---------------------------------------------------------------------------
- * 下载
+ * 下载（纯 HTTP 流式，一条路径）
  * ------------------------------------------------------------------------- */
 
-/* HEAD 取包长 */
-static int probe_size(iv_updfetch_t *u)
+static int do_download(iv_updfetch_t *u, const char *part)
 {
-    int  rc;
-    long clen;
+    FILE   *f;
+    long    total = 0;
+    long    remain;
+    int     rc;
 
-    rc = http_request(u, u->url_host, u->url_port, "HEAD", u->url_path, -1, -1);
-    if (rc != IV_OK)
-        return rc;
-    if (u->status != 200) {
-        IV_LOG_W(UF_MOD, "HEAD %s -> HTTP %d", u->url_path, u->status);
-        return IV_EPROTO;
-    }
-    clen = u->body_len;
-    if (clen <= 0) {
-        IV_LOG_W(UF_MOD, "HEAD %s has no usable Content-Length", u->url_path);
-        return IV_EPROTO;
-    }
-    if ((uint32_t)clen > u->max_bytes) {
-        IV_LOG_W(UF_MOD, "package %ld B exceeds limit %u B, refused", clen,
-                 (unsigned)u->max_bytes);
-        return IV_ERANGE;
-    }
-    u->file_size = clen;
-    /* HEAD 的应答没有 body；服务端若回了短连接，这里已经置了 need_reconnect */
-    return IV_OK;
-}
-
-/* 帧模式：按 1026 B 帧取，逐帧验 CRC16/MODBUS 后写 1024 B 数据 */
-static int fetch_frames(iv_updfetch_t *u, FILE *f)
-{
-    long     frames_total = u->file_size / (long)IV_UPDFETCH_FRAME_SIZE;
-    long     done = 0;
-    unsigned written = 0u;
-
-    while (done < frames_total) {
-        long   left = frames_total - done;
-        long   k = (left > (long)IV_UPDFETCH_WIN_FRAMES) ? (long)IV_UPDFETCH_WIN_FRAMES
-                                                         : left;
-        long   from = done * (long)IV_UPDFETCH_FRAME_SIZE;
-        long   to = from + k * (long)IV_UPDFETCH_FRAME_SIZE - 1;
-        long   i;
-        int    rc;
-
-        rc = http_request(u, u->url_host, u->url_port, "GET", u->url_path, from, to);
-        if (rc != IV_OK)
-            return rc;
-        if (u->status == 200) {
-            /* 服务端无视 Range 直接给整包：帧模式下没法增量校验 */
-            IV_LOG_I(UF_MOD, "server ignored Range (200), fall back to stream mode");
-            return UF_E_FALLBACK;
-        }
-        if (u->status != 206) {
-            IV_LOG_W(UF_MOD, "GET range %ld-%ld -> HTTP %d", from, to, u->status);
-            return IV_EPROTO;
-        }
-        if (u->body_len != k * (long)IV_UPDFETCH_FRAME_SIZE) {
-            IV_LOG_W(UF_MOD, "range %ld-%ld: Content-Length %ld, want %ld", from, to,
-                     u->body_len, k * (long)IV_UPDFETCH_FRAME_SIZE);
-            return IV_EPROTO;
-        }
-        rc = recv_body(u, u->win, (size_t)(k * (long)IV_UPDFETCH_FRAME_SIZE));
-        if (rc != IV_OK)
-            return rc;
-
-        for (i = 0; i < k; i++) {
-            const uint8_t *fr = u->win + (size_t)i * IV_UPDFETCH_FRAME_SIZE;
-            uint16_t want = (uint16_t)((fr[IV_UPDFETCH_FRAME_DATA] << 8) |
-                                       fr[IV_UPDFETCH_FRAME_DATA + 1u]);
-            uint16_t got = iv_crc16_modbus(fr, IV_UPDFETCH_FRAME_DATA,
-                                           IV_CRC16_MODBUS_SEED_INIT);
-
-            if (got != want) {
-                IV_LOG_W(UF_MOD, "frame %ld crc mismatch (calc 0x%04X, packet 0x%04X)",
-                         done + i, (unsigned)got, (unsigned)want);
-                /* 第一帧就错：更像是"服务器给的不是帧格式"而不是"网络传错"，
-                 * 让 run() 退回流模式再试一次 */
-                if (done == 0 && i == 0)
-                    return UF_E_FALLBACK;
-                return IV_EPROTO;
-            }
-            if (fwrite(fr, 1u, IV_UPDFETCH_FRAME_DATA, f) != IV_UPDFETCH_FRAME_DATA)
-                return IV_EIO;
-            written += IV_UPDFETCH_FRAME_DATA;
-        }
-        done += k;
-        u->st.frames += (uint64_t)k;
-    }
-
-    u->st.last_bytes = written;
-    return IV_OK;
-}
-
-/* 流模式：一次 GET，按 Content-Length 边收边写 */
-static int fetch_stream(iv_updfetch_t *u, FILE *f)
-{
-    long remain = u->file_size;
-    long total = 0;
-    int  rc;
-
-    rc = http_request(u, u->url_host, u->url_port, "GET", u->url_path, -1, -1);
+    rc = http_get(u, u->url_host, u->url_port, u->url_path);
     if (rc != IV_OK)
         return rc;
     if (u->status != 200) {
         IV_LOG_W(UF_MOD, "GET %s -> HTTP %d", u->url_path, u->status);
         return IV_EPROTO;
     }
-    if (u->body_len > 0 && u->body_len != u->file_size) {
-        IV_LOG_W(UF_MOD, "GET body %ld != HEAD size %ld", u->body_len, u->file_size);
-        return IV_EPROTO;
-    }
-    while (remain > 0) {
-        size_t want = (remain > (long)sizeof u->win) ? sizeof u->win : (size_t)remain;
+    u->file_size = u->body_len; /* -1 = 服务器没报长度（靠 EOF 收尾） */
 
-        rc = recv_body(u, u->win, want);
-        if (rc != IV_OK)
-            return rc;
-        if (fwrite(u->win, 1u, want, f) != want)
-            return IV_EIO;
-        remain -= (long)want;
-        total += (long)want;
+    f = fopen(part, "wb");
+    if (f == NULL) {
+        IV_LOG_W(UF_MOD, "open %s for write failed: %s", part, strerror(errno));
+        return (errno == ENOSPC) ? IV_ENOSPC : IV_EIO;
     }
+
+    /* 读满 Content-Length 就收工 —— **不能等对端关连接**：HTTP/1.1 默认 keep-alive，
+     * 服务器不会主动关，等关闭只会等到 SO_RCVTIMEO 到期，把正常下载判成超时
+     * （p01 第一版就是这么红的）。没有 Content-Length 时才靠 EOF 收尾。 */
+    remain = (u->body_len >= 0) ? u->body_len : -1;
+    for (;;) {
+        size_t want = sizeof u->buf;
+        long   n;
+
+        if (remain == 0)
+            break;
+        if (remain > 0 && (long)want > remain)
+            want = (size_t)remain;
+
+        n = recv_some(u, u->buf, want);
+        if (n == 0)
+            break; /* 对端先关了：靠下面的对账判短包 */
+        if (n < 0) {
+            IV_LOG_W(UF_MOD, "recv body failed after %ld B (%s)", total,
+                     (n == UF_R_TIMEOUT) ? "timeout" : "connection error");
+            rc = (n == UF_R_TIMEOUT) ? IV_ETIMEDOUT : IV_ECONN;
+            goto FAIL;
+        }
+        total += n;
+        if (remain > 0)
+            remain -= n;
+        /* 边下边判上限：不等服务器报长度，"给错文件把 UDISK 写满"是最贵的失败 */
+        if ((uint64_t)total > u->max_bytes) {
+            IV_LOG_W(UF_MOD, "package exceeds limit %u B, aborted at %ld B",
+                     (unsigned)u->max_bytes, total);
+            rc = IV_ERANGE;
+            goto FAIL;
+        }
+        if (fwrite(u->buf, 1u, (size_t)n, f) != (size_t)n) {
+            rc = (errno == ENOSPC) ? IV_ENOSPC : IV_EIO;
+            goto FAIL;
+        }
+    }
+
+    if (total == 0) {
+        IV_LOG_W(UF_MOD, "empty package body: %s", u->url_path);
+        rc = IV_EPROTO;
+        goto FAIL;
+    }
+    /* 对账：报了长度就必须一字不差，短包等于"拿半个包装上去" */
+    if (u->body_len >= 0 && total != u->body_len) {
+        IV_LOG_W(UF_MOD, "body %ld B != Content-Length %ld", total, u->body_len);
+        rc = IV_EPROTO;
+        goto FAIL;
+    }
+    if (u->body_len < 0)
+        IV_LOG_W(UF_MOD, "no Content-Length on %s, took %ld B by EOF", u->url_path,
+                 total);
+
+    if (fflush(f) != 0) {
+        rc = IV_EIO;
+        goto FAIL;
+    }
+    /* 落盘要真的落地再 rename：否则断电后请求文件指向一个空壳 */
+    if (fsync(fileno(f)) != 0) {
+        int e = errno;
+
+        (void)fclose(f);
+        return (e == ENOSPC) ? IV_ENOSPC : IV_EIO;
+    }
+    if (fclose(f) != 0)
+        return IV_EIO;
     u->st.last_bytes = (uint32_t)total;
     return IV_OK;
+
+FAIL:
+    (void)fclose(f);
+    return rc;
 }
 
 /* ---------------------------------------------------------------------------
@@ -855,66 +816,6 @@ static void name_from_url(iv_updfetch_t *u)
     copy_str(u->name, sizeof u->name, p + 1);
 }
 
-static int do_download(iv_updfetch_t *u, const char *part)
-{
-    FILE *f;
-    int   rc;
-
-    f = fopen(part, "wb");
-    if (f == NULL) {
-        IV_LOG_W(UF_MOD, "open %s for write failed: %s", part, strerror(errno));
-        return (errno == ENOSPC) ? IV_ENOSPC : IV_EIO;
-    }
-
-    /* 帧模式的前提是"服务器按 1026 帧打包"，这是参考固件的私有约定；
-     * 长度对得上才试，试不成（首帧 CRC 不符/服务端无视 Range）退回流模式。 */
-    if ((u->file_size % (long)IV_UPDFETCH_FRAME_SIZE) == 0) {
-        u->mode  = IV_UPDFETCH_MODE_FRAME;
-        u->st.frames = 0u;
-        rc = fetch_frames(u, f);
-        if (rc == UF_E_FALLBACK) {
-            IV_LOG_W(UF_MOD, "frame mode unusable, retrying as stream (size=%ld)",
-                     u->file_size);
-            (void)fclose(f);
-            f = fopen(part, "wb");
-            if (f == NULL)
-                return IV_EIO;
-            u->need_reconnect = 1; /* 上一轮可能停在半个应答上 */
-        } else if (rc != IV_OK) {
-            (void)fclose(f);
-            return rc;
-        }
-    } else {
-        IV_LOG_I(UF_MOD, "size %ld not a multiple of %u, stream mode", u->file_size,
-                 (unsigned)IV_UPDFETCH_FRAME_SIZE);
-    }
-
-    if (u->mode != IV_UPDFETCH_MODE_FRAME || u->st.frames == 0u) {
-        u->mode = IV_UPDFETCH_MODE_STREAM;
-        u->st.frames = 0u;
-        rc = fetch_stream(u, f);
-        if (rc != IV_OK) {
-            (void)fclose(f);
-            return rc;
-        }
-    }
-
-    if (fflush(f) != 0) {
-        (void)fclose(f);
-        return IV_EIO;
-    }
-    /* 落盘要真的落地再 rename：否则断电后请求文件指向一个空壳 */
-    if (fsync(fileno(f)) != 0) {
-        int e = errno;
-
-        (void)fclose(f);
-        return (e == ENOSPC) ? IV_ENOSPC : IV_EIO;
-    }
-    if (fclose(f) != 0)
-        return IV_EIO;
-    return IV_OK;
-}
-
 int iv_updfetch_run(iv_updfetch_t *u)
 {
     char   dir[IV_UPDFETCH_PATH_MAX];
@@ -929,9 +830,10 @@ int iv_updfetch_run(iv_updfetch_t *u)
         return IV_EINVAL;
     if (u->running != 0)
         return IV_EBUSY;
-    u->running = 1;
+    u->running      = 1;
     u->st.runs++;
-    u->st.mode = IV_UPDFETCH_MODE_NONE;
+    u->st.last_bytes = 0u;
+    u->st.last_http  = 0;
 
     if (u->host[0] == '\0' || u->ver[0] == '\0') {
         rc = IV_EINVAL;
@@ -964,16 +866,12 @@ int iv_updfetch_run(iv_updfetch_t *u)
     }
     IV_LOG_I(UF_MOD, "update available: %s -> %s", want_ver, u->info_version);
 
-    /* 3. URL 拆解 + HEAD 取长度 */
+    /* 3. URL 拆解 → 下载（先 .part） */
     rc = parse_url(u, url);
     if (rc != IV_OK)
         goto OUT;
     name_from_url(u);
-    rc = probe_size(u);
-    if (rc != IV_OK)
-        goto OUT;
 
-    /* 4. 下载（先 .part） */
     join_path(final, sizeof final, dir, u->name, "");
     join_path(part, sizeof part, dir, u->name, ".part");
     rc = do_download(u, part);
@@ -989,14 +887,11 @@ int iv_updfetch_run(iv_updfetch_t *u)
     }
     copy_str(u->st.file, sizeof u->st.file, u->name);
     u->st.bytes += (uint64_t)u->st.last_bytes;
-    u->st.mode = u->mode;
-    IV_LOG_I(UF_MOD, "downloaded %s (%u B, %s mode)", final,
-             (unsigned)u->st.last_bytes,
-             (u->mode == IV_UPDFETCH_MODE_FRAME) ? "frame" : "stream");
+    IV_LOG_I(UF_MOD, "downloaded %s (%u B)", final, (unsigned)u->st.last_bytes);
 
-    /* 5. 交给本地安装链路（本模块不装盘） */
+    /* 4. 交给本地安装链路（本模块不装盘） */
     {
-        iv_upd_cfg_t  uc;
+        iv_upd_cfg_t    uc;
         iv_upd_reason_t why = IV_UPD_OK;
 
         iv_upd_cfg_default(&uc);

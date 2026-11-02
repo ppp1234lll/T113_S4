@@ -298,7 +298,15 @@ while true; do
             else
                 "$IVSBOX_UPD" install "$req_pkg" >> "$ALERT" 2>&1
             fi
-            alert "OTA: 安装结束 rc=$?"
+            ota_rc=$?
+            alert "OTA: 安装结束 rc=$ota_rc"
+            # 安装失败 ⇒ 把结论落文件，由 ivsboxd 读出并上报平台 0xB3 0x00
+            # （0xB3 结果帧的"安装期"通道：装盘是另一个进程干的，主控自己看不见。
+            #  格式与 iv_upd.h 里的 IV_UPD_REPORT_NAME 一致：一行 `<0|1> <原因>`。
+            #  成功不写：`--restart` 会重启，成功与否由新版本起来后自己报。）
+            if [ "$ota_rc" -ne 0 ]; then
+                printf '0 install-failed\n' > "$IVSBOX_HOME/ota/report" 2>/dev/null || true
+            fi
             ;;
         *)
             alert "OTA: 请求里的路径不是绝对路径，已丢弃：$req_pkg"

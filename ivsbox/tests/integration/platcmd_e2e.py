@@ -56,8 +56,9 @@ DEFAULT_PORT = 6012
 # 0xB3「更新系统」用例的落点（临时目录，收尾删掉）：设备会往
 # `<root>/ota/download/` 下载、往 `<root>/ota/request` 写安装请求。
 OTA_ROOT = tempfile.mkdtemp(prefix='ivota_')
-# 包体 **2500 B**：刻意不是 1026 的整数倍 ⇒ 设备走"流模式"，
-# 用例不用在这里复刻 1026 帧 ＋ CRC16 的打包格式（帧模式由单测覆盖）。
+# 包体 **2500 B**：随便挑的、非整数长度。设备现在是**纯 HTTP 整包下载**
+# （2026-11-02 用户口径：升级不按单片机那套 1026 帧），所以这里给什么形状都行，
+# 只要"下载回来与发出去的字节逐字相等"这一条成立。
 OTA_PKG = bytes(((i * 7 + 3) & 0xFF) for i in range(2500))
 
 fails = []
@@ -400,8 +401,9 @@ def chk(cond, what):
 # ---------------------------------------------------------------------------
 # 假升级服务器（0xB3 用例）：按参考实现的接口形状应答
 #     GET  /<硬件名>/info.txt -> {"version":"…","url":"http://<ip>:<port>/pkg/ivsbox.pkg"}
-#     HEAD /pkg/ivsbox.pkg    -> Content-Length（无 body）
-#     GET  /pkg/ivsbox.pkg    -> 200 整包；带 Range 时回 206 切片
+#     GET  /pkg/ivsbox.pkg    -> 200 整包（设备只发这一种请求）
+# 仍然留了 HEAD / Range 的应答能力，但 B1f-6 会断言**设备从不发这两种请求** ——
+# 留着是为了让"设备多发了什么"能被同一段代码接住，而不是回 404 让人误判成失败。
 #
 # **必须监听出口网卡地址、不能用 127.0.0.1**：设备侧 `SO_BINDTODEVICE` 绑的是
 # 活动 WAN（VM 上是 ens33/enp0s3），绑了网卡就出不了回环 —— 这与平台链路踩的是
@@ -411,6 +413,8 @@ class _OtaHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     pkg = b''
     info = b''
+    head_n = 0    # 客户端发过几次 HEAD（现在应该是 0：纯整包 GET）
+    range_n = 0   # 客户端发过几次 Range（同上，应该 0）
 
     def log_message(self, *args):  # 静音，别把 e2e 输出刷满
         pass
@@ -419,12 +423,15 @@ class _OtaHandler(BaseHTTPRequestHandler):
         return self.path.split('?')[0].endswith('/info.txt')
 
     def do_HEAD(self):
+        type(self).head_n += 1
         body = self.info if self._is_info() else self.pkg
         self.send_response(200)
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
 
     def do_GET(self):
+        if self.headers.get('Range'):
+            type(self).range_n += 1
         if self._is_info():
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -462,6 +469,8 @@ class _OtaSrv(ThreadingMixIn, HTTPServer):
 def ota_start(ip):
     """起一个假升级服务器，返回 (server, port)；info.txt 的 url 指回自己。"""
     _OtaHandler.pkg = OTA_PKG
+    _OtaHandler.head_n = 0
+    _OtaHandler.range_n = 0
     srv = _OtaSrv(('', 0), _OtaHandler)
     port = srv.server_address[1]
     # 版本串故意与本机不同（本机是 `<硬件名>-<sysver>`），否则设备会回"已是最新"
@@ -577,7 +586,7 @@ def main():
         chk(plat.online(), 'B1e-2 受理上传后平台链路仍在线（阻塞上传没占 Reactor）')
         apply_cls('net', {'net.server.log.host': '', 'net.server.log.port': 0})
 
-        print('B1f 0xB3 更新系统 ⇒ 立即回 0x01，随后自己去升级服务器拉包并写好安装请求')
+        print('B1f 0xB3 更新系统 ⇒ 先回 ACK 0x01，随后自己去升级服务器整包下载（纯 HTTP）')
         ota, ota_port = ota_start(ip)
         try:
             r = apply_cls('net', {'net.server.upgrade.host': ip,
@@ -606,12 +615,35 @@ def main():
                 chk(line == pkg + ' 1',
                     'B1f-4 请求文件是「<包路径> 1」(restart=1)，交给 monitor.sh')
             chk(plat.online(), 'B1f-5 拉包期间平台链路仍在线（阻塞下载没占 Reactor）')
+            chk(_OtaHandler.head_n == 0 and _OtaHandler.range_n == 0,
+                'B1f-6 客户端只发整包 GET（没有 HEAD、没有 Range —— 常规 Linux 升级）')
         finally:
             ota.shutdown()
             ota.server_close()
             apply_cls('net', {
                 'net.server.upgrade.host': orig['net'].get('net.server.upgrade.host', ''),
                 'net.server.upgrade.port': orig['net'].get('net.server.upgrade.port', 0)})
+
+        print('B1h 0xB3 结果帧：安装失败（monitor 写的 ota/report）⇒ 设备主动上报 0xB3 0x00')
+        # 这条覆盖的是**跨重启/跨进程**那条路：装盘由 ivsbox-updater 干，它失败了
+        # 只会由 monitor.sh 写一行 `ota/report`；ivsboxd 每 5 s 查一次并上报平台。
+        # 这里直接造这个文件，等于站在 monitor 的位置说话（不用真起 monitor）。
+        os.makedirs(os.path.join(OTA_ROOT, 'ota'), exist_ok=True)
+        with open(os.path.join(OTA_ROOT, 'ota', 'report'), 'w') as fh:
+            fh.write('0 install-failed\n')
+        plat.clear()
+        res = plat.wait(0xB3, kind='bin', timeout=12.0)
+        chk(res is not None, 'B1h-1 设备主动发了一条 0xB3 结果帧')
+        if res is not None:
+            chk(res['code'] == 0, 'B1h-2 结果帧载荷 0x00（升级失败）')
+        chk(not os.path.exists(os.path.join(OTA_ROOT, 'ota', 'report')),
+            'B1h-3 report 文件已被消费（读走即删，不重复上报）')
+        rep = os.path.join(OTA_ROOT, 'ota', 'reported')
+        ok_mark = False
+        if os.path.exists(rep):
+            with open(rep, 'r') as fh:
+                ok_mark = fh.read().strip() == '- fail'
+        chk(ok_mark, 'B1h-4 ota/reported 记下「- fail」（下次开机不重复上报）')
 
         print('B1g 0xD9 设备重启 ⇒ 先回 ACK 0x01，2 s 后走到重启（本用例用测试开关拦住）')
         plat.clear()

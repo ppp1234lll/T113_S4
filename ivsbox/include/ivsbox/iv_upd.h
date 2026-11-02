@@ -115,6 +115,16 @@ extern "C" {
  * 由 `scripts/monitor.sh` 消费后拉起 `ivsbox-updater` 执行安装（S7.2 装配接线）。 */
 #define IV_UPD_REQUEST_NAME "request"
 
+/* 升级结果的**两个落地文件**（0xB3 结果帧的跨重启通道，2026-11-02）。
+ * 与 `request` 同目录（`<data_root>/ota/`），但**本模块不读也不写** —— 写/读的是
+ * `scripts/monitor.sh`（安装失败）与 `ivsboxd`（开机判定、上报后去重）。
+ *   `report`   待上报的结果：一行 `<0|1> <原因>`。安装阶段才失败的场景
+ *              （验签不过/空间不足）只有 monitor 看得见，ivsboxd 读走即删；
+ *   `reported` 已上报的去重标记：一行 `<版本> <ok|fail>`。**不删**，避免同一结果
+ *              每次开机都往平台发一遍。 */
+#define IV_UPD_REPORT_NAME "report"
+#define IV_UPD_REPORTED_NAME "reported"
+
 /* ivsboxd 自检通过后落下的就绪标记（S7.3：包装脚本拿它当"这次启动成不成"的判据）。
  * 放 `/tmp`（tmpfs）：**每次开机自然清空**，不需要额外的清理逻辑；每次拉起前由
  * 包装脚本再删一次，避免同一开机周期内上一实例的旧标记把新版"确认"掉。 */

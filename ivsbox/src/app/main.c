@@ -4322,6 +4322,10 @@ int main(int argc, char *argv[])
     /* 装配完成 ⇒ 落就绪标记（M7-S7.3 升级自检的判据，见函数注释） */
     ready_mark_write();
 
+    /* 0xB3 的跨重启结果帧：装配走通了才敢把"上次升级成功"报给平台 —— 顺序不能反，
+     * 就绪标记之前的任何一步失败都意味着"新版本起不来"，那该报的是失败。 */
+    (void)iv_agent_ota_boot_result(&g_agent);
+
     (void)iv_reactor_run(g_reactor);
 
     app_shutdown();

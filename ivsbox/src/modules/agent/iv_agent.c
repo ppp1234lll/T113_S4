@@ -5,11 +5,13 @@
  * 不含业务逻辑（策略都在 iv_probe / iv_netmgr / iv_report 内）。
  */
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -22,6 +24,7 @@
 #include "ivsbox/iv_log.h"
 #include "ivsbox/iv_serial.h"
 #include "ivsbox/iv_snmp.h"
+#include "ivsbox/iv_upd.h"
 #include "ivsbox/iv_version.h"
 
 #define AG_MOD "agent"
@@ -70,6 +73,8 @@ static void on_platform_update(const iv_proto_frame_t *f, void *arg);
 static int  updf_task_fn(iv_task_ctx_t *ctx);
 static void on_updf_done(uint64_t id, int rc, const void *result,
                          size_t result_len, void *arg);
+void iv_agent_ota_flush(iv_agent_t *a);
+static int  ota_report_take(iv_agent_t *a);
 static void on_dev_found(const iv_dev_desc_t *d, void *arg);
 static int  snmp_task_fn(iv_task_ctx_t *ctx);
 static void on_snmp_done(uint64_t id, int rc, const void *result,
@@ -1158,6 +1163,7 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
         (void)iv_device_tick(&a->dev, now_ms);
     ipc_reply_tick(a, now_ms); /* 0xE4 的延迟清单：相位机 DONE 时补那一帧 */
     ping_reply_tick(a, now_ms); /* 0xE8 的即席探测：一轮跑完补 st/dt 那一帧 */
+    iv_agent_ota_flush(a);        /* 0xB3 结果帧：与 on_pb_timer 同装同驱 */
     env_feed(a, now_ms);
     (void)iv_recovery_tick(&a->rec, now_ms);
     storage_drive(a, now_ms); /* M6-S6.5：SD 水位闸门（先于 rec_drive，同拍生效） */
@@ -2521,6 +2527,7 @@ static void on_pb_timer(void *arg)
      * 症状与"功能没做"完全一样（现场 2026-11-02 报的就是这个），而代码读起来
      * 每一步都对 —— 两条驱动路径必须同装同驱，别再只加一条。 */
     ping_reply_tick(a, now);
+    iv_agent_ota_flush(a); /* 0xB3 结果帧：与 step() 同装同驱（跨重启的那一帧靠它出去） */
     env_feed(a, now);
     (void)iv_recovery_tick(&a->rec, now);
     thresh_drive(a, now); /* 阈值下发重试（0xF1）：Reactor 下 step() 不被调用 */
@@ -3445,11 +3452,11 @@ void iv_agent_logup_stats(const iv_agent_t *a, iv_logup_stats_t *out)
  * 平台 0xB3「更新系统」：受理 → 慢任务池拉包 → 写安装请求（契约见
  * `iv_agent.h` 与 `iv_updfetch.h`）
  *
- * 为什么**受理就回 0x01**（而参考实现是下载完才回 0x01/0x00）：
- * 参考固件那个包只有几百 KB、几秒就下完，等结果没问题；本工程的包是几十 MB，
- * 4G 上几分钟起步，平台那条指令早就超时了 —— 现场只会看到"点了没反应"。
- * 结果一律落本机日志（`[updfetch]` 行）与 `ota/events.log`，平台用 0xE3 查版本
- * 就能确认最终有没有装上。
+ * 两段式应答（2026-11-02 用户口径「升级完成后上报升级成功/失败」）：
+ *   - 收到指令**先回 ACK**（`on_platform_update()`）。几十 MB 的包在 4G 上几分钟
+ *     起步，若等下载完再回，平台那条指令早超时了 —— 现场只会看到"点了没反应"；
+ *   - 升级真正完成后**再发一条独立的 `0xB3` 结果帧**（0x01 成功 / 0x00 失败），
+ *     下载失败立刻发；成功要等重启后新版本起来才发（见下面的结果帧小节）。
  * ------------------------------------------------------------------------- */
 
 /* worker 线程：同步跑完一次拉包。只写 `a->updf` 自身状态，不碰 Reactor。 */
@@ -3462,8 +3469,212 @@ static int updf_task_fn(iv_task_ctx_t *ctx)
     return iv_updfetch_run(&a->updf);
 }
 
-/* Reactor 线程：任务结算。**必须清 updf_state**，否则后续 0xB3 永远回 0x77。 */
-static void on_updf_done(uint64_t id, int rc, const void *result,
+/* ---------------------------------------------------------------------------
+ * 0xB3 的**结果帧**（跨重启通道，契约见 iv_agent.h）
+ *
+ * 平台发 0xB3 时先收到 ACK（受理）；升级真正完成/失败后再收到一条独立的
+ * `0xB3` 上行帧，载荷 1 字节 `0x01`（成功）/ `0x00`（失败）。
+ * 之所以要跨重启：**"升级成功"的判据是新版本能跑起来**，那只有重启后才知道
+ * （`pending.json` 的 state 就是这件事的账本，`iv_upd` 负责写，本层只读）。
+ * ------------------------------------------------------------------------- */
+
+/* 协议里"失败"就是 ACK 码 0x00 —— `iv_proto.h` 只给了 `IV_PROTO_ACK_OK`(0x01)，
+ * 没有 FAIL 常量，这里显式命名一次，免得代码里飘着裸 0x00。 */
+#define OTA_ACK_FAIL 0x00u
+
+/* OTA 落点根：配置优先，空则与 `iv_upd` 同默认（测试用 `IVSBOX_OTA_ROOT` 覆盖） */
+static const char *ota_root_of(const iv_agent_t *a)
+{
+    if (a != NULL && a->cfg.ota_root != NULL && a->cfg.ota_root[0] != '\0')
+        return a->cfg.ota_root;
+    return IV_UPD_DATA_ROOT_DEFAULT;
+}
+
+/* 拼 `<root>/ota/<name>`；-1 = 装不下（不截断着用，宁可当没有） */
+static int ota_dir_path(const iv_agent_t *a, const char *name, char *out, size_t cap)
+{
+    int n = snprintf(out, cap, "%s/" IV_UPD_OTA_SUBDIR "/%s", ota_root_of(a), name);
+
+    return (n < 0 || (size_t)n >= cap) ? -1 : 0;
+}
+
+static void ota_set_str(char *dst, size_t cap, const char *src)
+{
+    size_t n = 0u;
+
+    if (dst == NULL || cap == 0u)
+        return;
+    if (src != NULL) {
+        while (src[n] != '\0' && (n + 1u) < cap) {
+            dst[n] = src[n];
+            n++;
+        }
+    }
+    dst[n] = '\0';
+}
+
+/* 排一条结果（同一时刻只留最新一条：平台关心的是"最后一次升级"的结论） */
+static void ota_push_result(iv_agent_t *a, int ok, const char *ver, const char *why,
+                            int dedup)
+{
+    if (a == NULL)
+        return;
+    a->ota_result       = (uint8_t)(ok ? 1 : 2);
+    a->ota_result_dedup = (uint8_t)(dedup ? 1 : 0);
+    ota_set_str(a->ota_result_ver, sizeof a->ota_result_ver, ver);
+    ota_set_str(a->ota_result_why, sizeof a->ota_result_why, why);
+    if (ok)
+        IV_LOG_I(AG_MOD, "0xB3 result queued: OK (ver=%s, %s)", a->ota_result_ver,
+                 a->ota_result_why);
+    else
+        IV_LOG_W(AG_MOD, "0xB3 result queued: FAIL (ver=%s, %s)", a->ota_result_ver,
+                 a->ota_result_why);
+}
+
+/* `ota/reported` 里是否已有同样的结论（一行：`<版本> <ok|fail>`） */
+static int ota_reported_has(const iv_agent_t *a, const char *ver, int ok)
+{
+    char  path[IV_UPD_PATH_MAX];
+    char  line[96];
+    char  want[IV_AGENT_OTA_VER_MAX + 8u];
+    FILE *f;
+    char *e;
+
+    if (ota_dir_path(a, IV_UPD_REPORTED_NAME, path, sizeof path) != 0)
+        return 0;
+    f = fopen(path, "r");
+    if (f == NULL)
+        return 0;
+    line[0] = '\0';
+    if (fgets(line, sizeof line, f) == NULL) {
+        (void)fclose(f);
+        return 0;
+    }
+    (void)fclose(f);
+    e = line + strlen(line);
+    while (e > line && (e[-1] == '\n' || e[-1] == '\r'))
+        *--e = '\0';
+    (void)snprintf(want, sizeof want, "%s %s", ver, ok ? "ok" : "fail");
+    return (strcmp(line, want) == 0) ? 1 : 0;
+}
+
+/* 记下"这条结论已经报过了"，避免每次开机重复上报 */
+static void ota_mark_reported(const iv_agent_t *a, const char *ver, int ok)
+{
+    char  path[IV_UPD_PATH_MAX];
+    char  line[96];
+    size_t len;
+    int   fd;
+
+    if (ota_dir_path(a, IV_UPD_REPORTED_NAME, path, sizeof path) != 0)
+        return;
+    (void)snprintf(line, sizeof line, "%s %s\n", ver, ok ? "ok" : "fail");
+    len = strlen(line);
+    fd  = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        IV_LOG_W(AG_MOD, "cannot write %s: %s", path, strerror(errno));
+        return;
+    }
+    if (write(fd, line, len) != (ssize_t)len)
+        IV_LOG_W(AG_MOD, "short write on %s", path);
+    else
+        (void)fsync(fd);
+    (void)close(fd);
+}
+
+/* 发一条待发结果（Reactor 线程；两条驱动路径都调）。**链路没 UP 就不发**：
+ * `iv_proto_send()` 在链路非 UP 时回 IV_ESTATE，而 `iv_proto_ack()` 每失败一次
+ * 都要打一条 WARN ⇒ 200 ms 一条等于刷屏。直接看传输层状态，代价为 0。 */
+void iv_agent_ota_flush(iv_agent_t *a)
+{
+    uint8_t code;
+    int     rc;
+
+    if (a == NULL || a->opened == 0u)
+        return;
+
+    /* 空闲时每 5 s 看一眼 `ota/report`：**安装失败不会重启**（只有安装成功才由
+     * `--restart` 重启），所以"开机读一次"覆盖不到这条路径。代价只是一个几行的
+     * 本地文件，换来"平台点完升级最多 5 s 就能看到失败"。 */
+    if (a->ota_result == 0u) {
+        if (a->now_ms < a->ota_report_check_ms)
+            return;
+        a->ota_report_check_ms = a->now_ms + 5000u;
+        if (ota_report_take(a) == 0)
+            return;
+    }
+
+    if (a->rp.tr.state != IV_TRANSPORT_UP) {
+        a->ota_result_retries++;
+        return;
+    }
+    code = (a->ota_result == 1u) ? (uint8_t)IV_PROTO_ACK_OK : (uint8_t)OTA_ACK_FAIL;
+    /* QN 用 0：这是设备主动发的结果帧，不是对某条请求的应答（回填 last_qn 会让
+     * 平台把两条不相关的指令串起来）。 */
+    rc = iv_proto_send(&a->rp.pf, IV_PROTO_CMD_UPDATE, 0u, 0u, &code, 1u);
+    if (rc != IV_OK) {
+        a->ota_result_retries++;
+        return;
+    }
+    IV_LOG_I(AG_MOD, "0xB3 result sent: 0x%02X (ver=%s, %s)", (unsigned)code,
+             a->ota_result_ver, a->ota_result_why);
+    if (a->ota_result_dedup != 0u)
+        ota_mark_reported(a, a->ota_result_ver, a->ota_result == 1u);
+    a->ota_results_sent++;
+    a->ota_result       = 0u;
+    a->ota_result_dedup = 0u;
+}
+
+/* 读走 `<root>/ota/report`（monitor.sh 在 install 失败时写的一行 `<0|1> <原因>`）。
+ * 返回 1 = 排上了结果 / 0 = 没有文件（或内容不认识）。**读到即删**：修不好的设备
+ * 不该每次开机都重报一遍。
+ *
+ * 单独拆出来是因为它有**两个**调用时机：开机（`iv_agent_ota_boot_result()`）与
+ * 运行期周期检查（安装失败时设备不重启，只有校验失败才不重启）。这里只做
+ * open+read 一个小文件，不碰 `pending.json`/`events.log` —— 后者才是开机才做的事。 */
+static int ota_report_take(iv_agent_t *a)
+{
+    char  path[IV_UPD_PATH_MAX];
+    char  line[96];
+    char  why[IV_AGENT_OTA_WHY_MAX];
+    FILE *f;
+    int   code = -1;
+
+    if (ota_dir_path(a, IV_UPD_REPORT_NAME, path, sizeof path) != 0)
+        return 0;
+    f = fopen(path, "r");
+    if (f == NULL)
+        return 0;
+    why[0] = '\0';
+    line[0] = '\0';
+    if (fgets(line, sizeof line, f) != NULL) {
+        char *sp = strchr(line, ' ');
+        char *r;
+        char *e;
+
+        code = atoi(line);
+        if (sp != NULL) {
+            r = sp + 1;
+            while (*r == ' ')
+                r++;
+            e = r + strlen(r);
+            while (e > r && (e[-1] == '\n' || e[-1] == '\r'))
+                *--e = '\0';
+            ota_set_str(why, sizeof why, (*r != '\0') ? r : "install");
+        }
+    }
+    (void)fclose(f);
+    (void)unlink(path);
+    if (code != 0 && code != 1)
+        return 0;
+    if (why[0] == '\0')
+        ota_set_str(why, sizeof why, code ? "install" : "install-failed");
+    /* 安装失败时 pending.json 通常还没写，版本串用 "-"（平台按"最近一次升级"理解） */
+    ota_push_result(a, code, "-", why, 1);
+    return 1;
+}
+
+/* Reactor 线程：任务结算。**必须清 updf_state**，否则后续 0xB3 永远回 0x77。 */static void on_updf_done(uint64_t id, int rc, const void *result,
                          size_t result_len, void *arg)
 {
     iv_agent_t         *a = (iv_agent_t *)arg;
@@ -3477,16 +3688,19 @@ static void on_updf_done(uint64_t id, int rc, const void *result,
     iv_updfetch_stats(&a->updf, &st);
 
     if (rc == IV_OK) {
-        IV_LOG_I(AG_MOD, "ota #%llu fetched: %u B (%s), version=%s, request queued",
-                 (unsigned long long)id, (unsigned)st.last_bytes,
-                 (st.mode == IV_UPDFETCH_MODE_FRAME) ? "frame" : "stream",
-                 st.info_version);
+        /* **成功不在这里报**：真正"升级成功"的判据是新版本重启后能跑起来，
+         * 由 `iv_agent_ota_boot_result()` 在下次开机时补发 0x01。 */
+        IV_LOG_I(AG_MOD, "ota #%llu fetched: %u B, version=%s, request queued",
+                 (unsigned long long)id, (unsigned)st.last_bytes, st.info_version);
     } else if (rc == IV_UPDFETCH_SAME) {
         IV_LOG_I(AG_MOD, "ota #%llu: already latest (%s)", (unsigned long long)id,
                  st.info_version);
+        /* 平台点了升级、服务器说"你就是最新的" ⇒ 报成功（无事可做也是成功） */
+        ota_push_result(a, 1, st.info_version, "latest", 0);
     } else {
         IV_LOG_W(AG_MOD, "ota #%llu failed: rc=%d http=%d", (unsigned long long)id,
                  rc, st.last_http);
+        ota_push_result(a, 0, st.info_version, iv_upd_ret_name(rc), 0);
     }
 }
 
@@ -3587,6 +3801,62 @@ void iv_agent_ota_stats(const iv_agent_t *a, iv_updfetch_stats_t *out)
         return;
     }
     iv_updfetch_stats(&a->updf, out);
+}
+
+int iv_agent_ota_result_pending(const iv_agent_t *a)
+{
+    return (a == NULL) ? 0 : (int)a->ota_result;
+}
+
+/*
+ * 开机判定"上一次升级成没成"。**必须在 `app_init()` 成功之后调**（`main()` 里紧跟
+ * 就绪标记）：`pending.json` 的 state=pending 只说明"装上了、还没确认"，而
+ * "确认"的判据是装配真的跑通 —— 早于装配调用会把"起不来"报成成功。
+ */
+int iv_agent_ota_boot_result(iv_agent_t *a)
+{
+    iv_upd_cfg_t    uc;
+    iv_upd_status_t st;
+    char            ver[IV_AGENT_OTA_VER_MAX];
+    char            why[IV_AGENT_OTA_WHY_MAX];
+    int             ok = -1;
+
+    if (a == NULL)
+        return IV_EINVAL;
+
+    ver[0] = '\0';
+    why[0] = '\0';
+
+    /* ① monitor.sh 记下的"安装阶段失败"（验签不过/空间不足/ELF 不符）——
+     *    装盘是另一个进程干的，ivsboxd 自己看不见，只有这个文件能告诉它。 */
+    if (a->ota_result == 0u)
+        (void)ota_report_take(a);
+    if (a->ota_result != 0u)
+        return 1; /* 已经排上了（版本串为 "-"：安装失败时 pending.json 通常还没写） */
+
+    /* ② 没有安装期结论 ⇒ 看 pending.json 的终态（iv_upd 写的账本，这里只读） */
+    iv_upd_cfg_default(&uc);
+    uc.data_root = ota_root_of(a);
+    iv_upd_status(&uc, &st);
+    if (st.active != 0) {
+        iv_ota_ver_format(st.version, ver, sizeof ver);
+        ok = 1;
+        ota_set_str(why, sizeof why, "boot");
+    } else if (strcmp(st.state, "rolled-back") == 0) {
+        iv_ota_ver_format(st.version, ver, sizeof ver);
+        ok = 0;
+        ota_set_str(why, sizeof why,
+                    (st.last_reason[0] != '\0') ? st.last_reason : "rollback");
+    }
+    if (ok < 0)
+        return 0; /* 没升级过 / 早就确认过：不打扰平台 */
+
+    if (ver[0] == '\0')
+        ota_set_str(ver, sizeof ver, "-");
+    if (ota_reported_has(a, ver, ok))
+        return 0; /* 同一版本同一结论已经报过（`ota/reported` 是跨开机的账） */
+    ota_push_result(a, ok, ver, why, 1);
+    return 1;
 }
 
 uint64_t iv_agent_door_events(const iv_agent_t *a)

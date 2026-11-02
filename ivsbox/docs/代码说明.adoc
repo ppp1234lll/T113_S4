@@ -12117,3 +12117,122 @@ GET  <url>   [Range: bytes=a-b]  -> 206 分块 / 200 整包
   两种格式都能装，但"版本相同"的判据依赖 `info.txt` 的版本串与 `iv_version_sysver()` 同口径。
 * 下载期间不能取消（在飞只回 `0x77`）；包上限 64 MiB（`iv_updfetch_cfg_t.max_bytes`）。
 * `0xB3`/`0xD9` 在本文档旧的"未实现清单"表里仍标着未实现（历史记录只追加不改写，以本节为准）。
+
+== 2026-11-02 15:35 0xB3 按常规 Linux 重做（纯 HTTP 整包）＋ 升级结果帧
+
+=== 干了什么事
+
+**一、删掉 1026 帧那一整套下载路径**
+
+上一版照参考固件实现了"1026 B 一帧（1024 数据 ＋ 2 B CRC16 尾）、16 帧一窗 `Range`、
+首帧 CRC 不符退回流模式"。用户 2026-11-02 口径"不需要严格按照单片机，走常规 Linux"
+⇒ 全部删除，只留一条路：
+
+[source,text]
+----
+GET /<硬件名>/info.txt   -> 版本比对（相同即结束）
+GET <url>                -> 边收边写 .part，边计数判上限
+                          -> Content-Length 对账 -> fsync -> rename -> 写 ota/request
+----
+
+连带删掉 `HEAD`（上限不靠"提前知道长度"，靠边下边判）、`iv_crc` 依赖、`mode`/`frames`
+统计；句柄从 17 KiB 降到 5 KiB。
+
+|===
+|判据 |做法 |为什么
+
+|收工时机
+|读满 `Content-Length` 即停；无该头才靠 EOF
+|HTTP/1.1 默认 keep-alive，等对端关连接只会等到 `SO_RCVTIMEO`，把正常下载判成超时
+
+|超限
+|循环内累计字节 > `max_bytes` 立刻中止
+|把 UDISK 写满是最贵的失败（配置/日志一起废），不能"下完再判"
+
+|短包
+|`total != Content-Length` ⇒ `IV_EPROTO`
+|报 2500 给 1200 的服务器真存在；半个包装上去比失败更糟
+|===
+
+**二、加 0xB3 结果帧（升级成功/失败上平台）**
+
+两段式应答：**ACK 表示受理，结果帧表示成败**。
+
+[source,text]
+----
+平台 --0xB3--> 设备 : ACK 0x01（受理，立刻）
+平台 <--0xB3-- 设备 : 结果帧 1 B（0x01 成功 / 0x00 失败），稍后独立一发
+----
+
+结果的三个来源（这是本节的核心）：
+
+|===
+|时机 |来源 |代码
+
+|下载失败 / 版本相同
+|慢池任务结算
+|`on_updf_done()`：`SAME` ⇒ 0x01（已是最新）；其它 ⇒ 0x00
+
+|安装失败（验签/空间/ELF）
+|`monitor.sh` 写 `<data_root>/ota/report`
+|ivsboxd 每 5 s `ota_report_take()` —— **安装失败不重启**，开机读一次覆盖不到
+
+|升级成功 / 已回滚
+|`pending.json` 的 state
+|`iv_agent_ota_boot_result()`：`active` ⇒ 0x01；`rolled-back` ⇒ 0x00
+|===
+
+发送由 `iv_agent_ota_flush()` 负责，**两条驱动路径都挂**（`iv_agent_step()` 与
+`on_pb_timer()`）：板端走 Reactor，只挂一条等于没挂。链路未 `UP` 时留在队列里下拍再试；
+QN 用 0（设备主动发的结论帧，不是对某条请求的应答）。上报成功后写
+`<data_root>/ota/reported`（一行 `<版本> <ok|fail>`）去重，下次开机同结论不再重发。
+
+`main()` 里的顺序是有讲究的：`ready_mark_write()` **之后**才调
+`iv_agent_ota_boot_result()` —— 就绪标记之前的任何一步失败都意味着"新版本起不来"，
+那该报的是失败而不是成功。
+
+=== 解决什么问题
+
+* 上一版**没有把升级结果告诉平台**。结果只落 `[updfetch]` 日志与 `ota/events.log`，
+  平台点完升级只能靠 `0xE3` 查版本自己猜。用户明确要"升级完成后上报升级成功/失败"。
+* 上一版**把参考固件的私有分帧当成 HTTP 约定**。两套路径 ＝ 两倍降级逻辑 ＋ 两倍用例，
+  而现场只会看到"升级失败"。删掉之后代码少了一半，失败原因也更单一。
+* 顺带修掉一个会误判的真 bug：**按 EOF 收尾**在 keep-alive 服务器上必然超时
+  （单测 p01 第一版就是这么红的）。现在以 `Content-Length` 为准。
+
+=== 影响范围
+
+* `iv_updfetch_t` 从约 17 KiB 降到约 5 KiB（`buf[4096]` 取代 `win[16416]`）。
+* `iv_agent_t` 只加几十字节（结果码 ＋ 版本串 ＋ 原因串 ＋ 两个计数 ＋ 一个时刻）。
+* **新增配置键：没有**。只多两个落点文件：`<data_root>/ota/report`（monitor 写、
+  ivsboxd 读走即删）与 `<data_root>/ota/reported`（ivsboxd 写、不删，用于去重）。
+* `monitor.sh` 改一处：`install` 返回非 0 时写 `report`。**成功不写** —— 成功会
+  `--restart` 重启，结果由新版本自己报。
+* 运行期每 5 s 一次 `open()+read()`（几行的小文件）：安装失败不重启，没有这条通道
+  失败结论会永久丢。这是本轮唯一新增的周期 IO。
+* 未覆盖：真机到真实升级服务器；平台侧是否需要"下载进度"（参考实现也没有）。
+
+=== 验证方式与结果
+
+* `make test` **54** 全过（原 53 ＋ `test_agent_otares`）；`make asan` 干净；
+  `make arm` 零告警（md5 `28edb954b8f027e92564fe18f6f04f93`）。
+* `test_updfetch`（真 socket 假服务器）：p01 2500 B 逐字节相等 ＋ 只发 1 个 info ＋
+  1 个包请求（**无 HEAD/Range**）＋ 请求文件 `"<包> 1\n"`；p02 版本相同零包请求；
+  p03 短包不当成功且不留 `.part`；p04 超限 `IV_ERANGE` 且不留半截；p05 缺 url/https；
+  p06 404/不可达/空 host/close 后。
+* `test_agent_otares`（内存抓帧，`on_tx` 存字节）：安装失败 ⇒ 0x00、`report` 被消费、
+  `reported` = `- fail`；`pending` ⇒ 0x01；同版本第二次开机不重报；`rolled-back` ⇒ 0x00；
+  链路 DOWN 不发、UP 后补发。
+* 反向证伪 4 条全红后还原复绿：丢掉「头里残留 body」⇒ 12 条红；去掉 `Content-Length`
+  对账 ⇒ p03/p04 红；去掉去重 ⇒ s3 红；`st.active` 换成 `st.pending` ⇒ s4 红
+  （**回滚被当成功上报**，这条最该防）。
+* `platcmd_e2e.py` **168 PASS / 0 FAIL**：B1f 6 条（多一条"只发整包 GET"）、
+  B1h 4 条（造 `ota/report` ⇒ 平台 5 s 内收到 `0xB3 0x00`，文件被消费、`reported` 记账）。
+
+=== 遗留
+
+* **真机未验**：VM 无真实升级服务器。`47.104.98.214:8989` 上 T113 的 `info.txt` 与
+  包格式仍需发布侧确认 —— 现在不再猜 1026 帧，格式不符只会在 `ivsbox-updater install`
+  验签那一步失败，并如实上报 0x00。
+* `reported` 只保留最近一条结论：平台长时间掉线期间连做两次升级，中间那次会被覆盖。
+* 结果帧只有 1 字节（与参考实现一致），不带原因码。要带原因就得与平台侧先定格式。

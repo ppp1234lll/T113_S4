@@ -400,6 +400,16 @@ static int mkdir_for_channel(void)
 static int ctl_do_reboot(void *arg)
 {
     (void)arg;
+    /* 工装/集成测试用开关：`IVSBOX_NO_REBOOT=1` 时只落盘、不真的重启。
+     * 存在的理由很实在 —— 平台 0xD9 的验收动作**就是**重启，整机测试若真重启，
+     * 构建 VM 当场掉线、用例连结论都拿不到；而"不测这条命令"又等于把它退回
+     * 未实现。有了这个开关，e2e 才能验到"ACK 已发 ＋ 2 s 后确实走到了重启这一步"。
+     * 现场不会设这个变量，行为与原来完全一致。 */
+    if (getenv("IVSBOX_NO_REBOOT") != NULL && getenv("IVSBOX_NO_REBOOT")[0] != '\0') {
+        (void)sync();
+        IV_LOG_W(APP_MOD, "reboot suppressed by IVSBOX_NO_REBOOT (test/工装 only)");
+        return IV_OK;
+    }
     (void)sync();
     /* 正常停机前先停狗：否则 reboot 期间看门狗可能先咬、把复位做得更难看。
      * 这里不 disable 也能重启成功，但保留顺序与 app_shutdown 一致。 */
@@ -647,6 +657,14 @@ static int agent_sync_server_cfg(int force)
      * 定长缓冲，原地改写、指针一直有效）。 */
     g_agent.cfg.logup_host = cfg_str("net.server.log.host");
     g_agent.cfg.logup_port = (uint16_t)cfg_port("net.server.log.port");
+
+    /* 平台 0xB3「更新系统」的升级服务器（2026-11-02）：出厂就有值
+     * （`net.server.upgrade.host` = 47.104.98.214、端口 8989，与参考实现
+     * `sg_uploadparam_t`/`DEFALUT_OTA_*` 同源）。这里只刷**地址**：受理 0xB3 时
+     * 现取现用，配置一改下一条命令就跟着走。数据根（`ota_root`）只在
+     * `iv_agent_open()` 之前装配一次，因为 `iv_updfetch` 的落点 init 后不再变。 */
+    g_agent.cfg.ota_host = cfg_str("net.server.upgrade.host");
+    g_agent.cfg.ota_port = (uint16_t)cfg_port("net.server.upgrade.port");
 
     /* 2) 再比"解析出来到底连谁"。备份地址只在主地址没配时才顶上，所以
      *    "只改了当前没在用的备份"⇒ 解析结果不变 ⇒ 不重连。 */
@@ -3666,6 +3684,20 @@ static int agent_setup(void)
     ac.srv_port_bak[IV_WAN_WIRELESS] = cfg_port("net.server.wireless.port_bak");
     ac.srv_host_bak[IV_WAN_WIRED]    = cfg_str("net.server.wired.host_bak");
     ac.srv_port_bak[IV_WAN_WIRED]    = cfg_port("net.server.wired.port_bak");
+
+    /* 平台 0xB3「更新系统」（2026-11-02）：升级服务器与 OTA 数据根。
+     * **必须在 `iv_agent_open()` 之前给** —— `iv_updfetch` 的 data_root 只在 init
+     * 时拷进句柄；地址与版本串则由 `iv_agent_ota_update()` 每次受理时刷新，
+     * 所以那两项在 `agent_sync_server_cfg()` 里再刷一遍就够了（见 649 行附近）。
+     * 升级服务器**不吃平台地址回落**：它的端口与路径都与平台链路不同。
+     * `IVSBOX_OTA_ROOT` 只给工装/集成测试把落点挪到临时目录用。 */
+    ac.ota_host = cfg_str("net.server.upgrade.host");
+    ac.ota_port = (uint16_t)cfg_port("net.server.upgrade.port");
+    {
+        const char *env_root = getenv("IVSBOX_OTA_ROOT");
+
+        ac.ota_root = (env_root != NULL && env_root[0] != '\0') ? env_root : NULL;
+    }
 
     /* 定时上报间隔（配置单位秒 → 毫秒） */
     if (iv_config_get_int(g_cfg, "sys.report.interval_s", &v) == IV_OK && v > 0)

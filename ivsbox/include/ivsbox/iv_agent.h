@@ -101,6 +101,7 @@
 #include "ivsbox/iv_netmgr.h"
 #include "ivsbox/iv_probe.h"
 #include "ivsbox/iv_reactor.h"
+#include "ivsbox/iv_updfetch.h"
 #include "ivsbox/iv_recctl.h"
 #include "ivsbox/iv_store.h"
 #include "ivsbox/iv_storage.h"
@@ -472,6 +473,18 @@ typedef struct {
     const char *logup_host;
     uint16_t    logup_port;
     const char *logup_root;
+
+    /* ---- 平台触发升级（平台 0xB3「更新系统」，2026-11-02）----
+     * `ota_host`：升级服务器地址；**空串/NULL ⇒ 无法拉包**（与日志上报不同，
+     *   升级服务器不能用平台地址顶替 —— 端口与服务都不同）。
+     *   对应配置键 `net.server.upgrade.host`（出厂 47.104.98.214）。
+     * `ota_port`：0 ⇒ `IV_UPDFETCH` 默认 8989（`net.server.upgrade.port` 出厂值）。
+     * `ota_root`：OTA 数据根（`<root>/ota/…`）；NULL ⇒ `/mnt/UDISK/ivsbox`。
+     *   **不在这里给硬件名与版本串**：那是编译期事实（`IV_UPDFETCH_HW_DEFAULT`
+     *   ＋ `iv_version_sysver()`），装配层在受理时现取。 */
+    const char *ota_host;
+    uint16_t    ota_port;
+    const char *ota_root;
 } iv_agent_cfg_t;
 
 /* ---------------------------------------------------------------------------
@@ -632,6 +645,12 @@ typedef struct {
     uint8_t      logup_state;
     uint64_t     logup_runs;      /* 累计受理的 0xB2 次数 */
     uint64_t     logup_busy_acks; /* 累计因在飞而回 0x77 的次数 */
+
+    /* 平台触发升级（0xB3）：拉包在慢任务池 worker 里跑，装盘交给 monitor.sh */
+    iv_updfetch_t updf;
+    uint8_t       updf_state;      /* 1 = 一次拉包在飞（后续 0xB3 回 0x77） */
+    uint64_t      updf_runs;       /* 累计受理的 0xB3 次数 */
+    uint64_t      updf_busy_acks;  /* 累计因在飞而回 0x77 的次数 */
 
     uint64_t     now_ms;
     uint8_t      opened;
@@ -1164,6 +1183,30 @@ int iv_agent_logup_state(const iv_agent_t *a);
 
 /* 统计快照（累计次数、最近 rc/http、最近字节数）。参数非法时清零返回。 */
 void iv_agent_logup_stats(const iv_agent_t *a, iv_logup_stats_t *out);
+
+/* ---------------------------------------------------------------------------
+ * 平台 0xB3「更新系统」（2026-11-02）
+ *
+ * 协议依据＝参考实现 `General_Version/main/APP/Update/`：**设备自己去升级服务器
+ * 取包**（info.txt → 版本比对 → HEAD 取长 → 分块下载），不是平台把固件推下来。
+ * 这里同样只是**受理 + 丢给慢任务池**，细节见 `iv_updfetch.h`。
+ *
+ * **与参考实现的一处有意偏差**：参考实现在"下载完成/失败"时才回 0x01/0x00
+ * （成功那一次甚至是重启后由 Boot 参数补发的）。本工程改成**受理即回 0x01**，
+ * 理由与 0xB2 相同：一个几十 MB 的包在 4G 上要几分钟，平台等不到应答只会显示
+ * "指令超时"，现场无法判断到底受理没受理。结果落本机日志与 `events.log`，
+ * 平台后续可用 `0xE3` 查版本确认。
+ *
+ * 返回：IV_OK 受理（回 0x01）／IV_EBUSY 在飞（回 0x77）／IV_ESTATE 没池或
+ * 升级服务器地址未配（回 0x74）。`now_ms` 只用于日志时间线。
+ * ------------------------------------------------------------------------- */
+int iv_agent_ota_update(iv_agent_t *a, uint64_t now_ms);
+
+/* 拉包进度：0 空闲 / 1 在飞 */
+int iv_agent_ota_state(const iv_agent_t *a);
+
+/* 统计快照（累计次数、最近 rc/http、最近字节数/模式）。参数非法时清零返回。 */
+void iv_agent_ota_stats(const iv_agent_t *a, iv_updfetch_stats_t *out);
 
 /* ---------------------------------------------------------------------------
  * S2.5 GPS / NMEA

@@ -32,12 +32,16 @@
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 
 CTL = '/var/run/ivsbox/ctl'
 LOGROOT = '/mnt/UDISK/log'
@@ -48,6 +52,13 @@ HDR = struct.Struct('<IHHIIQII')
 PLAT_PORT = 16099
 DEFAULT_HOST = '47.104.250.225'
 DEFAULT_PORT = 6012
+
+# 0xB3「更新系统」用例的落点（临时目录，收尾删掉）：设备会往
+# `<root>/ota/download/` 下载、往 `<root>/ota/request` 写安装请求。
+OTA_ROOT = tempfile.mkdtemp(prefix='ivota_')
+# 包体 **2500 B**：刻意不是 1026 的整数倍 ⇒ 设备走"流模式"，
+# 用例不用在这里复刻 1026 帧 ＋ CRC16 的打包格式（帧模式由单测覆盖）。
+OTA_PKG = bytes(((i * 7 + 3) & 0xFF) for i in range(2500))
 
 fails = []
 rid = 0
@@ -386,9 +397,85 @@ def chk(cond, what):
         fails.append(what)
 
 
+# ---------------------------------------------------------------------------
+# 假升级服务器（0xB3 用例）：按参考实现的接口形状应答
+#     GET  /<硬件名>/info.txt -> {"version":"…","url":"http://<ip>:<port>/pkg/ivsbox.pkg"}
+#     HEAD /pkg/ivsbox.pkg    -> Content-Length（无 body）
+#     GET  /pkg/ivsbox.pkg    -> 200 整包；带 Range 时回 206 切片
+#
+# **必须监听出口网卡地址、不能用 127.0.0.1**：设备侧 `SO_BINDTODEVICE` 绑的是
+# 活动 WAN（VM 上是 ens33/enp0s3），绑了网卡就出不了回环 —— 这与平台链路踩的是
+# 同一个坑（见 0xB2 用例与修改记录里"别把 net.server.* 指到 127.0.0.1"）。
+# ---------------------------------------------------------------------------
+class _OtaHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    pkg = b''
+    info = b''
+
+    def log_message(self, *args):  # 静音，别把 e2e 输出刷满
+        pass
+
+    def _is_info(self):
+        return self.path.split('?')[0].endswith('/info.txt')
+
+    def do_HEAD(self):
+        body = self.info if self._is_info() else self.pkg
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+
+    def do_GET(self):
+        if self._is_info():
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(self.info)))
+            self.end_headers()
+            self.wfile.write(self.info)
+            return
+        rng = self.headers.get('Range') or ''
+        if rng.startswith('bytes='):
+            first, _, last = rng[6:].partition('-')
+            a = int(first)
+            b = int(last) if last else len(self.pkg) - 1
+            b = min(b, len(self.pkg) - 1)
+            chunk = self.pkg[a:b + 1]
+            self.send_response(206)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(len(chunk)))
+            self.send_header('Content-Range',
+                             'bytes %d-%d/%d' % (a, a + len(chunk) - 1, len(self.pkg)))
+            self.end_headers()
+            self.wfile.write(chunk)
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', str(len(self.pkg)))
+        self.end_headers()
+        self.wfile.write(self.pkg)
+
+
+class _OtaSrv(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def ota_start(ip):
+    """起一个假升级服务器，返回 (server, port)；info.txt 的 url 指回自己。"""
+    _OtaHandler.pkg = OTA_PKG
+    srv = _OtaSrv(('', 0), _OtaHandler)
+    port = srv.server_address[1]
+    # 版本串故意与本机不同（本机是 `<硬件名>-<sysver>`），否则设备会回"已是最新"
+    _OtaHandler.info = (
+        '{"version":"OTA-TEST-9.9.9","url":"http://%s:%d/pkg/ivsbox.pkg"}'
+        % (ip, port)).encode()
+    th = threading.Thread(target=srv.serve_forever, kwargs={'poll_interval': 0.2})
+    th.daemon = True
+    th.start()
+    return srv, port
+
+
 def main():
     global BASE
-
     if wait_ctl(0.1):
         print('FAIL: 已经有 ivsboxd 在跑，换个环境再测')
         return 1
@@ -400,8 +487,14 @@ def main():
     print('平台冒充地址 = %s:%d（本机 %s = %s/%d）' % (ip, PLAT_PORT, ifn, ip, plen))
 
     plat = Plat(PLAT_PORT)
+    # IVSBOX_NO_REBOOT：0xD9 的验收动作**就是**重启，真重启会把构建 VM/板子弄掉线、
+    # 用例连结论都拿不到；IVSBOX_OTA_ROOT：把 0xB3 的下载落点挪到临时目录，
+    # 别往 /mnt/UDISK/ivsbox 里塞东西（也不依赖那块盘存在）。
+    denv = dict(os.environ)
+    denv['IVSBOX_NO_REBOOT'] = '1'
+    denv['IVSBOX_OTA_ROOT'] = OTA_ROOT
     p = subprocess.Popen([BIN], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+                         start_new_session=True, env=denv)
     try:
         if not wait_ctl():
             print('FAIL: ivsboxd 没起来')
@@ -483,6 +576,54 @@ def main():
         time.sleep(0.5)
         chk(plat.online(), 'B1e-2 受理上传后平台链路仍在线（阻塞上传没占 Reactor）')
         apply_cls('net', {'net.server.log.host': '', 'net.server.log.port': 0})
+
+        print('B1f 0xB3 更新系统 ⇒ 立即回 0x01，随后自己去升级服务器拉包并写好安装请求')
+        ota, ota_port = ota_start(ip)
+        try:
+            r = apply_cls('net', {'net.server.upgrade.host': ip,
+                                  'net.server.upgrade.port': ota_port})
+            chk(r.get('ok') is True, 'B1f-0 升级服务器指向本机假服务')
+            plat.clear()
+            plat.send(build_downlink(0xB3))
+            f = plat.wait(0xB3, kind='bin', timeout=6.0)
+            chk(f is not None and f['code'] == 1, 'B1f-1 0xB3 回了 ACK 0x01')
+            req = os.path.join(OTA_ROOT, 'ota', 'request')
+            pkg = os.path.join(OTA_ROOT, 'ota', 'download', 'ivsbox.pkg')
+            t0 = time.time()
+            got_req = False
+            while time.time() - t0 < 20.0:
+                if os.path.exists(req) and os.path.exists(pkg):
+                    got_req = True
+                    break
+                time.sleep(0.2)
+            chk(got_req, 'B1f-2 包已落盘（ota/download/ivsbox.pkg）且安装请求已写')
+            if got_req:
+                with open(pkg, 'rb') as fh:
+                    blob = fh.read()
+                chk(blob == OTA_PKG, 'B1f-3 下载内容与服务器给的字节逐字相等')
+                with open(req, 'r') as fh:
+                    line = fh.read().strip()
+                chk(line == pkg + ' 1',
+                    'B1f-4 请求文件是「<包路径> 1」(restart=1)，交给 monitor.sh')
+            chk(plat.online(), 'B1f-5 拉包期间平台链路仍在线（阻塞下载没占 Reactor）')
+        finally:
+            ota.shutdown()
+            ota.server_close()
+            apply_cls('net', {
+                'net.server.upgrade.host': orig['net'].get('net.server.upgrade.host', ''),
+                'net.server.upgrade.port': orig['net'].get('net.server.upgrade.port', 0)})
+
+        print('B1g 0xD9 设备重启 ⇒ 先回 ACK 0x01，2 s 后走到重启（本用例用测试开关拦住）')
+        plat.clear()
+        plat.send(build_downlink(0xD9, b'\x00'))
+        a9 = plat.wait(0xD9, kind='bin', timeout=6.0)
+        chk(a9 is not None and a9['code'] == 1, 'B1g-1 0xD9 回了 ACK 0x01')
+        chk(wait_log('0xD9 reboot scheduled', 8.0) is not None,
+            'B1g-2 先发 ACK 再挂 2 s 定时器（不是当场 reboot）')
+        time.sleep(3.0)
+        chk(wait_ctl(0.2), 'B1g-3 定时器到点仍能调 ctl（重启被 IVSBOX_NO_REBOOT 拦住）')
+        chk(wait_log('reboot suppressed', 5.0) is not None,
+            'B1g-4 确实走到了 ctl_do_reboot（现场不设该变量时就是真重启）')
 
         print('B2 0xE1 查询参数 ⇒ 回 JSON，且 pn 的量纲必须与 0xFE 写下去的一致')
 
@@ -1265,6 +1406,7 @@ def main():
         if plat.err is not None:
             print(plat.err)
         plat.close()
+        shutil.rmtree(OTA_ROOT, ignore_errors=True)
         try:
             p.terminate()
             p.wait(timeout=8)

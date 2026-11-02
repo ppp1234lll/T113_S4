@@ -12018,3 +12018,102 @@ POST /fnwlw/oss/log/upload/finish?uploadId=
 
 * 现场首测要盯三样：`[logup] upload start/ok/failed` 日志、`/mnt/UDISK/ivsbox/logup.state` 的推进、服务端 `code:200`。
 * `0xB2` 在 `代码说明.adoc` 旧的"未实现清单"表里仍标着未实现（历史记录只追加不改写，本次以本节为准）。
+
+== 2026-11-02 14:31 平台 0xB3 更新系统（拉包 → 安装请求）＋ 0xD9 重启补端到端覆盖
+
+=== 干了什么事
+
+新增模块 `iv_updfetch`（`include/ivsbox/iv_updfetch.h` + `src/modules/updfetch/iv_updfetch.c`，
+libivmodules，仅依赖 libc 与同层的 `iv_crc`/`iv_upd`），让设备**自己去升级服务器取包**：
+
+[source,text]
+----
+GET  /<硬件名>/info.txt          -> {"version":"<硬件名>-<版本>","url":"http://…"}
+（版本串与本地 iv_version_sysver() 拼法相同则直接结束，一个包请求都不发）
+HEAD <url>                       -> Content-Length（超 max_bytes 即拒）
+GET  <url>   [Range: bytes=a-b]  -> 206 分块 / 200 整包
+----
+
+|===
+|环节 |落点 |关键实现
+
+|格式分派
+|`iv_updfetch_run()`
+|`Content-Length % 1026 == 0` ⇒ 帧模式；否则流模式。**判据只看长度**，不猜文件头
+
+|帧模式
+|`fetch_frames()`
+|16 帧一窗发一个 `Range`；每帧 1026 B ＝ 1024 数据 ＋ 2 B **大端 CRC16/MODBUS** 尾，逐帧 `iv_crc16_modbus()` 校验
+
+|两种降级
+|`UF_E_FALLBACK`
+|首帧 CRC 不符、或服务器无视 `Range` 回 200 ⇒ **退回流模式重下一次，只试一次**
+
+|落盘
+|`do_download()`
+|写 `ota/download/<名字>.part` → `fflush`＋`fsync`＋`fclose` → `rename()` 成正式名；失败 `unlink(.part)`
+
+|交棒
+|`iv_upd_request_write(cfg, final, 1, &why)`
+|只写 `<root>/ota/request` 一行；**不碰** `current`/`previous`/`pending.json`（`iv_upd` 单写者约定）
+
+|装配
+|`iv_agent.c: on_platform_update()/iv_agent_ota_update()`
+|0xB3 → 在飞回 `0x77`、无池/无地址回 `0x74`、受理回 `0x01`，本体进慢任务池（§4.2，`timeout_ms=900000`）
+|===
+
+`0xD9` 的行为**没改**（`on_plat_reboot()`：先 ACK、2 s 一次性定时器、无 Reactor 不动作），
+本轮只在 `ctl_do_reboot()` 入口加了 `IVSBOX_NO_REBOOT` 开关：非空即 `sync()` 后直接返回，
+让整机 e2e 能验到"ACK 到 → 定时器到 → 真的走到重启函数"而不真断电。同时补 e2e B1g。
+
+=== 解决什么问题
+
+* `0xB3` 此前完全没有 handler（命令字在 `iv_proto.h`），平台点「更新系统」只得到 `0x74`。
+  参考实现（`APP/Update/src/update_http.c`）给的是完整协议：设备拉包、按 1026 B 分帧、
+  逐帧验 CRC 后刷 Flash，重启后由 `update_status_detection()` 补发 `0xB3 0x01/0x00`。
+  本工程不需要照抄"刷 SPI Flash"这一段 —— 升级落点早已是 `iv_upd`（`request` 文件 ＋
+  `monitor.sh` 拉起 `ivsbox-updater`），缺的正是**把包从服务器取到 `ota/` 下**这一步。
+* `net.server.upgrade.host/port`（出厂 `47.104.98.214:8989`）**一直是死键**：`iv_config.c` 里
+  有默认值，全工程无消费方。本次接上，且**不回落平台地址** —— 升级服务器与业务平台不是同一台。
+* `0xD9` 是"做了但没验"：函数在、路由在，可它一调就真重启，整机测试根本覆盖不到。
+  加一个环境变量开关的成本远低于"现场发现 ACK 没出去"的代价。
+
+=== 影响范围
+
+* 新增约 17 KiB/实例（`iv_updfetch_t`，内嵌 `iv_agent_t`）：`hdr[1024] + win[16416]`。窗口按
+  16×1026 定，是因为 4G 下每帧一个 `Range` 等于每帧一次 RTT（45 ms），一兆的包要跑十几分钟。
+  板端 `g_agent` 是全局，加这点内存不影响既有用法。
+* 新增线程：**没有**。下载跑在已有慢任务池（2 worker）里，`900 s` 只是"健康检查不再等它"，
+  任务自己会收尾并清 `updf_state`（`on_updf_done()` 必须清，否则后续 `0xB3` 永远回 `0x77`）。
+* 配置：只消费已存在但无消费方的 `net.server.upgrade.host/port`，**没有新增配置键**，
+  `test_config` 的默认项计数不变。
+* **顺序约束（踩过一次）**：`ota_root` 必须在 `iv_agent_open()` **之前**装进 `ac`。首轮 e2e 红，
+  日志显示包落到了 `/mnt/UDISK/ivsbox/ota/download/` 而不是临时目录 —— `agent_sync_server_cfg()`
+  跑在 `iv_agent_open()` 之后，句柄里 `updf` 的 root 早已定型。现在 `agent_sync_server_cfg()`
+  只刷 host/port（这两项现取现用，改配置下一条命令就跟着走），root 由 `main()` 的 `ac` 装配段给
+  （`IVSBOX_OTA_ROOT` 可覆盖，工装/集成测试用）。
+* 未覆盖：真机到真实升级服务器（VM 无 `usb0`、无该服务）；`0xB3` 的"下载结果再报一帧"。
+
+=== 验证方式与结果
+
+* `make test` **53**（原 52 + `test_updfetch`），全过；`make asan` 干净；`make arm` 零告警
+  （`build/arm/ivsboxd` md5 `123c33774c190ad4ade54cd60900ba6c`）。
+* `test_updfetch`（真 socket 假升级服务器）：p01 帧模式 5 帧丢 CRC 尾后逐字节相等、`frames==5`、
+  只发一次 `Range`、请求文件 `"<包路径> 1\n"`；p02 版本相同 ⇒ `SAME` 且 `head_reqs` 不增；
+  p03 2500 B ⇒ 流模式；p04 服务器无视 `Range` 回 200 ⇒ 退流模式仍装完；p05 首帧 CRC 错 ⇒
+  退流模式仍装完；p06 超限 `IV_ERANGE` 且不留 `.part`、端口 1 ⇒ `IV_ECONN`、空 host/close 后 ⇒ `IV_EINVAL`。
+* 反向证伪：F1（`u->body_off = end` → `u->hdr_len`，丢掉头部残留 body）判红 **25 条**；
+  F2（首帧 CRC 错改回 `IV_EPROTO`，不退流模式）判红 **3 条**；还原后全绿。
+* `platcmd_e2e.py` 全部通过：B1f（`0xB3` → `ACK 0x01`、包落盘且**字节逐字相等**、请求文件
+  `"<包> 1"`、平台链路仍在线）、B1g（`0xD9 00` → `ACK 0x01` → `D9 reboot scheduled` →
+  3 s 后进程仍活 → `reboot suppressed`）。
+
+=== 遗留
+
+* **`0xB3` 与参考实现的有意偏差**：参考是"下载完成/失败后补发 `0x01`/`0x00`"，本工程**受理即
+  回 `0x01`**（`0x77` 在飞、`0x74` 拒绝）。平台是否需要"下载结果"再报一帧待确认 ——
+  真要补，`on_updf_done()` 里 `rc` 与 `stats` 都在，一个 `iv_proto_ack()` 即可。
+* **发布侧待确认**：`47.104.98.214:8989` 上是否有 T113 的 `info.txt`、包是否 1026 帧格式。
+  两种格式都能装，但"版本相同"的判据依赖 `info.txt` 的版本串与 `iv_version_sysver()` 同口径。
+* 下载期间不能取消（在飞只回 `0x77`）；包上限 64 MiB（`iv_updfetch_cfg_t.max_bytes`）。
+* `0xB3`/`0xD9` 在本文档旧的"未实现清单"表里仍标着未实现（历史记录只追加不改写，以本节为准）。

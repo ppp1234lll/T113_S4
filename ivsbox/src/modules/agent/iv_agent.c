@@ -66,6 +66,10 @@ static void on_upload_log(const iv_proto_frame_t *f, void *arg);
 static int  logup_task_fn(iv_task_ctx_t *ctx);
 static void on_logup_done(uint64_t id, int rc, const void *result,
                           size_t result_len, void *arg);
+static void on_platform_update(const iv_proto_frame_t *f, void *arg);
+static int  updf_task_fn(iv_task_ctx_t *ctx);
+static void on_updf_done(uint64_t id, int rc, const void *result,
+                         size_t result_len, void *arg);
 static void on_dev_found(const iv_dev_desc_t *d, void *arg);
 static int  snmp_task_fn(iv_task_ctx_t *ctx);
 static void on_snmp_done(uint64_t id, int rc, const void *result,
@@ -708,6 +712,23 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
         (void)iv_logup_init(&a->logup, &lc);
     }
     (void)iv_proto_route(&a->rp.pf, IV_PROTO_CMD_UPLOAD_LOG, on_upload_log, a);
+
+    /* 0xB3「更新系统」（2026-11-02）：设备自己去升级服务器取包（参考
+     * `General_Version/main/APP/Update/`），拉完只**写一行安装请求**，
+     * 真正装盘由 `scripts/monitor.sh` 拉起 `ivsbox-updater` 完成 ——
+     * 装盘要停/换正在运行的程序，不该在 reactor 里阻塞（与 S7.2 接线同口径）。
+     * 硬件名与版本串都是编译期事实，受理时现取（见 `iv_agent_ota_update()`）。 */
+    {
+        iv_updfetch_cfg_t uc;
+
+        iv_updfetch_cfg_default(&uc);
+        uc.host      = a->cfg.ota_host;
+        uc.port      = a->cfg.ota_port;
+        uc.data_root = a->cfg.ota_root;
+        uc.ver_str   = iv_version_sysver();
+        (void)iv_updfetch_init(&a->updf, &uc);
+    }
+    (void)iv_proto_route(&a->rp.pf, IV_PROTO_CMD_UPDATE, on_platform_update, a);
 
     /* ---- 5. 摄像机网络状态探测（S4.1）＋ 自愈（S4.4）＋ 0xA5 路由 ----
      * **这三项都不依赖 Reactor**：camdet 是相位机、recovery 是纯逻辑，两者都只由
@@ -3418,6 +3439,154 @@ void iv_agent_logup_stats(const iv_agent_t *a, iv_logup_stats_t *out)
         return;
     }
     iv_logup_stats(&a->logup, out);
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台 0xB3「更新系统」：受理 → 慢任务池拉包 → 写安装请求（契约见
+ * `iv_agent.h` 与 `iv_updfetch.h`）
+ *
+ * 为什么**受理就回 0x01**（而参考实现是下载完才回 0x01/0x00）：
+ * 参考固件那个包只有几百 KB、几秒就下完，等结果没问题；本工程的包是几十 MB，
+ * 4G 上几分钟起步，平台那条指令早就超时了 —— 现场只会看到"点了没反应"。
+ * 结果一律落本机日志（`[updfetch]` 行）与 `ota/events.log`，平台用 0xE3 查版本
+ * 就能确认最终有没有装上。
+ * ------------------------------------------------------------------------- */
+
+/* worker 线程：同步跑完一次拉包。只写 `a->updf` 自身状态，不碰 Reactor。 */
+static int updf_task_fn(iv_task_ctx_t *ctx)
+{
+    iv_agent_t *a = (ctx != NULL) ? (iv_agent_t *)ctx->arg : NULL;
+
+    if (a == NULL)
+        return IV_EINVAL;
+    return iv_updfetch_run(&a->updf);
+}
+
+/* Reactor 线程：任务结算。**必须清 updf_state**，否则后续 0xB3 永远回 0x77。 */
+static void on_updf_done(uint64_t id, int rc, const void *result,
+                         size_t result_len, void *arg)
+{
+    iv_agent_t         *a = (iv_agent_t *)arg;
+    iv_updfetch_stats_t st;
+
+    (void)result;
+    (void)result_len;
+    if (a == NULL)
+        return;
+    a->updf_state = 0;
+    iv_updfetch_stats(&a->updf, &st);
+
+    if (rc == IV_OK) {
+        IV_LOG_I(AG_MOD, "ota #%llu fetched: %u B (%s), version=%s, request queued",
+                 (unsigned long long)id, (unsigned)st.last_bytes,
+                 (st.mode == IV_UPDFETCH_MODE_FRAME) ? "frame" : "stream",
+                 st.info_version);
+    } else if (rc == IV_UPDFETCH_SAME) {
+        IV_LOG_I(AG_MOD, "ota #%llu: already latest (%s)", (unsigned long long)id,
+                 st.info_version);
+    } else {
+        IV_LOG_W(AG_MOD, "ota #%llu failed: rc=%d http=%d", (unsigned long long)id,
+                 rc, st.last_http);
+    }
+}
+
+static void on_platform_update(const iv_proto_frame_t *f, void *arg)
+{
+    iv_agent_t *a = (iv_agent_t *)arg;
+    uint8_t     ack;
+    int         rc;
+
+    if (f == NULL || a == NULL)
+        return;
+    /* 载荷：参考实现 `com_deal_update_system_function()` 不看 buff（平台发不发、
+     * 发什么都不影响"去取包"这个动作），这里也不因为长度异常而拒执行。 */
+    if (f->len != 0u)
+        IV_LOG_I(AG_MOD, "0xB3 payload len=%u (ignored)", (unsigned)f->len);
+
+    rc = iv_agent_ota_update(a, a->now_ms);
+    if (rc == IV_OK)
+        ack = IV_PROTO_ACK_OK;
+    else if (rc == IV_EBUSY)
+        ack = IV_PROTO_ERR_BUSY; /* 0x77：上一次拉包还在跑 */
+    else
+        ack = IV_PROTO_ERR_EXEC; /* 0x74：没池 / 升级服务器地址未配 / 提交失败 */
+    (void)iv_proto_ack(&a->rp.pf, f->cmd, ack);
+    IV_LOG_I(AG_MOD, "platform 0xB3 update -> rc=%d, ack=0x%02x", rc, (unsigned)ack);
+}
+
+int iv_agent_ota_update(iv_agent_t *a, uint64_t now_ms)
+{
+    iv_task_req_t req;
+    uint64_t      id = 0u;
+    const char   *host;
+    const char   *wan;
+    int           rc;
+
+    if (a == NULL || a->opened == 0u)
+        return IV_ESTATE;
+    if (a->updf_state != 0u) {
+        a->updf_busy_acks++;
+        return IV_EBUSY;
+    }
+    if (a->cfg.pool == NULL)
+        return IV_ESTATE; /* 没有慢池：几十 MB 的下载绝不上 Reactor 线程（§4.2） */
+
+    /* 升级服务器地址**只认配置**（`net.server.upgrade.host`，出厂 47.104.98.214）：
+     * 与日志上报不同，这里不能拿平台地址顶替 —— 服务与端口都不是同一个。 */
+    host = (a->cfg.ota_host != NULL) ? a->cfg.ota_host : "";
+    if (host[0] == '\0') {
+        IV_LOG_W(AG_MOD, "ota: no upgrade server (net.server.upgrade.host is empty)");
+        return IV_ESTATE;
+    }
+    wan = iv_agent_active_wan_name(a); /* 出口跟着 netmgr 走，双 WAN 的坑同传输层 */
+    rc  = iv_updfetch_set_target(&a->updf, host, a->cfg.ota_port, wan,
+                                 iv_version_sysver());
+    if (rc != IV_OK) {
+        IV_LOG_W(AG_MOD, "ota: set_target(%s, %u, %s) failed: %d", host,
+                 (unsigned)a->cfg.ota_port, (wan != NULL) ? wan : "-", rc);
+        return rc;
+    }
+
+    memset(&req, 0, sizeof req);
+    req.name        = "otafetch";
+    req.fn          = updf_task_fn;
+    req.arg         = a;
+    /* 几十 MB / 1 KiB 片、4G 上一个 16 KiB 窗口可能要几秒 ⇒ 给足 15 分钟。
+     * 超时只是"健康检查不再等它"，任务自己会收尾并清 updf_state。 */
+    req.timeout_ms  = 900000u;
+    req.on_done     = on_updf_done;
+    req.on_done_arg = a;
+
+    rc = iv_taskpool_submit(a->cfg.pool, &req, &id);
+    if (rc != IV_OK) {
+        IV_LOG_W(AG_MOD, "ota submit failed: %d", rc);
+        return rc;
+    }
+    a->updf_state = 1u;
+    a->updf_runs++;
+    a->now_ms = now_ms;
+    IV_LOG_I(AG_MOD, "ota accepted: -> %s:%u via %s (id=%llu, runs=%llu, ver=%s)",
+             host, (unsigned)a->updf.port,
+             (wan != NULL && wan[0] != '\0') ? wan : "(route)",
+             (unsigned long long)id, (unsigned long long)a->updf_runs,
+             iv_version_sysver());
+    return IV_OK;
+}
+
+int iv_agent_ota_state(const iv_agent_t *a)
+{
+    return (a == NULL) ? 0 : (int)a->updf_state;
+}
+
+void iv_agent_ota_stats(const iv_agent_t *a, iv_updfetch_stats_t *out)
+{
+    if (out == NULL)
+        return;
+    if (a == NULL) {
+        memset(out, 0, sizeof *out);
+        return;
+    }
+    iv_updfetch_stats(&a->updf, out);
 }
 
 uint64_t iv_agent_door_events(const iv_agent_t *a)

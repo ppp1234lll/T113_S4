@@ -62,6 +62,10 @@ static int  agent_send_power(const void *data, uint16_t len, void *arg);
 static void on_camdet_change(int ch, iv_camdet_status_t old_st,
                              iv_camdet_status_t new_st, void *arg);
 static void on_door_open(int ds, void *arg);
+static void on_upload_log(const iv_proto_frame_t *f, void *arg);
+static int  logup_task_fn(iv_task_ctx_t *ctx);
+static void on_logup_done(uint64_t id, int rc, const void *result,
+                          size_t result_len, void *arg);
 static void on_dev_found(const iv_dev_desc_t *d, void *arg);
 static int  snmp_task_fn(iv_task_ctx_t *ctx);
 static void on_snmp_done(uint64_t id, int rc, const void *result,
@@ -686,6 +690,24 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     /* 0xE8「查询 PING 信息」（2026-10-29 补）：此前这条**根本没注册** ⇒ 平台点
      * 「查询PING」落默认分支回 0x74，测试计划的 N-06 一直是"未实现"。 */
     (void)iv_proto_route(&a->rp.pf, IV_PROTO_CMD_QUERY_PING, on_query_ping, a);
+
+    /* 0xB2「日志上报」（2026-11-02）：三步 HTTP 分片上传（参考实现
+     * `General_Version/main/APP/Upload/`），本体跑在慢任务池。
+     * 句柄只在这里初始化；**地址与出口网卡每次受理时按"这一刻"刷新**
+     * （配置可能还没读到、netmgr 也可能刚切过出口），见 `iv_agent_log_upload()`。 */
+    {
+        iv_logup_cfg_t lc;
+        char           sn[16];
+
+        iv_logup_cfg_default(&lc);
+        (void)snprintf(sn, sizeof sn, "%lX", (unsigned long)a->cfg.devid);
+        lc.root      = a->cfg.logup_root;
+        lc.host      = a->cfg.logup_host;
+        lc.port      = a->cfg.logup_port;
+        lc.device_sn = sn;
+        (void)iv_logup_init(&a->logup, &lc);
+    }
+    (void)iv_proto_route(&a->rp.pf, IV_PROTO_CMD_UPLOAD_LOG, on_upload_log, a);
 
     /* ---- 5. 摄像机网络状态探测（S4.1）＋ 自愈（S4.4）＋ 0xA5 路由 ----
      * **这三项都不依赖 Reactor**：camdet 是相位机、recovery 是纯逻辑，两者都只由
@@ -2472,6 +2494,12 @@ static void on_pb_timer(void *arg)
     if (iv_device_is_open(&a->dev))
         (void)iv_device_tick(&a->dev, now);
     ipc_reply_tick(a, now); /* 0xE4 延迟清单：Reactor 下 step() 不被调用 */
+    /* 0xE8 的即席探测收尾（2026-11-02 补漏）：这条**原先只挂在 `iv_agent_step()`
+     * 里**，而板端/daemon 走的是 Reactor 模式（`r != NULL`），`step()` 根本不会被
+     * 调用 ⇒ 平台点「查询 PING」只收到 ACK、永远等不到 st/dt 那一帧。
+     * 症状与"功能没做"完全一样（现场 2026-11-02 报的就是这个），而代码读起来
+     * 每一步都对 —— 两条驱动路径必须同装同驱，别再只加一条。 */
+    ping_reply_tick(a, now);
     env_feed(a, now);
     (void)iv_recovery_tick(&a->rec, now);
     thresh_drive(a, now); /* 阈值下发重试（0xF1）：Reactor 下 step() 不被调用 */
@@ -3242,6 +3270,154 @@ int iv_agent_record_forced(const iv_agent_t *a)
 int iv_agent_record_held_off(const iv_agent_t *a)
 {
     return (a != NULL) ? iv_recctl_held_off(&a->recm) : 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * 平台 0xB2「日志上报」（2026-11-02）
+ *
+ * 参考实现把上传做成"三接口 HTTP 分片"（`APP/Upload/src/upload_http.c`）：
+ * start 拿 uploadId → chunk 逐片传 → finish 收尾。本层只做**受理与调度**，
+ * 上传本体在 `iv_logup`（慢任务池 worker 里跑）。平台侧只期待 1 字节 ACK，
+ * 没有第二条确认报文，所以结果只落本机日志与统计。
+ * ------------------------------------------------------------------------- */
+
+/* worker 线程：同步跑完一次上传。只写 `a->logup` 自身状态（与 iv_media 的
+ * worker 同性质），不碰 agent 的其它字段、不碰 Reactor。 */
+static int logup_task_fn(iv_task_ctx_t *ctx)
+{
+    iv_agent_t *a = (ctx != NULL) ? (iv_agent_t *)ctx->arg : NULL;
+
+    if (a == NULL)
+        return IV_EINVAL;
+    return iv_logup_run(&a->logup);
+}
+
+/* Reactor 线程：任务结算。**必须清 logup_state**，否则后续 0xB2 永远回 0x77。 */
+static void on_logup_done(uint64_t id, int rc, const void *result,
+                          size_t result_len, void *arg)
+{
+    iv_agent_t      *a = (iv_agent_t *)arg;
+    iv_logup_stats_t st;
+
+    (void)result;
+    (void)result_len;
+    if (a == NULL)
+        return;
+    a->logup_state = 0;
+    iv_logup_stats(&a->logup, &st);
+
+    if (rc == IV_OK) {
+        IV_LOG_I(AG_MOD, "log upload #%llu ok: %u B, chunks total %llu, http=%d",
+                 (unsigned long long)id, (unsigned)st.last_bytes,
+                 (unsigned long long)st.chunks, st.last_http);
+    } else if (rc == IV_ENOENT) {
+        /* 没有新日志不是故障：游标已在最新位置，平台再点一次也不会多发 */
+        IV_LOG_I(AG_MOD, "log upload #%llu: nothing new since last run",
+                 (unsigned long long)id);
+    } else {
+        IV_LOG_W(AG_MOD, "log upload #%llu failed: rc=%d http=%d",
+                 (unsigned long long)id, rc, st.last_http);
+    }
+}
+
+static void on_upload_log(const iv_proto_frame_t *f, void *arg)
+{
+    iv_agent_t *a = (iv_agent_t *)arg;
+    uint8_t     ack;
+    int         rc;
+
+    if (f == NULL || a == NULL)
+        return;
+    rc = iv_agent_log_upload(a, a->now_ms);
+    if (rc == IV_OK) {
+        ack = IV_PROTO_ACK_OK;
+    } else if (rc == IV_EBUSY) {
+        ack = IV_PROTO_ERR_BUSY; /* 0x77：上一条（本设备上一次）上传还在跑 */
+    } else {
+        ack = IV_PROTO_ERR_EXEC; /* 0x74：没池 / 没地址 / 提交失败 */
+    }
+    (void)iv_proto_ack(&a->rp.pf, f->cmd, ack);
+    IV_LOG_I(AG_MOD, "platform 0xB2 log upload -> rc=%d, ack=0x%02x", rc,
+             (unsigned)ack);
+}
+
+int iv_agent_log_upload(iv_agent_t *a, uint64_t now_ms)
+{
+    iv_task_req_t req;
+    uint64_t      id       = 0u;
+    uint16_t      srv_port = 0u;
+    const char   *host;
+    const char   *wan;
+    int           rc;
+
+    if (a == NULL || a->opened == 0u)
+        return IV_ESTATE;
+    if (a->logup_state != 0u) {
+        a->logup_busy_acks++;
+        return IV_EBUSY;
+    }
+    if (a->cfg.pool == NULL)
+        return IV_ESTATE; /* 没有慢池：阻塞上传绝不上 Reactor 线程（§4.2） */
+
+    /* 目标地址：`net.server.log.host` 优先；没有就**用平台服务器地址**
+     * （用户口径「地址是一样的」）。出口取"这一刻"的活动 WAN —— netmgr 刚切过
+     * 出口时，下一次上传必须跟着走，否则日志从已经不通的链路发（4G/有线双 WAN
+     * 的坑与传输层同一个）。 */
+    wan  = iv_agent_active_wan_name(a);
+    host = (a->cfg.logup_host != NULL && a->cfg.logup_host[0] != '\0')
+               ? a->cfg.logup_host
+               : iv_agent_pick_host(&a->cfg, (int)iv_agent_active_wan(a), &srv_port);
+    if (host == NULL || host[0] == '\0') {
+        IV_LOG_W(AG_MOD, "log upload: no server address (net.server.log.host / "
+                         "net.server.* all empty)");
+        return IV_ESTATE;
+    }
+    rc = iv_logup_set_target(&a->logup, host, a->cfg.logup_port, wan);
+    if (rc != IV_OK) {
+        IV_LOG_W(AG_MOD, "log upload: set_target(%s, %u, %s) failed: %d", host,
+                 (unsigned)a->cfg.logup_port, wan != NULL ? wan : "-", rc);
+        return rc;
+    }
+
+    memset(&req, 0, sizeof req);
+    req.name        = "logup";
+    req.fn          = logup_task_fn;
+    req.arg         = a;
+    /* 单次上限 1 MiB / 1 KiB = 1024 片；4G 每片一个 RTT（约 45 ms）＋服务端处理，
+     * 给足 5 分钟。超时只是"健康检查不再等它"，任务自己会收尾。 */
+    req.timeout_ms  = 300000u;
+    req.on_done     = on_logup_done;
+    req.on_done_arg = a;
+
+    rc = iv_taskpool_submit(a->cfg.pool, &req, &id);
+    if (rc != IV_OK) {
+        IV_LOG_W(AG_MOD, "log upload submit failed: %d", rc);
+        return rc;
+    }
+    a->logup_state = 1u;
+    a->logup_runs++;
+    a->now_ms = now_ms;
+    IV_LOG_I(AG_MOD, "log upload accepted: -> %s:%u via %s (id=%llu, runs=%llu)",
+             host, (unsigned)a->logup.port,
+             (wan != NULL && wan[0] != '\0') ? wan : "(route)",
+             (unsigned long long)id, (unsigned long long)a->logup_runs);
+    return IV_OK;
+}
+
+int iv_agent_logup_state(const iv_agent_t *a)
+{
+    return (a == NULL) ? 0 : (int)a->logup_state;
+}
+
+void iv_agent_logup_stats(const iv_agent_t *a, iv_logup_stats_t *out)
+{
+    if (out == NULL)
+        return;
+    if (a == NULL) {
+        memset(out, 0, sizeof *out);
+        return;
+    }
+    iv_logup_stats(&a->logup, out);
 }
 
 uint64_t iv_agent_door_events(const iv_agent_t *a)

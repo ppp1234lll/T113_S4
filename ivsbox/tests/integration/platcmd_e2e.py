@@ -447,7 +447,46 @@ def main():
             chk(b'2874540201432778632' in d,
                 'B1c qn 原样回显请求里的 QN（qn1qn2 十进制拼接）')
 
+        print('B1d 0xE8 远程 PING ⇒ 先 ACK 0x01，再补一帧 JSON（st1..st4/dt1..dt4）')
+        # 目标取 127.0.0.1：回环一定回包，用例不依赖现场网络，也不会被"目标不通"
+        # 干扰 —— 这条验的是**链路与应答形状**，不是网络质量。
+        plat.clear()
+        plat.send(build_downlink(0xE8, socket.inet_aton('127.0.0.1')))
+        a = plat.wait(0xE8, kind='bin', timeout=6.0)
+        chk(a is not None and a['code'] == 1, 'B1d-1 0xE8 回了 ACK 0x01')
+        j8 = plat.wait(0xE8, kind='json', timeout=15.0)
+        chk(j8 is not None, 'B1d-2 0xE8 在探测跑完后补了一帧 JSON')
+        if j8 is not None:
+            try:
+                body = json.loads(j8['data'].decode('utf-8', 'replace'))
+            except Exception:
+                body = {}
+            d8 = body.get('data') if isinstance(body, dict) else None
+            d8 = d8 if isinstance(d8, dict) else {}
+            keys = ('st1', 'dt1', 'st2', 'dt2', 'st3', 'dt3', 'st4', 'dt4')
+            chk(all(k in d8 for k in keys), 'B1d-3 st1..dt4 八个字段齐全')
+            # 平台按整数取；本工程发的是字符串（与 0xE1 同口径），两种都接受，
+            # 但**只接受 0/1**：st 出别的值说明探测结果没归一。
+            chk(str(d8.get('st1')) in ('0', '1'), 'B1d-4 st 取值是 0/1')
+            chk(body.get('code') == 0, 'B1d-5 顶层 code == 0')
+
+        print('B1e 0xB2 日志上报 ⇒ 立即回 0x01，上传在慢任务池里跑')
+        # 先把日志服务指到回环：本用例**不允许**把本机日志真的传到外网。
+        # 回环 18080 没有服务 ⇒ 上传必然失败，但 ACK 必须在受理那一刻就发出去
+        # （参考实现同样是先回 0x01 再传）。收尾在下方还原成空/0。
+        apply_cls('net', {'net.server.log.host': '127.0.0.1',
+                          'net.server.log.port': 18080})
+        plat.clear()
+        plat.send(build_downlink(0xB2))
+        f = plat.wait(0xB2, kind='bin', timeout=6.0)
+        chk(f is not None and f['code'] == 1, 'B1e-1 0xB2 回了 ACK 0x01')
+        time.sleep(0.5)
+        chk(plat.online(), 'B1e-2 受理上传后平台链路仍在线（阻塞上传没占 Reactor）')
+        apply_cls('net', {'net.server.log.host': '', 'net.server.log.port': 0})
+
         print('B2 0xE1 查询参数 ⇒ 回 JSON，且 pn 的量纲必须与 0xFE 写下去的一致')
+
+
         plat.clear()
         plat.send(build_downlink(0xE1))
         f = plat.wait(0xE1, kind='json')

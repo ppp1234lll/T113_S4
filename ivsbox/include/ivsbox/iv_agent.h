@@ -95,6 +95,7 @@
 #include "ivsbox/iv_device.h"
 #include "ivsbox/iv_fault.h"
 #include "ivsbox/iv_gps.h"
+#include "ivsbox/iv_logup.h"
 #include "ivsbox/iv_media.h"
 #include "ivsbox/iv_netlink.h"
 #include "ivsbox/iv_netmgr.h"
@@ -458,6 +459,19 @@ typedef struct {
     /* 自动重拨：`cell_dial_cmd` 为空串 = 关闭；NULL = 用 `IV_AGENT_CELL_DIAL_DEFAULT`。
      * 参数按出场脚本的固定形态给（vid pid 网卡名），不开放成配置细节。 */
     const char *cell_dial_cmd;
+
+    /* ---- 日志上报（平台 0xB2，2026-11-02）----
+     * `logup_host`：日志服务地址；**空串/NULL ⇒ 用活动出口的平台地址**
+     *   （用户口径「地址是一样的」：日志服务与平台同一个 IP）。
+     *   对应配置键 `net.server.log.host`（出厂空串）。
+     * `logup_port`：0 ⇒ `IV_LOGUP_PORT_DEFAULT`（18080，参考实现的端口）；
+     *   对应配置键 `net.server.log.port`（出厂 0）。
+     * `logup_root`：日志根；NULL ⇒ `/mnt/UDISK/log`（与 iv_log 同源）。
+     * 出口网卡不在这里：运行时按 `iv_agent_active_wan_name()` 取，出口一切换
+     * 下一次上传就跟着走（4G/有线的坑见 iv_logup.h 的 bind_dev 说明）。 */
+    const char *logup_host;
+    uint16_t    logup_port;
+    const char *logup_root;
 } iv_agent_cfg_t;
 
 /* ---------------------------------------------------------------------------
@@ -608,6 +622,16 @@ typedef struct {
     uint32_t     th_drops;     /* 累计被更新的阈值覆盖掉的待发项次数（诊断） */
     uint16_t     th_tries;     /* 当前待发项已重试次数（日志降噪用） */
     uint64_t     th_next_ms;   /* 下次允许重试的时刻；0 = 立即 */
+
+    /* ---- 日志上报（平台 0xB2，2026-11-02）----
+     * 上传本体在 `iv_logup`（worker 线程里跑：DNS/connect/read 都是阻塞的，
+     * 架构 §4.2 禁止留在 Reactor 线程）。这里只存"在飞"标志与受理计数。
+     * `logup_state`：0 空闲 / 1 在飞。**同一时刻只允许一个上传**：两路并发会让
+     * 服务端收到两个同名 `device.txt` 会话，而游标只有一份，谁后写谁覆盖。 */
+    iv_logup_t   logup;
+    uint8_t      logup_state;
+    uint64_t     logup_runs;      /* 累计受理的 0xB2 次数 */
+    uint64_t     logup_busy_acks; /* 累计因在飞而回 0x77 的次数 */
 
     uint64_t     now_ms;
     uint8_t      opened;
@@ -1121,6 +1145,25 @@ int iv_agent_snmp_get(const iv_agent_t *a, int which, int i,
  * ------------------------------------------------------------------------- */
 int iv_agent_build_snmp_json(const iv_agent_t *a, int which, const char *qn,
                              char *out, size_t cap);
+
+/* ---------------------------------------------------------------------------
+ * 平台 0xB2「日志上报」（2026-11-02）
+ *
+ * 协议依据＝参考实现 `General_Version/main/APP/Upload/`（三步 HTTP 分片上传），
+ * 接口路径与端口见 `iv_logup.h`。这里只是**受理 + 丢给慢任务池**：
+ *   - 已在传 ⇒ 返回 IV_EBUSY，调用方回 `0x77`（上一条指令执行中）；
+ *   - 没有任务池 / 日志上报未配置 ⇒ IV_ESTATE（回 `0x74`）；
+ *   - 受理成功 ⇒ 返回 IV_OK（调用方回 `0x01`），结果在完成回调里打日志，
+ *     平台侧没有第二条确认报文（参考实现同样只回 0x01）。
+ * `now_ms` 只用于日志时间线，不参与判定。
+ * ------------------------------------------------------------------------- */
+int iv_agent_log_upload(iv_agent_t *a, uint64_t now_ms);
+
+/* 上传进度：0 空闲 / 1 在飞（给 Web 与诊断用） */
+int iv_agent_logup_state(const iv_agent_t *a);
+
+/* 统计快照（累计次数、最近 rc/http、最近字节数）。参数非法时清零返回。 */
+void iv_agent_logup_stats(const iv_agent_t *a, iv_logup_stats_t *out);
 
 /* ---------------------------------------------------------------------------
  * S2.5 GPS / NMEA

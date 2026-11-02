@@ -11949,3 +11949,72 @@ snmp_val_list(a, which, "poeStatus", poe, sizeof poe, IV_AGENT_SNMP_ROWS_MAX);
 
 
 
+
+== 2026-11-02 14:02 平台 0xB2 日志上报（三步 HTTP 分片）＋ 修 0xE8 在 Reactor 路径不回结果
+
+=== 干了什么事
+
+新增模块 `iv_logup`（`include/ivsbox/iv_logup.h` + `src/modules/logup/iv_logup.c`，libivmodules，仅依赖 libc），
+把本机日志按参考固件 `General_Version/main/APP/Upload/` 的接口传到日志服务：
+
+[source,text]
+----
+POST /fnwlw/oss/log/upload/start?deviceSn=&totalSize=&totalChunks=&fileName=&logType=
+POST /fnwlw/oss/log/upload/chunk     multipart: uploadId / chunkIndex / file   (1 KiB/片)
+POST /fnwlw/oss/log/upload/finish?uploadId=
+----
+
+|===
+|环节 |落点 |关键实现
+
+|日志源
+|`scan_dates()` / `span_walk()`
+|扫 `<root>/YYYY-MM-DD/HH.log`（严格名字白名单，防目录穿越），按 (日期, 小时) 升序
+
+|不重不漏
+|游标文件 `<date> <hour> <offset>`
+|`cursor_load()/cursor_save()`；**三步全过才写新游标**，失败原样保留 ⇒ 下次重传同一段
+
+|HTTP
+|`conn_open()/read_resp()/post_chunk()`
+|`getaddrinfo` ＋ 非阻塞 connect 超时 ＋ `SO_BINDTODEVICE`（活动出口）＋ keep-alive；应答按 `Content-Length`/chunked 读满再发下一请求
+
+|装配
+|`iv_agent.c: on_upload_log()/iv_agent_log_upload()`
+|0xB2 → 在飞回 `0x77`、无池/无地址回 `0x74`、受理回 `0x01`，本体进慢任务池（§4.2）
+|===
+
+同时修 0xE8：`on_pb_timer()`（Reactor 模式的 200 ms 节拍）**原先没有** `ping_reply_tick()`，
+只有 `iv_agent_step()` 里有 ⇒ 板端收到的 0xE8 只回 ACK，st/dt 那一帧永远不发。
+
+=== 解决什么问题
+
+* `0xB2` 此前完全没实现（命令字在 `iv_proto.h`，无任何 handler）：平台点「日志上报」只得到 `0x74`。
+* `0xE8` 的应答拼装在 2026-10-29 已完成并有单测，但**生产路径漏了收尾节拍**。这不是"没做"，
+  而是"做了不生效"——比没做更难查：代码每步都对，现场只看到"点了查询 PING 没反应"。
+  2026-11-02 新增的 e2e 用例 B1d 在修复前实测红（ACK 收到、JSON 15 s 没来），修复后转绿。
+
+=== 影响范围
+
+* 新增 5 KiB/实例（`iv_logup_t`，内嵌 `iv_agent_t`）：`resp[2048] + body[1600] + chunk[1024] + hdr[512]`。
+  板端 `g_agent` 是全局，加这点内存不影响既有用法。
+* 新增线程：**没有**。上传跑在已有慢任务池（2 worker）里；池被 SNMP 占满时 `submit` 回 `IV_EBUSY` ⇒ 0xB2 回 `0x74`（有界失败，不排队、不丢静默）。
+* 配置：只消费**已存在但一直是死键**的 `net.server.log.host/port`（出厂空/0）⇒ 空时回落活动出口的平台地址、端口 18080。
+  **没有新增配置键**，`test_config` 的默认项计数不变。
+* 出口绑定：`bind_dev` 取 `iv_agent_active_wan_name()`，每次受理刷新。4G/有线同时在线时日志跟着活动出口走；
+  切换发生在一次上传中途时本次仍用旧网卡（下次跟随）。
+* 未覆盖：真机到平台的上传（VM 无外网日志服务）；md5 校验（参考出厂也关闭）；多份日志并发上传（句柄只有一个游标）。
+
+=== 验证方式与结果
+
+* `make test` **52**（原 51 + `test_logup`），全过。
+* `test_logup`（真 socket 假服务端）：2500 B→3 片、拼回逐字节相等；二次 `IV_ENOENT`；
+  追加只传新增；HTTP 500 ⇒ `IV_EPROTO` 且游标不动、恢复后重传成功；空 host ⇒ `IV_EINVAL`。
+* 反向证伪：`cursor_save()` 提前 `return` ⇒ 6 条红；还原复绿。
+* `make asan` 干净、`make arm` 零告警。
+* `platcmd_e2e.py` 全部通过：B1d（0xE8 ACK ＋ JSON 八字段）、B1e（0xB2 回 0x01 且平台链路不被阻塞）。
+
+=== 遗留
+
+* 现场首测要盯三样：`[logup] upload start/ok/failed` 日志、`/mnt/UDISK/ivsbox/logup.state` 的推进、服务端 `code:200`。
+* `0xB2` 在 `代码说明.adoc` 旧的"未实现清单"表里仍标着未实现（历史记录只追加不改写，本次以本节为准）。

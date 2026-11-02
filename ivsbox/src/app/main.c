@@ -641,6 +641,13 @@ static int agent_sync_server_cfg(int force)
         g_agent.cfg.srv_port_bak[i] = bport;
     }
 
+    /* 日志上报（0xB2）的服务器地址。出厂是**空串 / 0**（`net.server.log.*`）
+     * ⇒ agent 回落到上面解析出的平台地址（用户口径「地址是一样的」）；现场要
+     * 单独一处日志服务时再填这两个键。指针语义与 `srv_host[]` 同（配置内部
+     * 定长缓冲，原地改写、指针一直有效）。 */
+    g_agent.cfg.logup_host = cfg_str("net.server.log.host");
+    g_agent.cfg.logup_port = (uint16_t)cfg_port("net.server.log.port");
+
     /* 2) 再比"解析出来到底连谁"。备份地址只在主地址没配时才顶上，所以
      *    "只改了当前没在用的备份"⇒ 解析结果不变 ⇒ 不重连。 */
     for (i = 0; i < IV_WAN_N; i++) {

@@ -16,6 +16,8 @@
      `payload_len`；sha256 必须是 **64 位小写 hex**（大写不接受）。
   2. `version` 是 `M.m.p`（三段，每段 <= 65535），**不是** `iv_version_sysver()`
      那种四段串；它必须**严格大于**设备当前版本，且设备当前版本 >= `minrollback`。
+     **不给 --version 时取 `include/ivsbox/ivsbox.h` 的三个版本宏** —— 包版本与
+     设备自报的平台版本必须同源，否则装完平台那两栏不会变（2026-11-02 的坑）。
   3. 路径围栏：不以 `/` 开头、不含 `..` 分量、不含 `:`、不含反斜杠、不以 `/` 结尾。
 
 用法：见 `--help` 或文件末尾的示例。
@@ -23,6 +25,7 @@
 import argparse
 import hashlib
 import os
+import re
 import struct
 import sys
 
@@ -31,10 +34,35 @@ MANIFEST_MAX = 8192
 FILES_MAX = 32
 PATH_MAX = 95  # 含 NUL 是 96
 
+# `--version` 不给时从这里读，保证包版本与设备自报版本同源（见 ivsbox.h 顶部注释）
+HDR_REL = os.path.join("include", "ivsbox", "ivsbox.h")
+
 
 def die(msg):
     sys.stderr.write("mkota: %s\n" % msg)
     sys.exit(2)
+
+
+def version_from_header():
+    """读 ivsbox.h 的 IVSBOX_VERSION_{MAJOR,MINOR,PATCH}，拼成 M.m.p。
+
+    2026-11-02 的教训：包清单版本手填 1.0.1/1.0.2/1.0.3，二进制里的宏一直是 1.0.0，
+    装完平台「系统版本 / 固件版本」两栏一格都不动。让两边只有一个来源就没这个坑。
+    """
+    hdr = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", HDR_REL)
+    try:
+        with open(hdr, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as e:
+        die("读不到 %s：%s（请显式给 --version）" % (hdr, e))
+    out = []
+    for key in ("MAJOR", "MINOR", "PATCH"):
+        m = re.search(r"^#define\s+IVSBOX_VERSION_%s\s+(\d+)\s*$" % key,
+                      text, re.MULTILINE)
+        if m is None:
+            die("%s 里找不到 IVSBOX_VERSION_%s" % (hdr, key))
+        out.append(m.group(1))
+    return ".".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +109,9 @@ def cmd_build(a):
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+    if a.version is None:
+        a.version = version_from_header()
+        print("包版本：%s（取自 include/ivsbox/ivsbox.h）" % a.version)
     check_version(a.version)
     check_version(a.minrollback)
 
@@ -209,7 +240,8 @@ def main():
 
     b = sub.add_parser("build", help="造包")
     b.add_argument("--out", required=True, help="输出 .pkg 路径")
-    b.add_argument("--version", required=True, help="包版本 M.m.p（须 > 设备当前版本）")
+    b.add_argument("--version", default=None,
+                   help="包版本 M.m.p（须 > 设备当前版本）；不给则取 ivsbox.h 的版本宏")
     b.add_argument("--minrollback", default="1.0.0", help="允许升级的本机版本下限")
     b.add_argument("--model", default="IVSBOX-T113", help="产品型号（必须与设备一致）")
     b.add_argument("--hwmin", type=int, default=1)

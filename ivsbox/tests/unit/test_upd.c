@@ -44,12 +44,42 @@
 #include <openssl/evp.h>
 
 #include "ivsbox/iv_ota.h"
+#include "ivsbox/ivsbox.h" /* IVSBOX_VERSION_*：本机版本的真来源 */
 #include "ivsbox/iv_ret.h"
 #include "ivsbox/iv_sha256.h"
 #include "ivsbox/iv_upd.h"
 
 static int g_fail;
 static int g_skip;
+
+/*
+ * ============================ 测试里的版本世界 ============================
+ * "本机当前版本"的**真来源**是编译期 `IVSBOX_VERSION_*`（`iv_upd.c` 的 `self_version()`
+ * 在 current 缺失时退回这三个宏，`iv_upd_adopt()` 也拿它给 releases 目录起名）。
+ *
+ * 所以这里**不能写死 1.0.0 / 1.0.1**：2026-11-02 把 PATCH 从 0 抬到 4（让平台上的
+ * 系统版本真的变），adopt 建出来的目录变成 `releases/1.0.4`、比包里的 1.0.1 还大，
+ * 于是每一处 install 都被"版本不递增"拒掉 —— 89 条断言全红，看着像验签坏了。
+ *
+ * 现在：`g_vold` = 编译期版本（adopt 出来的那一格），`g_vnew` = 它 patch+1（升级包）。
+ * 发版抬宏，这里自动跟上。
+ */
+static char g_vold[16];
+static char g_vnew[16];
+
+/*
+ * 拼 "<prefix><ver><tail>" 形式的期望路径。
+ * 用 4 只轮转的静态缓冲：同一条断言里连着拼两三个也不会互相踩。
+ */
+static const char *vp(const char *prefix, const char *ver, const char *tail)
+{
+    static char     ring[4][512];
+    static unsigned idx;
+    char           *b = ring[idx++ & 3u];
+
+    (void)snprintf(b, sizeof ring[0], "%s%s%s", prefix, ver, tail);
+    return b;
+}
 
 static void chk(int cond, const char *what)
 {
@@ -460,7 +490,7 @@ static const char *write_good_pkg(const char *ver, char *path_out, size_t cap)
     size_t n;
 
     files_default(f);
-    n = mk_pkg(MODEL, 1u, 2u, ver, "1.0.0", f, 2u);
+    n = mk_pkg(MODEL, 1u, 2u, ver, g_vold, f, 2u);
     chk(n > 0u, "build package");
     cat(path_out, cap, g_root, "/pkg.ivota");
     chk(wr_file(path_out, g_pkg, n, 0644) == 0, "write package file");
@@ -591,7 +621,7 @@ static void t03_happy_path(void)
     root_new();
     seed_bare();
     cfg_make(&c);
-    (void)write_good_pkg("1.0.1", pkg, sizeof pkg);
+    (void)write_good_pkg(g_vnew, pkg, sizeof pkg);
 
     rc = iv_upd_install(pkg, &c, &why);
     chk(rc == IV_OK, "t03: install ok");
@@ -599,54 +629,60 @@ static void t03_happy_path(void)
         fprintf(stderr, "      why=%s\n", iv_upd_reason_name(why));
 
     /* 版本目录内容与权限 */
-    app_path(p, sizeof p, "releases/1.0.1/bin/ivsboxd");
-    chk(exists(p), "t03: releases/1.0.1/bin/ivsboxd exists");
+    app_path(p, sizeof p, vp("releases/", g_vnew, "/bin/ivsboxd"));
+    chk(exists(p), "t03: releases/<new>/bin/ivsboxd exists");
     chk(mode_of(p) == 0755u, "t03: bin file mode is 0755");
     chk(rd_file(p, buf, sizeof buf) == (int)g_elf_len, "t03: installed elf byte length");
-    app_path(p, sizeof p, "releases/1.0.1/etc/ivsbox.json");
-    chk(exists(p), "t03: releases/1.0.1/etc/ivsbox.json exists");
+    app_path(p, sizeof p, vp("releases/", g_vnew, "/etc/ivsbox.json"));
+    chk(exists(p), "t03: releases/<new>/etc/ivsbox.json exists");
     chk(mode_of(p) == 0644u, "t03: etc file mode is 0644");
     chk(rd_file(p, buf, sizeof buf) > 0 && strcmp(buf, "{\"sys\":{\"name\":\"ivupd-test\"}}") == 0,
         "t03: etc file content byte-equal");
 
     /* adopt 出来的"上一版本"必须真实存在，否则回滚无处可去 */
-    app_path(p, sizeof p, "releases/1.0.0/bin/ivsboxd");
-    chk(exists(p), "t03: adopted releases/1.0.0/bin/ivsboxd exists");
+    app_path(p, sizeof p, vp("releases/", g_vold, "/bin/ivsboxd"));
+    chk(exists(p), "t03: adopted releases/<old>/bin/ivsboxd exists");
 
     /* 链接切换 */
     chk(link_of(g_app, "current", lnk, sizeof lnk) != NULL &&
-            strcmp(lnk, "releases/1.0.1") == 0,
-        "t03: current -> releases/1.0.1");
+            strcmp(lnk, vp("releases/", g_vnew, "")) == 0,
+        "t03: current -> releases/<new>");
     chk(link_of(g_app, "previous", lnk, sizeof lnk) != NULL &&
-            strcmp(lnk, "releases/1.0.0") == 0,
-        "t03: previous -> releases/1.0.0");
+            strcmp(lnk, vp("releases/", g_vold, "")) == 0,
+        "t03: previous -> releases/<old>");
 
     /* pending.json 的字节形态（读取端 iv_upd 与它是一份契约） */
     data_path(p, sizeof p, "pending.json");
     chk(rd_file(p, buf, sizeof buf) > 0, "t03: pending.json readable");
     chk(strstr(buf, "\"state\":\"pending\"") != NULL, "t03: pending state byte form");
-    chk(strstr(buf, "\"version\":\"1.0.1\"") != NULL, "t03: pending version byte form");
-    chk(strstr(buf, "\"previous\":\"1.0.0\"") != NULL, "t03: pending previous byte form");
+    chk(strstr(buf, vp("\"version\":\"", g_vnew, "\"")) != NULL, "t03: pending version byte form");
+    chk(strstr(buf, vp("\"previous\":\"", g_vold, "\"")) != NULL, "t03: pending previous byte form");
     chk(strstr(buf, "\"bootcount\":0") != NULL, "t03: pending bootcount starts at 0");
 
     /* status */
     iv_upd_status(&c, &st);
     chk(st.pending == 1 && st.active == 1, "t03: status pending+active");
     chk(strcmp(st.state, "pending") == 0, "t03: status state");
-    chk(st.version.major == 1u && st.version.minor == 0u && st.version.patch == 1u,
+    /* 版本三元组也按版本世界断言（写死 1/0/1 的话，抬 ivsbox.h 就红） */
+    chk(st.version.major == (unsigned)IVSBOX_VERSION_MAJOR &&
+            st.version.minor == (unsigned)IVSBOX_VERSION_MINOR &&
+            st.version.patch == (unsigned)IVSBOX_VERSION_PATCH + 1u,
         "t03: status version parsed");
-    chk(st.previous.patch == 0u, "t03: status previous parsed");
+    chk(st.previous.major == (unsigned)IVSBOX_VERSION_MAJOR &&
+            st.previous.minor == (unsigned)IVSBOX_VERSION_MINOR &&
+            st.previous.patch == (unsigned)IVSBOX_VERSION_PATCH,
+        "t03: status previous parsed");
     chk(st.bootcount == 0u && st.max_boot == 3u, "t03: status boot counts");
     chk(st.rollbacks == 0u, "t03: status rollbacks zero");
     chk(strcmp(st.last_event, "install") == 0, "t03: last event is install");
-    chk(strcmp(st.current_dir, "1.0.1") == 0, "t03: current_dir");
+    chk(strcmp(st.current_dir, g_vnew) == 0, "t03: current_dir");
 
     data_path(p, sizeof p, "events.log");
     chk(rd_file(p, buf, sizeof buf) > 0 && strstr(buf, " install ") != NULL,
         "t03: events.log has install line");
 
     /* 暂存目录**有意保留**（失败现场要留得住），如实断言一下，免得将来被"顺手清理" */
-    data_path(p, sizeof p, "staging/1.0.1/bin/ivsboxd");
+    data_path(p, sizeof p, vp("staging/", g_vnew, "/bin/ivsboxd"));
     chk(exists(p), "t03: staging dir intentionally kept");
 
     root_drop();
@@ -671,10 +707,10 @@ static void t04_bootcount_rollback(void)
     root_new();
     seed_bare();
     cfg_make(&c);
-    (void)write_good_pkg("1.0.1", pkg, sizeof pkg);
+    (void)write_good_pkg(g_vnew, pkg, sizeof pkg);
     chk(iv_upd_install(pkg, &c, &why) == IV_OK, "t04: install ok");
 
-    cat(exp, sizeof exp, g_app, "/releases/1.0.1");
+    cat(exp, sizeof exp, g_app, vp("/releases/", g_vnew, ""));
     for (i = 1; i <= 3; i++) {
         rolled = -1;
         chk(iv_upd_boot_begin(&c, dir, sizeof dir, &rolled, &why) == IV_OK,
@@ -689,10 +725,10 @@ static void t04_bootcount_rollback(void)
     rolled = 0;
     chk(iv_upd_boot_begin(&c, dir, sizeof dir, &rolled, &why) == IV_OK, "t04: 4th boot_begin ok");
     chk(rolled == 1, "t04: 4th boot_begin rolled back");
-    cat(exp, sizeof exp, g_app, "/releases/1.0.0");
+    cat(exp, sizeof exp, g_app, vp("/releases/", g_vold, ""));
     chk(strcmp(dir, exp) == 0, "t04: boots the previous release");
     chk(link_of(g_app, "current", lnk, sizeof lnk) != NULL &&
-            strcmp(lnk, "releases/1.0.0") == 0,
+            strcmp(lnk, vp("releases/", g_vold, "")) == 0,
         "t04: current switched back");
 
     iv_upd_status(&c, &st);
@@ -729,7 +765,7 @@ static void t05_confirm(void)
     root_new();
     seed_bare();
     cfg_make(&c);
-    (void)write_good_pkg("1.0.1", pkg, sizeof pkg);
+    (void)write_good_pkg(g_vnew, pkg, sizeof pkg);
     chk(iv_upd_install(pkg, &c, &why) == IV_OK, "t05: install ok");
     chk(iv_upd_boot_begin(&c, dir, sizeof dir, NULL, &why) == IV_OK, "t05: boot_begin ok");
 
@@ -746,7 +782,7 @@ static void t05_confirm(void)
     chk(strcmp(st.state, "confirmed") == 0, "t05: still confirmed");
 
     /* 确认之后 boot_begin 走 current，且不再消耗 bootcount */
-    cat(exp, sizeof exp, g_app, "/releases/1.0.1");
+    cat(exp, sizeof exp, g_app, vp("/releases/", g_vnew, ""));
     chk(iv_upd_boot_begin(&c, dir, sizeof dir, NULL, &why) == IV_OK, "t05: boot after confirm");
     chk(strcmp(dir, exp) == 0, "t05: boots current release");
     iv_upd_status(&c, &st);
@@ -773,12 +809,12 @@ static void t06_selftest_fail(void)
     root_new();
     seed_bare();
     cfg_make(&c);
-    (void)write_good_pkg("1.0.1", pkg, sizeof pkg);
+    (void)write_good_pkg(g_vnew, pkg, sizeof pkg);
     chk(iv_upd_install(pkg, &c, &why) == IV_OK, "t06: install ok");
     chk(iv_upd_boot_fail(&c, &why) == IV_OK, "t06: boot_fail ok");
 
     chk(link_of(g_app, "current", lnk, sizeof lnk) != NULL &&
-            strcmp(lnk, "releases/1.0.0") == 0,
+            strcmp(lnk, vp("releases/", g_vold, "")) == 0,
         "t06: current rolled back");
     iv_upd_status(&c, &st);
     chk(strcmp(st.state, "rolled-back") == 0, "t06: state rolled-back");
@@ -812,16 +848,16 @@ static void t07_missing_release(void)
     root_new();
     seed_bare();
     cfg_make(&c);
-    (void)write_good_pkg("1.0.1", pkg, sizeof pkg);
+    (void)write_good_pkg(g_vnew, pkg, sizeof pkg);
     chk(iv_upd_install(pkg, &c, &why) == IV_OK, "t07: install ok");
 
     /* 模拟"新版目录被清掉 / 从没落全"：pending 指向的 app_dir 消失 */
-    app_path(p, sizeof p, "releases/1.0.1");
+    app_path(p, sizeof p, vp("releases/", g_vnew, ""));
     chk(rm_rf(p) == 0, "t07: remove new release dir");
 
     chk(iv_upd_boot_begin(&c, dir, sizeof dir, &rolled, &why) == IV_OK, "t07: boot_begin ok");
     chk(rolled == 1, "t07: rolled back");
-    cat(exp, sizeof exp, g_app, "/releases/1.0.0");
+    cat(exp, sizeof exp, g_app, vp("/releases/", g_vold, ""));
     chk(strcmp(dir, exp) == 0, "t07: boots previous");
     chk(why == IV_UPD_OK, "t07: rollback itself succeeded");
 
@@ -851,7 +887,7 @@ static void t08_power_loss(void)
         seed_bare();
         cfg_make(&c);
         c.fault_at = ph;
-        (void)write_good_pkg("1.0.1", pkg, sizeof pkg);
+        (void)write_good_pkg(g_vnew, pkg, sizeof pkg);
 
         rc = iv_upd_install(pkg, &c, &why);
         chk(rc == IV_EFAIL && why == IV_UPD_EFAULT, ph);
@@ -859,18 +895,18 @@ static void t08_power_loss(void)
             fprintf(stderr, "      phase=%s rc=%d why=%s\n", ph, rc, iv_upd_reason_name(why));
 
         /* 每个阶段"盘上该停在哪儿"逐个钉住 */
-        app_path(p, sizeof p, "releases/1.0.1");
+        app_path(p, sizeof p, vp("releases/", g_vnew, ""));
         if (strcmp(ph, "verify") == 0 || strcmp(ph, "stage") == 0)
             chk(!exists(p), "t08: verify/stage must not create the release dir");
 
         /* adopt 在 verify 之后才开始（verify 阶段必须一个字节都没写） */
-        app_path(p, sizeof p, "releases/1.0.0");
+        app_path(p, sizeof p, vp("releases/", g_vold, ""));
         if (strcmp(ph, "verify") == 0)
             chk(!exists(p), "t08: verify phase must not adopt");
         else
             chk(exists(p), "t08: adopt ran for this phase");
 
-        data_path(p, sizeof p, "staging/1.0.1");
+        data_path(p, sizeof p, vp("staging/", g_vnew, ""));
         if (strcmp(ph, "verify") == 0)
             chk(!exists(p), "t08: verify must not create staging");
         if (strcmp(ph, "stage") == 0)
@@ -892,7 +928,7 @@ static void t08_power_loss(void)
         if (strcmp(ph, "switch") == 0 || strcmp(ph, "pending") == 0) {
             char exp[IV_UPD_PATH_MAX];
 
-            cat(exp, sizeof exp, g_app, "/releases/1.0.1");
+            cat(exp, sizeof exp, g_app, vp("/releases/", g_vnew, ""));
             chk(strcmp(dir, exp) == 0,
                 "t08: switch/pending phase must boot the NEW release (its dir is complete)");
         } else if (strcmp(ph, "verify") == 0) {
@@ -900,12 +936,12 @@ static void t08_power_loss(void)
         } else {
             char exp[IV_UPD_PATH_MAX];
 
-            /* stage / install：current 仍指在 adopt 出来的 1.0.0 上 */
-            cat(exp, sizeof exp, g_app, "/releases/1.0.0");
+            /* stage / install：current 仍指在 adopt 出来的 <old> 上 */
+            cat(exp, sizeof exp, g_app, vp("/releases/", g_vold, ""));
             chk(strcmp(dir, exp) == 0, "t08: stage/install phase keeps booting the old release");
         }
 
-        /* 重跑安装：只有 pending 阶段（current 已切到 1.0.1）应当因"版本不递增"被拒 */
+        /* 重跑安装：只有 pending 阶段（current 已切到 <new>）应当因"版本不递增"被拒 */
         {
             iv_upd_cfg_t    c2;
             iv_upd_reason_t w2 = IV_UPD_OK;
@@ -945,7 +981,7 @@ static void t09_reject_no_residue(void)
     seed_bare();
     cfg_make(&c);
     files_default(f);
-    n = mk_pkg("OTHER-BOARD", 1u, 2u, "1.0.1", "1.0.0", f, 2u);
+    n = mk_pkg("OTHER-BOARD", 1u, 2u, g_vnew, g_vold, f, 2u);
     cat(pkg, sizeof pkg, g_root, "/bad.ivota");
     (void)wr_file(pkg, g_pkg, n, 0644);
     rc = iv_upd_install(pkg, &c, &why);
@@ -963,11 +999,11 @@ static void t09_reject_no_residue(void)
     cfg_make(&c);
     memset(zero, 0, sizeof zero);
     c.pubkey = zero;
-    (void)write_good_pkg("1.0.1", pkg, sizeof pkg);
+    (void)write_good_pkg(g_vnew, pkg, sizeof pkg);
     rc = iv_upd_install(pkg, &c, &why);
     chk(rc != IV_OK, "t09: zero pubkey rejected (fail-closed)");
     chk(why == IV_UPD_ESIG, "t09: reason bad-package");
-    app_path(p, sizeof p, "releases/1.0.1");
+    app_path(p, sizeof p, vp("releases/", g_vnew, ""));
     chk(!exists(p), "t09: no release dir on key reject");
     root_drop();
 }
@@ -997,11 +1033,11 @@ static void t10_nospace(void)
     seed_bare();
     cfg_make(&c);
     c.data_root = "/proc/self";
-    (void)write_good_pkg("1.0.1", pkg, sizeof pkg);
+    (void)write_good_pkg(g_vnew, pkg, sizeof pkg);
 
     rc = iv_upd_install(pkg, &c, &why);
     chk(rc == IV_ENOSPC && why == IV_UPD_ENOSPC, "t10: install reports ENOSPC");
-    app_path(p, sizeof p, "releases/1.0.1");
+    app_path(p, sizeof p, vp("releases/", g_vnew, ""));
     chk(!exists(p), "t10: nothing installed when out of space");
     root_drop();
 }
@@ -1125,12 +1161,12 @@ static void t12_admission_reject(void)
     f[1].path = "etc/ivsbox.json";
     f[1].data = TXT;
     f[1].len = sizeof(TXT) - 1u;
-    n = mk_pkg(MODEL, 1u, 2u, "1.0.1", "1.0.0", f, 2u);
+    n = mk_pkg(MODEL, 1u, 2u, g_vnew, g_vold, f, 2u);
     cat(pkg, sizeof pkg, g_root, "/notelf.ivota");
     (void)wr_file(pkg, g_pkg, n, 0644);
     rc = iv_upd_install(pkg, &c, &why);
     chk(rc == IV_EPROTO && why == IV_UPD_EELF, "t12: non-elf program rejected");
-    app_path(p, sizeof p, "releases/1.0.1");
+    app_path(p, sizeof p, vp("releases/", g_vnew, ""));
     chk(!exists(p), "t12: no release dir for non-elf");
     data_path(p, sizeof p, "pending.json");
     chk(!exists(p), "t12: no pending for non-elf");
@@ -1149,12 +1185,12 @@ static void t12_admission_reject(void)
     f[1].path = "etc/ivsbox.json";
     f[1].data = TXT;
     f[1].len = sizeof(TXT) - 1u;
-    n = mk_pkg(MODEL, 1u, 2u, "1.0.1", "1.0.0", f, 2u);
+    n = mk_pkg(MODEL, 1u, 2u, g_vnew, g_vold, f, 2u);
     cat(pkg, sizeof pkg, g_root, "/dep.ivota");
     (void)wr_file(pkg, g_pkg, n, 0644);
     rc = iv_upd_install(pkg, &c, &why);
     chk(rc == IV_ENOENT && why == IV_UPD_EDEPS, "t12: unsatisfiable dep rejected");
-    app_path(p, sizeof p, "releases/1.0.1");
+    app_path(p, sizeof p, vp("releases/", g_vnew, ""));
     chk(!exists(p), "t12: no release dir for missing dep");
     root_drop();
 }
@@ -1244,9 +1280,9 @@ static void t14_rollback_guards(void)
     root_new();
     seed_bare();
     cfg_make(&c);
-    (void)write_good_pkg("1.0.1", pkg, sizeof pkg);
+    (void)write_good_pkg(g_vnew, pkg, sizeof pkg);
     chk(iv_upd_install(pkg, &c, &why) == IV_OK, "t14: install ok");
-    app_path(p, sizeof p, "releases/1.0.0");
+    app_path(p, sizeof p, vp("releases/", g_vold, ""));
     chk(rm_rf(p) == 0, "t14: remove previous release");
 
     chk(link_of(g_app, "current", before, sizeof before) != NULL, "t14: read current before");
@@ -1289,29 +1325,29 @@ static void t15_guard_rollback_target(void)
     root_new();
     seed_bare();
     cfg_make(&c);
-    (void)write_good_pkg("1.0.1", pkg, sizeof pkg);
-    chk(iv_upd_install(pkg, &c, &why) == IV_OK, "t15: install 1.0.1 ok");
+    (void)write_good_pkg(g_vnew, pkg, sizeof pkg);
+    chk(iv_upd_install(pkg, &c, &why) == IV_OK, "t15: install <new> ok");
     chk(iv_upd_boot_fail(&c, &why) == IV_OK, "t15: rollback ok");
 
-    /* 回滚之后：current -> 1.0.0，previous -> 1.0.1（正好落在"可装却等于 previous"那一格） */
+    /* 回滚之后：current -> <old>，previous -> <new>（正好落在"可装却等于 previous"那一格） */
     chk(link_of(g_app, "current", lnk, sizeof lnk) != NULL &&
-            strcmp(lnk, "releases/1.0.0") == 0,
-        "t15: current is back at 1.0.0");
+            strcmp(lnk, vp("releases/", g_vold, "")) == 0,
+        "t15: current is back at <old>");
     chk(link_of(g_app, "previous", lnk, sizeof lnk) != NULL &&
-            strcmp(lnk, "releases/1.0.1") == 0,
+            strcmp(lnk, vp("releases/", g_vnew, "")) == 0,
         "t15: previous remembers the rolled-back version");
 
-    /* 同一个包再装：1.0.1 > current(1.0.0) ⇒ 过得去"版本递增"，只能靠护栏拦下 */
+    /* 同一个包再装：<new> > current(<old>) ⇒ 过得去"版本递增"，只能靠护栏拦下 */
     why = IV_UPD_OK;
     chk(iv_upd_install(pkg, &c, &why) == IV_ESTATE,
         "t15: reinstall of the rollback target is refused");
     chk(why == IV_UPD_ESTATE, "t15: reason is ESTATE");
 
     /* 护栏的实义：回滚目标那一份必须还在 */
-    app_path(p, sizeof p, "releases/1.0.1/bin/ivsboxd");
+    app_path(p, sizeof p, vp("releases/", g_vnew, "/bin/ivsboxd"));
     chk(exists(p), "t15: rollback target dir survived");
     chk(link_of(g_app, "previous", lnk, sizeof lnk) != NULL &&
-            strcmp(lnk, "releases/1.0.1") == 0,
+            strcmp(lnk, vp("releases/", g_vnew, "")) == 0,
         "t15: previous link untouched");
 
     root_drop();
@@ -1326,6 +1362,12 @@ int main(void)
     /* 让 NEEDED 查找只认显式给的 lib_paths：否则宿主的 LD_LIBRARY_PATH 会
      * 让"缺依赖"的用例随环境漂移。 */
     (void)unsetenv("LD_LIBRARY_PATH");
+
+    /* 版本世界先立起来（见文件顶部 g_vold / g_vnew 的说明） */
+    (void)snprintf(g_vold, sizeof g_vold, "%d.%d.%d", IVSBOX_VERSION_MAJOR,
+                   IVSBOX_VERSION_MINOR, IVSBOX_VERSION_PATCH);
+    (void)snprintf(g_vnew, sizeof g_vnew, "%d.%d.%d", IVSBOX_VERSION_MAJOR,
+                   IVSBOX_VERSION_MINOR, IVSBOX_VERSION_PATCH + 1);
 
     if (!pubkey_from_seed(PUB)) {
         fprintf(stderr, "FATAL: cannot derive test pubkey\n");

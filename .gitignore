@@ -39,3 +39,9 @@ ScreenShot_*.png
 # 打包产物
 *.ipk
 *.tar.gz
+
+# OTA 交付目录（联调包 + 测试密钥；私钥绝不入库）
+ota-pkg/
+*.pkg
+ed25519.pem
+*.pub.hex

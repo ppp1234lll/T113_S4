@@ -293,10 +293,19 @@ while true; do
         case "$req_pkg" in
         /*)
             alert "OTA: 开始安装 $req_pkg (restart=${req_restart:-0})"
+            # 联调/工装专用：内置公钥未部署时（`iv_ota_builtin_pubkey()` 全零 ⇒
+            # fail-closed 拒一切包），可用 `IVSBOX_OTA_PUBKEY`（64 hex）临时指定公钥。
+            # **量产必须把公钥写进 `src/modules/ota/iv_ota_pubkey.c` 且不设这个变量**
+            # —— 否则等于把"验签根"交给环境，谁改得了环境谁就能装包。
+            ota_pub=""
+            if [ -n "${IVSBOX_OTA_PUBKEY:-}" ]; then
+                ota_pub="--pubkey-hex $IVSBOX_OTA_PUBKEY"
+            fi
+            # shellcheck disable=SC2086  # ota_pub 要么空、要么正好两个词，故意的
             if [ "$req_restart" = "1" ]; then
-                "$IVSBOX_UPD" install "$req_pkg" --restart >> "$ALERT" 2>&1
+                "$IVSBOX_UPD" install "$req_pkg" --restart $ota_pub >> "$ALERT" 2>&1
             else
-                "$IVSBOX_UPD" install "$req_pkg" >> "$ALERT" 2>&1
+                "$IVSBOX_UPD" install "$req_pkg" $ota_pub >> "$ALERT" 2>&1
             fi
             ota_rc=$?
             alert "OTA: 安装结束 rc=$ota_rc"

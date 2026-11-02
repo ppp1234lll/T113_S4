@@ -3674,7 +3674,8 @@ static int ota_report_take(iv_agent_t *a)
     return 1;
 }
 
-/* Reactor 线程：任务结算。**必须清 updf_state**，否则后续 0xB3 永远回 0x77。 */static void on_updf_done(uint64_t id, int rc, const void *result,
+/* Reactor 线程：任务结算。**必须清 updf_state**，否则后续 0xB3 永远回 0x77。 */
+static void on_updf_done(uint64_t id, int rc, const void *result,
                          size_t result_len, void *arg)
 {
     iv_agent_t         *a = (iv_agent_t *)arg;

@@ -12236,3 +12236,71 @@ QN 用 0（设备主动发的结论帧，不是对某条请求的应答）。上
   验签那一步失败，并如实上报 0x00。
 * `reported` 只保留最近一条结论：平台长时间掉线期间连做两次升级，中间那次会被覆盖。
 * 结果帧只有 1 字节（与参考实现一致），不带原因码。要带原因就得与平台侧先定格式。
+
+== 2026-11-02 15:52 造包工具 mkota.py ＋ 联调公钥通道（交付验证包）
+
+=== 干了什么事
+
+* `tools/mkota.py`（**新增**）：`IVSOTA01` 包的造包工具，三个子命令。
+** `genkey`：`Ed25519PrivateKey.generate()` ⇒ 私钥 PEM（PKCS8 无加密、`chmod 0600`）＋ `ed25519.pub.hex`。
+** `build`：读文件 → 算 SHA-256（`hashlib.sha256(blob).hexdigest()`，**小写**）→ 拼行式清单 →
+`MAGIC + struct.pack("<II", manifest_len, payload_len) + manifest + payload` →
+对 `header+manifest+payload` 整体签名 → 追加 64 B 签名 → `fsync`。
+** `info`：写 `{"version":"<硬件名>-<四段>","url":"http://…"}`，并按设备取的路径
+（`GET /<硬件名>/info.txt`）把父目录铺出来。
+* `scripts/monitor.sh`：安装段读 `IVSBOX_OTA_PUBKEY`（64 hex），非空时把
+  `--pubkey-hex <hex>` 追加给 `ivsbox-updater install`。
+* `iv_agent.c`：修一处注释与函数定义挤在同一行的排版（`on_updf_done()`）。
+* `.gitignore`：忽略交付目录与密钥文件。
+
+=== 解决什么问题
+
+`iv_ota_builtin_pubkey()` 现在返回**全零** ⇒ 按 fail-closed 口径拒绝一切包。于是：
+
+* 没有真包，链路在现场**一次都验不了**；而手搓包必错在三处细节上 —— 清单末行也必须
+  有 `\n`、总长必须严格等于 `16 + manifest_len + payload_len + 64`、签名必须覆盖它之前
+  的**全部**字节。任何一处不对，`iv_ota_verify_file()` 只回一个"非法"，看不出差在哪。
+* 公钥硬编码在固件里，联调每换一把钥匙就得重编一次固件、重刷一次板子。
+
+于是把"造包"工具化（判据与设备侧同一套，**造的时候就拦住**，而不是装的时候才发现），
+并给联调留一条显式的公钥通道。
+
+=== 两个必须分开的版本概念
+
+| 位置 | 形态 | 谁用 |
+|---|---|---|
+| 包清单 `version` | `M.m.p`（三段 ≤65535） | `iv_ota` 判"严格大于本机版本"、"≥ `minrollback`" |
+| `info.txt` `version` | `<硬件名>-<`iv_version_sysver()`>`，即 `IVSBOX-T113-1.0.0.<构建日期>` | `iv_updfetch` 判"要不要下载"，**只做字符串相等比较** |
+
+第二行只比相等、不比大小 ⇒ 只要与板端现跑的串不同就会下载。本次交付的板端二进制
+恰好也是 `20261102` 构建（与包里的同一份），所以 `info.txt` 故意写 `20261103` 来触发。
+装完之后设备版本是 1.0.1，再点一次会因为"1.0.1 不大于 1.0.1"被拒 `bad-version` —— 正确行为。
+
+=== 联调公钥通道的红线
+
+`--pubkey-hex`（updater）与 `IVSBOX_OTA_PUBKEY`（monitor）**只用于联调/产线**。
+量产必须把公钥写进 `src/modules/ota/iv_ota_pubkey.c`，且**不设**这个环境变量：
+否则等于把"验签根"交给环境，谁改得了环境谁就能装任意包。updater 的 `usage()` 与
+monitor 的注释里都写死了这一条。
+
+=== 验证方式与结果
+
+* 造包：`build/arm/ivsboxd`（`md5 28edb954…`）→ `ivsbox-1.0.1.pkg`（439572 B、
+  `md5 a6aa5ae8…`）；清单 `model=IVSBOX-T113`、`hwmin=1 hwmax=2`、`version=1.0.1`、
+  `minrollback=1.0.0`、`files=1`。
+* 正向（VM x86_64 跑 `build/host/ivsbox-updater`）：`install: ok` ⇒ `releases/1.0.1`
+  落地、`current` 软链切换、`bin/ivsboxd` 0755、md5 与源文件一致；`boot-begin` +
+  `boot-ok` ⇒ `state=confirmed active=false`。
+* 反向 4 条全拒且原因准确（`<data_root>/ota/events.log`，命令行只给粗粒度的
+  `bad-package`）：错公钥 `bad-signature`、负载翻转 1 字节 `bad-signature`、
+  同版本号 `bad-version`、型号不符 `model-mismatch`。
+* **ARM 包在 x86 上跑**停在 `bad-elf`：验签、清单、SHA-256 全过，只差本机架构闸门 ——
+  这条同时证明了"包装对了"和"架构闸门真的拦得住"。
+
+=== 遗留
+
+* **真机 0xB3 未验**：板端 `monitor.sh` 是 10-30 版本，缺联调公钥透传与
+  `ota/report` 落盘，必须先换 `scripts/monitor.sh` 再测。
+* 内置公钥仍是全零（fail-closed），量产前必须换成真公钥并删掉这条环境变量通道。
+* `hwmin/hwmax` 是**整数**硬件版本（设备默认 1），不是四段版本串 —— 造包时写错会
+  直接报"invalid int"。

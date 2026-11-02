@@ -7898,6 +7898,29 @@ relay.set ch=3 on=true  → {"port":2,"status":1}  → RELAY3: 2 → 1
   `make analyze` 0 报告、`make arm` 0 告警、`platcmd_e2e.py` 114/114。
 * `build/arm/ivsboxd` md5 **`a7f529d44837fea09fc94b56a8b3e8ad`**（上一版 `6a5f15f0…`）。
 
+=== 真机踩到的坑：目录列表没有 Content-Length
+
+板子换上第一版列表逻辑后，平台点升级，日志停在：
+
+```text
+GET /FN_RZTY_PY/info.txt -> HTTP 404
+no /FN_RZTY_PY/info.txt (HTTP 404), fall back to directory listing
+GET /FN_RZTY_PY/: empty listing
+```
+
+`nginx/1.17.1` 的 autoindex 是现生成的，头里**只有 `Connection: close`、没有
+`Content-Length`**，body 以连接关闭结束；而第一版代码 `if (body_len <= 0) 空列表`
+（取不到就是 -1）把一份 291 字节的列表判成了空。
+
+修法：`== 0` 才算空；`< 0` 时读到 EOF 为止（上限仍是 4 KiB 头缓冲）。
+静态文件（info.txt／包）不受影响 —— 那种响应 nginx 一定给 CL，所以
+`fetch_info()`／`do_download()` 一行都没动。
+
+**单测也因此改了**：测试服务器的目录响应现在也"不带 CL ＋ `Connection: close`
+后断连"（`srv_send_nocl()`）。原来用带 CL 的 200 把真机 bug 遮住了 ——
+单测里最该照抄的是对端的真实行为，不是我们希望的形状。证伪 F7（`== 0` 改回
+`<= 0`）红 9 条。
+
 === 遗留给采集板侧
 
 * `0xD1` 无应答：按表应回 JSON。主控现在只能"发出去就算成功"，实际执行结果无从确认；

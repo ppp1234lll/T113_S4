@@ -982,27 +982,38 @@ static int fetch_listing(iv_updfetch_t *u, char *url_out, size_t url_cap,
         IV_LOG_W(UF_MOD, "GET %s -> HTTP %d", path, u->status);
         return IV_EPROTO;
     }
-    if (u->body_len <= 0) {
+    /* **目录列表没有 `Content-Length`**：nginx 1.17 的 autoindex 是现生成的，
+     * 头里只有 `Connection: close`（实测 2026-11-02，`Server: nginx/1.17.1`），
+     * body 以**连接关闭**为结束。所以这里既不能要求 `body_len > 0`，也不能拿它
+     * 当读多少字节的依据 —— 只能读到 EOF。静态文件（info.txt／包）不受影响：
+     * 那种响应 nginx 一定给 Content-Length。 */
+    if (u->body_len == 0) {
         IV_LOG_W(UF_MOD, "GET %s: empty listing", path);
         return IV_EPROTO;
     }
     /* 列表页远小于 4 KiB（几十个条目也就几百字节）。**超过就截断解析**：
      * 截断最多漏掉排在后面的包，不会把某个名字读错。 */
-    want = (u->body_len < (long)(sizeof u->buf - 1u)) ? u->body_len
-                                                     : (long)(sizeof u->buf - 1u);
+    want = (u->body_len >= 0 && u->body_len < (long)(sizeof u->buf - 1u))
+               ? u->body_len
+               : (long)(sizeof u->buf - 1u);
     while (got < want) {
         long n = recv_some(u, u->buf + got, (size_t)want - (size_t)got);
 
-        if (n == 0) {
-            IV_LOG_W(UF_MOD, "GET %s: short listing (%ld/%ld)", path, got, want);
-            return IV_ECONN;
-        }
+        if (n == 0)
+            break; /* EOF＝读完了（`Connection: close` 那种） */
         if (n < 0)
             return (n == UF_R_TIMEOUT) ? IV_ETIMEDOUT : IV_ECONN;
         got += n;
     }
-    u->buf[want] = '\0';
-    if (u->body_len > want) {
+    if (got == 0) {
+        IV_LOG_W(UF_MOD, "GET %s: EOF without body", path);
+        return IV_EPROTO;
+    }
+    u->buf[got] = '\0';
+    if (u->body_len < 0 && got >= want) {
+        IV_LOG_W(UF_MOD, "GET %s: listing truncated at %ld B, later entries ignored",
+                 path, want);
+    } else if (u->body_len > want) {
         IV_LOG_W(UF_MOD, "GET %s: listing truncated at %ld B, later entries ignored",
                  path, want);
     }

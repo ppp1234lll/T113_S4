@@ -25,6 +25,8 @@
  *   p07 目录列表模式：没有 info.txt（404）⇒ 读 autoindex，按文件名里的 M.m.p 取最大
  *       （0.9.9/1.0.1/1.0.9 ⇒ 1.0.9），`notes.txt` 与 `*.tar.gz` 跳过；
  *       顺带验编译期默认硬件名 ⇒ 请求的是 `/<默认硬件名>/`。
+ *       **目录响应故意不带 Content-Length**（`Connection: close` 收尾）—— nginx 的
+ *       autoindex 就是这样，body 只能读到 EOF 才知道结束。
  *   p08 列表里的版本不比本机新 ⇒ `IV_UPDFETCH_SAME`，零包请求。
  *   p09 列表里一个 `.pkg` 都没有 ⇒ `IV_ENOENT`，什么都不拉。
  *
@@ -35,7 +37,10 @@
  *   F4 去掉 `fetch_listing()` 开头那句 `need_reconnect = 1` ⇒ p07 红（404 的 body
  *      没读走就复用连接，下一份应答的头从 body 中间开始解析）；
  *   F5 挑"第一个"而不是"最大" ⇒ p07 红（会挑到 0.9.9）；
- *   F6 去掉 `.pkg` 后缀过滤 ⇒ p07/p09 红（把 notes.txt / .tar.gz 当包）。
+ *   F6 去掉 `.pkg` 后缀过滤 ⇒ p07/p09 红（把 notes.txt / .tar.gz 当包）；
+ *   F7 把"没有 Content-Length"判成空 body（`== 0` 改成 `<= 0`）⇒ p07/p08/p09 红 9 条。
+ *      **这条是真机抓到的**：2026-11-02 平台点升级，日志 `GET /FN_RZTY_PY/: empty
+ *      listing` —— nginx autoindex 不带 CL，被当成空列表。
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
@@ -205,6 +210,23 @@ static void srv_send(int fd, int status, const char *extra, const void *body,
     (void)send(fd, head, pos, 0);
 }
 
+/* 目录列表那种响应：**不给 Content-Length**，用 `Connection: close` 收尾
+ * （nginx 的 autoindex 就是这样，2026-11-02 在 47.104.98.214:8989 上实测：
+ * `HTTP/1.1 200 OK / Server: nginx/1.17.1 / Connection: close`，没有 CL）。
+ * 客户端只能读到 EOF 才知道完事 —— p07 走的就是这条，别图省事改成带 CL 的。 */
+static void srv_send_nocl(int fd, const char *body, size_t blen)
+{
+    char head[160];
+    int  n = snprintf(head, sizeof head,
+                      "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+                      "Connection: close\r\n\r\n");
+
+    if (n > 0)
+        (void)send(fd, head, (size_t)n, 0);
+    if (blen > 0u)
+        (void)send(fd, body, blen, 0);
+}
+
 static void *srv_thread(void *arg)
 {
     srv_t *s = arg;
@@ -276,9 +298,8 @@ static void *srv_thread(void *arg)
                     if (hl > 0u && rp[hl - 1u] == '/') {
                         (void)snprintf(s->last_dir_path, sizeof s->last_dir_path, "%s", rp);
                         s->dir_reqs++;
-                        srv_send(fd, 200, "Content-Type: text/html\r\n", s->dir_html,
-                                 strlen(s->dir_html), strlen(s->dir_html));
-                        continue;
+                        srv_send_nocl(fd, s->dir_html, strlen(s->dir_html));
+                        break; /* Connection: close ⇒ 客户端读到 EOF 才算完 */
                     }
                 }
             }

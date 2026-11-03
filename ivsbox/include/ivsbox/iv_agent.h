@@ -1051,6 +1051,30 @@ int iv_agent_record_held_off(const iv_agent_t *a);
  * 就是上报数据段 `MN=` 字段的生产者（见 iv_report.h 的 env.mn[]）。 */
 uint8_t           iv_agent_mn(const iv_agent_t *a, int w);
 
+/*
+ * 重新解析两条 WAN 的 ifindex（内核把网卡注销再注册时会变），返回变化的路数。
+ *
+ * 为什么必须有：`wan_ifindex[]` 原先**只在 open 里解析一次**。4G 模组开机 80 s
+ * 左右会把自己注销再注册一遍（板端 dmesg：`[2.62] register usb0` →
+ * `[80.70] unregister` → `[82.44] register`），ifindex 8 → 9。缓存留在 8 的后果：
+ *   · netlink 的 LINK_UP 带新索引，与缓存对不上 ⇒ `wan_link_up[]` 恒 0；
+ *   · 探测项绑在旧 ifindex ⇒ 发不出也收不到 ⇒ 该项恒"不通"；
+ *   ⇒ `mn_state_of()` 恒 2 ⇒ 界面「4G 断开」、`net.state=BOTH_DOWN`，
+ *   而平台 TCP 按**网卡名**绑（`bind_ifname`）总能解析到新索引 ⇒ 连接正常。
+ *   同一屏「4G 断开」＋「已连接」并存，就是这条。
+ *
+ * 调用点（**三条都要挂**，板端走定时器那条）：
+ *   · `iv_agent_step()`     —— 无 Reactor 的驱动路径
+ *   · `on_nm_timer()`       —— Reactor，1 s 一拍
+ *   · `on_nl_evt()` LINK_*  —— 事件带 ifname，认出来就地重做（少等一拍）
+ *
+ * 语义：`if_nametoindex()` 在注销与再注册之间的空窗返回 0，那**不**代表该 WAN
+ * 消失，一律跳过（改缓存成 0 会让 netmgr 白切一次默认路由）。变化时重建探测表，
+ * 并在变化的正好是**活动出口**时按名字重连（顺带复位 TCP 重连退避）。
+ * 未 open 返回 0。
+ */
+int iv_agent_rescan_ifindex(iv_agent_t *a, uint64_t now_ms);
+
 /* 「主网检测 IP」（`probe.target1/2`）的探测结论 —— **界面显示与上报故障码同源**：
  *   0 未知（没配 / 第一轮 4 个包还没攒满 / 没建成项）
  *   1 通      —— 4 包全响应，平均 RTT ≤ `probe.timeout_ms`

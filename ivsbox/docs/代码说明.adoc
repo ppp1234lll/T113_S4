@@ -12580,5 +12580,132 @@ finish -> 200 "https://minio.fnwlwiot.com:18444/fnwlw-01/device-log/B2CC1/device
 重置的**。写分片上传时，"片数"必须能由 `totalSize` 唯一算出；一旦片数依赖"怎么切"，
 就一定会在多文件/多段拼装的场景下对不上。
 
+== 2026-11-03 11:26 4G「断开」却「已连接」：ifindex 只解析一次（网卡重新枚举）
+
+=== 现场现象
+
+用户截的是本地 Web「网络」页（不是平台），同一屏里两句话互相打架：
+
+|===
+|区块 |内容
+
+|链路状态（只读） |网络状态 *`双链路断开`*、有线 *`断开`*、4G *`断开`*（三块全红）
+|平台通信（只读） |当前通信网口 `usb0 无线（4G）`、平台连接 ***`已连接`***、传输层实际绑定 `usb0`、待发送队列 *`172 条`*
+|===
+
+问的是「4G 连接平台这么慢吗」。查下来是**三件不同的事**，只有一件真是 bug。
+
+=== 第一件（真 bug）：`wan_ifindex[]` 全仓只在 open 里解析一次
+
+`iv_agent_open()` 里一行 `a->wan_ifindex[w] = wan_ifindex_of(cfg->wan_name[w])`，
+之后**再没有任何地方更新它**。而 4G 模组在开机 80 s 左右会把自己注销再注册一遍：
+
+[source,text]
+----
+[    2.623186] cdc_ether 2-1.3:1.0 usb0: register 'cdc_ether' …      ← ifindex 8（agent 读到的是这个）
+[   80.705810] cdc_ether 2-1.3:1.0 usb0: unregister 'cdc_ether' …    ← 模组重新枚举
+[   82.445810] cdc_ether 2-1.3:1.0 usb0: register 'cdc_ether' …      ← ifindex 9（内核此后一直用它）
+----
+
+于是三件事全部错位：
+
+* netlink 的 LINK_UP 带的是 **9**，与缓存的 8 对不上 ⇒ `wan_link_up[]` 恒 0；
+* 探测项绑在 **8** 上 ⇒ 包发不出去、回包的 ifindex 校验也过不了 ⇒ 该项恒"不通"；
+* ⇒ `mn_state_of()` 恒 2 ⇒ 界面「4G 断开」、`net.state=BOTH_DOWN`。
+
+而平台 TCP 是按 **网卡名** 绑的（`bind_ifname="usb0"`），内核每次都能解析到 9 ⇒
+连接、上报全正常。两套事实不同源，于是同一屏里「4G 断开」和「已连接」并存。
+
+板端取证（未改任何配置）：
+
+[source,text]
+----
+GET /api/overview  ->  wan.ifindex = 8
+cat /sys/class/net/usb0/ifindex  ->  9
+ping -I usb0 47.104.250.225  -> 4 packets, 0% loss, avg 33 ms   ← 4G 本身好得很
+ping -I eth0 47.104.250.225  -> 4 packets, 100% loss            ← 有线（现场老问题）
+----
+
+=== 修法：`iv_agent_rescan_ifindex()`
+
+[source,c]
+----
+for (w = 0; w < IV_WAN_N; w++) {
+    int ni = wan_ifindex_of(a->cfg.wan_name[w]);   /* if_nametoindex */
+    if (ni == 0 || ni == a->wan_ifindex[w]) continue;   /* 0 = 重新枚举的空窗，不动 */
+    a->wan_ifindex[w]        = ni;
+    a->wan_link_up[w]        = 0u;
+    a->nm.cfg.wan[w].ifindex = ni;                 /* 切换事务按它删/建默认路由 */
+    …
+}
+agent_probe_rebuild(a, &pc, now_ms);               /* 探测项绑的是 ifindex，必须整表重建 */
+if (active wan changed) agent_reconnect(a, …);     /* 按名字重连，顺带复位 TCP 退避 */
+----
+
+三条驱动路径**全都挂**（板端走 Reactor，只挂一条等于没修）：
+
+[cols="1,2"]
+|===
+|路径 |时机
+
+|`iv_agent_step()` |无 Reactor 的驱动
+|`on_nm_timer()` |Reactor，1 s 一拍
+|`on_nl_evt()` LINK_* |事件带 ifname，认出来就地重做（比定时器早一拍）
+|===
+
+`ni == 0` 一律跳过：注销与再注册之间的空窗不代表"这个 WAN 没了"，把缓存改成 0 会让
+netmgr 白跑一次切换事务（把默认路由挪到一条更差的链路上）—— 那比不修更糟。
+
+=== 第二件：队列 172 条不是"当时慢"，是上次运行留下的持久积压
+
+`/mnt/UDISK/ivsbox/queue` 是持久队列，重启后接着补传。日志实测：
+
+[source,text]
+----
+11:05:02 queue item written: seq=204 left=256     ← 重启后第一件，队列里已有 257 条
+11:05:54 queue item written: seq=460 left=1
+11:08:50 queue item written: seq=461 left=1       ← 之后就是 180 s 一帧的周期上报
+----
+
+257 条 / 52 s ≈ **5 帧每秒**（取件泵一拍一件，reactor 节拍 200 ms），排空后 `queue`
+恒 0。积压的成因是此前有线不通、4G 未拨通期间每 180 s 一帧全部落盘 —— 也就是说
+"看到 172 条"那一刻，设备正在**补传 12 小时前的欠账**，不是当时传得慢。
+
+=== 第三件：真正慢的地方是开机头两分钟
+
+`11:02:50`（agent up，`bind=usb0/usb0`）→ `11:05:01`（`transport -> CONNECTING/UP`）
+＝ **2 分 11 秒**。主体是模组重新枚举（80 s）＋ DHCP 取址 ＋ TCP 重连退避（1 s 起
+翻倍、封顶 30 s）。修好 ifindex 之后，活动出口换索引会立刻重连并**复位退避**，
+那"最多 30 s 的干等"没有了；重枚举本身属于硬件事实，不在固件里改。
+
+=== 顺手修的测试替身竞态（`make tsan` 原来就是红的）
+
+`test_logup.c` / `test_updfetch.c` 里的假服务器用 `volatile int stop` 当停止标志、
+普通 `unsigned` 当计数器，主线程还在服务线程跑着的时候就读它们做断言；`updfetch`
+更直接：主线程 `snprintf(s->dir_html, …)` 的同时服务线程正在 `srv_send_nocl()` 里读
+同一份。TSAN 如实报 data race（`test_updfetch.c:277/345/587/592`）。
+
+* 停止标志与计数器 ⇒ C11 `_Atomic`（写法一字未变）；
+* "改配置 vs 读配置"补一把配置锁：服务线程每条连接持锁，主线程只在一次下载
+  （`iv_updfetch_run()`）期间放锁 —— 那段时间它自己不改配置；
+* `srv_stop()` 之前先放锁再 `pthread_join()`，别留"拿锁去 join"的死锁面。
+
+=== 验证
+
+* VM：`make test` **52 项 / 0 FAIL**（新增 `test_agent_ifindex`）、`make asan` rc=0、
+  `setarch -R make tsan` **rc=0 / 0 条 ThreadSanitizer / 55 项**、`make arm` 0 告警
+  （ARM ELF32）、`make analyze` 0 条；`make itest` **17 RUN / 16 passed / 1 SKIP**（tunnel 缺 sn）。
+* 反向证伪 4 条（撤缓存赋值 / 空窗不跳过 0 / 不重建探测表 / 不同步 netmgr）→
+  对应用例分别转红，还原即复绿。
+
+=== 教训
+
+**"只解析一次的缓存"是嵌入式里的定时炸弹**：USB 网卡（4G 模组）、热插拔网口、
+`usbnet`/`cdc_ether` 在重新枚举后 ifindex 就会变，而按**名字**绑的东西（bind、
+`if_nametoindex`）会自己跟上 —— 两套口径混用时，出问题的永远是缓存那一侧，且症状
+表现为"界面在说谎"而不是"功能坏了"。凡是拿 ifindex 当键的表（探测项、路由事务、
+netlink 事件匹配），都必须有一个"重新解析"的入口，并且挂在**所有**驱动路径上。
+
+
 
 

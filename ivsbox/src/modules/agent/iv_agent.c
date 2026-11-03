@@ -451,6 +451,75 @@ static void agent_probe_rebuild(iv_agent_t *a, const iv_probe_cfg_t *pc, uint64_
 }
 
 /* ---------------------------------------------------------------------------
+ * 网卡重新枚举后的 ifindex 重解析（2026-11-03）
+ *
+ * 病根：`a->wan_ifindex[]` 全仓**只在 `iv_agent_open()` 里解析一次**。而 4G 模组
+ * 开机 80 s 左右会把自己注销再注册一次（板端 `dmesg` 实证：
+ *   `[2.62]` register usb0  →  `[80.70]` **unregister**  →  `[82.44]` register
+ * ），ifindex 8 → 9。之后三件事全错位：
+ *   · netlink 的 LINK_UP 带的是新索引 9，与缓存的 8 对不上 ⇒ `wan_link_up[]` 恒 0；
+ *   · 探测项绑在 8 上 ⇒ 包发不出去、回包也对不上 ifindex ⇒ 该项恒 UNKNOWN/不通；
+ *   ⇒ `mn_state_of()` 恒 2 ⇒ 界面「4G 断开」＋ `net.state=BOTH_DOWN`；
+ *   而平台 TCP 是按**网卡名**绑的（`bind_ifname="usb0"`），内核每次都解析到 9，
+ *   于是它照样连上、照样上报 ⇒ 同一屏里「4G 断开」和「已连接」并存，
+ *   外加 `netmgr` 认为没有可用 WAN（2026-11-03 现场就是这样）。
+ *
+ * 判据只认"**解析到新值且不为 0**"：`if_nametoindex()` 在注销与再注册之间那段
+ * 空窗返回 0，那不代表"这个 WAN 没了"，只代表一瞬间没有；把缓存改成 0 会让
+ * netmgr 白跑一次切换事务（把默认路由挪到一条更差的链路上），所以 0 一律跳过，
+ * 等它带着新 ifindex 回来再重建。
+ *
+ * 返回值＝索引发生变化的 WAN 个数（0 ＝ 无事发生）。
+ * ------------------------------------------------------------------------- */
+int iv_agent_rescan_ifindex(iv_agent_t *a, uint64_t now_ms)
+{
+    int changed = 0;
+    int reconn  = 0;
+    int w;
+
+    if (a == NULL || !a->opened)
+        return 0;
+    a->now_ms = now_ms;
+
+    for (w = 0; w < IV_WAN_N; w++) {
+        int ni = wan_ifindex_of(a->cfg.wan_name[w]);
+
+        if (ni == 0 || ni == a->wan_ifindex[w])
+            continue;
+        IV_LOG_W(AG_MOD, "wan %s ifindex re-resolved %d -> %d (re-enumerated)",
+                 a->cfg.wan_name[w], a->wan_ifindex[w], ni);
+        a->wan_ifindex[w]        = ni;
+        a->wan_link_up[w]        = 0u; /* 新接口的载波等新的 netlink 事件/seed */
+        a->nm.cfg.wan[w].ifindex = ni; /* 切换事务按它删/建默认路由 */
+        changed++;
+        if (iv_netmgr_active_wan(&a->nm) == (iv_wan_t)w)
+            reconn = 1;
+    }
+    if (changed == 0)
+        return 0;
+
+    /* 探测项绑的是 ifindex ⇒ 必须**整表重建**（stop/init/build ＋ 重播链路现状），
+     * 单改字段没用：旧项还挂在旧 ifindex 上。 */
+    {
+        iv_probe_cfg_t pc;
+
+        probe_cfg_of(&a->cfg, &pc);
+        agent_probe_rebuild(a, &pc, now_ms);
+    }
+
+    /* 出口网卡换了索引：在用的那条 socket 是在**旧接口**上建的，路由与源地址都
+     * 可能已经失效。按名字重连一次（队列与镜像都不动，未确认数据由取件泵补传），
+     * 顺带把 TCP 的重连退避复位 —— 否则要等到下一轮 30 s 封顶退避才重试，
+     * 现场看到的就是"网卡已经回来了、平台还要等半分钟"。 */
+    if (reconn != 0) {
+        int aw = (int)iv_netmgr_active_wan(&a->nm);
+
+        (void)agent_reconnect(a, a->wan_ifindex[aw]);
+    }
+    return changed;
+}
+
+/* ---------------------------------------------------------------------------
  * S4.3 SNMP 采集作业装配（`a->cfg.snmp[t]` → `a->snmp_job[t]`）
  *
  * 抽成函数是为了**热生效**（2026-10-22 `camera.snmp.*` / `switch.snmp.*`）：
@@ -1158,6 +1227,9 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
     a->now_ms = now_ms;
     if (a->cfg.pool != NULL)
         (void)iv_taskpool_process(a->cfg.pool, 0); /* 收 SNMP 完成结果（同线程） */
+    /* 网卡可能被重新枚举（4G 模组开机 80 s 会注销再注册 usb0），ifindex 一变，
+     * 探测项与 netlink 事件就全对不上 —— 每拍先重解析一次（见 rescan 的注释）。 */
+    (void)iv_agent_rescan_ifindex(a, now_ms);
     probe_drive(a, now_ms);
     netmgr_feed(a, now_ms);
     (void)iv_netmgr_tick(&a->nm, now_ms);
@@ -2491,6 +2563,19 @@ static void on_nl_evt(const iv_netlink_evt_t *e, void *arg)
             a->wan_ifindex[IV_WAN_WIRED] == e->ifindex)
             (void)iv_camdet_set_link(&a->cd, up, a->now_ms);
         (void)iv_probe_set_link(&a->pb, e->ifindex, up, a->now_ms);
+        /* **接口被重新枚举**（4G 模组注销再注册 usb0）：事件里的 ifindex 与缓存
+         * 对不上，上面那个循环等于什么都没做。LINK 事件带 ifname，按名字认出来
+         * 就地重解析 + 重建探测项 —— 比等 1 s 的定时器早一拍，也比"永远不修"好。
+         * 判据里要求 `e->ifname` 非空：ADDR/ROUTE 事件不填这个字段。 */
+        for (w = 0; w < IV_WAN_N; w++) {
+            if (e->ifname[0] == '\0' || a->cfg.wan_name[w][0] == '\0')
+                continue;
+            if (strcmp(a->cfg.wan_name[w], e->ifname) != 0)
+                continue;
+            if (a->wan_ifindex[w] != e->ifindex)
+                (void)iv_agent_rescan_ifindex(a, a->now_ms);
+            break;
+        }
         break;
     }
     case IV_NLEVT_ROUTE_ADD:
@@ -2545,6 +2630,7 @@ static void on_nm_timer(void *arg)
     uint64_t    now = iv_clock_monotonic_ms();
 
     a->now_ms = now;
+    (void)iv_agent_rescan_ifindex(a, now); /* 与 step() 同装同驱：板端走这条 */
     netmgr_feed(a, now);
     (void)iv_netmgr_tick(&a->nm, now);
     env_feed(a, now); /* 主网 MN 更新 ＋ 故障沿（1 s 粒度足够） */

@@ -35,6 +35,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,7 +67,11 @@ typedef struct {
     int      listen_fd;
     int      port;
     pthread_t th;
-    volatile int stop;
+    /* `volatile` **不足以**让 TSAN 满意（它只挡编译器优化，挡不住乱序与撕裂），
+     * 而 `make tsan` 会把它算成 data race：`srv_stop()` 写、`srv_thread()` 读。
+     * 这里要的是一个真正的原子标志 —— 用 C11 `_Atomic int`，读取侧仍是
+     * `while (!s->stop)`，写法不变。 */
+    _Atomic int stop;
 
     unsigned reqs;        /* 收到的请求数 */
     unsigned starts;

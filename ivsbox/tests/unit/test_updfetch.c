@@ -50,6 +50,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,12 +91,16 @@ typedef struct {
     int         listen_fd;
     int         port;
     pthread_t   th;
-    volatile int stop;
+    /* 停止标志与计数器都是**跨线程**的：`srv_stop()`/`srv_thread()` 写，主线程在
+     * 服务端还在跑的时候就读它们做断言。`volatile` 挡不住乱序与撕裂，`make tsan`
+     * 会如实算成 data race（2026-11-03 门禁红），所以这里用 C11 原子类型 ——
+     * 读写写法一字未变。 */
+    _Atomic int stop;
 
-    unsigned reqs;
-    unsigned info_reqs;
-    unsigned pkg_reqs;
-    unsigned dir_reqs;
+    _Atomic unsigned reqs;
+    _Atomic unsigned info_reqs;
+    _Atomic unsigned pkg_reqs;
+    _Atomic unsigned dir_reqs;
 
     int      mode;
     char     version[64];  /* info.txt 里的 version */
@@ -104,7 +109,14 @@ typedef struct {
     char     last_dir_path[96];   /* 最近一次被当成"目录"的请求路径 */
     unsigned char buf[SRV_BUF_MAX];
     size_t   len;
+
+    /* 配置互斥：见 srv_begin()/srv_end() 的说明 */
+    pthread_mutex_t mu;
 } srv_t;
+
+/* 定义在服务线程之后，这里先声明（服务线程要用） */
+static void srv_begin(srv_t *s);
+static void srv_end(srv_t *s);
 
 static int srv_listen(srv_t *s)
 {
@@ -241,6 +253,7 @@ static void *srv_thread(void *arg)
                 continue;
             break;
         }
+        srv_begin(s); /* 本连接期间独占配置视图 */
         for (;;) {
             char hdr[2048];
 
@@ -318,14 +331,35 @@ static void *srv_thread(void *arg)
             srv_send(fd, 200, "Content-Type: application/octet-stream\r\n", s->buf,
                      s->len, s->len);
         }
+        srv_end(s);
         (void)close(fd);
     }
     return NULL;
 }
 
+/* ---- 配置互斥（2026-11-03）-------------------------------------------------
+ * 主线程"改配置"（mode/version/dir_html/buf …）与服务线程"读配置"（组应答）之间
+ * 必须有时序边，否则 `make tsan` 会如实报 data race：主线程 snprintf 一份新
+ * `dir_html` 的同时，服务线程正在 `srv_send_nocl()` 里读旧的那份。
+ *
+ * 约定：服务线程每接一条连接就持锁到该连接结束；主线程除一次下载（那段 run）
+ * 之外一直持锁 —— 那段时间它自己不改配置。于是"写 → 解锁 → 下次连接加锁读"与
+ * "读 → 解锁 → 主线程加锁写"两个方向都成立，谁先谁后都不会漏。
+ */
+static void srv_begin(srv_t *s)
+{
+    (void)pthread_mutex_lock(&s->mu);
+}
+
+static void srv_end(srv_t *s)
+{
+    (void)pthread_mutex_unlock(&s->mu);
+}
+
 static int srv_start(srv_t *s)
 {
     memset(s, 0, sizeof *s);
+    (void)pthread_mutex_init(&s->mu, NULL);
     s->listen_fd = -1;
     (void)snprintf(s->url_path, sizeof s->url_path, "/pkg/ivsbox.pkg");
     if (srv_listen(s) != 0) {
@@ -429,6 +463,7 @@ int main(void)
         return 0;
     }
 
+    srv_begin(&srv); /* 主线程持配置锁，只有 run 期间放锁 */
     (void)snprintf(pkg_path, sizeof pkg_path, "%s/ota/download/ivsbox.pkg", g_root);
     (void)snprintf(part_path, sizeof part_path, "%s/ota/download/ivsbox.pkg.part", g_root);
     (void)snprintf(req_path, sizeof req_path, "%s/ota/request", g_root);
@@ -442,7 +477,9 @@ int main(void)
     /* ---- p01：正常整包下载，逐字节相等 ---- */
     cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p01 init");
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     rc = iv_updfetch_run(&g_uf);
+    srv_begin(&srv);
     if (rc != IV_OK) { /* 失败时把 rc/http 打出来：只报"不等于 IV_OK"没法定位 */
         iv_updfetch_stats(&g_uf, &st);
         fprintf(stderr, "  p01 rc=%d http=%d\n", rc, st.last_http);
@@ -479,7 +516,9 @@ int main(void)
     before_pkg = srv.pkg_reqs;
     cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p02 init");
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     rc = iv_updfetch_run(&g_uf);
+    srv_begin(&srv);
     chk(rc == IV_UPDFETCH_SAME, "p02 same version -> IV_UPDFETCH_SAME");
     chk(srv.pkg_reqs == before_pkg, "p02 no package request for an up-to-date device");
     iv_updfetch_stats(&g_uf, &st);
@@ -493,7 +532,9 @@ int main(void)
     (void)unlink(part_path);
     cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p03 init");
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     rc = iv_updfetch_run(&g_uf);
+    srv_begin(&srv);
     /* 短包在传输层就是"连接提前关"，报 IV_ECONN；关键是**不能当成功**、
      * 也不能留下半截包。两种错误码都接受，但 IV_OK 绝对不行。 */
     chk(rc != IV_OK && rc != IV_UPDFETCH_SAME, "p03 short body is not success");
@@ -508,7 +549,9 @@ int main(void)
     cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
     cfg.max_bytes = 2000u; /* 客户端只允许 2 KB */
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p04 init");
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     rc = iv_updfetch_run(&g_uf);
+    srv_begin(&srv);
     chk(rc == IV_ERANGE, "p04 oversize -> IV_ERANGE");
     chk(exists(part_path) == 0, "p04 no .part left after ERANGE");
     chk(exists(pkg_path) == 0, "p04 no final package after ERANGE");
@@ -519,13 +562,17 @@ int main(void)
     srv.mode = SRV_NOURL;
     cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p05 init (no url)");
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     chk(iv_updfetch_run(&g_uf) == IV_EPROTO, "p05 info.txt without url -> IV_EPROTO");
+    srv_begin(&srv);
     iv_updfetch_close(&g_uf);
 
     srv.mode = SRV_HTTPS;
     cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p05 init (https)");
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     chk(iv_updfetch_run(&g_uf) == IV_ENOTSUP, "p05 https url -> IV_ENOTSUP");
+    srv_begin(&srv);
     iv_updfetch_close(&g_uf);
     srv.mode = SRV_OK;
 
@@ -548,7 +595,9 @@ int main(void)
     cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
     cfg.hw_name = NULL; /* **不设硬件名** ⇒ 顺带验编译期默认值（发布侧那个目录名） */
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p07 init (listing)");
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     rc = iv_updfetch_run(&g_uf);
+    srv_begin(&srv);
     if (rc != IV_OK) {
         iv_updfetch_stats(&g_uf, &st);
         fprintf(stderr, "  p07 rc=%d http=%d\n", rc, st.last_http);
@@ -579,7 +628,9 @@ int main(void)
     cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
     cfg.hw_name = NULL;
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p08 init (listing, up to date)");
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     chk(iv_updfetch_run(&g_uf) == IV_UPDFETCH_SAME, "p08 listing same version -> SAME");
+    srv_begin(&srv);
     chk(srv.pkg_reqs == before_pkg, "p08 no package request when up to date");
     iv_updfetch_close(&g_uf);
 
@@ -591,7 +642,9 @@ int main(void)
     cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
     cfg.hw_name = NULL;
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p09 init (no pkg in listing)");
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     chk(iv_updfetch_run(&g_uf) == IV_ENOENT, "p09 listing without .pkg -> IV_ENOENT");
+    srv_begin(&srv);
     chk(srv.pkg_reqs == before_pkg, "p09 nothing downloaded");
     iv_updfetch_close(&g_uf);
     srv.mode = SRV_OK;
@@ -600,7 +653,9 @@ int main(void)
     srv.mode = SRV_NOINFO;
     cfg_of(&cfg, &srv, "127.0.0.1", "1.0.0.20261102");
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p06 init (404)");
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     chk(iv_updfetch_run(&g_uf) == IV_EPROTO, "p06 info.txt 404 -> IV_EPROTO");
+    srv_begin(&srv);
     iv_updfetch_close(&g_uf);
     srv.mode = SRV_OK;
 
@@ -608,15 +663,24 @@ int main(void)
     cfg.port       = 1u; /* 这个端口上没有服务 */
     cfg.connect_ms = 300u;
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p06 init (bad port)");
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     chk(iv_updfetch_run(&g_uf) == IV_ECONN, "p06 unreachable server -> IV_ECONN");
+    srv_begin(&srv);
     iv_updfetch_close(&g_uf);
 
     cfg_of(&cfg, &srv, "", "1.0.0.20261102");
     chk(iv_updfetch_init(&g_uf, &cfg) == IV_OK, "p06 init with empty host allowed");
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     chk(iv_updfetch_run(&g_uf) == IV_EINVAL, "p06 empty host -> IV_EINVAL");
+    srv_begin(&srv);
     iv_updfetch_close(&g_uf);
+    srv_end(&srv); /* run 期间交还配置锁：服务线程要读它才能应答 */
     chk(iv_updfetch_run(&g_uf) == IV_EINVAL, "p06 run after close -> IV_EINVAL");
+    srv_begin(&srv);
 
+    /* 先放锁再 join：服务线程在每条连接开头要拿这把锁，主线程攥着它去 join 会
+     * 在"恰好有一条连接正在进来"时互等（这里虽然不会有客户端，但别留这种死锁面）。 */
+    srv_end(&srv);
     srv_stop(&srv);
     rm_root();
 

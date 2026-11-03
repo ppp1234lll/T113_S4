@@ -66,19 +66,37 @@ int main(void)
         (void)snprintf(expect, sizeof(expect), "%s+", semver);
         chk(strncmp(v, expect, strlen(expect)) == 0, "semver prefix matches ivsbox.h");
 
-        /* 1) 串尾与 iv_version_git() 严格自洽（不再有"或 unknown"这种模糊空间） */
+        /* 1) 串尾与 iv_version_git() 严格自洽（不再有"或 unknown"这种模糊空间）。
+         *
+         * **`+` 之后不一定就是原值**：注入可用时串是 `+g<sha>`（`g` 是标记，不属于
+         * 哈希本身），降级时串是 `+nogit`（`iv_version_git()` 同样返回 `nogit`，无标记）。
+         * 2026-11-03 修：原来这里无条件拿串尾和原值比，一旦注入哈希必然不等
+         * （`g2492857` vs `2492857`）——而历史门禁 `make test` 都**不带 GIT_VER**
+         * 跑，走的全是降级分支，所以这条错断言一直没被触发；只有 `make arm`
+         * （会注入）编出来的二进制真带哈希。判据：`make test GIT_VER=<sha>` 必须也全绿。 */
         git = iv_version_git();
         chk(git != NULL, "iv_version_git not NULL");
-        chk(strcmp(v + strlen(expect), git) == 0,
-            "suffix is exactly what iv_version_git() reports");
+        {
+            const char *suffix = v + strlen(expect);
+
+            if (iv_version_git_valid()) {
+                /* 先判 `g` 再比后面：suffix 为空时不能拿 suffix+1 去 strcmp */
+                chk(suffix[0] == 'g' && strcmp(suffix + 1, git) == 0,
+                    "suffix after 'g' is exactly what iv_version_git() reports");
+            } else {
+                chk(strcmp(suffix, git) == 0,
+                    "suffix is exactly what iv_version_git() reports");
+            }
+        }
 
         /* 2) 合法性判定与串尾一一对应 */
         if (iv_version_git_valid()) {
             chk(*git != '\0', "valid flag implies non-empty");
             chk(looks_like_sha(git) == 1, "valid flag implies hex sha");
-            chk(strcmp(v + strlen(expect), git) == 0, "valid flag => suffix is the sha");
-            chk(strcmp(git, "nogit") != 0, "valid flag => git value is not the placeholder");
             chk(v[strlen(expect)] == 'g', "valid flag => suffix carries the 'g' tag");
+            chk(strcmp(v + strlen(expect) + 1, git) == 0,
+                "valid flag => suffix is 'g' + the sha");
+            chk(strcmp(git, "nogit") != 0, "valid flag => git value is not the placeholder");
         } else {
             chk(strcmp(v + strlen(expect), "nogit") == 0,
                 "invalid flag => suffix degraded to 'nogit'");

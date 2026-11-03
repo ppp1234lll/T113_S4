@@ -513,9 +513,13 @@ int iv_logup_run(iv_logup_t *u)
     }
     copy_str(u->file_name, sizeof u->file_name, LU_FILE_NAME);
 
+    /* 打的是**起点**（游标 cur_*），不是 last_* —— last 是本次要走到哪儿，
+     * 结束行才打它。2026-11-03 就因为这行印了 last，start/ok 两行一模一样，
+     * 被误读成"游标没推进"。 */
     IV_LOG_I(LU_MOD, "upload start: %u B (one request) -> %s:%u (from %s %02d +%ld)",
-             (unsigned)total, u->up.host, (unsigned)u->up.port, sp.last_date,
-             sp.last_hour, sp.last_off);
+             (unsigned)total, u->up.host, (unsigned)u->up.port,
+             (sp.cur_hour >= 0) ? sp.cur_date : "(no cursor)",
+             (sp.cur_hour >= 0) ? sp.cur_hour : 0, sp.cur_off);
 
     rc = iv_uphttp_connect(&u->up);
     if (rc != IV_OK)

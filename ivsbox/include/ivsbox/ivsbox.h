@@ -15,9 +15,13 @@
  *
  * 所以规矩是：**每发一个包，先把这里抬上去**（`tools/mkota.py build` 不给 --version
  * 时直接读这三个宏，包版本与设备自报版本同源，抬一处就够）。 */
+/* 2026-11-03：1.0.6 → 1.0.7。1.0.6 这个号已经被三个不同内容的构建用过
+ * （官方 `b38444b2`、上午的 `5c9d3c5c`、修完日志行的 `7e8fcfd4`），
+ * 版本串却一模一样 ⇒ 现场分不清、OTA 也判不出"要不要装"。抬号是为了让
+ * `releases/1.0.6` 恢复成官方内容、新构建独占 `1.0.7`。 */
 #define IVSBOX_VERSION_MAJOR 1
 #define IVSBOX_VERSION_MINOR 0
-#define IVSBOX_VERSION_PATCH 6
+#define IVSBOX_VERSION_PATCH 7
 
 #ifdef __cplusplus
 extern "C" {

@@ -1,5 +1,5 @@
 /*
- * 日志上报（平台 0xB2）—— HTTP 三步分片上传
+ * 日志上报（平台 0xB2）—— HTTP 三步上传（一个请求发完）
  *
  * ============================ 它是什么 ============================
  * 平台下 `0xB2`「日志上报」后，把本机日志按参考实现（GD32F460 主控
@@ -23,16 +23,18 @@
  *      游标文件记「下一个未上传字节」＝ `<date> <hour> <offset>`。上传成功才
  *      推进游标；失败保持不动，下一次 0xB2 从同一位置重传。游标指向的文件
  *      已被保留期清掉（3 天）⇒ 自动从现存最旧文件开头开始。
- *   3) **单次有上限**（`IV_LOGUP_MAX_BYTES_DEFAULT` = 1 MiB）：1 KiB 一片 ⇒
- *      最多 1024 次 chunk。参考没上限是因为 littlefs 批次本身有 5000 条上限；
- *      本机保留 3 天、每小时 1 MiB 上限，一次全传最多 72 MiB，1 KiB 分片在
- *      4G 上是几小时 —— 必须截断。剩下的留给后续 0xB2（或下一次平台催报）。
+ *   3) **单次有上限**（`IV_LOGUP_MAX_BYTES_DEFAULT` = 1 MiB）：一个请求发完，
+ *      不再切 1 KiB 片。参考没上限是因为 littlefs 批次本身有 5000 条上限；
+ *      本机保留 3 天、每小时 1 MiB 上限，一次全传最多 72 MiB，仍必须截断。
+ *      剩下的留给后续 0xB2（或下一次平台催报）。
  *   4) **finish 不带 md5**：参考的 `finish_md5_enable` 出厂就是 DISABLE，服务端
  *      接受不带 md5；本工程借此免一个 MD5 实现（`iv_sha256` 是另一套）。
- *   5) **连接 keep-alive**：一次上传（start + N×chunk + finish）复用同一条 TCP。
- *      1 KiB 一片、4G RTT 45 ms，每片重连光握手就要 135 ms，1024 片会拖到
- *      两分多钟；复用后只剩服务端处理时间。服务端回 `Connection: close` 或
- *      断链时自动重连，并从**当前这一片**重试（同一 chunkIndex 重发是幂等的）。
+ *   5) **连接 keep-alive**：一次上传（start + chunk + finish）复用同一条 TCP。
+ *      **分片数是 1**（`totalChunks=1`）：2026-11-03 真机实测同一张 164744 B 的图，
+ *      1 片 2.2 s、1 KiB×161 片 17.6 s，三份文件 md5 全部等于原图 ⇒ 服务端不要求
+ *      1 KiB 边界。1 MiB 日志整块 12.4 s（原来 1024 片要上百秒）。详见
+ *      `iv_uphttp.h` 文件头。服务端回 `Connection: close` 或断链时自动重连，
+ *      并从**本次上传开头**重来（游标不推进，日志是整段快照，重传不产生重复）。
  *
  * ============================ 线程与调用纪律 ============================
  *   `iv_logup_run()` 是**同步阻塞**的（DNS、connect、读写 socket、读文件）。
@@ -69,8 +71,8 @@ extern "C" {
 #define IV_LOGUP_PATH_FINISH IV_UPHTTP_PATH_FINISH
 
 #define IV_LOGUP_PORT_DEFAULT      IV_UPHTTP_PORT_DEFAULT
-#define IV_LOGUP_CHUNK_SIZE        IV_UPHTTP_CHUNK_SIZE
-#define IV_LOGUP_MAX_BYTES_DEFAULT (1024u * 1024u) /* 单次上传上限 1 MiB ⇒ ≤1024 片 */
+#define IV_LOGUP_SEND_CHUNK        IV_UPHTTP_SEND_CHUNK
+#define IV_LOGUP_MAX_BYTES_DEFAULT (1024u * 1024u) /* 单次上传上限 1 MiB，一个请求发完 */
 #define IV_LOGUP_RETRY_MAX         3              /* 单请求重试次数（参考同名常量） */
 
 /* 长度上限（全部含结尾 NUL） */
@@ -84,9 +86,6 @@ extern "C" {
 #define IV_LOGUP_ID_MAX       64u  /* start 应答的 uploadId */
 
 /* 缓冲尺寸 */
-#define IV_LOGUP_HDR_MAX  512u
-#define IV_LOGUP_RESP_MAX 2048u                                    /* 应答（头+JSON body） */
-#define IV_LOGUP_BODY_MAX (512u + IV_LOGUP_CHUNK_SIZE + 64u)       /* multipart 组包 */
 #define IV_LOGUP_DAYS_MAX 16u                                      /* 单次扫到的日期目录数上限 */
 #define IV_LOGUP_FILES_MAX (IV_LOGUP_DAYS_MAX * 24u)               /* 跨 3 天最多 72 个 */
 
@@ -112,7 +111,7 @@ typedef struct {
     uint64_t runs;      /* 累计执行次数（含失败） */
     uint64_t ok;        /* 三步全过的次数 */
     uint64_t fail;      /* 失败次数（连接/应答/无日志） */
-    uint64_t chunks;    /* 累计成功上传的分片数 */
+    uint64_t chunks;    /* 累计成功上传的请求数（一次上传 = 1，字段名沿用旧口径） */
     uint64_t bytes;     /* 累计成功上传的字节数（游标实际推进量） */
     int      last_rc;   /* 最近一次 `iv_logup_run()` 返回码 */
     int      last_http; /* 最近一次 HTTP 状态码（0 = 没连上/没应答） */
@@ -136,8 +135,8 @@ typedef struct {
     char     file_name[IV_LOGUP_NAME_MAX];
 
     /* HTTP 这一半在 `iv_uphttp`（与图片上传共用同一份实现）：连接、keep-alive、
-     * "按 Content-Length 读满应答"、1 KiB 分片全在那边，本层只管"传哪一段字节"。
-     * 句柄体因此约 5 KiB；不要放栈上。 */
+     * "按 Content-Length 读满应答"、multipart 组包全在那边，本层只管"传哪一段字节"。
+     * 句柄体因此约 8 KiB；不要放栈上。 */
     iv_uphttp_t up;
 
     iv_logup_stats_t st;

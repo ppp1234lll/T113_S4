@@ -378,8 +378,8 @@ int main(void)
     chk(iv_imgup_pending(&iu) == 0, "i02 queue drained");
     chk(iu.st.ok == 1u && iu.st.bytes == 2500u, "i02 stats ok/bytes");
     chk(srv.starts == 1u && srv.finishes == 1u, "i02 start/finish once");
-    chk(srv.chunks == 3u, "i02 2500 B -> 3 chunks");
-    chk(srv.chunk_index_ok == 1, "i02 chunkIndex strictly increasing");
+    chk(srv.chunks == 1u, "i02 2500 B -> one request");
+    chk(srv.last_chunk_index == 0, "i02 chunkIndex 0");
     chk(srv.data_len == 2500u, "i02 server got 2500 B");
     {
         unsigned char expect[8192];
@@ -395,7 +395,7 @@ int main(void)
         "i02 start carries the jpg file name");
     chk(strstr(srv.start_line, "logType=IMAGE") != NULL, "i02 start logType=IMAGE");
     chk(strstr(srv.start_line, "deviceSn=B2CC1") != NULL, "i02 start deviceSn");
-    chk(strstr(srv.start_line, "totalChunks=3") != NULL, "i02 totalChunks matches");
+    chk(strstr(srv.start_line, "totalChunks=1") != NULL, "i02 totalChunks=1");
     chk(iu.st.last_url[0] != '\0', "i02 finish url captured");
 
     /* ---- i03：空队列 ---- */

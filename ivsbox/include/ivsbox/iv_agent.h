@@ -1248,7 +1248,8 @@ int iv_agent_build_snmp_json(const iv_agent_t *a, int which, const char *qn,
 /* ---------------------------------------------------------------------------
  * 平台 0xB2「日志上报」（2026-11-02）
  *
- * 协议依据＝参考实现 `General_Version/main/APP/Upload/`（三步 HTTP 分片上传），
+ * 协议依据＝参考实现 `General_Version/main/APP/Upload/`（三步 HTTP 上传；
+ * 我们只发一片，`totalChunks=1`，见 `iv_uphttp.h` 的实测数据），
  * 接口路径与端口见 `iv_logup.h`。这里只是**受理 + 丢给慢任务池**：
  *   - 已在传 ⇒ 返回 IV_EBUSY，调用方回 `0x77`（上一条指令执行中）；
  *   - 没有任务池 / 日志上报未配置 ⇒ IV_ESTATE（回 `0x74`）；

@@ -1,16 +1,18 @@
 /*
- * 平台 HTTP 上传客户端实现 —— start / chunk × N / finish，契约见 iv_uphttp.h
+ * 平台 HTTP 上传客户端实现 —— start / chunk(整块一片) / finish，契约见 iv_uphttp.h
  *
- * 结构一句话：一条 keep-alive 连接上依次发 start、N 个 chunk、finish；每一步都
- * 把应答**按 Content-Length 读满**再往下走。重试留给调用者（同 chunkIndex 重发
- * 幂等），本层只负责"一次请求做对"。
+ * 结构一句话：一条 keep-alive 连接上依次发 start、**一次** chunk（body 由
+ * begin/write/end 三段流式发出）、finish；每一步都把应答**按 Content-Length
+ * 读满**再往下走。重试留给调用者，本层只负责"一次上传做对"。
  *
- * 三个必须记住的口径（都是真机踩出来的）：
+ * 三个必须记住的口径：
  *   1) 应答必须读满：只读到 `\r\n\r\n` 就用，下一请求的应答会从上一请求的残留
  *      body 开始解析，`code` 永远读不到 200。
- *   2) 1 KiB 一片是**服务端拼接口径**（按 chunkIndex 摞），不是性能参数。
- *   3) 分片边界必须落在**整条字节流**上：调用者申报的 totalChunks 必须等于
- *      ceil(totalSize / 1024)，多一片服务端就回"分片序号无效"。
+ *   2) **1 KiB 一片是单片机的约束，不是服务端的**（2026-11-03 真机实测：同一张
+ *      164744 B 的图，1 片 2.2 s、64 KiB×3 2.2 s、1 KiB×161 17.6 s，三份文件
+ *      md5 全等于原图）。现在固定 `totalChunks=1`，一个文件一次请求。
+ *   3) 分片号与申报的 totalChunks 必须自洽（服务端按 `chunkIndex` 摞字节，多一片
+ *      回"分片序号无效"）；整块传时就是 0/1，不会踩到。
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1 /* SO_BINDTODEVICE / getaddrinfo 的 GNU 扩展 */
@@ -351,53 +353,152 @@ static int post_query(iv_uphttp_t *u, const char *path, int keep_alive)
     return (u->status >= 200 && u->status < 300) ? IV_OK : IV_EPROTO;
 }
 
-/* 一片数据：multipart/form-data，字段与参考实现逐字对齐 */
-static int post_chunk(iv_uphttp_t *u, unsigned index, const void *data, size_t len)
+/* 一片数据（现在是**唯一**一片）：请求头 + multipart 前缀先发出去，剩下的
+ * 内容由 `iv_uphttp_write()` 逐段发，`iv_uphttp_end()` 补尾并收 finish 应答。
+ * 三段的 Content-Length 必须一次算准：`前缀 + total + 尾`。 */
+int iv_uphttp_begin(iv_uphttp_t *h)
 {
-    size_t pos;
+    size_t plen;
+    size_t tlen;
     int    n;
 
-    if (len > IV_UPHTTP_CHUNK_SIZE)
-        return IV_ERANGE;
-    n = snprintf(u->body, sizeof u->body,
+    if (h == NULL || !h->inited)
+        return IV_EINVAL;
+    if (h->upload_id[0] == '\0')
+        return IV_ESTATE; /* 还没 start */
+    if (h->sending)
+        return IV_ESTATE; /* 上一次还没 end */
+    if (h->total == 0u)
+        return IV_EINVAL;
+
+    n = snprintf(h->pre, sizeof h->pre,
                  "--%s\r\nContent-Disposition: form-data; name=\"uploadId\"\r\n\r\n%s\r\n"
-                 "--%s\r\nContent-Disposition: form-data; name=\"chunkIndex\"\r\n\r\n%u\r\n"
+                 "--%s\r\nContent-Disposition: form-data; name=\"chunkIndex\"\r\n\r\n0\r\n"
                  "--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
                  "Content-Type: application/octet-stream\r\n\r\n",
-                 UU_BOUNDARY, u->upload_id, UU_BOUNDARY, index, UU_BOUNDARY,
-                 u->file_name);
-    if (n < 0 || (size_t)n + len + 64u >= sizeof u->body)
+                 UU_BOUNDARY, h->upload_id, UU_BOUNDARY, UU_BOUNDARY, h->file_name);
+    if (n < 0 || (size_t)n >= sizeof h->pre)
         return IV_ERANGE;
-    pos = (size_t)n;
-    memcpy(u->body + pos, data, len);
-    pos += len;
-    n = snprintf(u->body + pos, sizeof u->body - pos, "\r\n--%s--\r\n", UU_BOUNDARY);
-    if (n < 0 || (size_t)n >= sizeof u->body - pos)
-        return IV_ERANGE;
-    pos += (size_t)n;
+    plen = (size_t)n;
 
-    if (ensure_conn(u) != IV_OK)
+    n = snprintf(h->tail, sizeof h->tail, "\r\n--%s--\r\n", UU_BOUNDARY);
+    if (n < 0 || (size_t)n >= sizeof h->tail)
+        return IV_ERANGE;
+    tlen = (size_t)n;
+
+    if (ensure_conn(h) != IV_OK)
         return IV_ECONN;
-    n = snprintf(u->hdr, sizeof u->hdr,
+    n = snprintf(h->hdr, sizeof h->hdr,
                  "POST %s HTTP/1.1\r\n"
                  "Host: %s:%u\r\n"
                  "Content-Type: multipart/form-data; boundary=%s\r\n"
                  "Content-Length: %lu\r\n"
                  "Connection: keep-alive\r\n\r\n",
-                 IV_UPHTTP_PATH_CHUNK, u->host, (unsigned)u->port, UU_BOUNDARY,
-                 (unsigned long)pos);
-    if (n < 0 || (size_t)n >= sizeof u->hdr)
+                 IV_UPHTTP_PATH_CHUNK, h->host, (unsigned)h->port, UU_BOUNDARY,
+                 (unsigned long)(plen + (size_t)h->total + tlen));
+    if (n < 0 || (size_t)n >= sizeof h->hdr)
         return IV_ERANGE;
-    if (send_all(u, u->hdr, (size_t)n) != IV_OK ||
-        send_all(u, u->body, pos) != IV_OK) {
-        u->need_reconnect = 1;
+    if (send_all(h, h->hdr, (size_t)n) != IV_OK ||
+        send_all(h, h->pre, plen) != IV_OK) {
+        h->need_reconnect = 1;
         return IV_ECONN;
     }
-    if (read_resp(u) != IV_OK)
-        return u->need_reconnect ? IV_ECONN : IV_ETIMEDOUT;
-    if (u->status < 200 || u->status >= 300)
+    h->left    = h->total;
+    h->sending = 1;
+    return IV_OK;
+}
+
+int iv_uphttp_write(iv_uphttp_t *h, const void *data, size_t len)
+{
+    if (h == NULL || !h->inited || data == NULL)
+        return IV_EINVAL;
+    if (!h->sending)
+        return IV_ESTATE;
+    if (len > (size_t)h->left)
+        return IV_ERANGE;
+    if (send_all(h, data, len) != IV_OK) {
+        h->need_reconnect = 1;
+        h->sending        = 0;
+        return IV_ECONN;
+    }
+    h->left -= (uint32_t)len;
+    return IV_OK;
+}
+
+int iv_uphttp_end(iv_uphttp_t *h, char *url, size_t cap)
+{
+    char path[256];
+    size_t tlen;
+    int  n;
+    int  rc;
+
+    if (h == NULL || !h->inited)
+        return IV_EINVAL;
+    if (!h->sending)
+        return IV_ESTATE;
+    if (h->left != 0u)
+        return IV_ESTATE; /* 少发了：宁可失败，也不让服务端存半个文件 */
+    tlen = strlen(h->tail);
+    if (send_all(h, h->tail, tlen) != IV_OK) {
+        h->need_reconnect = 1;
+        h->sending        = 0;
+        return IV_ECONN;
+    }
+    h->sending = 0;
+
+    /* chunk 请求的应答（"分片上传成功"） */
+    if (read_resp(h) != IV_OK)
+        return h->need_reconnect ? IV_ECONN : IV_ETIMEDOUT;
+    if (h->status < 200 || h->status >= 300 || api_ok(h) != IV_OK)
         return IV_EPROTO;
-    return api_ok(u);
+
+    /* finish：触发服务端拼片并转存 OSS，链接只在这一次应答里 */
+    n = snprintf(path, sizeof path, "%s?uploadId=%s", IV_UPHTTP_PATH_FINISH,
+                 h->upload_id);
+    if (n < 0 || (size_t)n >= sizeof path)
+        return IV_ERANGE;
+    rc = post_query(h, path, 0);
+    if (rc != IV_OK)
+        return rc;
+    if (api_ok(h) != IV_OK)
+        return IV_EPROTO;
+    if (url != NULL && cap > 0u)
+        (void)body_str(h, "data", url, cap); /* 取不到不算失败 */
+    return IV_OK;
+}
+
+int iv_uphttp_put_fd(iv_uphttp_t *h, int fd, char *url, size_t cap)
+{
+    size_t  want;
+    ssize_t n;
+    int     rc;
+
+    if (h == NULL || !h->inited || fd < 0)
+        return IV_EINVAL;
+    rc = iv_uphttp_begin(h);
+    if (rc != IV_OK)
+        return rc;
+    while (h->left > 0u) {
+        want = (h->left < sizeof h->io) ? (size_t)h->left : sizeof h->io;
+        n    = read(fd, h->io, want);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            iv_uphttp_disconnect(h);
+            h->sending = 0;
+            return IV_EIO;
+        }
+        if (n == 0) {
+            /* 文件比申报的短：已经发出去的头改不了，只能断链作废这次上传 */
+            iv_uphttp_disconnect(h);
+            h->sending = 0;
+            return IV_ERANGE;
+        }
+        rc = iv_uphttp_write(h, h->io, (size_t)n);
+        if (rc != IV_OK)
+            return rc;
+    }
+    return iv_uphttp_end(h, url, cap);
 }
 
 /* ---------------------------------------------------------------------------
@@ -480,7 +581,7 @@ int iv_uphttp_connect(iv_uphttp_t *h)
 }
 
 int iv_uphttp_start(iv_uphttp_t *h, const char *file_name, const char *type,
-                    uint32_t total_size, unsigned total_chunks)
+                    uint32_t total_size)
 {
     char path[384];
     int  n;
@@ -489,14 +590,20 @@ int iv_uphttp_start(iv_uphttp_t *h, const char *file_name, const char *type,
         return IV_EINVAL;
     if (h->host[0] == '\0')
         return IV_EINVAL;
+    if (total_size == 0u)
+        return IV_EINVAL;
 
     copy_str(h->file_name, sizeof h->file_name, file_name);
     h->upload_id[0] = '\0';
+    h->sending      = 0;
+    h->total        = total_size;
+    h->left         = 0u;
 
+    /* totalChunks 恒为 1：一个文件一次 chunk 请求（见文件头实测数据） */
     n = snprintf(path, sizeof path,
-                 "%s?deviceSn=%s&totalSize=%lu&totalChunks=%u&fileName=%s&logType=%s",
+                 "%s?deviceSn=%s&totalSize=%lu&totalChunks=1&fileName=%s&logType=%s",
                  IV_UPHTTP_PATH_START, h->dev_sn, (unsigned long)total_size,
-                 total_chunks, h->file_name,
+                 h->file_name,
                  (type != NULL && type[0] != '\0') ? type : "SYSTEM");
     if (n < 0 || (size_t)n >= sizeof path)
         return IV_ERANGE;
@@ -509,42 +616,6 @@ int iv_uphttp_start(iv_uphttp_t *h, const char *file_name, const char *type,
     if (body_str(h, "uploadId", h->upload_id, sizeof h->upload_id) != IV_OK ||
         h->upload_id[0] == '\0')
         return IV_EPROTO;
-    return IV_OK;
-}
-
-int iv_uphttp_chunk(iv_uphttp_t *h, unsigned index, const void *data, size_t len)
-{
-    if (h == NULL || !h->inited || data == NULL)
-        return IV_EINVAL;
-    if (h->upload_id[0] == '\0')
-        return IV_ESTATE; /* 还没 start */
-    return post_chunk(h, index, data, len);
-}
-
-int iv_uphttp_finish(iv_uphttp_t *h, char *url, size_t cap)
-{
-    char path[256];
-    int  n;
-    int  rc;
-
-    if (h == NULL || !h->inited)
-        return IV_EINVAL;
-    if (h->upload_id[0] == '\0')
-        return IV_ESTATE;
-    if (url != NULL && cap > 0u)
-        url[0] = '\0';
-
-    n = snprintf(path, sizeof path, "%s?uploadId=%s", IV_UPHTTP_PATH_FINISH,
-                 h->upload_id);
-    if (n < 0 || (size_t)n >= sizeof path)
-        return IV_ERANGE;
-    rc = post_query(h, path, 0);
-    if (rc != IV_OK)
-        return rc;
-    if (api_ok(h) != IV_OK)
-        return IV_EPROTO;
-    if (url != NULL && cap > 0u)
-        (void)body_str(h, "data", url, cap); /* 取不到不算失败（参考实现也不用它） */
     return IV_OK;
 }
 

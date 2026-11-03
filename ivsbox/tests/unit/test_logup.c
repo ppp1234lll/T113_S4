@@ -399,13 +399,13 @@ int main(void)
     chk(rc == IV_OK, "p01 run rc == IV_OK");
     chk(srv.starts == 1u, "p01 one start");
     chk(srv.finishes == 1u, "p01 one finish");
-    chk(srv.chunks == 3u, "p01 2500 B -> 3 chunks");
+    chk(srv.chunks == 1u, "p01 2500 B -> one request");
     chk(srv.data_len == sizeof big - 1u, "p01 server received full size");
     chk(memcmp(srv.data, big, srv.data_len) == 0, "p01 bytes identical");
     chk(srv.chunk_index_ok == 1, "p01 chunkIndex strictly increasing");
     iv_logup_stats(&up, &st);
     chk(st.ok == 1u && st.fail == 0u, "p01 stats ok=1");
-    chk(st.chunks == 3u, "p01 stats chunks=3");
+    chk(st.chunks == 1u, "p01 stats one request");
     chk(st.last_http == 200, "p01 last http 200");
 
     /* ---- p02：游标推进后第二次运行 = 没有新日志 ---- */
@@ -491,7 +491,7 @@ int main(void)
         chk(iv_logup_init(&up, &cfg) == IV_OK, "p06 init");
         rc = iv_logup_run(&up);
         chk(rc == IV_OK, "p06 run rc == IV_OK");
-        chk(srv.chunks == 3u, "p06 3000 B across two files -> 3 chunks");
+        chk(srv.chunks == 1u, "p06 3000 B across two files -> one request");
         chk(srv.data_len == 3000u, "p06 server received exactly 3000 B");
         chk(srv.data_len == 3000u && memcmp(srv.data, a, 1500) == 0 &&
                 memcmp(srv.data + 1500, b, 1500) == 0,

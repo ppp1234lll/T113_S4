@@ -1,16 +1,17 @@
 /*
- * 箱门抓拍图片上传实现 —— 目录队列 + `iv_uphttp` 三步分片，契约见 iv_imgup.h
+ * 箱门抓拍图片上传实现 —— 目录队列 + `iv_uphttp`（一个文件一次请求），契约见 iv_imgup.h
  *
  * 一句话数据流：
  *   门开 → 抓拍落盘 → `iv_imgup_enqueue()` 拷进队列 → worker 里
- *   `iv_imgup_run()` 传最旧的一张（start → chunk×N → finish）→ 成功后删队列副本。
+ *   `iv_imgup_run()` 传最旧的一张（start → 整包 chunk → finish）→ 成功后删队列副本。
  *
  * 三个容易写错的地方：
  *   1) **队列副本必须是拷贝**：`/mnt/sdcard`（CD 卡）→ `/mnt/UDISK` 是两个文件
  *      系统，`link()` 会 EXDEV；而"共享一个文件 + 队列记路径"会被存储策略的
  *      保留期删原图搞成悬空引用。
- *   2) **片号必须从 0 连续**、`totalChunks` 必须等于 `ceil(size/1024)`：服务端
- *      按 chunkIndex 摞字节，多一片就回"分片序号无效"（日志上报真机踩过）。
+ *   2) **一个文件一片**（`totalChunks=1`）：服务端不要求 1 KiB 边界，真机实测
+ *      整块比 1 KiB 分片快 8 倍（164 KB：2.2 s vs 17.6 s，三份 md5 全一致，
+ *      见 `iv_uphttp.h`）。重试必须**整文件重来**并换新 uploadId。
  *   3) **失败不删文件**：队列里的文件就是"没传成功"的唯一证据；删了既丢图又
  *      看不出发生过什么。
  */
@@ -371,8 +372,6 @@ int iv_imgup_run(iv_imgup_t *u)
     int      fd;
     int      rc;
     uint32_t total;
-    unsigned chunks;
-    unsigned i;
     int      try;
 
     if (u == NULL || !u->inited)
@@ -401,8 +400,7 @@ int iv_imgup_run(iv_imgup_t *u)
         rc = IV_EIO;
         goto out;
     }
-    total  = (uint32_t)sb.st_size;
-    chunks = (total + IV_UPHTTP_CHUNK_SIZE - 1u) / IV_UPHTTP_CHUNK_SIZE;
+    total = (uint32_t)sb.st_size;
 
     fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -418,57 +416,29 @@ int iv_imgup_run(iv_imgup_t *u)
         goto out;
     }
 
+    /* 一个文件一次请求（`totalChunks=1`）：start → 整包 chunk → finish。
+     * 失败重试是**整文件重来** —— 复用同一个 uploadId 会把同一片再摞一遍，
+     * 服务端存出来就是双倍长度的坏文件。 */
     rc = IV_EPROTO;
     for (try = 0; try < IV_IMGUP_RETRY_MAX; try++) {
-        rc = iv_uphttp_start(&u->up, names[0], IV_IMGUP_TYPE, total, chunks);
-        if (rc == IV_OK)
-            break;
-        u->up.need_reconnect = 1;
-    }
-    if (rc != IV_OK) {
-        IV_LOG_W(IU_MOD, "start failed for %s: rc=%d http=%d", names[0], rc,
-                 iv_uphttp_status(&u->up));
-        (void)close(fd);
-        goto out;
-    }
-
-    for (i = 0; i < chunks; i++) {
-        size_t  want = (total - i * IV_UPHTTP_CHUNK_SIZE > IV_UPHTTP_CHUNK_SIZE)
-                           ? IV_UPHTTP_CHUNK_SIZE
-                           : (size_t)(total - i * IV_UPHTTP_CHUNK_SIZE);
-        ssize_t got  = read(fd, u->up.chunk, want);
-
-        if (got <= 0) {
-            /* 文件在传输期间被删/被截断：服务端已 start，这一具会话只能废弃 */
-            rc = IV_EIO;
-            IV_LOG_W(IU_MOD, "read %s at chunk #%u failed", names[0], i);
-            (void)close(fd);
-            goto out;
-        }
-        for (try = 0; try < IV_IMGUP_RETRY_MAX; try++) {
-            rc = iv_uphttp_chunk(&u->up, i, u->up.chunk, (size_t)got);
-            if (rc == IV_OK)
-                break;
+        if (try > 0) {
+            (void)lseek(fd, 0, SEEK_SET); /* 上一轮已经把 fd 读出去一截 */
             u->up.need_reconnect = 1;
         }
+        rc = iv_uphttp_start(&u->up, names[0], IV_IMGUP_TYPE, total);
         if (rc != IV_OK) {
-            IV_LOG_W(IU_MOD, "chunk #%u/%u failed for %s: rc=%d http=%d", i, chunks,
-                     names[0], rc, iv_uphttp_status(&u->up));
-            (void)close(fd);
-            goto out;
+            u->up.need_reconnect = 1;
+            continue;
         }
-    }
-    (void)close(fd);
-
-    for (try = 0; try < IV_IMGUP_RETRY_MAX; try++) {
-        rc = iv_uphttp_finish(&u->up, url, sizeof url);
+        rc = iv_uphttp_put_fd(&u->up, fd, url, sizeof url);
         if (rc == IV_OK)
             break;
         u->up.need_reconnect = 1;
     }
+    (void)close(fd);
     if (rc != IV_OK) {
-        IV_LOG_W(IU_MOD, "finish failed for %s: rc=%d http=%d", names[0], rc,
-                 iv_uphttp_status(&u->up));
+        IV_LOG_W(IU_MOD, "upload failed for %s (%u B): rc=%d http=%d", names[0],
+                 (unsigned)total, rc, iv_uphttp_status(&u->up));
         goto out;
     }
 
@@ -478,8 +448,8 @@ int iv_imgup_run(iv_imgup_t *u)
     u->st.bytes += total;
     copy_str(u->st.last_name, sizeof u->st.last_name, names[0]);
     copy_str(u->st.last_url, sizeof u->st.last_url, url);
-    IV_LOG_I(IU_MOD, "upload ok: %s (%u B, %u chunks) -> %s", names[0],
-             (unsigned)total, chunks, url[0] != '\0' ? url : "(no url)");
+    IV_LOG_I(IU_MOD, "upload ok: %s (%u B) -> %s", names[0], (unsigned)total,
+             url[0] != '\0' ? url : "(no url)");
 
 out:
     u->st.last_rc   = rc;

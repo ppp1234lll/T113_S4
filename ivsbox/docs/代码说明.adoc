@@ -12832,6 +12832,104 @@ uint16_t port = (a->cfg.imgup_port != 0u) ? a->cfg.imgup_port : a->cfg.logup_por
 链路必须抽公共件**：如果把 339 行 HTTP 客户端复制一份进 `iv_imgup`，下次改超时、
 改分片大小就得改两处，而两处一定会漂。
 
+== 2026-11-03 14:52 图片/日志上传改为"一个文件一个请求"（去掉 1 KiB 分片）
+
+=== 起因：把源设备的能力约束当成了服务端约束
+
+用户一句话点破："单片机分片是因为内存小，Linux 内存大，可以一次性传，不需要分包。"
+回头查，我们不但照抄了 1 KiB 分片，还在注释里写成"服务端按 1 KiB 边界拼，*不许改*"。
+
+那条注释是**错的**。2026-11-02 真机踩的坑（`分片序号无效，有效范围：0-19`）只证明
+"实际片数必须等于自己 `start` 时申报的 `totalChunks`" —— 那是**我们自己申报的规则**，
+不是服务端的硬约束。当时为了对齐它，反而加了"跨文件攒满 1 KiB 才发"的补偿逻辑，
+把一个不存在的约束固化成了代码。
+
+=== 先实测（板端 python3 直连，按 `SO_BINDTODEVICE` 绑 `usb0`）
+
+同一张 164744 B 真抓拍图，三组各传一次，每次把 URL 下载回来比 md5：
+
+[cols="1,1,1,1"]
+|===
+|传法 |片数 |耗时 |回读 md5
+
+|`totalChunks=1`（整块） |1 |*2.2 s* |`e444e4b5…` 与原图一致
+|64 KiB 一片 |3 |*2.2 s* |一致
+|1 KiB 一片（原来） |161 |*17.6 s* |一致
+|===
+
+服务端**不要求 1 KiB**，片数自洽就拼得对；整块最快。边界也测了：
+
+* 1 MiB 真日志（`SYSTEM` + `device.txt`）整块 *12.4 s* 成功，16 片 64 KiB 14.1 s；
+* 4 MiB 图片整块 *50.7 s* 成功（约 640 kbps 上行，4G 正常水平）；
+* 顺带发现：`.log` 扩展名会被拒（finish 回 `code=500 文件上传OSS失败`），同一份内容
+  换 `.txt` / `.jpg` 立刻成功，与 `logType` 无关。日志文件名沿用 `device.txt`，
+  **别改成 `.log`**。
+
+⇒ 图片 ≤4 MiB、日志 ≤1 MiB，整块能覆盖全部场景，分片路径可以彻底删掉。
+
+=== 改法：整块 ≠ 整块读进内存
+
+`iv_uphttp` 的 API 从"按片喂"改成"流式三段"：
+
+[source,c]
+----
+iv_uphttp_start(h, name, type, total);   /* 恒 totalChunks=1 */
+iv_uphttp_begin(h);                      /* 发请求头 + multipart 前缀 */
+iv_uphttp_write(h, buf, n);              /* 反复调用，累计不许超过 total */
+iv_uphttp_end(h, url, cap);              /* 补尾 → chunk 应答 → finish → URL */
+
+iv_uphttp_put_fd(h, fd, url, cap);       /* 便捷：begin + read/write 循环 + end */
+----
+
+`Content-Length` 一次算准 = 前缀 + total + 尾，所以内存只占一个 `IV_UPHTTP_SEND_CHUNK`
+（4 KiB）的缓冲，**与文件大小无关** —— 4 MiB 的图也不会多占一字节堆/栈。
+
+调用方：
+
+* `iv_imgup`：`start → put_fd() → end`，一张图一个请求；
+* `iv_logup`：`start → begin → span_walk(边遍历边 write) → end`。**跨文件拼一条流**
+  的能力保留了（多份 `<date>/<hh>.log` 顺序读），只是不再攒片 —— `span_t` 里的
+  `buf/fill/sent_chunks` 和 `span_flush()` 整块删掉。
+
+=== 失败语义跟着变（重要）
+
+流一旦开始发，头里的 `Content-Length` 就改不了 ⇒ 中途失败**只能整次作废**：
+
+* `iv_logup`：游标不推进，下一次从同一位置整段重传（日志是整段快照，重传不产生重复）；
+* `iv_imgup`：文件留在队列，重试要 `lseek(fd,0)` **并重新 `start` 换 uploadId** ——
+  复用旧 uploadId 会把同一片再摞一遍，服务端存出来就是双倍长度的坏文件。
+
+原来那套"同 chunkIndex 幂等重发"随分片一起消失了，别再照抄。
+
+=== 验证
+
+* VM：`make test` *56 项 / 0 FAIL*（`test_imgup`/`test_logup` 的断言从"3 片"改成
+  "1 个请求 / `totalChunks=1` / `chunkIndex=0`"）、`make asan` rc=0、`setarch -R make
+  tsan` *0 条*、`make arm` 0 告警（`ivsboxd` md5 `1abdae8b`）、`make analyze` 0 条。
+* 板端 · 图片：164744 B 真抓拍 *2 秒* 传完（改前同图同链路 *18 秒*），下载回读
+  md5 与原图逐字节一致。
+* 板端 · 日志：用**设备侧真代码** `iv_logup_run()` 打真服务器（临时交叉编译
+  `logprobe`，root 指向 `/tmp/logtest`、游标写 `/tmp/logprobe.state`，不碰生产游标）：
+
+[source,text]
+----
+run rc=0 ok=1 fail=0 bytes=1047598 reqs=1 last_http=200 last_bytes=1047598
+state: 2026-11-03 14 1047598          (12 秒；改前 1 MiB = 1024 片，上百秒)
+----
+
+* 未做：平台 0xB2 完整链路（平台下发 → ACK → 上传 → 统计）未在平台侧点一次复核。
+
+=== 教训
+
+**"照抄参考实现"要分清两类常量**：一类是**对端约束**（协议、接口、状态码），必须
+照做；另一类是**源设备的能力约束**（内存、flash、表项上限），换平台就该重算。1 KiB
+分片属于后者，我们却把它写进了"不许改"的注释里，还围着它加了补偿逻辑 ——
+一个错误假设的成本，往往不是那行常量，而是后续为它打的补丁。
+
+**性能问题先量再说**：这次从"用户质疑"到"数据定案"只花了四组探针。164 KB 从 18 s
+到 2 s，改的不是算法，是"每文件发多少次请求"这个显而易见的量。
+
+
 
 
 

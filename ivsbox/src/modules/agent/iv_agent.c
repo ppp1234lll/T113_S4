@@ -771,7 +771,7 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
      * 「查询PING」落默认分支回 0x74，测试计划的 N-06 一直是"未实现"。 */
     (void)iv_proto_route(&a->rp.pf, IV_PROTO_CMD_QUERY_PING, on_query_ping, a);
 
-    /* 0xB2「日志上报」（2026-11-02）：三步 HTTP 分片上传（参考实现
+    /* 0xB2「日志上报」（2026-11-02）：三步 HTTP 上传、**一个请求发完**（参考实现
      * `General_Version/main/APP/Upload/`），本体跑在慢任务池。
      * 句柄只在这里初始化；**地址与出口网卡每次受理时按"这一刻"刷新**
      * （配置可能还没读到、netmgr 也可能刚切过出口），见 `iv_agent_log_upload()`。 */
@@ -3419,7 +3419,10 @@ int iv_agent_record_held_off(const iv_agent_t *a)
  * 平台 0xB2「日志上报」（2026-11-02）
  *
  * 参考实现把上传做成"三接口 HTTP 分片"（`APP/Upload/src/upload_http.c`）：
- * start 拿 uploadId → chunk 逐片传 → finish 收尾。本层只做**受理与调度**，
+ * start 拿 uploadId → chunk 逐片传 → finish 收尾。**我们只发一片**
+ * （`totalChunks=1`：服务端不要求 1 KiB 边界，2026-11-03 板端实测整块比 1 KiB
+ * 分片快 8 倍，见 `iv_uphttp.h`），所以一次上传就是 start → chunk → finish。
+ * 本层只做**受理与调度**，
  * 上传本体在 `iv_logup`（慢任务池 worker 里跑）。平台侧只期待 1 字节 ACK，
  * 没有第二条确认报文，所以结果只落本机日志与统计。
  * ------------------------------------------------------------------------- */
@@ -3526,8 +3529,8 @@ int iv_agent_log_upload(iv_agent_t *a, uint64_t now_ms)
     req.name        = "logup";
     req.fn          = logup_task_fn;
     req.arg         = a;
-    /* 单次上限 1 MiB / 1 KiB = 1024 片；4G 每片一个 RTT（约 45 ms）＋服务端处理，
-     * 给足 5 分钟。超时只是"健康检查不再等它"，任务自己会收尾。 */
+    /* 单次上限 1 MiB，**一个请求发完**：4G 上行约 12 s ＋ 服务端转存，给足 5 分钟。
+     * 超时只是"健康检查不再等它"，任务自己会收尾。 */
     req.timeout_ms  = 300000u;
     req.on_done     = on_logup_done;
     req.on_done_arg = a;
@@ -3582,7 +3585,7 @@ void iv_agent_logup_stats(const iv_agent_t *a, iv_logup_stats_t *out)
 /* 等抓拍落盘的上限（槽位数 `IV_AGENT_IMGUP_WAIT_N` 在头文件里 —— 数组要用）：
  * 10 s 还等不到一张 jpg 就当这一张抓拍失败，放弃它，别堵住后面的。 */
 #define IV_AGENT_IMGUP_SETTLE_MS 10000u
-/* 单张图任务超时：4 MiB 上限 / 1 KiB = 4096 片，4G 上远小于 5 分钟。 */
+/* 单张图任务超时：4 MiB 上限、整块一次请求，4G 上行约 50 s（真机实测），给足 5 分钟。 */
 #define IV_AGENT_IMGUP_TASK_MS   300000u
 
 static int imgup_task_fn(iv_task_ctx_t *ctx)

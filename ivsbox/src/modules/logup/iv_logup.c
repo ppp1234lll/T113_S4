@@ -243,13 +243,6 @@ typedef struct {
     char        last_date[LU_DATE_LEN + 1u];
     int         last_hour;
     long        last_off;
-    unsigned    sent_chunks;/* 第二遍用：下一个 chunkIndex */
-    /* 跨文件累积缓冲（2026-11-02 真机踩坑后加的）：
-     * 分片必须按**整条字节流**切，不能"每个日志文件各自从新片开始" ——
-     * 每个文件末尾那半片会让实际片数大于 ceil(total/1024)，超出的 chunkIndex
-     * 被服务端直接拒（`分片序号无效，有效范围：0-19`）。详见 span_send()。 */
-    uint8_t     buf[IV_LOGUP_CHUNK_SIZE];
-    size_t      fill;       /* buf 里已攒的字节数 */
 } span_t;
 
 /* 每段回调：path 从 off 起有 len 字节待处理；返回 IV_OK 继续 */
@@ -312,41 +305,15 @@ static int span_walk(span_t *s, span_cb_t cb)
  * 上传主体
  * ------------------------------------------------------------------------- */
 
-/* 第二遍的读文件回调：一个文件段可能跨多片，按 1 KiB 切开逐片发 */
-/* 把攒满（或收尾时不满）的一片发出去。index 严格递增；失败用同一下标重试。 */
-static int span_flush(span_t *s)
-{
-    iv_logup_t *u = s->u;
-    int         try;
-    int         rc = IV_EPROTO;
-
-    if (s->fill == 0u)
-        return IV_OK;
-    for (try = 0; try < IV_LOGUP_RETRY_MAX; try++) {
-        rc = iv_uphttp_chunk(&u->up, s->sent_chunks, s->buf, s->fill);
-        if (rc == IV_OK)
-            break;
-        u->up.need_reconnect = 1; /* 下一轮从同一下标重发（幂等） */
-    }
-    if (rc != IV_OK) {
-        /* 失败现场必须留证据：`http=200` 却失败只有两种可能 ——
-         * ① 应答里没有 `"code":200`（业务拒绝）；② body 没读到（头到了、
-         * body 还在路上，被 `resp_complete()` 判成"无 CL = 已收完"）。
-         * 2026-11-02 真机第 1024 片就是这么翻的，当时只有 rc/http，
-         * 看不出是哪一种。这里把 len 与应答原文（含头）一起打出来。 */
-        IV_LOG_W(LU_MOD, "chunk #%u failed: rc=%d http=%d len=%u resp=%s",
-                 s->sent_chunks, rc, iv_uphttp_status(&u->up), (unsigned)s->fill,
-                 iv_uphttp_resp(&u->up));
-        return (rc == IV_EPROTO) ? IV_EPROTO : IV_ECONN;
-    }
-    s->sent_chunks++;
-    s->fill = 0u;
-    return IV_OK;
-}
-
+/* 第二遍的读文件回调：把这一段字节**直接推进上传流**。
+ * 2026-11-03 起整次上传只有一片（`totalChunks=1`），所以不再攒 1 KiB：
+ * 读多少发多少，内存只占一个 `IV_UPHTTP_SEND_CHUNK` 的栈缓冲。 */
 static int span_send(span_t *s, const char *path, long off, size_t len)
 {
-    int fd;
+    iv_logup_t *u = s->u;
+    uint8_t     buf[IV_UPHTTP_SEND_CHUNK];
+    int         fd;
+    int         rc;
 
     fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -358,32 +325,26 @@ static int span_send(span_t *s, const char *path, long off, size_t len)
         return IV_EIO;
     }
     while (len > 0u) {
-        size_t  room = sizeof s->buf - s->fill;
-        size_t  want = (len > room) ? room : len;
-        ssize_t n    = read(fd, s->buf + s->fill, want);
-        int     rc;
+        size_t  want = (len > sizeof buf) ? sizeof buf : len;
+        ssize_t n    = read(fd, buf, want);
 
         if (n <= 0) {
+            IV_LOG_W(LU_MOD, "read %s failed at +%ld (%s)", path, off,
+                     strerror(errno));
             (void)close(fd);
             return IV_EIO;
         }
-        s->fill += (size_t)n;
-        len     -= (size_t)n;
-        /* **攒满一片才发**：分片边界必须落在**整条字节流**上，才与 start 里
-         * 申报的 `totalChunks` 严格一致。早先的写法是"每个日志文件各自按
-         * 1 KiB 切"，每个文件末尾都会留一片不满的（比如 18620 B 切成 18 满片
-         * +188 B），下一个文件又从新片开始 ⇒ 实际片数 > ceil(total/1024)。
-         * 多出来的那个 chunkIndex 会被服务端直接拒：
-         *   `{"code":500,"msg":"分片序号无效，有效范围：0-19"}`
-         * 真机 1 MiB 上传就死在最后这一片（`chunk #1024 failed rc=-21 http=200`），
-         * 前面 1023 片白传。 */
-        if (s->fill == sizeof s->buf) {
-            rc = span_flush(s);
-            if (rc != IV_OK) {
-                (void)close(fd);
-                return rc;
-            }
+        /* 头已经发出去了，Content-Length 不能改 ⇒ 这里失败只能让整次上传作废，
+         * 游标不推进，下次从头重传（日志是整段快照，重传不会产生重复数据）。 */
+        rc = iv_uphttp_write(&u->up, buf, (size_t)n);
+        if (rc != IV_OK) {
+            IV_LOG_W(LU_MOD, "write failed inside %s: rc=%d http=%d", path, rc,
+                     iv_uphttp_status(&u->up));
+            (void)close(fd);
+            return rc;
         }
+        len -= (size_t)n;
+        off += (long)n;
     }
     (void)close(fd);
     return IV_OK;
@@ -392,33 +353,23 @@ static int span_send(span_t *s, const char *path, long off, size_t len)
 /* start：文件名/类型/尺寸由本层给，协议细节在 `iv_uphttp_start()`。
  * 重试留在本层（同一次 start 重发是幂等的：服务端每次给一个新 uploadId，
  * 只是废掉前一具"半截会话"）。 */
-static int start_upload(iv_logup_t *u, size_t total, unsigned total_chunks)
+static int start_upload(iv_logup_t *u, size_t total)
 {
     int try;
     int rc = IV_EPROTO;
 
+    /* start 可重试：服务端每次给一个新 uploadId，旧的半截会话只是作废 */
     for (try = 0; try < IV_LOGUP_RETRY_MAX; try++) {
-        rc = iv_uphttp_start(&u->up, u->file_name, u->log_type, (uint32_t)total,
-                             total_chunks);
+        rc = iv_uphttp_start(&u->up, u->file_name, u->log_type, (uint32_t)total);
         if (rc == IV_OK)
-            return IV_OK;
+            break;
         u->up.need_reconnect = 1;
     }
-    return rc;
-}
-
-static int finish_upload(iv_logup_t *u)
-{
-    int try;
-    int rc = IV_EPROTO;
-
-    for (try = 0; try < IV_LOGUP_RETRY_MAX; try++) {
-        rc = iv_uphttp_finish(&u->up, NULL, 0); /* 日志不关心返回的 URL */
-        if (rc == IV_OK)
-            return IV_OK;
-        u->up.need_reconnect = 1;
-    }
-    return rc;
+    if (rc != IV_OK)
+        return rc;
+    /* 前缀只发一次：重发会把 uploadId/chunkIndex 那一段摞两遍，服务端存出来
+     * 的文件头就是坏的。失败就让整次上传作废，游标不推进。 */
+    return iv_uphttp_begin(&u->up);
 }
 
 /* ---------------------------------------------------------------------------
@@ -519,7 +470,6 @@ int iv_logup_run(iv_logup_t *u)
     int         nd;
     int         rc = IV_OK;
     size_t      total;
-    unsigned    chunks;
 
     if (u == NULL || !u->inited)
         return IV_EINVAL;
@@ -561,18 +511,16 @@ int iv_logup_run(iv_logup_t *u)
         rc = IV_ENOENT;
         goto out;
     }
-    chunks = (unsigned)((total + IV_LOGUP_CHUNK_SIZE - 1u) / IV_LOGUP_CHUNK_SIZE);
-
     copy_str(u->file_name, sizeof u->file_name, LU_FILE_NAME);
 
-    IV_LOG_I(LU_MOD, "upload start: %u B in %u chunks -> %s:%u (from %s %02d +%ld)",
-             (unsigned)total, chunks, u->up.host, (unsigned)u->up.port, sp.last_date,
+    IV_LOG_I(LU_MOD, "upload start: %u B (one request) -> %s:%u (from %s %02d +%ld)",
+             (unsigned)total, u->up.host, (unsigned)u->up.port, sp.last_date,
              sp.last_hour, sp.last_off);
 
     rc = iv_uphttp_connect(&u->up);
     if (rc != IV_OK)
         goto out;
-    rc = start_upload(u, total, chunks);
+    rc = start_upload(u, total);
     if (rc != IV_OK) {
         IV_LOG_W(LU_MOD, "start failed: rc=%d http=%d", rc,
                  iv_uphttp_status(&u->up));
@@ -581,46 +529,35 @@ int iv_logup_run(iv_logup_t *u)
 
     /* 第二遍：从同一游标起真读真发。游标的"起始"位置由 walk 内部按 cur_* 判定，
      * 这里把 got 清零（第一遍累计的量只用于算尺寸）。 */
-    sp.got         = 0u;
-    sp.sent_chunks = 0u;
-    rc             = span_walk(&sp, span_send);
+    sp.got = 0u;
+    rc     = span_walk(&sp, span_send);
     if (rc != IV_OK) {
-        IV_LOG_W(LU_MOD, "chunks aborted at #%u: rc=%d http=%d", sp.sent_chunks, rc,
-                 iv_uphttp_status(&u->up));
+        IV_LOG_W(LU_MOD, "body aborted after %u/%u B: rc=%d http=%d", (unsigned)sp.got,
+                 (unsigned)total, rc, iv_uphttp_status(&u->up));
         goto out;
     }
-    /* 尾片：最后一次攒下的不足 1 KiB 的那一片。少了这一步，服务端收到的
-     * 字节数会少于 start 时的 totalSize，finish 也拼不出完整文件。 */
-    if (sp.fill > 0u) {
-        rc = span_flush(&sp);
-        if (rc != IV_OK) {
-            IV_LOG_W(LU_MOD, "tail chunk #%u failed: rc=%d http=%d", sp.sent_chunks,
-                     rc, iv_uphttp_status(&u->up));
-            goto out;
-        }
-    }
-    if (sp.sent_chunks != chunks) {
+    if (sp.got != total) {
         /* 文件在传输期间被清理会走到这里：宁可不推进游标，下次重传 */
-        IV_LOG_W(LU_MOD, "chunk count mismatch: sent=%u planned=%u", sp.sent_chunks,
-                 chunks);
+        IV_LOG_W(LU_MOD, "byte count mismatch: sent=%u planned=%u", (unsigned)sp.got,
+                 (unsigned)total);
         rc = IV_EIO;
         goto out;
     }
 
-    rc = finish_upload(u);
+    rc = iv_uphttp_end(&u->up, NULL, 0); /* 日志不关心返回的 URL */
     if (rc != IV_OK) {
-        IV_LOG_W(LU_MOD, "finish failed: rc=%d http=%d", rc, iv_uphttp_status(&u->up));
+        IV_LOG_W(LU_MOD, "finish failed: rc=%d http=%d resp=%s", rc,
+                 iv_uphttp_status(&u->up), iv_uphttp_resp(&u->up));
         goto out;
     }
-
     /* 只有三步全过才推进游标 —— 失败必重传是这套游标的核心承诺 */
     cursor_save(u, sp.last_date, sp.last_hour, sp.last_off);
     u->st.bytes += total;
-    u->st.chunks += chunks;
+    u->st.chunks += 1u; /* 一次上传 = 一个请求（历史字段名保留，语义已变） */
     u->st.last_bytes = (uint32_t)total;
     copy_str(u->st.last_file, sizeof u->st.last_file, u->file_name);
-    IV_LOG_I(LU_MOD, "upload ok: %u B, %u chunks, cursor -> %s %02d +%ld",
-             (unsigned)total, chunks, sp.last_date, sp.last_hour, sp.last_off);
+    IV_LOG_I(LU_MOD, "upload ok: %u B (1 request), cursor -> %s %02d +%ld",
+             (unsigned)total, sp.last_date, sp.last_hour, sp.last_off);
 
 out:
     if (rc == IV_OK) {

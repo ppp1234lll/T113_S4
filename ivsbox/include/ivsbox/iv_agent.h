@@ -96,6 +96,7 @@
 #include "ivsbox/iv_fault.h"
 #include "ivsbox/iv_gps.h"
 #include "ivsbox/iv_logup.h"
+#include "ivsbox/iv_imgup.h"
 #include "ivsbox/iv_media.h"
 #include "ivsbox/iv_netlink.h"
 #include "ivsbox/iv_netmgr.h"
@@ -477,7 +478,17 @@ typedef struct {
     uint16_t    logup_port;
     const char *logup_root;
 
-    /* ---- 平台触发升级（平台 0xB3「更新系统」，2026-11-02）----
+    /* ---- 箱门抓拍图片上传（2026-11-03）----
+     * 与日志上报走**同一个服务、同一套三步 HTTP**（`iv_uphttp`），差别只是
+     * fileName（`snap_<秒>.jpg`）与 logType（`IMAGE`）。因此这里不给独立地址，
+     * 只允许"覆盖"：
+     *   `imgup_host` / `imgup_port`：NULL/0 ⇒ 依次回落到 `logup_host`/`logup_port`，
+     *   再回落到活动出口的平台地址（`iv_agent_pick_host()`）。
+     *   `imgup_queue`：待传队列目录；NULL ⇒ `$IVSBOX_HOME/imgup`
+     *   （再退 `/mnt/UDISK/ivsbox/imgup`）。队列是磁盘目录 ⇒ 掉电不丢、重启续传。 */
+    const char *imgup_host;
+    uint16_t    imgup_port;
+    const char *imgup_queue;    /* ---- 平台触发升级（平台 0xB3「更新系统」，2026-11-02）----
      * `ota_host`：升级服务器地址；**空串/NULL ⇒ 无法拉包**（与日志上报不同，
      *   升级服务器不能用平台地址顶替 —— 端口与服务都不同）。
      *   对应配置键 `net.server.upgrade.host`（出厂 47.104.98.214）。
@@ -489,6 +500,18 @@ typedef struct {
     uint16_t    ota_port;
     const char *ota_root;
 } iv_agent_cfg_t;
+
+/* 门开抓拍的"等落盘"槽位（2026-11-03 图片上传用）。
+ * 抓拍是异步的：`iv_media_capture_async()` 只入队，磁盘上的 jpg 由 media worker
+ * 稍后写出。所以要等**连续两拍尺寸不变**才认为写完 —— 拿"文件存在"当完成会
+ * 拷到半张图。`IV_AGENT_IMGUP_WAIT_N` 是同时在等的上限（门连续开关的正常量）。 */
+#define IV_AGENT_IMGUP_WAIT_N 8u
+
+typedef struct {
+    char     path[IV_MEDIA_URL_MAX];
+    long     size;        /* 上一拍看到的字节数；0 = 还没见到文件 */
+    uint64_t deadline_ms; /* 超过这个时刻还等不到就放弃这一张 */
+} agent_imgup_wait_t;
 
 /* ---------------------------------------------------------------------------
  * 句柄
@@ -648,6 +671,21 @@ typedef struct {
     uint8_t      logup_state;
     uint64_t     logup_runs;      /* 累计受理的 0xB2 次数 */
     uint64_t     logup_busy_acks; /* 累计因在飞而回 0x77 的次数 */
+
+    /* ---- 箱门抓拍图片上传（2026-11-03）----
+     * 没有平台命令：触发是"门开抓拍成功"（入队）＋"队列里有待传件"（定时泵）。
+     * 队列在磁盘（`imgup_queue`），所以断网/掉电期间开的门不会丢，恢复后按
+     * 文件名（= 抓拍时刻）顺序补传。
+     * `imgup_state`：1 = 一次上传在飞（同一时刻只传一张，免得把慢池占满）。
+     * `imgup_next_ms`：失败退避后的下一次允许时刻；0 = 立即（成功后续传下一张）。 */
+    iv_imgup_t   imgup;
+    uint8_t      imgup_state;
+    uint64_t     imgup_runs;    /* 累计提交的上传任务数 */
+    uint64_t     imgup_enqs;    /* 累计入队的抓拍张数 */
+    uint64_t     imgup_next_ms; /* 下次允许提交的时刻；0 = 立即 */
+    uint64_t     imgup_scan_ms; /* 上次扫队列的时刻（限速：readdir 最多 1 次/秒） */
+    agent_imgup_wait_t imgup_wait[IV_AGENT_IMGUP_WAIT_N]; /* 等抓拍落盘的槽位 */
+    uint8_t      imgup_wait_n;
 
     /* 平台触发升级（0xB3）：拉包在慢任务池 worker 里跑，装盘交给 monitor.sh */
     iv_updfetch_t updf;
@@ -1225,6 +1263,31 @@ int iv_agent_logup_state(const iv_agent_t *a);
 
 /* 统计快照（累计次数、最近 rc/http、最近字节数）。参数非法时清零返回。 */
 void iv_agent_logup_stats(const iv_agent_t *a, iv_logup_stats_t *out);
+
+/* ---------------------------------------------------------------------------
+ * 箱门抓拍图片上传（2026-11-03）
+ *
+ * 与 0xB2 日志上报**同一套三步 HTTP**（`iv_uphttp`），差别只有两点：
+ *   - 没有平台命令：触发是门开抓拍成功（`on_door_open()` 入队）；
+ *   - 一次 run 只传一张图，队列是磁盘目录（掉电不丢，重启续传）。
+ *
+ * 调度口径：
+ *   - `iv_agent_imgup_pump()` 由 `iv_agent_step()` 与 `on_pb_timer()` **两条驱动
+ *     路径**各调一次（铁律：只挂一条在板端等于没挂）：没在飞、队列非空、退避
+ *     到点 ⇒ 提交一个慢任务池任务；
+ *   - 失败按 `IV_AGENT_IMGUP_RETRY_MS` 退避，成功立刻接着传下一张；
+ *   - 队列满（`IV_IMGUP_MAX_FILES`）丢最旧的，绝不把 UDISK 塞满。
+ * ------------------------------------------------------------------------- */
+
+/* 一次泵：有活就提交，没活返回 IV_ENOENT（不是错误）。 */
+int iv_agent_imgup_pump(iv_agent_t *a, uint64_t now_ms);
+
+/* 抓拍成功后把文件放进待传队列（Reactor 线程可调：一次磁盘拷贝）。 */
+int iv_agent_imgup_queue(iv_agent_t *a, const char *path);
+
+/* 进度：0 空闲 / 1 在飞；统计快照（参数非法时清零）。 */
+int  iv_agent_imgup_state(const iv_agent_t *a);
+void iv_agent_imgup_stats(const iv_agent_t *a, iv_imgup_stats_t *out);
 
 /* ---------------------------------------------------------------------------
  * 平台 0xB3「更新系统」（2026-11-02，2026-11-02 修改）

@@ -5,14 +5,15 @@
  * 一段"，再在**一条 keep-alive 连接**上跑 start → chunk×N → finish，全过才推进
  * 游标。任何一步失败都保持游标不动，下次从同一位置重传。
  *
- * 三个必须记住的口径：
+ * 2026-11-03：**HTTP 那一半已抽到 `iv_uphttp`**（箱门图片上传要复用同一套），
+ * 本文件只剩"传哪一段字节"：游标、扫目录、按整条字节流切 1 KiB 片。
+ * 连接/keep-alive/"按 Content-Length 读满应答"/multipart 组包都在 iv_uphttp.c。
+ *
+ * 两个必须记住的口径：
  *   1) 游标是「下一个未上传字节」= `<YYYY-MM-DD> <HH> <offset>`。它是**唯一**的
  *      去重依据：别改成"按文件名判断"，那样同一小时文件被追加新行后就永远漏传。
- *   2) 服务端应答必须**按 Content-Length 读满**再发下一个请求，否则下一个请求的
- *      应答会从上一个应答的残留 body 开始解析（错位后 code 永远读不到 200）。
- *      chunked 应答读到 `\r\n0\r\n\r\n` 为止（参考实现同样处理）。
- *   3) 1 KiB 一片是**参考实现的线上口径**（服务端按 chunkIndex 拼），不要为了
- *      "快"改成 64 KiB —— 服务端的 slice 校验会按 1 KiB 边界对不上。
+ *   2) 分片边界必须落在**整条字节流**上（`span_flush()` 攒满才发）：按"每个日志
+ *      文件各自切片"会让片数 > ceil(total/1024)，服务端回"分片序号无效"。
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1 /* SO_BINDTODEVICE / getaddrinfo 的 GNU 扩展 */
@@ -22,30 +23,21 @@
 
 #include "ivsbox/iv_log.h"
 
-#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <poll.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
 #define LU_MOD "logup"
 
-/* 参考实现的请求头/表单缓冲口径（`upload_http.c`） */
-#define LU_BOUNDARY      "----FNLOG_UPLOAD_BOUNDARY"
-#define LU_FORM_MAX      512u
-#define LU_API_CODE_OK   200 /* 服务端接口 JSON 的 `code` 成功值 */
-#define LU_FILE_NAME     "device.txt" /* 参考 `LOG_CURRENT_LOG_FILE_NAME` */
-#define LU_DATE_LEN      10u
+#define LU_FILE_NAME "device.txt" /* 参考 `LOG_CURRENT_LOG_FILE_NAME` */
+#define LU_DATE_LEN  10u
 
 /* ---------------------------------------------------------------------------
  * 小工具
@@ -317,345 +309,6 @@ static int span_walk(span_t *s, span_cb_t cb)
 }
 
 /* ---------------------------------------------------------------------------
- * HTTP 客户端（阻塞、带超时、keep-alive）
- * ------------------------------------------------------------------------- */
-
-static void conn_close(iv_logup_t *u)
-{
-    if (u->fd >= 0) {
-        (void)close(u->fd);
-        u->fd = -1;
-    }
-}
-
-static void set_timeo(int fd, int opt, uint32_t ms)
-{
-    struct timeval tv;
-
-    tv.tv_sec  = (time_t)(ms / 1000u);
-    tv.tv_usec = (suseconds_t)((ms % 1000u) * 1000u);
-    (void)setsockopt(fd, SOL_SOCKET, opt, &tv, sizeof tv);
-}
-
-static int conn_open(iv_logup_t *u)
-{
-    struct addrinfo hints;
-    struct addrinfo *res = NULL;
-    struct addrinfo *p;
-    char             pstr[8];
-    int              rc;
-
-    if (u->host[0] == '\0')
-        return IV_EINVAL;
-
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    (void)snprintf(pstr, sizeof pstr, "%u", (unsigned)u->port);
-    rc = getaddrinfo(u->host, pstr, &hints, &res);
-    if (rc != 0 || res == NULL) {
-        IV_LOG_W(LU_MOD, "resolve %s failed: %s", u->host, gai_strerror(rc));
-        return IV_ECONN;
-    }
-
-    for (p = res; p != NULL; p = p->ai_next) {
-        int  fd;
-        int  err = 0;
-        int  fl;
-        socklen_t elen = sizeof err;
-
-        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd < 0)
-            continue;
-        /* 出口绑定必须在 connect 前：双 WAN 同时在线时，只靠路由会把日志从
-         * 不通的那条链路发出去（传输层踩过同一个坑，见 iv_transport）。 */
-        if (u->bind_dev[0] != '\0') {
-            if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, u->bind_dev,
-                           (socklen_t)(strlen(u->bind_dev) + 1u)) != 0) {
-                IV_LOG_W(LU_MOD, "bind %s failed (%s), fallback to route",
-                         u->bind_dev, strerror(errno));
-            }
-        }
-        fl = fcntl(fd, F_GETFL, 0);
-        (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-        rc = connect(fd, p->ai_addr, p->ai_addrlen);
-        if (rc != 0 && errno == EINPROGRESS) {
-            struct pollfd pfd;
-
-            pfd.fd     = fd;
-            pfd.events = POLLOUT;
-            rc = poll(&pfd, 1, (int)u->connect_ms);
-            if (rc == 0) {
-                IV_LOG_W(LU_MOD, "connect %s:%u timeout", u->host, (unsigned)u->port);
-                (void)close(fd);
-                continue;
-            }
-            if (rc < 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0 ||
-                err != 0) {
-                (void)close(fd);
-                continue;
-            }
-        } else if (rc != 0) {
-            (void)close(fd);
-            continue;
-        }
-        (void)fcntl(fd, F_SETFL, fl); /* 回到阻塞；超时交给 SO_*TIMEO */
-        set_timeo(fd, SO_SNDTIMEO, u->send_ms);
-        set_timeo(fd, SO_RCVTIMEO, u->recv_ms);
-        u->fd           = fd;
-        u->need_reconnect = 0;
-        (void)freeaddrinfo(res);
-        return IV_OK;
-    }
-
-    (void)freeaddrinfo(res);
-    return IV_ECONN;
-}
-
-static int ensure_conn(iv_logup_t *u)
-{
-    if (u->fd >= 0 && u->need_reconnect == 0)
-        return IV_OK;
-    conn_close(u);
-    return conn_open(u);
-}
-
-static int send_all(iv_logup_t *u, const void *buf, size_t len)
-{
-    const char *p = buf;
-
-    while (len > 0u) {
-        ssize_t n = send(u->fd, p, len, 0);
-
-        if (n > 0) {
-            p += n;
-            len -= (size_t)n;
-            continue;
-        }
-        if (n < 0 && errno == EINTR)
-            continue;
-        return IV_ECONN;
-    }
-    return IV_OK;
-}
-
-/* 应答是否收完（参考 `upload_http_response_complete()` 的同口径） */
-static int resp_complete(const iv_logup_t *u)
-{
-    const char *he;
-    const char *p;
-
-    he = strstr(u->resp, "\r\n\r\n");
-    if (he == NULL)
-        return 0;
-    p = strstr(u->resp, "Transfer-Encoding:");
-    if (p != NULL && p < he) {
-        return (strstr(he, "\r\n0\r\n\r\n") != NULL) ? 1 : 0;
-    }
-    p = strstr(u->resp, "Content-Length:");
-    if (p == NULL || p > he)
-        return 1; /* 无长度信息：视为已收完（参考同口径） */
-    {
-        long want = strtol(p + 15, NULL, 10);
-        long got  = (long)u->resp_len - (long)(he + 4 - u->resp);
-
-        if (want < 0)
-            return 1;
-        return got >= want;
-    }
-}
-
-static int read_resp(iv_logup_t *u)
-{
-    const char *sp;
-    const char *he;
-
-    u->resp_len  = 0u;
-    u->resp[0]   = '\0';
-    u->status    = 0;
-    u->resp_body = u->resp;
-
-    for (;;) {
-        ssize_t n;
-
-        if (resp_complete(u))
-            break;
-        if (u->resp_len + 1u >= sizeof u->resp) {
-            /* 缓冲满还没收完：应答异常（或服务端回了超大 JSON）——
-             * 判错并重连，别把半截 JSON 当完整去解析 */
-            u->need_reconnect = 1;
-            return IV_EPROTO;
-        }
-        n = recv(u->fd, u->resp + u->resp_len, sizeof u->resp - 1u - u->resp_len, 0);
-        if (n > 0) {
-            u->resp_len += (size_t)n;
-            u->resp[u->resp_len] = '\0';
-            continue;
-        }
-        if (n == 0) {
-            u->need_reconnect = 1; /* 对端关连接：已收到的头仍可用 */
-            break;
-        }
-        if (errno == EINTR)
-            continue;
-        /* EAGAIN/EWOULDBLOCK = SO_RCVTIMEO 到期 */
-        u->need_reconnect = 1;
-        if (!resp_complete(u))
-            return IV_ETIMEDOUT;
-        break;
-    }
-
-    sp = strstr(u->resp, "HTTP/");
-    if (sp == NULL || sscanf(sp, "HTTP/%*d.%*d %d", &u->status) != 1) {
-        u->need_reconnect = 1;
-        return IV_EPROTO;
-    }
-    he = strstr(u->resp, "\r\n\r\n");
-    u->resp_body = (he != NULL) ? (he + 4) : (u->resp + u->resp_len);
-    /* `Connection: close` 只看**头**：body 里出现 "close" 是业务字段，
-     * 拿整个应答去 strstr 会在 JSON 含该词时误判成"要重连"。 */
-    if (he != NULL) {
-        char *mut = (char *)he; /* 只在本次判断里临时截断，立刻还原 */
-        char  save = *mut;
-
-        *mut = '\0';
-        if (strstr(u->resp, "Connection: close") != NULL ||
-            strstr(u->resp, "Connection:close") != NULL) {
-            u->need_reconnect = 1;
-        }
-        *mut = save;
-    }
-    return IV_OK;
-}
-
-/* 从应答 JSON 里取整型字段（直接在原始应答里搜，不引 json-c） */
-static int body_int(const iv_logup_t *u, const char *key, int *out)
-{
-    char        pat[32];
-    const char *p;
-
-    if (u->resp_body == NULL)
-        return IV_ENOENT;
-    (void)snprintf(pat, sizeof pat, "\"%s\"", key);
-    p = strstr(u->resp_body, pat);
-    if (p == NULL)
-        return IV_ENOENT;
-    p = strchr(p, ':');
-    if (p == NULL)
-        return IV_ENOENT;
-    return (sscanf(p + 1, "%d", out) == 1) ? IV_OK : IV_ENOENT;
-}
-
-static int body_str(const iv_logup_t *u, const char *key, char *out, size_t cap)
-{
-    char        pat[32];
-    const char *p;
-    const char *e;
-    size_t      n;
-
-    if (u->resp_body == NULL || out == NULL || cap == 0u)
-        return IV_EINVAL;
-    (void)snprintf(pat, sizeof pat, "\"%s\"", key);
-    p = strstr(u->resp_body, pat);
-    if (p == NULL)
-        return IV_ENOENT;
-    p = strchr(p, ':');
-    if (p == NULL)
-        return IV_ENOENT;
-    p++;
-    while (*p == ' ' || *p == '\t' || *p == '"')
-        p++;
-    e = p;
-    while (*e != '\0' && *e != '"' && *e != ',' && *e != '}')
-        e++;
-    n = (size_t)(e - p);
-    if (n == 0u || n >= cap)
-        return IV_ERANGE;
-    memcpy(out, p, n);
-    out[n] = '\0';
-    return IV_OK;
-}
-
-static int api_ok(const iv_logup_t *u)
-{
-    int code = 0;
-
-    return (body_int(u, "code", &code) == IV_OK && code == LU_API_CODE_OK) ? IV_OK
-                                                                          : IV_EPROTO;
-}
-
-/* 无 body 的 POST（start / finish） */
-static int post_query(iv_logup_t *u, const char *path, int keep_alive)
-{
-    int n;
-
-    if (ensure_conn(u) != IV_OK)
-        return IV_ECONN;
-    n = snprintf(u->hdr, sizeof u->hdr,
-                 "POST %s HTTP/1.1\r\n"
-                 "Host: %s:%u\r\n"
-                 "Content-Length: 0\r\n"
-                 "Connection: %s\r\n\r\n",
-                 path, u->host, (unsigned)u->port, keep_alive ? "keep-alive" : "close");
-    if (n < 0 || (size_t)n >= sizeof u->hdr)
-        return IV_ERANGE;
-    if (send_all(u, u->hdr, (size_t)n) != IV_OK) {
-        u->need_reconnect = 1;
-        return IV_ECONN;
-    }
-    if (read_resp(u) != IV_OK)
-        return u->need_reconnect ? IV_ECONN : IV_ETIMEDOUT;
-    return (u->status >= 200 && u->status < 300) ? IV_OK : IV_EPROTO;
-}
-
-/* 一片日志：multipart/form-data，字段与参考实现逐字对齐 */
-static int post_chunk(iv_logup_t *u, unsigned index, const void *data, size_t len)
-{
-    size_t pos;
-    int    n;
-
-    n = snprintf(u->body, sizeof u->body,
-                 "--%s\r\nContent-Disposition: form-data; name=\"uploadId\"\r\n\r\n%s\r\n"
-                 "--%s\r\nContent-Disposition: form-data; name=\"chunkIndex\"\r\n\r\n%u\r\n"
-                 "--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
-                 "Content-Type: application/octet-stream\r\n\r\n",
-                 LU_BOUNDARY, u->upload_id, LU_BOUNDARY, index, LU_BOUNDARY,
-                 u->file_name);
-    if (n < 0 || (size_t)n + len + 64u >= sizeof u->body)
-        return IV_ERANGE;
-    pos = (size_t)n;
-    memcpy(u->body + pos, data, len);
-    pos += len;
-    n = snprintf(u->body + pos, sizeof u->body - pos, "\r\n--%s--\r\n", LU_BOUNDARY);
-    if (n < 0 || (size_t)n >= sizeof u->body - pos)
-        return IV_ERANGE;
-    pos += (size_t)n;
-
-    if (ensure_conn(u) != IV_OK)
-        return IV_ECONN;
-    n = snprintf(u->hdr, sizeof u->hdr,
-                 "POST %s HTTP/1.1\r\n"
-                 "Host: %s:%u\r\n"
-                 "Content-Type: multipart/form-data; boundary=%s\r\n"
-                 "Content-Length: %lu\r\n"
-                 "Connection: keep-alive\r\n\r\n",
-                 IV_LOGUP_PATH_CHUNK, u->host, (unsigned)u->port, LU_BOUNDARY,
-                 (unsigned long)pos);
-    if (n < 0 || (size_t)n >= sizeof u->hdr)
-        return IV_ERANGE;
-    if (send_all(u, u->hdr, (size_t)n) != IV_OK ||
-        send_all(u, u->body, pos) != IV_OK) {
-        u->need_reconnect = 1;
-        return IV_ECONN;
-    }
-    if (read_resp(u) != IV_OK)
-        return u->need_reconnect ? IV_ECONN : IV_ETIMEDOUT;
-    if (u->status < 200 || u->status >= 300)
-        return IV_EPROTO;
-    return api_ok(u);
-}
-
-/* ---------------------------------------------------------------------------
  * 上传主体
  * ------------------------------------------------------------------------- */
 
@@ -670,10 +323,10 @@ static int span_flush(span_t *s)
     if (s->fill == 0u)
         return IV_OK;
     for (try = 0; try < IV_LOGUP_RETRY_MAX; try++) {
-        rc = post_chunk(u, s->sent_chunks, s->buf, s->fill);
+        rc = iv_uphttp_chunk(&u->up, s->sent_chunks, s->buf, s->fill);
         if (rc == IV_OK)
             break;
-        u->need_reconnect = 1; /* 下一轮从同一下标重发（幂等） */
+        u->up.need_reconnect = 1; /* 下一轮从同一下标重发（幂等） */
     }
     if (rc != IV_OK) {
         /* 失败现场必须留证据：`http=200` 却失败只有两种可能 ——
@@ -682,7 +335,8 @@ static int span_flush(span_t *s)
          * 2026-11-02 真机第 1024 片就是这么翻的，当时只有 rc/http，
          * 看不出是哪一种。这里把 len 与应答原文（含头）一起打出来。 */
         IV_LOG_W(LU_MOD, "chunk #%u failed: rc=%d http=%d len=%u resp=%s",
-                 s->sent_chunks, rc, u->status, (unsigned)s->fill, u->resp);
+                 s->sent_chunks, rc, iv_uphttp_status(&u->up), (unsigned)s->fill,
+                 iv_uphttp_resp(&u->up));
         return (rc == IV_EPROTO) ? IV_EPROTO : IV_ECONN;
     }
     s->sent_chunks++;
@@ -735,50 +389,34 @@ static int span_send(span_t *s, const char *path, long off, size_t len)
     return IV_OK;
 }
 
+/* start：文件名/类型/尺寸由本层给，协议细节在 `iv_uphttp_start()`。
+ * 重试留在本层（同一次 start 重发是幂等的：服务端每次给一个新 uploadId，
+ * 只是废掉前一具"半截会话"）。 */
 static int start_upload(iv_logup_t *u, size_t total, unsigned total_chunks)
 {
-    char path[384];
-    int  n;
-    int  try;
-    int  rc = IV_EPROTO;
-
-    n = snprintf(path, sizeof path,
-                 "%s?deviceSn=%s&totalSize=%lu&totalChunks=%u&fileName=%s&logType=%s",
-                 IV_LOGUP_PATH_START, u->dev_sn, (unsigned long)total, total_chunks,
-                 u->file_name, u->log_type);
-    if (n < 0 || (size_t)n >= sizeof path)
-        return IV_ERANGE;
+    int try;
+    int rc = IV_EPROTO;
 
     for (try = 0; try < IV_LOGUP_RETRY_MAX; try++) {
-        rc = post_query(u, path, 1);
-        if (rc == IV_OK && api_ok(u) == IV_OK &&
-            body_str(u, "uploadId", u->upload_id, sizeof u->upload_id) == IV_OK &&
-            u->upload_id[0] != '\0') {
-            return IV_OK;
-        }
+        rc = iv_uphttp_start(&u->up, u->file_name, u->log_type, (uint32_t)total,
+                             total_chunks);
         if (rc == IV_OK)
-            rc = IV_EPROTO; /* 2xx 但 JSON 里没有 uploadId */
-        u->need_reconnect = 1;
+            return IV_OK;
+        u->up.need_reconnect = 1;
     }
     return rc;
 }
 
 static int finish_upload(iv_logup_t *u)
 {
-    char path[256];
-    int  n;
-    int  try;
-    int  rc = IV_EPROTO;
+    int try;
+    int rc = IV_EPROTO;
 
-    n = snprintf(path, sizeof path, "%s?uploadId=%s", IV_LOGUP_PATH_FINISH,
-                 u->upload_id);
-    if (n < 0 || (size_t)n >= sizeof path)
-        return IV_ERANGE;
     for (try = 0; try < IV_LOGUP_RETRY_MAX; try++) {
-        rc = post_query(u, path, 0);
+        rc = iv_uphttp_finish(&u->up, NULL, 0); /* 日志不关心返回的 URL */
         if (rc == IV_OK)
-            return api_ok(u);
-        u->need_reconnect = 1;
+            return IV_OK;
+        u->up.need_reconnect = 1;
     }
     return rc;
 }
@@ -807,13 +445,14 @@ void iv_logup_cfg_default(iv_logup_cfg_t *cfg)
 
 int iv_logup_init(iv_logup_t *u, const iv_logup_cfg_t *cfg)
 {
+    iv_uphttp_cfg_t uc;
+
     if (u == NULL || cfg == NULL)
         return IV_EINVAL;
     if (u->inited)
         return IV_ESTATE;
 
     memset(u, 0, sizeof *u);
-    u->fd = -1;
 
     copy_str(u->root, sizeof u->root,
              (cfg->root != NULL && cfg->root[0] != '\0') ? cfg->root
@@ -822,27 +461,36 @@ int iv_logup_init(iv_logup_t *u, const iv_logup_cfg_t *cfg)
         copy_str(u->state_path, sizeof u->state_path, cfg->state_path);
     else
         cursor_default_path(u->state_path, sizeof u->state_path);
-    copy_str(u->host, sizeof u->host, cfg->host);
-    copy_str(u->bind_dev, sizeof u->bind_dev, cfg->bind_dev);
-    copy_str(u->dev_sn, sizeof u->dev_sn,
-             (cfg->device_sn != NULL && cfg->device_sn[0] != '\0') ? cfg->device_sn : "0");
     copy_str(u->log_type, sizeof u->log_type,
              (cfg->log_type != NULL && cfg->log_type[0] != '\0') ? cfg->log_type
                                                                  : "SYSTEM");
-    u->port       = (cfg->port != 0u) ? cfg->port : (uint16_t)IV_LOGUP_PORT_DEFAULT;
     u->max_bytes  = (cfg->max_bytes != 0u) ? cfg->max_bytes : IV_LOGUP_MAX_BYTES_DEFAULT;
-    u->connect_ms = (cfg->connect_ms != 0u) ? cfg->connect_ms : 5000u;
-    u->send_ms    = (cfg->send_ms != 0u) ? cfg->send_ms : 10000u;
-    u->recv_ms    = (cfg->recv_ms != 0u) ? cfg->recv_ms : 10000u;
+
+    /* HTTP 那一半交给 `iv_uphttp` 初始化（图片上传走同一份实现） */
+    iv_uphttp_cfg_default(&uc);
+    uc.host       = cfg->host;
+    uc.port       = (cfg->port != 0u) ? cfg->port : (uint16_t)IV_LOGUP_PORT_DEFAULT;
+    uc.bind_dev   = cfg->bind_dev;
+    uc.device_sn  = cfg->device_sn;
+    uc.connect_ms = cfg->connect_ms;
+    uc.send_ms    = cfg->send_ms;
+    uc.recv_ms    = cfg->recv_ms;
+    {
+        int urc = iv_uphttp_init(&u->up, &uc);
+
+        if (urc != IV_OK)
+            return urc;
+    }
     u->inited     = 1;
 
-    if (u->host[0] == '\0') {
+    if (u->up.host[0] == '\0') {
         /* 不判失败：装配层常常先 init、等出口定了再 set_target 补地址 */
         IV_LOG_W(LU_MOD, "init: no host yet, set_target() before run()");
     }
     IV_LOG_I(LU_MOD, "init: server=%s:%u root=%s state=%s dev=%s type=%s max=%u",
-             u->host[0] != '\0' ? u->host : "(unset)", (unsigned)u->port, u->root,
-             u->state_path, u->dev_sn, u->log_type, (unsigned)u->max_bytes);
+             u->up.host[0] != '\0' ? u->up.host : "(unset)", (unsigned)u->up.port,
+             u->root, u->state_path, u->up.dev_sn, u->log_type,
+             (unsigned)u->max_bytes);
     return IV_OK;
 }
 
@@ -852,23 +500,15 @@ int iv_logup_set_target(iv_logup_t *u, const char *host, uint16_t port,
     if (u == NULL || !u->inited)
         return IV_ESTATE;
     if (u->running)
-        return IV_EBUSY;
-    if (host == NULL || host[0] == '\0')
-        return IV_EINVAL;
-    if (strcmp(u->host, host) != 0) {
-        copy_str(u->host, sizeof u->host, host);
-        u->need_reconnect = 1; /* 旧连接指向旧地址，必须换 */
-    }
-    u->port = (port != 0u) ? port : (uint16_t)IV_LOGUP_PORT_DEFAULT;
-    copy_str(u->bind_dev, sizeof u->bind_dev, bind_dev);
-    return IV_OK;
+        return IV_EBUSY; /* 上传中途换地址会让 keep-alive 与游标同时错位 */
+    return iv_uphttp_set_target(&u->up, host, port, bind_dev);
 }
 
 void iv_logup_close(iv_logup_t *u)
 {
     if (u == NULL)
         return;
-    conn_close(u);
+    iv_uphttp_close(&u->up);
     u->inited = 0;
 }
 
@@ -883,15 +523,15 @@ int iv_logup_run(iv_logup_t *u)
 
     if (u == NULL || !u->inited)
         return IV_EINVAL;
-    if (u->host[0] == '\0')
+    if (u->up.host[0] == '\0')
         return IV_EINVAL; /* 装配层忘了 set_target（或配置里根本没有地址） */
     if (u->running)
         return IV_EBUSY;
 
-    u->running        = 1;
+    u->running           = 1;
     u->st.runs++;
-    u->status         = 0;
-    u->need_reconnect = 0;
+    u->up.status         = 0;
+    u->up.need_reconnect = 0;
 
     memset(&sp, 0, sizeof sp);
     sp.u = u;
@@ -924,18 +564,18 @@ int iv_logup_run(iv_logup_t *u)
     chunks = (unsigned)((total + IV_LOGUP_CHUNK_SIZE - 1u) / IV_LOGUP_CHUNK_SIZE);
 
     copy_str(u->file_name, sizeof u->file_name, LU_FILE_NAME);
-    u->upload_id[0] = '\0';
 
     IV_LOG_I(LU_MOD, "upload start: %u B in %u chunks -> %s:%u (from %s %02d +%ld)",
-             (unsigned)total, chunks, u->host, (unsigned)u->port, sp.last_date,
+             (unsigned)total, chunks, u->up.host, (unsigned)u->up.port, sp.last_date,
              sp.last_hour, sp.last_off);
 
-    rc = conn_open(u);
+    rc = iv_uphttp_connect(&u->up);
     if (rc != IV_OK)
         goto out;
     rc = start_upload(u, total, chunks);
     if (rc != IV_OK) {
-        IV_LOG_W(LU_MOD, "start failed: rc=%d http=%d", rc, u->status);
+        IV_LOG_W(LU_MOD, "start failed: rc=%d http=%d", rc,
+                 iv_uphttp_status(&u->up));
         goto out;
     }
 
@@ -946,7 +586,7 @@ int iv_logup_run(iv_logup_t *u)
     rc             = span_walk(&sp, span_send);
     if (rc != IV_OK) {
         IV_LOG_W(LU_MOD, "chunks aborted at #%u: rc=%d http=%d", sp.sent_chunks, rc,
-                 u->status);
+                 iv_uphttp_status(&u->up));
         goto out;
     }
     /* 尾片：最后一次攒下的不足 1 KiB 的那一片。少了这一步，服务端收到的
@@ -955,7 +595,7 @@ int iv_logup_run(iv_logup_t *u)
         rc = span_flush(&sp);
         if (rc != IV_OK) {
             IV_LOG_W(LU_MOD, "tail chunk #%u failed: rc=%d http=%d", sp.sent_chunks,
-                     rc, u->status);
+                     rc, iv_uphttp_status(&u->up));
             goto out;
         }
     }
@@ -969,7 +609,7 @@ int iv_logup_run(iv_logup_t *u)
 
     rc = finish_upload(u);
     if (rc != IV_OK) {
-        IV_LOG_W(LU_MOD, "finish failed: rc=%d http=%d", rc, u->status);
+        IV_LOG_W(LU_MOD, "finish failed: rc=%d http=%d", rc, iv_uphttp_status(&u->up));
         goto out;
     }
 
@@ -993,8 +633,8 @@ out:
         u->st.last_bytes = 0u;
     }
     u->st.last_rc   = rc;
-    u->st.last_http = u->status;
-    conn_close(u);
+    u->st.last_http = iv_uphttp_status(&u->up);
+    iv_uphttp_disconnect(&u->up);
     u->running = 0;
     return rc;
 }

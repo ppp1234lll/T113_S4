@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -65,6 +66,7 @@ static int  agent_send_power(const void *data, uint16_t len, void *arg);
 static void on_camdet_change(int ch, iv_camdet_status_t old_st,
                              iv_camdet_status_t new_st, void *arg);
 static void on_door_open(int ds, void *arg);
+static void imgup_wait_add(iv_agent_t *a, const char *path, uint64_t now_ms);
 static void on_upload_log(const iv_proto_frame_t *f, void *arg);
 static int  logup_task_fn(iv_task_ctx_t *ctx);
 static void on_logup_done(uint64_t id, int rc, const void *result,
@@ -791,6 +793,23 @@ int iv_agent_open(iv_agent_t *a, const iv_agent_cfg_t *cfg, iv_reactor_t *r,
     }
     (void)iv_proto_route(&a->rp.pf, IV_PROTO_CMD_UPLOAD_LOG, on_upload_log, a);
 
+    /* 箱门抓拍图片上传（2026-11-03）：与日志上报同一个服务、同一套三步 HTTP，
+     * 差别只有 fileName/logType。**没有平台命令**——门开抓拍成功就入队，由
+     * `iv_agent_imgup_pump()` 在两条驱动路径上按需提交。
+     * 地址同样"每次提交前按这一刻刷新"（出口会切），见 pump()。 */
+    {
+        iv_imgup_cfg_t ic;
+        char           isn[16];
+
+        iv_imgup_cfg_default(&ic);
+        (void)snprintf(isn, sizeof isn, "%lX", (unsigned long)a->cfg.devid);
+        ic.queue_dir = a->cfg.imgup_queue;
+        ic.host      = a->cfg.imgup_host;
+        ic.port      = a->cfg.imgup_port;
+        ic.device_sn = isn;
+        (void)iv_imgup_init(&a->imgup, &ic);
+    }
+
     /* 0xB3「更新系统」（2026-11-02）：设备自己去升级服务器取包（参考
      * `General_Version/main/APP/Update/`），拉完只**写一行安装请求**，
      * 真正装盘由 `scripts/monitor.sh` 拉起 `ivsbox-updater` 完成 ——
@@ -1239,6 +1258,7 @@ int iv_agent_step(iv_agent_t *a, uint64_t now_ms)
         (void)iv_device_tick(&a->dev, now_ms);
     ipc_reply_tick(a, now_ms); /* 0xE4 的延迟清单：相位机 DONE 时补那一帧 */
     ping_reply_tick(a, now_ms); /* 0xE8 的即席探测：一轮跑完补 st/dt 那一帧 */
+    (void)iv_agent_imgup_pump(a, now_ms); /* 门开抓拍图片上传：收图 ＋ 有活就提交 */
     iv_agent_ota_flush(a);        /* 0xB3 结果帧：与 on_pb_timer 同装同驱 */
     env_feed(a, now_ms);
     (void)iv_recovery_tick(&a->rec, now_ms);
@@ -1361,12 +1381,16 @@ static void on_door_open(int ds, void *arg)
         return;
     }
     rc = iv_media_capture_async(&a->media, NULL, path, sizeof(path));
-    if (rc == IV_OK)
+    if (rc == IV_OK) {
         IV_LOG_I(AG_MOD, "door open event #%llu (DS=%d): capture -> %s",
                  (unsigned long long)a->door_events, ds, path);
-    else
+        /* 抓拍是异步的（媒体进程稍后写盘）⇒ 只登记"等它长好"，真正拷进上传
+         * 队列由 `iv_agent_imgup_pump()` 在尺寸稳定后做。失败不影响门开事件。 */
+        imgup_wait_add(a, path, a->now_ms);
+    } else {
         IV_LOG_W(AG_MOD, "door open event #%llu (DS=%d): capture rejected (%d)",
                  (unsigned long long)a->door_events, ds, rc);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -2616,6 +2640,7 @@ static void on_pb_timer(void *arg)
      * 症状与"功能没做"完全一样（现场 2026-11-02 报的就是这个），而代码读起来
      * 每一步都对 —— 两条驱动路径必须同装同驱，别再只加一条。 */
     ping_reply_tick(a, now);
+    (void)iv_agent_imgup_pump(a, now); /* 门开抓拍图片上传：与 step() 同装同驱 */
     iv_agent_ota_flush(a); /* 0xB3 结果帧：与 step() 同装同驱（跨重启的那一帧靠它出去） */
     env_feed(a, now);
     (void)iv_recovery_tick(&a->rec, now);
@@ -3516,7 +3541,7 @@ int iv_agent_log_upload(iv_agent_t *a, uint64_t now_ms)
     a->logup_runs++;
     a->now_ms = now_ms;
     IV_LOG_I(AG_MOD, "log upload accepted: -> %s:%u via %s (id=%llu, runs=%llu)",
-             host, (unsigned)a->logup.port,
+             host, (unsigned)a->logup.up.port,
              (wan != NULL && wan[0] != '\0') ? wan : "(route)",
              (unsigned long long)id, (unsigned long long)a->logup_runs);
     return IV_OK;
@@ -3536,6 +3561,237 @@ void iv_agent_logup_stats(const iv_agent_t *a, iv_logup_stats_t *out)
         return;
     }
     iv_logup_stats(&a->logup, out);
+}
+
+/* ---------------------------------------------------------------------------
+ * 箱门抓拍图片上传（2026-11-03）
+ *
+ * 与 0xB2 日志上报同一套三步 HTTP（`iv_uphttp`），但链路两端都不同：
+ *   - **没有平台命令**：触发是"门开 → 抓拍成功"；
+ *   - 抓拍是**异步**的（`iv_media_capture_async()` 只入队，磁盘上的 jpg 由
+ *     media worker 稍后写出），所以这里要等文件"长好"再拷进队列 —— 判据是
+ *     **连续两拍尺寸不变**（学 `iv_media` 自己"200 + stat 判成败"的口径，
+ *     拿"文件已存在"当完成会拷到半张图）。
+ *
+ * 为什么用磁盘队列而不是内存队列：门开可能发生在断网/掉电前，图必须留着。
+ * 队列目录见 `iv_agent_cfg_t::imgup_queue`，成功一步才 unlink（`iv_imgup`）。
+ * ------------------------------------------------------------------------- */
+
+/* 失败退避：一次失败后 60 s 再试。太短会在断网时空转慢池，太长则恢复后迟迟不补。 */
+#define IV_AGENT_IMGUP_RETRY_MS  60000u
+/* 等抓拍落盘的上限（槽位数 `IV_AGENT_IMGUP_WAIT_N` 在头文件里 —— 数组要用）：
+ * 10 s 还等不到一张 jpg 就当这一张抓拍失败，放弃它，别堵住后面的。 */
+#define IV_AGENT_IMGUP_SETTLE_MS 10000u
+/* 单张图任务超时：4 MiB 上限 / 1 KiB = 4096 片，4G 上远小于 5 分钟。 */
+#define IV_AGENT_IMGUP_TASK_MS   300000u
+
+static int imgup_task_fn(iv_task_ctx_t *ctx)
+{
+    iv_agent_t *a = (ctx != NULL) ? (iv_agent_t *)ctx->arg : NULL;
+
+    if (a == NULL)
+        return IV_EINVAL;
+    return iv_imgup_run(&a->imgup); /* 一次只传最旧的一张 */
+}
+
+/* Reactor 线程：任务结算。成功 → 下一拍接着传；失败 → 退避 60 s。 */
+static void on_imgup_done(uint64_t id, int rc, const void *result,
+                          size_t result_len, void *arg)
+{
+    iv_agent_t      *a = (iv_agent_t *)arg;
+    iv_imgup_stats_t st;
+
+    (void)result;
+    (void)result_len;
+    if (a == NULL)
+        return;
+    a->imgup_state = 0u;
+    iv_imgup_stats(&a->imgup, &st);
+
+    if (rc == IV_OK) {
+        a->imgup_next_ms = 0u; /* 还有就立刻传下一张 */
+        IV_LOG_I(AG_MOD, "img upload #%llu ok: %s -> %s (total ok=%llu)",
+                 (unsigned long long)id, st.last_name, st.last_url,
+                 (unsigned long long)st.ok);
+    } else if (rc == IV_ENOENT) {
+        a->imgup_next_ms = 0u; /* 队列被别的路径清空了，不算失败 */
+        IV_LOG_I(AG_MOD, "img upload #%llu: queue empty", (unsigned long long)id);
+    } else {
+        a->imgup_next_ms = a->now_ms + (uint64_t)IV_AGENT_IMGUP_RETRY_MS;
+        IV_LOG_W(AG_MOD, "img upload #%llu failed: rc=%d http=%d, retry in %us",
+                 (unsigned long long)id, rc, st.last_http,
+                 (unsigned)(IV_AGENT_IMGUP_RETRY_MS / 1000u));
+    }
+}
+
+/* 等抓拍落盘的槽位：path + 上一拍看到的尺寸（0 = 还没见到文件）。 */
+static void imgup_wait_add(iv_agent_t *a, const char *path, uint64_t now_ms)
+{
+    unsigned i;
+    unsigned slot;
+
+    if (path == NULL || path[0] == '\0')
+        return;
+    if (a->imgup_wait_n >= IV_AGENT_IMGUP_WAIT_N) {
+        /* 满了丢最旧的槽位：那一张大概率已经失败（抓拍被拒），不值得再等 */
+        for (i = 1; i < IV_AGENT_IMGUP_WAIT_N; i++)
+            a->imgup_wait[i - 1u] = a->imgup_wait[i];
+        a->imgup_wait_n = IV_AGENT_IMGUP_WAIT_N - 1u;
+        IV_LOG_W(AG_MOD, "img wait list full, oldest slot dropped");
+    }
+    slot = a->imgup_wait_n++;
+    (void)snprintf(a->imgup_wait[slot].path, sizeof a->imgup_wait[slot].path, "%s",
+                   path);
+    a->imgup_wait[slot].size      = 0;
+    a->imgup_wait[slot].deadline_ms = now_ms + (uint64_t)IV_AGENT_IMGUP_SETTLE_MS;
+}
+
+/* 把"尺寸连续两拍不变"的那几张拷进队列；返回本次入队张数。 */
+static int imgup_wait_drain(iv_agent_t *a, uint64_t now_ms)
+{
+    unsigned i = 0;
+    int      moved = 0;
+
+    while (i < a->imgup_wait_n) {
+        agent_imgup_wait_t *w = &a->imgup_wait[i];
+        struct stat         sb;
+        int                 ready = 0;
+
+        if (stat(w->path, &sb) == 0 && S_ISREG(sb.st_mode) && sb.st_size > 0) {
+            if (w->size == (long)sb.st_size)
+                ready = 1; /* 两拍尺寸一致 ⇒ 认为写完了 */
+            else
+                w->size = (long)sb.st_size;
+        }
+        if (!ready && now_ms >= w->deadline_ms) {
+            IV_LOG_W(AG_MOD, "img capture never settled: %s (give up)", w->path);
+            a->imgup_wait[i] = a->imgup_wait[a->imgup_wait_n - 1u];
+            a->imgup_wait_n--;
+            continue;
+        }
+        if (ready) {
+            if (iv_agent_imgup_queue(a, w->path) == IV_OK) {
+                a->imgup_enqs++;
+                moved++;
+            }
+            a->imgup_wait[i] = a->imgup_wait[a->imgup_wait_n - 1u];
+            a->imgup_wait_n--;
+            continue;
+        }
+        i++;
+    }
+    return moved;
+}
+
+/* 抓拍成功后登记一张待入队（Reactor 线程；真正拷贝在下一拍 pump 里做）。 */
+int iv_agent_imgup_queue(iv_agent_t *a, const char *path)
+{
+    if (a == NULL || path == NULL || path[0] == '\0')
+        return IV_EINVAL;
+    if (!a->imgup.inited)
+        return IV_ESTATE;
+    return iv_imgup_enqueue(&a->imgup, path);
+}
+
+int iv_agent_imgup_state(const iv_agent_t *a)
+{
+    return (a == NULL) ? 0 : (int)a->imgup_state;
+}
+
+void iv_agent_imgup_stats(const iv_agent_t *a, iv_imgup_stats_t *out)
+{
+    if (out == NULL)
+        return;
+    if (a == NULL) {
+        memset(out, 0, sizeof *out);
+        return;
+    }
+    iv_imgup_stats(&a->imgup, out);
+}
+
+/* 一次泵：先把等落盘的几张收进队列，再看要不要提交一个上传任务。
+ * **两条驱动路径都要调**（`iv_agent_step()` 与 `on_pb_timer()`）。 */
+int iv_agent_imgup_pump(iv_agent_t *a, uint64_t now_ms)
+{
+    iv_task_req_t req;
+    uint64_t      id       = 0u;
+    uint16_t      srv_port = 0u;
+    const char   *host;
+    const char   *wan;
+    int           rc;
+
+    if (a == NULL || a->opened == 0u)
+        return IV_ESTATE;
+    if (!a->imgup.inited)
+        return IV_ESTATE;
+
+    (void)imgup_wait_drain(a, now_ms); /* 先收图，慢也无妨（一次 160 KiB） */
+
+    if (a->imgup_state != 0u)
+        return IV_EBUSY;
+    if (a->imgup_next_ms != 0u && now_ms < a->imgup_next_ms)
+        return IV_EAGAIN;
+    /* 限速：本函数在 on_pb_timer() 里每 200 ms 被调一次，readdir 不能跟着跑。
+     * 队列有新件时最迟 1 s 内会被发现，对"门开→平台出图"完全够。 */
+    if (a->imgup_scan_ms != 0u && now_ms - a->imgup_scan_ms < 1000u)
+        return IV_EAGAIN;
+    a->imgup_scan_ms = now_ms;
+    if (a->cfg.pool == NULL)
+        return IV_ESTATE; /* 没有慢池：阻塞上传绝不上 Reactor 线程（§4.2） */
+    if (iv_imgup_pending(&a->imgup) <= 0)
+        return IV_ENOENT; /* 队列空是常态，不是错误 */
+
+    /* 地址：`net.server.image.*`（如有）→ `net.server.log.*` → 活动出口的平台地址。
+     * 出口每次现取：netmgr 刚切过出口时，这一张必须跟着走。 */
+    wan  = iv_agent_active_wan_name(a);
+    host = (a->cfg.imgup_host != NULL && a->cfg.imgup_host[0] != '\0')
+               ? a->cfg.imgup_host
+               : ((a->cfg.logup_host != NULL && a->cfg.logup_host[0] != '\0')
+                      ? a->cfg.logup_host
+                      : iv_agent_pick_host(&a->cfg, (int)iv_agent_active_wan(a),
+                                           &srv_port));
+    if (host == NULL || host[0] == '\0') {
+        IV_LOG_W(AG_MOD, "img upload: no server address (logup/image/server all empty)");
+        return IV_ESTATE;
+    }
+    {
+        /* 端口：`imgup_port` → `logup_port` → 0（= `IV_UPHTTP_PORT_DEFAULT`，18080）。
+         * **不能拿 `srv_port` 兜底**：那是平台 TCP 的端口（6013），图片走的是日志
+         * HTTP 服务；2026-11-03 板测就是在这里错拿 6013，连上以后 POST 永不应答，
+         * 任务挂到 300 s 超时才失败。`iv_uphttp_set_target()` 里 0 本来就等于默认值，
+         * 直接传下去即可。 */
+        uint16_t port = (a->cfg.imgup_port != 0u) ? a->cfg.imgup_port : a->cfg.logup_port;
+
+        rc = iv_imgup_set_target(&a->imgup, host, port, wan);
+        if (rc != IV_OK) {
+            IV_LOG_W(AG_MOD, "img upload: set_target(%s, %u, %s) failed: %d", host,
+                     (unsigned)port, wan != NULL ? wan : "-", rc);
+            return rc;
+        }
+    }
+
+    memset(&req, 0, sizeof req);
+    req.name        = "imgup";
+    req.fn          = imgup_task_fn;
+    req.arg         = a;
+    req.timeout_ms  = IV_AGENT_IMGUP_TASK_MS;
+    req.on_done     = on_imgup_done;
+    req.on_done_arg = a;
+
+    rc = iv_taskpool_submit(a->cfg.pool, &req, &id);
+    if (rc != IV_OK) {
+        IV_LOG_W(AG_MOD, "img upload submit failed: %d", rc);
+        a->imgup_next_ms = now_ms + (uint64_t)IV_AGENT_IMGUP_RETRY_MS;
+        return rc;
+    }
+    a->imgup_state = 1u;
+    a->imgup_runs++;
+    a->now_ms = now_ms;
+    IV_LOG_I(AG_MOD, "img upload accepted: -> %s:%u via %s (id=%llu, pending=%d)",
+             host, (unsigned)a->imgup.up.port,
+             (wan != NULL && wan[0] != '\0') ? wan : "(route)",
+             (unsigned long long)id, iv_imgup_pending(&a->imgup));
+    return IV_OK;
 }
 
 /* ---------------------------------------------------------------------------

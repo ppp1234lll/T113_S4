@@ -54,18 +54,22 @@
 #include <stdint.h>
 
 #include "ivsbox/iv_ret.h"
+#include "ivsbox/iv_uphttp.h" /* 三步 HTTP 与图片上传同源（2026-11-03 抽出） */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* 参考实现的接口路径与端口（`APP/Upload/inc/upload_http.h` / `upload.c`） */
-#define IV_LOGUP_PATH_START  "/fnwlw/oss/log/upload/start"
-#define IV_LOGUP_PATH_CHUNK  "/fnwlw/oss/log/upload/chunk"
-#define IV_LOGUP_PATH_FINISH "/fnwlw/oss/log/upload/finish"
+/* 参考实现的接口路径与端口 —— **定义在 iv_uphttp.h**，这里保留旧名做别名：
+ * 日志与图片走同一条 `/fnwlw/oss/log/upload` 接口（三个子路径），只是
+ * fileName/logType 不同
+ * （2026-11-03 用 .jpg 实测同一个桶同一个前缀，见 iv_uphttp.h 文件头）。 */
+#define IV_LOGUP_PATH_START  IV_UPHTTP_PATH_START
+#define IV_LOGUP_PATH_CHUNK  IV_UPHTTP_PATH_CHUNK
+#define IV_LOGUP_PATH_FINISH IV_UPHTTP_PATH_FINISH
 
-#define IV_LOGUP_PORT_DEFAULT      18080u
-#define IV_LOGUP_CHUNK_SIZE        1024u
+#define IV_LOGUP_PORT_DEFAULT      IV_UPHTTP_PORT_DEFAULT
+#define IV_LOGUP_CHUNK_SIZE        IV_UPHTTP_CHUNK_SIZE
 #define IV_LOGUP_MAX_BYTES_DEFAULT (1024u * 1024u) /* 单次上传上限 1 MiB ⇒ ≤1024 片 */
 #define IV_LOGUP_RETRY_MAX         3              /* 单请求重试次数（参考同名常量） */
 
@@ -118,35 +122,23 @@ typedef struct {
 
 /* 句柄：内嵌进 `iv_agent_t`（与 iv_media/iv_storage 同风格，零 malloc） */
 typedef struct {
-    /* 配置（字符串落在下方定长缓冲里，init 后自洽） */
+    /* 配置（字符串落在下方定长缓冲里，init 后自洽）。
+     * 地址 / 出口网卡 / deviceSn / 超时**只在 `up` 里存一份**（与图片上传同源），
+     * 本层不另抄 —— 抄两份迟早漂移。 */
     char     root[IV_LOGUP_ROOT_MAX];
     char     state_path[IV_LOGUP_STATE_MAX];
-    char     host[IV_LOGUP_HOST_MAX];
-    char     bind_dev[IV_LOGUP_BIND_MAX];
-    char     dev_sn[IV_LOGUP_SN_MAX];
     char     log_type[IV_LOGUP_TYPE_MAX];
-    uint16_t port;
     uint32_t max_bytes;
-    uint32_t connect_ms;
-    uint32_t send_ms;
-    uint32_t recv_ms;
     int      inited;
 
     /* 一次上传的会话状态（只在 run() 内用） */
-    int      fd;              /* -1 = 未连 */
     int      running;         /* 1 = run() 在飞（防 set_target 中途改地址） */
-    int      status;          /* 最近一次 HTTP 状态码 */
-    int      need_reconnect;  /* 1 = 下一次请求前重连（服务端 close / 断链） */
-    char     upload_id[IV_LOGUP_ID_MAX + 1u];
     char     file_name[IV_LOGUP_NAME_MAX];
-    size_t   resp_len;
-    const char *resp_body;    /* 指向 resp 内 body 起点（无 body 时指向末尾） */
 
-    /* 缓冲（句柄体因此约 5 KiB；不要放栈上） */
-    char     hdr[IV_LOGUP_HDR_MAX];
-    char     resp[IV_LOGUP_RESP_MAX];
-    char     body[IV_LOGUP_BODY_MAX];
-    uint8_t  chunk[IV_LOGUP_CHUNK_SIZE];
+    /* HTTP 这一半在 `iv_uphttp`（与图片上传共用同一份实现）：连接、keep-alive、
+     * "按 Content-Length 读满应答"、1 KiB 分片全在那边，本层只管"传哪一段字节"。
+     * 句柄体因此约 5 KiB；不要放栈上。 */
+    iv_uphttp_t up;
 
     iv_logup_stats_t st;
 } iv_logup_t;

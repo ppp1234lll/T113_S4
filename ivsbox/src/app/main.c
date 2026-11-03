@@ -658,6 +658,14 @@ static int agent_sync_server_cfg(int force)
     g_agent.cfg.logup_host = cfg_str("net.server.log.host");
     g_agent.cfg.logup_port = (uint16_t)cfg_port("net.server.log.port");
 
+    /* 箱门抓拍图片上传（2026-11-03）：**与日志上报同一个服务**（用户口径
+     * 「参照日志上报」），所以默认沿用上面两个键，不新增配置项（配置表只剩 9 槽，
+     * 不为"同一个地址"再占一格）。真要分开时由这两行改成独立键即可 ——
+     * pump() 在 host 为空时回落到 logup_host，再回落到平台地址。 */
+    g_agent.cfg.imgup_host = cfg_str("net.server.log.host");
+    g_agent.cfg.imgup_port = (uint16_t)cfg_port("net.server.log.port");
+    g_agent.cfg.imgup_queue = NULL; /* NULL ⇒ $IVSBOX_HOME/imgup（默认数据根） */
+
     /* 平台 0xB3「更新系统」的升级服务器（2026-11-02）：出厂就有值
      * （`net.server.upgrade.host` = 47.104.98.214、端口 8989，与参考实现
      * `sg_uploadparam_t`/`DEFALUT_OTA_*` 同源）。这里只刷**地址**：受理 0xB3 时

@@ -12706,6 +12706,132 @@ netmgr 白跑一次切换事务（把默认路由挪到一条更差的链路上�
 表现为"界面在说谎"而不是"功能坏了"。凡是拿 ifindex 当键的表（探测项、路由事务、
 netlink 事件匹配），都必须有一个"重新解析"的入口，并且挂在**所有**驱动路径上。
 
+== 2026-11-03 14:19 门开抓拍图片上报：复用日志 HTTP 链路（`iv_uphttp` ＋ `iv_imgup`）
+
+=== 起点：不是"缺协议"，是"没去找"
+
+门开抓拍原来只到落盘为止（`0xC1` → `on_door_open()` → `iv_media_capture_async()`
+→ `/mnt/sdcard/snap/*.jpg`），全仓没有任何上传路径；S6.4「方式一：设备主动向平台
+文件服务分片上传」登记为**卡平台文件服务协议**。
+
+真服务器探针推翻了这个前提：**日志服务不校验用途，也不校验扩展名**。
+
+[source,text]
+----
+POST /fnwlw/oss/log/upload/start?deviceSn=B2CC1&totalSize=164744&totalChunks=161
+     &fileName=snap_x.jpg&logType=IMAGE      -> 200 + uploadId
+POST /fnwlw/oss/log/upload/chunk?…           -> 200
+POST /fnwlw/oss/log/upload/finish?…          -> 200 + data=https://minio.fnwlwiot.com:18444/
+                                                  fnwlw-01/device-log/B2CC1/snap_x_<ts>.jpg
+/fnwlw/oss/image/upload/start                -> 404
+/fnwlw/oss/file/upload/start                 -> 404
+----
+
+结论：**门开抓拍复用日志的三条子路径就能上传**，不必等新协议、也不必扩 bird_media
+（它的 `capture` 已经负责把图落到本地，新的只是"发出去"）。
+
+=== 做法：先把 HTTP 客户端抽出来，再写图片队列
+
+* `iv_uphttp`（`include/ivsbox/iv_uphttp.h` ＋ `src/modules/uphttp/iv_uphttp.c`）：
+  把 `iv_logup.c` 里那段阻塞客户端（`getaddrinfo` → `SO_BINDTODEVICE` → 非阻塞
+  `connect` → `SO_*TIMEO` → **按 `Content-Length` 读完整应答**）原样搬出来，日志与
+  图片共用。`IV_LOGUP_PATH_*` / `IV_LOGUP_PORT_DEFAULT` / `IV_LOGUP_CHUNK_SIZE`
+  全部改成它的别名 ⇒ **`iv_logup` 的对外行为与配置键一字未变**，只是 `iv_logup_t`
+  瘦掉 20 余字段、内嵌一个 `iv_uphttp_t up`。
+* `iv_imgup`（`src/modules/imgup/`）：目录队列上传器。
+  - 队列默认 `${IVSBOX_HOME}/imgup`（板端 `/mnt/UDISK/ivsbox/imgup`），只管
+    `.jpg/.jpeg`（大小写不敏感）；**按文件名排序**就是抓拍时序（`snap_<ts>.jpg`）。
+  - 单张 ≤ 4 MiB、队列 32 张，满则**丢最旧**（新图比旧图值钱）。
+  - 入队是**拷贝**不是 `link()`：抓拍在 `/mnt/sdcard`、队列在 `/mnt/UDISK`，跨设备
+    硬链接必 `EXDEV`；而存储策略本来就要回收原图，拷贝语义才自洽。
+  - 成功才 `unlink`，失败留档等下轮（单张限 3 次）；每条统计都进
+    `iv_imgup_stats_t`（`enq/ok/fail/drop/bytes/last_rc/last_http/last_name/last_url`）。
+
+=== 装配：什么时候算"图写完了"
+
+`iv_media_capture_async()` 只保证**受理**，文件可能还在写。直接入队会传半张图
+（服务端不知道，字节数还对得上），所以：
+
+* `on_door_open()` 抓拍受理成功后 `imgup_wait_add(path, deadline=now+10s)`；
+* `iv_agent_imgup_pump()` 每拍先 `imgup_wait_drain()`：**相邻两拍 `st_size` 不变**才
+  入队，到 `deadline` 就放弃（不无限等）；
+* 之后再判忙（`imgup_state`）／退避（失败 60 s）／扫描限速（1 s，本函数在
+  `on_pb_timer()` 里 200 ms 一拍，`readdir` 不能跟着跑）／慢池／队列非空，才解析
+  地址并 `iv_taskpool_submit(name="imgup", timeout=300 s)` —— **阻塞 HTTP 绝不占
+  Reactor 线程**（S4.2 口径）；
+* `on_imgup_done()`：成功即把 `next_ms` 清零，接着传下一张；`IV_ENOENT` 当"队列被
+  别的路径清空"不算失败。
+
+**两条驱动路径同装**（铁律）：`iv_agent_step()` 与 `on_pb_timer()` 都调
+`iv_agent_imgup_pump()`，板端走后者。
+
+=== 踩到的坑：端口回落拿到了平台 TCP 的 6013
+
+首版写成 `port = imgup_port ?: logup_port ?: srv_port`，而两者都是 0 时 `srv_port`
+是**平台 TCP 的 6013**，于是：
+
+[source,text]
+----
+[agent] img upload accepted: -> 47.104.250.225:6013 via usb0 (id=1, pending=1)
+[imgup] start failed for snap_1793327941.jpg: rc=-22 http=0
+[agent] img upload #1 failed: rc=-22 http=0, retry in 60s      ← 每 60 s 白等一次
+----
+
+连得上（6013 是开着的），但 HTTP POST 打到 TCP 端口上永不应答，30 s 后超时失败。
+`iv_uphttp_set_target()` 里 **`port == 0` 本来就等于 `IV_UPHTTP_PORT_DEFAULT`(18080)**，
+所以正确写法只回落到 `logup_port`，把 0 原样传下去：
+
+[source,c]
+----
+uint16_t port = (a->cfg.imgup_port != 0u) ? a->cfg.imgup_port : a->cfg.logup_port;
+----
+
+=== 配置：不新增键
+
+图片与日志是**同一台机器同一个服务**，`imgup_host/imgup_port` 直接取
+`net.server.log.host/port`（`main.c` 装配），不占 `sys` 分类只剩的 9 个槽位。
+
+=== 验证
+
+* VM：`make test` **56 项 RUN / 0 FAIL**（新增 `test_imgup` 7 组：入队拷贝、上传
+  字节逐一致＋`chunkIndex` 连续＋`fileName/logType/deviceSn/totalChunks` 校验、
+  `ENOENT` 空队列、`code=500` 留档后重试成功、超大 `IV_ERANGE`、队列满丢最旧、
+  空 host `IV_EINVAL`）、`make asan` rc=0、`setarch -R make tsan` **0 条
+  ThreadSanitizer**、`make arm` 0 告警（449504 B）、`make analyze` 0 条。
+* 板端真机（`root@192.168.1.120`，`ivsboxd` md5 **`ee61439e`**，装在
+  `releases/1.0.6/bin/`）：
+
+[source,text]
+----
+[imgup] init: server=(unset):18080 queue=/mnt/UDISK/ivsbox/imgup dev=B2CC1
+[agent] img upload accepted: -> 47.104.250.225:18080 via usb0 (id=1, pending=1)
+[imgup] upload ok: snap_1793327941.jpg (164744 B, 161 chunks)
+        -> https://minio.fnwlwiot.com:18444/fnwlw-01/device-log/B2CC1/snap_1793327941_20261103141921.jpg
+[agent] img upload #1 ok: … (total ok=1)
+----
+
+  全程 **18 s**，队列清空。把该 URL 下载回来 md5 `e444e4b5a0ce3cd9cb5f467e7a882d02`，
+  与板端原图 `md5sum /mnt/sdcard/snap/snap_1793327941.jpg` **逐字节一致**（164744 B）。
+  注：`init: server=(unset)` 与 `[logup] init` 同一形态 —— 地址在 `pump()` 每拍现取，
+  不是没配上。
+
+=== 未覆盖（如实登记）
+
+* **门开真实触发**（`0xC1` 由采集板上送）未现场开门复测 —— 本轮验到的是"队列里有图
+  → 上传成功"，`imgup_wait_add()/wait_drain()` 的尺寸稳定判据靠代码审查 ＋ 板端丢图
+  路径旁证。
+* 平台侧"图片"页面是否独立展示这批文件**待平台确认**：现在落在日志服务的
+  `device-log` 命名空间，只有 `logType=IMAGE` 与扩展名能区分。
+* 上传 3 次仍失败会留档占队列（不自动丢弃），需要现场观察一次 4G 断连重连场景。
+
+=== 教训
+
+**"卡协议"要先当假设去证伪。** 同一台服务器已经有能跑通的私有上传链路时，先拿真实
+凭据打一次探针（换 `logType`、换扩展名、试相邻路径），比照着文档等新接口快得多 ——
+这次三个 404 ＋ 一个 200 就把"必须等平台"变成了"今天就能上"。反过来，**复用别人的
+链路必须抽公共件**：如果把 339 行 HTTP 客户端复制一份进 `iv_imgup`，下次改超时、
+改分片大小就得改两处，而两处一定会漂。
+
 
 
 

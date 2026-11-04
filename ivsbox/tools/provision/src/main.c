@@ -6,8 +6,8 @@
  *
  *   1. **设备侧（默认）**：同时加入**两个**组播组（协议文档的 239.255.255.252:37200
  *      和「设备配置软件」写死的 239.255.255.249:65000），收 `search` 就回设备信息、
- *      收 `update_mac` 就把设备 ID/MAC 写进 `private` 裸分区并回声；应答回到
- *      **收到请求的那一组**：
+ *      收 `update_mac` 就把设备 ID/MAC 写进 `private` 裸分区并回声；应答默认
+ *      **单播回请求来源**（来源端口 ＋ 本组固定端口各一份，见 `run_device()`）：
  *        ivsbox-provision                       # 常驻监听，Ctrl-C/SIGTERM 退出
  *        ivsbox-provision --timeout 60 --once   # 收一条就退（产线脚本用）
  *        ivsbox-provision --dry-run             # 只解析/决策，不落盘（验证用）
@@ -41,6 +41,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -76,7 +79,7 @@ typedef struct {
     int         dry;
     int         force;
     int         keep_id;
-    int         reply_unicast;
+    int         reply_mcast; /* 应答回组播组（默认是单播给请求来源，两个端口各一份） */
     int         watch;
     int         search;
     int         set_id;
@@ -115,7 +118,8 @@ static void usage(const char *argv0)
         "  --tnam/--mcu/--mod/--sv/--inip/--outip/--iccid/--name/--password STR\n"
         "                    device-info field overrides (default empty)\n"
         "  --keep-id         ignore the new device id in update_mac (MAC only)\n"
-        "  --reply-unicast   reply to the sender instead of the group\n"
+        "  --reply-mcast     reply to the group instead of the sender\n"
+        "                    (default: unicast to sender, source port + fixed port)\n"
         "  --once            device: exit after one handled request\n"
         "  --timeout S       exit/collect window in seconds (0 = forever;\n"
         "                    default: device 0 / fixture 3)\n"
@@ -320,6 +324,11 @@ static int make_socket(const char *grp, int local_port, int join)
         (void)setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
     }
 
+    /* 记下每个包是从哪张网卡进来的：回单播时要按原路出去（见 addr_on_link /
+     * nl_route_host）。丢了这个 ifindex，就只能猜网卡。 */
+    if (join)
+        (void)setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &on, sizeof(on));
+
     if (join) {
         struct ip_mreq mreq;
         int             loop = 0;
@@ -359,6 +368,141 @@ static int send_msg(int fd, const char *dst_ip, int dst_port, const char *msg, i
         return -1;
     }
     return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * 直连（link scope）/32 路由
+ * --------------------------------------------------------------------------
+ * 现场根因：工装电脑常常在同一块网卡上挂**两个网段**（本例 192.168.1.228 ＋
+ * 192.168.2.228），Windows 发组播时挑了 192.168.2.228 当源地址，而我们（设备）
+ * 只有 192.168.1.0/24 ＋ 默认网关 —— 回给 192.168.2.228 的单播会被丢给网关，
+ * 网关又不认这个网段，包就死了。设备的日志明明写着 `replied ...`，软件却是 0 台。
+ *
+ * 但那个地址**就在同一根网线上**（`ip neigh` 能 ARP 到）。所以：对端地址不在
+ * 本机任何直连网段时，临时给它挂一条 /32 的 link scope 路由（**只这一台、用完即删**），
+ * 让内核按二层直达发出去。不改对端任何配置，也不往路由表里留垃圾。
+ */
+static int nl_route_host(uint32_t dst_be, int oif, int add)
+{
+    struct {
+        struct nlmsghdr nh;
+        struct rtmsg    rm;
+        char            attr[64];
+    } req;
+    struct sockaddr_nl nl;
+    struct iovec       iov;
+    struct msghdr      mh;
+    char               ack[512];
+    ssize_t            n;
+    int                fd;
+    int                err = 0;
+
+    if (oif <= 0)
+        return -1;
+
+    fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (fd < 0)
+        return -1;
+
+    memset(&req, 0, sizeof(req));
+    req.nh.nlmsg_len    = NLMSG_LENGTH(sizeof(struct rtmsg));
+    req.nh.nlmsg_type   = (uint16_t)(add ? RTM_NEWROUTE : RTM_DELROUTE);
+    req.nh.nlmsg_flags  = NLM_F_REQUEST | NLM_F_ACK;
+    req.nh.nlmsg_seq    = 1u;
+    if (add)
+        req.nh.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+    req.rm.rtm_family   = AF_INET;
+    req.rm.rtm_dst_len  = 32u;
+    req.rm.rtm_table    = RT_TABLE_MAIN;
+    req.rm.rtm_protocol = RTPROT_BOOT;
+    req.rm.rtm_scope    = RT_SCOPE_LINK;
+    req.rm.rtm_type     = RTN_UNICAST;
+
+    {
+        struct rtattr *rta = (struct rtattr *)(void *)
+                             ((char *)&req + NLMSG_ALIGN(req.nh.nlmsg_len));
+
+        rta->rta_type = RTA_DST;
+        rta->rta_len  = (unsigned short)RTA_LENGTH(4u);
+        memcpy(RTA_DATA(rta), &dst_be, 4u);
+        req.nh.nlmsg_len = NLMSG_ALIGN(req.nh.nlmsg_len) + RTA_ALIGN(rta->rta_len);
+    }
+    {
+        struct rtattr *rta = (struct rtattr *)(void *)
+                             ((char *)&req + NLMSG_ALIGN(req.nh.nlmsg_len));
+
+        rta->rta_type = RTA_OIF;
+        rta->rta_len  = (unsigned short)RTA_LENGTH(sizeof(int));
+        memcpy(RTA_DATA(rta), &oif, sizeof(int));
+        req.nh.nlmsg_len = NLMSG_ALIGN(req.nh.nlmsg_len) + RTA_ALIGN(rta->rta_len);
+    }
+
+    memset(&nl, 0, sizeof(nl));
+    nl.nl_family = AF_NETLINK;
+    memset(&iov, 0, sizeof(iov));
+    iov.iov_base = &req;
+    iov.iov_len  = req.nh.nlmsg_len;
+    memset(&mh, 0, sizeof(mh));
+    mh.msg_name    = &nl;
+    mh.msg_namelen = sizeof(nl);
+    mh.msg_iov     = &iov;
+    mh.msg_iovlen  = 1;
+
+    if (sendmsg(fd, &mh, 0) < 0) {
+        (void)close(fd);
+        return -1;
+    }
+    n = recv(fd, ack, sizeof(ack), 0);
+    if (n > 0) {
+        const struct nlmsghdr *h = (const struct nlmsghdr *)(const void *)ack;
+
+        if (h->nlmsg_type == NLMSG_ERROR) {
+            const struct nlmsgerr *e =
+                (const struct nlmsgerr *)(const void *)NLMSG_DATA(h);
+
+            err = e->error;
+        }
+    }
+    (void)close(fd);
+
+    if (err == 0)
+        return 1;  /* 加/删成功 */
+    if (err == -EEXIST)
+        return 0;  /* 本来就在：不是我们加的 ⇒ 之后不要删 */
+    return -1;
+}
+
+/* 目标是否落在本机某个直连网段里（是 ⇒ 不用动路由）。查不到就保守返回 1。 */
+static int addr_on_link(uint32_t dst_be)
+{
+    struct ifaddrs *ifa = NULL;
+    struct ifaddrs *p;
+    int             on = 0;
+
+    if (getifaddrs(&ifa) != 0)
+        return 1;
+
+    for (p = ifa; p != NULL && on == 0; p = p->ifa_next) {
+        const struct sockaddr_in *a;
+        const struct sockaddr_in *m;
+        uint32_t                  na;
+        uint32_t                  nm;
+
+        if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET)
+            continue;
+        if (p->ifa_netmask == NULL)
+            continue;
+        if ((p->ifa_flags & IFF_LOOPBACK) != 0)
+            continue;
+        a  = (const struct sockaddr_in *)(const void *)p->ifa_addr;
+        m  = (const struct sockaddr_in *)(const void *)p->ifa_netmask;
+        na = a->sin_addr.s_addr;
+        nm = m->sin_addr.s_addr;
+        if ((dst_be & nm) == (na & nm))
+            on = 1;
+    }
+    (void)freeifaddrs(ifa);
+    return on;
 }
 
 /* --------------------------------------------------------------------------
@@ -594,40 +738,115 @@ static int run_device(const opts_t *o, const char *own_tid_opt, iv_prov_id_t *id
 
         for (i = 0; i < ne; i++) {
             struct sockaddr_in from;
-            socklen_t          fl = sizeof(from);
+            struct iovec       iov;
+            struct msghdr      mh;
+            char               cbuf[CMSG_SPACE(sizeof(struct in_pktinfo))];
+            int                from_if = 0;
             ssize_t            n;
             int                reply_len = 0;
 
             if ((pfd[i].revents & POLLIN) == 0)
                 continue;
 
-            n = recvfrom(ep[i].fd, buf, sizeof(buf) - 1u, 0,
-                         (struct sockaddr *)&from, &fl);
+            /* recvmsg（而不是 recvfrom）：要 IP_PKTINFO 里的入口网卡号，
+             * 回单播时按这张网卡出去。 */
+            memset(&from, 0, sizeof(from));
+            memset(&mh, 0, sizeof(mh));
+            iov.iov_base       = buf;
+            iov.iov_len        = sizeof(buf) - 1u;
+            mh.msg_name        = &from;
+            mh.msg_namelen     = sizeof(from);
+            mh.msg_iov         = &iov;
+            mh.msg_iovlen      = 1;
+            mh.msg_control     = cbuf;
+            mh.msg_controllen  = sizeof(cbuf);
+
+            n = recvmsg(ep[i].fd, &mh, 0);
             if (n < 0) {
                 if (errno == EINTR)
                     continue;
                 /* 单个端点出错不该让整个设备侧退出（另一组还在服务） */
-                fprintf(stderr, "recvfrom failed on %s:%d: %s\n",
+                fprintf(stderr, "recvmsg failed on %s:%d: %s\n",
                         ep[i].grp, ep[i].port, strerror(errno));
                 continue;
+            }
+            {
+                struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+
+                for (; c != NULL; c = CMSG_NXTHDR(&mh, c)) {
+                    if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
+                        struct in_pktinfo pi;
+
+                        memcpy(&pi, (const void *)CMSG_DATA(c), sizeof(pi));
+                        from_if = pi.ipi_ifindex;
+                        break;
+                    }
+                }
             }
             buf[n] = '\0';
 
             if (handle_request(o, buf, (size_t)n, own_tid, id, id_valid, &from,
                                reply, sizeof(reply), &reply_len)) {
-                /* 回**收到请求的那一组**：软件在 249 上搜，应答就必须回 249；
-                 * 一律回主组的话软件永远收不到（2026-11-04 现场根因之一）。 */
-                struct sockaddr_in dst = ep[i].self;
+                /* ---------- 应答往哪儿送（2026-11-04 现场定论） ----------
+                 * 协议文档写的是"设备→组播"，但工装电脑往往有多块网卡、默认路由在
+                 * 别的网卡上（现场：`WLAN 2` metric 0，有线 `以太网 2` metric 25），
+                 * 软件的 IGMP 加入跟着默认路由落到了 WiFi 那张网卡 —— 我们的包从
+                 * 有线进，成员关系不在那张卡上，组播应答直接被内核丢掉。
+                 * 所以默认走**单播**，而且两个端口各送一份：
+                 *   ① 请求来源端口：软件每轮新建的临时端口（标准玩法）
+                 *   ② 本组固定端口：软件**启动就 bind** 的那个（本例 65000）。
+                 *      单播到本机地址不校验组播成员关系，一定能收。
+                 * `--reply-mcast` 保留给"只听组播"的旧工具。 */
+                int sent = 0;
+                int off_link = 0;
+                int pinned = 0;
 
-                if (o->reply_unicast)
-                    dst = from; /* 回给请求来源（单播；验证与点对点刷机都走这条） */
-                if (sendto(ep[i].fd, reply, (size_t)reply_len, 0,
-                           (struct sockaddr *)&dst, sizeof(dst)) == (ssize_t)reply_len) {
-                    printf("  replied %d bytes to %s:%u\n", reply_len,
-                           inet_ntoa(dst.sin_addr), (unsigned)ntohs(dst.sin_port));
-                } else {
-                    fprintf(stderr, "  reply sendto failed: %s\n", strerror(errno));
+                if (!o->reply_mcast && addr_on_link(from.sin_addr.s_addr) == 0) {
+                    /* 对端地址不在本机任何直连网段（工装 PC 同卡双网段的典型症状）：
+                     * 先给它挂一条 /32 直连路由，否则包会被丢给默认网关。 */
+                    int r;
+
+                    off_link = 1;
+                    r = nl_route_host(from.sin_addr.s_addr, from_if, 1);
+                    pinned = (r > 0);
+                    if (r < 0)
+                        fprintf(stderr, "  warn: cannot pin /32 route for %s (oif %d): %s\n",
+                                inet_ntoa(from.sin_addr), from_if, strerror(errno));
                 }
+
+                if (o->reply_mcast) {
+                    struct sockaddr_in g = ep[i].self;
+
+                    if (sendto(ep[i].fd, reply, (size_t)reply_len, 0,
+                               (struct sockaddr *)&g, sizeof(g)) == (ssize_t)reply_len)
+                        sent++;
+                    printf("  replied %d bytes to group %s:%d\n", reply_len,
+                           ep[i].grp, ep[i].port);
+                } else {
+                    struct sockaddr_in d = from;
+
+                    if (sendto(ep[i].fd, reply, (size_t)reply_len, 0,
+                               (struct sockaddr *)&d, sizeof(d)) == (ssize_t)reply_len) {
+                        sent++;
+                        printf("  replied %d bytes to %s:%u (source port)%s\n", reply_len,
+                               inet_ntoa(d.sin_addr), (unsigned)ntohs(d.sin_port),
+                               off_link ? (pinned ? " [pinned /32]" : " [off-link]") : "");
+                    }
+                    if (from.sin_port != htons((uint16_t)ep[i].port)) {
+                        d = from;
+                        d.sin_port = htons((uint16_t)ep[i].port);
+                        if (sendto(ep[i].fd, reply, (size_t)reply_len, 0,
+                                   (struct sockaddr *)&d, sizeof(d)) == (ssize_t)reply_len) {
+                            sent++;
+                            printf("  replied %d bytes to %s:%u (fixed port)\n", reply_len,
+                                   inet_ntoa(d.sin_addr), (unsigned)ntohs(d.sin_port));
+                        }
+                    }
+                }
+                if (pinned)
+                    (void)nl_route_host(from.sin_addr.s_addr, from_if, 0);
+                if (sent == 0)
+                    fprintf(stderr, "  reply sendto failed: %s\n", strerror(errno));
                 handled++;
                 if (o->once) {
                     quit = 1;
@@ -817,8 +1036,10 @@ int main(int argc, char *argv[])
             o.password = argv[++i];
         } else if (strcmp(a, "--keep-id") == 0) {
             o.keep_id = 1;
+        } else if (strcmp(a, "--reply-mcast") == 0) {
+            o.reply_mcast = 1;
         } else if (strcmp(a, "--reply-unicast") == 0) {
-            o.reply_unicast = 1;
+            o.reply_mcast = 0; /* 兼容旧写法：单播现在是默认，显式写等于确认 */
         } else if (strcmp(a, "--once") == 0) {
             o.once = 1;
         } else if (strcmp(a, "--timeout") == 0 && i + 1 < argc) {

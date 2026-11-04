@@ -255,6 +255,30 @@ int main(void)
             strcmp(m.mac, "02-00-00-44-6c-40") == 0,
             "p02c: mac kept raw");
 
+        /* date 可选、且设备侧从不使用它 ⇒ **不能因为它的格式不同就否掉整条请求**。
+         * 早先按 IV_PROV_DATE_MAX(16) 严格读：带时分秒的日期("2026-11-04 15:15:00"，
+         * 19 B)整包 IV_EPROTO，现场表现是"软件在搜、设备一条都不回"，与"设备没上线"
+         * 完全同形（2026-11-04 真机实测：3 发 3 拒）。 */
+        {
+            const char *d19 = "{\"info\":{\"tid\":\"000000\","
+                              "\"date\":\"2026-11-04 15:15:00\"},"
+                              "\"data\":{\"types\":\"search\"}}";
+            const char *d14 = "{\"info\":{\"tid\":\"000000\",\"date\":\"20261104151500\"},"
+                              "\"data\":{\"types\":\"search\"}}";
+            const char *dnum = "{\"info\":{\"tid\":\"000000\",\"date\":20261104151500},"
+                               "\"data\":{\"types\":\"search\"}}";
+
+            chk(iv_prov_msg_parse(d19, strlen(d19), &m) == IV_OK &&
+                strcmp(m.types, "search") == 0 && m.date[0] == '\0',
+                "p02l: over-long date tolerated (date kept empty, packet accepted)");
+            chk(iv_prov_msg_parse(d14, strlen(d14), &m) == IV_OK &&
+                strcmp(m.date, "20261104151500") == 0,
+                "p02m: 14-digit date kept verbatim");
+            chk(iv_prov_msg_parse(dnum, strlen(dnum), &m) == IV_OK &&
+                strcmp(m.types, "search") == 0 && m.date[0] == '\0',
+                "p02n: non-string date tolerated");
+        }
+
         chk(parse_str("{\"info\":{\"tid\":\"1\"}}", &m) == IV_EPROTO,
             "p02d: missing data object rejected");
         chk(parse_str("{\"data\":{\"types\":\"search\"}}", &m) == IV_EPROTO,

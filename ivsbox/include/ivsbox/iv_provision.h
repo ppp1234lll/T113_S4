@@ -91,7 +91,10 @@ extern "C" {
 /* 组播参数（协议文档定稿，2026-10-14） */
 #define IV_PROV_MCAST_ADDR      "239.255.255.252" /* 搜索/查询/配置ID·MAC/继电器/跳转 */
 #define IV_PROV_MCAST_PORT      37200
-#define IV_PROV_MCAST_ADDR_NET  "239.255.255.249" /* 配置IP/配置服务器地址（未实现，仅登记） */
+/* 「设备配置软件」的**固定**组播组（软件设置里写死，不可改）。
+ * 协议文档里它只承担 update_ip/update_server，但实测该软件把 search 也发到这里
+ * ⇒ **设备侧必须同时加入这一组**，否则软件永远搜不到设备（2026-11-04 现场）。 */
+#define IV_PROV_MCAST_ADDR_NET  "239.255.255.249"
 #define IV_PROV_MCAST_PORT_NET  65000
 #define IV_PROV_TTL             1   /* 组播 TTL：产线同一网段，不跨路由 */
 

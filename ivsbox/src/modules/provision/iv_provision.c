@@ -587,9 +587,29 @@ int iv_prov_msg_parse(const char *json, size_t len, iv_prov_msg_t *out)
     if (!found)
         return IV_EPROTO; /* 文档要求 info.tid 必在（可为空串） */
 
-    /* date 可选：文档里是存在字段，但设备回复时不依赖它 */
-    if (obj_get_string(json, ib, ie, "date", out->date, sizeof(out->date), NULL) < 0)
-        return IV_EPROTO;
+    /* date 是**可选且设备侧从不使用**的字段（应答里的 date 由本机时间生成）。
+     * 早先按 IV_PROV_DATE_MAX(16) 的定长缓冲严格读它：对方只要给
+     * "2026-11-04 15:15:00"(19 B)、或写成不带引号的数字，整包就 IV_EPROTO ——
+     * 现场表现是"软件在搜、设备一条都没回"，与"设备没上线"完全同形
+     * （2026-11-04 实测：19 B 日期 3 发 3 拒）。协议文档写的是 YYYYMMDD /
+     * YYYYMMDDHHMMSS，但**别拿没用到的字段去否掉整条请求**：
+     * 能落地就落地，落不了就留空，格式一律不判。 */
+    {
+        char   raw[40];
+        size_t colon = 0u;
+
+        out->date[0] = '\0';
+        if (find_key(json, ib, ie, "date", &colon) >= 0) {
+            size_t v = skip_ws(json, colon, ie);
+
+            if (v < ie && json[v] == '"' &&
+                obj_get_string(json, ib, ie, "date", raw, sizeof(raw), NULL) > 0) {
+                /* 装得下就原样保留，装不下就留空 —— 不截断（截断的日期比空值更容易骗人） */
+                if (strlen(raw) < sizeof(out->date))
+                    memcpy(out->date, raw, strlen(raw) + 1u);
+            }
+        }
+    }
 
     if (obj_get_string(json, db, de, "types", out->types, sizeof(out->types), &found) < 0)
         return IV_EPROTO;

@@ -4,8 +4,10 @@
  * ============================ 它怎么用 ============================
  * 同一个二进制两种角色：
  *
- *   1. **设备侧（默认）**：加入组播组，收 `search` 就回设备信息、收 `update_mac`
- *      就把设备 ID/MAC 写进 `private` 裸分区并回声：
+ *   1. **设备侧（默认）**：同时加入**两个**组播组（协议文档的 239.255.255.252:37200
+ *      和「设备配置软件」写死的 239.255.255.249:65000），收 `search` 就回设备信息、
+ *      收 `update_mac` 就把设备 ID/MAC 写进 `private` 裸分区并回声；应答回到
+ *      **收到请求的那一组**：
  *        ivsbox-provision                       # 常驻监听，Ctrl-C/SIGTERM 退出
  *        ivsbox-provision --timeout 60 --once   # 收一条就退（产线脚本用）
  *        ivsbox-provision --dry-run             # 只解析/决策，不落盘（验证用）
@@ -285,8 +287,14 @@ static int write_secure(const char *dir, const iv_prov_id_t *id)
 
 /* --------------------------------------------------------------------------
  * socket
- * -------------------------------------------------------------------------- */
-static int make_socket(const opts_t *o, int join)
+ * --------------------------------------------------------------------------
+ * 参数化成"组地址 ＋ 本地端口"，因为设备侧要同时听**两组**组播（见 run_device）：
+ *   239.255.255.252:37200 —— 协议文档的搜索/配置 ID·MAC 组
+ *   239.255.255.249:65000 —— 「设备配置软件」的固定组播地址（它的设置里写死）
+ * 早先只实现了前者、把后者当"配置IP/服务器地址"登记为未实现，结果软件永远
+ * 搜不到设备（2026-11-04 现场）。
+ */
+static int make_socket(const char *grp, int local_port, int join)
 {
     struct sockaddr_in addr;
     int                fd;
@@ -300,13 +308,13 @@ static int make_socket(const opts_t *o, int join)
     memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY); /* 组播端口必须绑 INADDR_ANY 才收得到 */
-    addr.sin_port        = htons((uint16_t)o->local_port);
+    addr.sin_port        = htons((uint16_t)local_port);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         (void)close(fd);
         return -1;
     }
 
-    if (is_mcast_addr(o->ip)) {
+    if (is_mcast_addr(grp)) {
         int ttl = IV_PROV_TTL;
 
         (void)setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
@@ -322,14 +330,14 @@ static int make_socket(const opts_t *o, int join)
         (void)setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
 
         memset(&mreq, 0, sizeof(mreq));
-        (void)inet_aton(o->ip, &mreq.imr_multiaddr);
+        (void)inet_aton(grp, &mreq.imr_multiaddr);
         mreq.imr_interface.s_addr = htonl(INADDR_ANY); /* 任选出口，多网口不挑 */
         if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) != 0) {
             /* **join 失败不致命**：单播/直连场景（验证、点对点刷机）照样能收；
              * 板端网卡未起时也不该让工装直接退出。 */
             fprintf(stderr, "warn: IP_ADD_MEMBERSHIP(%s) failed: %s "
                             "(continue, unicast still works)\n",
-                    o->ip, strerror(errno));
+                    grp, strerror(errno));
         }
     }
     return fd;
@@ -356,6 +364,30 @@ static int send_msg(int fd, const char *dst_ip, int dst_port, const char *msg, i
 /* --------------------------------------------------------------------------
  * 设备侧
  * -------------------------------------------------------------------------- */
+/* 把报文按可打印形式打出来（不可打印字节写成 \xNN）。
+ * **拒收时必须留下原文**：现场"软件搜不到设备"只有一个 `rejected ... (rc=-21)`，
+ * 没有原文就无从判断是软件发的格式不同、还是被截断/拼包 —— 这一步只花几十字节
+ * 日志，省掉一次到现场的往返。 */
+static void log_esc(const char *p, size_t n)
+{
+    size_t i;
+
+    putchar('"');
+    for (i = 0u; i < n && i < 300u; i++) {
+        unsigned char c = (unsigned char)p[i];
+
+        if (c == '"' || c == '\\')
+            printf("\\%c", c);
+        else if (c >= 0x20u && c < 0x7Fu)
+            putchar((int)c);
+        else
+            printf("\\x%02x", (unsigned)c);
+    }
+    putchar('"');
+    if (n > 300u)
+        printf("...(%zu more)", n - 300u);
+}
+
 static int handle_request(const opts_t *o, const char *buf, size_t len,
                           const char *own_tid, iv_prov_id_t *id, int *id_valid,
                           struct sockaddr_in *from, char *reply, size_t reply_cap,
@@ -366,8 +398,10 @@ static int handle_request(const opts_t *o, const char *buf, size_t len,
 
     rc = iv_prov_decide(buf, len, own_tid, &plan);
     if (rc != IV_OK) {
-        printf("rejected %zu-byte datagram from %s (rc=%d)\n",
+        printf("rejected %zu-byte datagram from %s (rc=%d): ",
                len, inet_ntoa(from->sin_addr), rc);
+        log_esc(buf, len);
+        printf("\n");
         return 0;
     }
     if (plan.act == IV_PROV_ACT_NONE) {
@@ -450,12 +484,35 @@ static int handle_request(const opts_t *o, const char *buf, size_t len,
     }
 }
 
+/* 设备侧的一个监听端点：一组"组播地址:端口"配一个 socket。
+ * 应答必须回到**收到请求的那一组**（不能一律回主组）—— 否则软件在 249 上搜、
+ * 设备把应答发到 252，软件永远收不到。 */
+typedef struct {
+    int                fd;
+    struct sockaddr_in self; /* 应答目标（本组的组播地址 ＋ 端口） */
+    const char        *grp;
+    int                port;
+} dev_ep_t;
+
+static int ep_open(dev_ep_t *e, const char *grp, int port, int local_port)
+{
+    memset(e, 0, sizeof(*e));
+    e->grp  = grp;
+    e->port = port;
+    e->self.sin_family = AF_INET;
+    (void)inet_aton(grp, &e->self.sin_addr);
+    e->self.sin_port = htons((uint16_t)port);
+    e->fd = make_socket(grp, local_port, 1);
+    return e->fd;
+}
+
 static int run_device(const opts_t *o, const char *own_tid_opt, iv_prov_id_t *id,
                       int *id_valid)
 {
     char               own_tid[IV_PROV_TID_MAX];
-    struct sockaddr_in self;
-    int                fd;
+    dev_ep_t           ep[2];
+    int                ne = 0;
+    int                i;
     time_t             t0 = time(NULL);
     int                handled = 0;
     int                tid_pinned = 0; /* --tid 显式钉死 ⇒ 不按身份记录重新派生 */
@@ -477,28 +534,39 @@ static int run_device(const opts_t *o, const char *own_tid_opt, iv_prov_id_t *id
                o->dev, own_tid);
     }
 
-    memset(&self, 0, sizeof(self));
-    self.sin_family = AF_INET;
-    (void)inet_aton(o->ip, &self.sin_addr);
-    self.sin_port = htons((uint16_t)o->port);
-
-    fd = make_socket(o, 1);
-    if (fd < 0) {
-        fprintf(stderr, "socket setup failed (local port %d): %s\n",
-                o->local_port, strerror(errno));
+    /* 端点 1：主组（`--ip`/`--port`，默认 239.255.255.252:37200）。 */
+    if (ep_open(&ep[ne], o->ip, o->port, o->local_port) < 0) {
+        fprintf(stderr, "socket setup failed on %s:%d (local %d): %s\n",
+                o->ip, o->port, o->local_port, strerror(errno));
         return 1;
     }
-    printf("device side listening: group %s:%d, local %d, tid=%s%s\n",
-           o->ip, o->port, o->local_port, own_tid, o->dry ? " (dry-run)" : "");
+    ne++;
+
+    /* 端点 2：**设备配置软件的固定组播组** 239.255.255.249:65000。
+     * 软件设置里这两项是写死的（用户 2026-11-04 确认"这就是固定的组播地址"），
+     * 所以设备侧必须自己适配 —— 只监听 252:37200 时软件永远搜不到设备。
+     * 命令行已把主组指到这一组时不重复打开。 */
+    if (strcmp(o->ip, IV_PROV_MCAST_ADDR_NET) != 0 ||
+        o->port != IV_PROV_MCAST_PORT_NET) {
+        if (ep_open(&ep[ne], IV_PROV_MCAST_ADDR_NET, IV_PROV_MCAST_PORT_NET,
+                    IV_PROV_MCAST_PORT_NET) < 0) {
+            /* 第二组起不来不致命：主组照常工作，但要在日志里说清楚 */
+            fprintf(stderr, "warn: cannot listen on %s:%d: %s (main group still up)\n",
+                    IV_PROV_MCAST_ADDR_NET, IV_PROV_MCAST_PORT_NET, strerror(errno));
+        } else {
+            ne++;
+        }
+    }
+
+    for (i = 0; i < ne; i++)
+        printf("device side listening: group %s:%d, tid=%s%s\n",
+               ep[i].grp, ep[i].port, own_tid, o->dry ? " (dry-run)" : "");
 
     for (;;) {
-        struct pollfd      pfd;
-        struct sockaddr_in from;
-        socklen_t          fl = sizeof(from);
+        struct pollfd      pfd[2];
         char               buf[IV_PROV_JSON_MAX + 1u];
         char               reply[IV_PROV_JSON_MAX];
-        ssize_t            n;
-        int                reply_len = 0;
+        int                quit = 0;
 
         /* own_tid 是身份记录的**派生值**，每轮重新派生 —— 不能开机算一次就缓存：
          * update_mac 写盘后 `*id / *id_valid` 已更新，若 own_tid 还是旧值，紧接着的
@@ -516,41 +584,64 @@ static int run_device(const opts_t *o, const char *own_tid_opt, iv_prov_id_t *id
             break;
         }
 
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        if (poll(&pfd, 1, 500) <= 0)
+        for (i = 0; i < ne; i++) {
+            pfd[i].fd      = ep[i].fd;
+            pfd[i].events  = POLLIN;
+            pfd[i].revents = 0;
+        }
+        if (poll(pfd, (nfds_t)ne, 500) <= 0)
             continue;
 
-        n = recvfrom(fd, buf, sizeof(buf) - 1u, 0, (struct sockaddr *)&from, &fl);
-        if (n < 0) {
-            if (errno == EINTR)
+        for (i = 0; i < ne; i++) {
+            struct sockaddr_in from;
+            socklen_t          fl = sizeof(from);
+            ssize_t            n;
+            int                reply_len = 0;
+
+            if ((pfd[i].revents & POLLIN) == 0)
                 continue;
-            fprintf(stderr, "recvfrom failed: %s\n", strerror(errno));
-            break;
-        }
-        buf[n] = '\0';
 
-        if (handle_request(o, buf, (size_t)n, own_tid, id, id_valid, &from,
-                           reply, sizeof(reply), &reply_len)) {
-            struct sockaddr_in dst = self;
-
-            if (o->reply_unicast)
-                dst = from; /* 回给请求来源（单播；验证与点对点刷机都走这条） */
-            if (sendto(fd, reply, (size_t)reply_len, 0, (struct sockaddr *)&dst,
-                       sizeof(dst)) == (ssize_t)reply_len) {
-                printf("  replied %d bytes to %s:%u\n", reply_len,
-                       inet_ntoa(dst.sin_addr), (unsigned)ntohs(dst.sin_port));
-            } else {
-                fprintf(stderr, "  reply sendto failed: %s\n", strerror(errno));
+            n = recvfrom(ep[i].fd, buf, sizeof(buf) - 1u, 0,
+                         (struct sockaddr *)&from, &fl);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                /* 单个端点出错不该让整个设备侧退出（另一组还在服务） */
+                fprintf(stderr, "recvfrom failed on %s:%d: %s\n",
+                        ep[i].grp, ep[i].port, strerror(errno));
+                continue;
             }
-            handled++;
-            if (o->once)
-                break;
+            buf[n] = '\0';
+
+            if (handle_request(o, buf, (size_t)n, own_tid, id, id_valid, &from,
+                               reply, sizeof(reply), &reply_len)) {
+                /* 回**收到请求的那一组**：软件在 249 上搜，应答就必须回 249；
+                 * 一律回主组的话软件永远收不到（2026-11-04 现场根因之一）。 */
+                struct sockaddr_in dst = ep[i].self;
+
+                if (o->reply_unicast)
+                    dst = from; /* 回给请求来源（单播；验证与点对点刷机都走这条） */
+                if (sendto(ep[i].fd, reply, (size_t)reply_len, 0,
+                           (struct sockaddr *)&dst, sizeof(dst)) == (ssize_t)reply_len) {
+                    printf("  replied %d bytes to %s:%u\n", reply_len,
+                           inet_ntoa(dst.sin_addr), (unsigned)ntohs(dst.sin_port));
+                } else {
+                    fprintf(stderr, "  reply sendto failed: %s\n", strerror(errno));
+                }
+                handled++;
+                if (o->once) {
+                    quit = 1;
+                    break;
+                }
+            }
         }
+
+        if (quit)
+            break;
     }
 
-    (void)close(fd);
+    for (i = 0; i < ne; i++)
+        (void)close(ep[i].fd);
     printf("device side done (%d request(s) handled)\n", handled);
     return 0;
 }
@@ -568,7 +659,7 @@ static int run_fixture(const opts_t *o)
     int         round = 0;
     int         seen = 0;
 
-    fd = make_socket(o, 0);
+    fd = make_socket(o->ip, o->local_port, 0);
     if (fd < 0) {
         fprintf(stderr, "socket setup failed (local port %d): %s\n",
                 o->local_port, strerror(errno));

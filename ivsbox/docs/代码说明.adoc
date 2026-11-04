@@ -13942,3 +13942,126 @@ md5 `2f33db53bc4bfbdb0e459dfe57a4edbb`。）
 **单点回调靠不住。** 第一版只把比对挂在 `on_cfg_committed()` 的 CAMERA 分支上，
 板端用 ctl `config.apply` 改 IP 时那条分支里读到的还是旧值（`reloaded … 0 class(es) changed`），
 品牌没跟。加 2 s 巡检兜底后同一动作 1 s 内完成 —— 兜底不是冗余，是这条链路必须有。
+
+== 2026-11-04 21:51 运维箱远程访问.exe 1.1.0：SN 可在界面切换（钥匙现算、配置现写）
+
+=== 干了什么事
+
+改的是**仓库外**的工具源码 `_deploy/exe/src/ivremote.c`（单文件 Win32 程序，
+MinGW 编译，`_deploy/exe/build.sh` 打包，产物即 `运维箱远程访问.exe`）。
+该源码不入库（内含 frps 令牌与专用密钥），本节留档。
+
+. **不再释放固定 visitor.toml**。原来 `WinMain()` 里 `extract_res(RES_TOML, g_toml)`
+  把打包好的 `payload/visitor.toml`（`serverName = "0B2CC1"`，
+  `secretKey = "a13db1c3eb45118f"`）原样落到 `%LOCALAPPDATA%\ivsbox-remote\`。
+  现在改为 `cfg_load()` 读参数 → `sn_apply(g_sn)` → `toml_write()` 现场生成。
+. **钥匙现算**：`md5_hex16(sn, token, out)` 用 CryptoAPI（`CryptAcquireContext` +
+  `CALG_MD5` + `CryptHashData(sn)` + `CryptHashData(token)`），取前 8 字节转小写 hex，
+  即 `secretKey`。与设备侧 `iv_tunnel_secret()`（`md5_hex16(sn, token)`）同一算法同一顺序
+  —— **拼串顺序换一下，钥匙就完全不同，两端握手失败且都不报"钥匙错"**。
+. **界面**：主窗口顶部新增"设备条"——`设备 SN` 静态文本 + `CBS_DROPDOWN` 组合框
+  （`ID_CMB_SN`，可下拉可手输）+ `切换`（`ID_BTN_SWAP`）+ `服务器设置`（`ID_BTN_SET`）
+  + 右侧常显 `服务器 a.b.c.d:7000`。状态行改成
+  `当前设备 <SN>（服务器 <host>:<port>）   通道：…`。
+  `layout()` 相应把状态行 10→40、列表 38→66（组合框的"高度"是下拉展开高度，给 260）。
+. **服务器设置对话框**（新窗口类 `IVSET`，`WS_EX_CONTROLPARENT` 让 Tab 能走）：
+  frps 地址 / 端口 / 令牌 三个字段 + 保存 / 取消，校验不通过就地弹框，不关窗。
+  拆成 `settings_create()`（建窗即返回，供 `--openset` 截图）与
+  `settings_dialog()`（建窗 + 自转消息循环做模态）。
+. **持久化** `%LOCALAPPDATA%\ivsbox-remote\remote.ini`：
+  `[server] host/port/token`、`[device] sn`、`[devices] sn0..sn23`（历史，最近的在前）。
+  读写用 `Get/WritePrivateProfileStringW`。exe 同目录的 `sns.txt`（一行一个 SN，
+  `#` 注释）会在 `cfg_load()` 里并入下拉框 —— 现场批量灌 SN 用。
+. **frpc 必须跟着配置走**：新增 `g_frpcGen`（每写一次 toml +1）与 `g_frpcProcGen`。
+  `ensure_frpc()` 命中"进程活着但代数不符"时先 `kill_frpc()` 再重拉；
+  若 16000 被占却不是本程序起的（上次崩溃/强杀留下的），也先清掉。
+. **输入白名单**：`sn_ok()`（字母数字 `-` `_`，1..40）、`tok_ok()`（与设备侧
+  `iv_tunnel_token_valid()` 同一套 `0-9A-Za-z-_.~+/=@`，1..63）、`host_ok()`
+  （字母数字 `.` `-` `:` `_`）。这三项都是"要拼进 TOML 双引号值"的字符串，
+  不挡 `"` / `\n` 就等于让人往配置里注任意键。
+. **自检**（`--selftest`）新增 6 条：钥匙黄金向量 `0B2CC1`→`a13db1c3eb45118f`、
+  不同 SN 不同钥匙、切 `0A19B4` 后 toml 跟着换、切回原 SN 能还原、
+  带引号的非法 SN 被拒、当前 toml 与 SN 一致；另加 `--sn <SN>` 命令行覆盖。
+. 顺带修自检误判：挑下载样本时跳过 0 字节文件（录像刚建好的文件就是 0 字节，
+  原逻辑要求 `got > 0`，一碰到就报"下载失败"）。
+
+=== 解决什么问题
+
+改动前：**exe 是绑死在一台设备上的**。`visitor.toml` 里的 `serverName` 是 SN、
+`secretKey` 是 `MD5(SN+令牌)` 前 8 字节，两者都是打包时的死值。换一台设备（哪怕只是
+换个 SN）就必须重编译重打包一个 exe；现场多人多机时根本没法用。
+
+改动后：一台运维 PC 上双击同一个 exe，下拉框选哪台就连哪台。选完（或点「切换」）
+立刻发生三件事：重算钥匙 → 重写 visitor.toml → 停旧 frpc（下次操作时按新配置拉起）。
+
+=== 影响范围
+
+* 只影响这个 Windows 工具：`_deploy/exe/*`、交付目录 `delivery-1.0.0/tools/运维箱远程访问/`。
+  **设备侧、协议、Web 一行没改**。
+* 与设备侧的契约没变（还是 stcp + `secretKey = md5_hex16(sn, token)`），
+  所以设备侧不需要跟着升级；变化的只是"这个值从哪来"——从打包时算，改成运行时算。
+* 依赖：设备上必须已有本程序公钥（`/root/.ssh/authorized_keys`）与
+  `cams.py` / `checkcam.py` / `camstat.py`，否则 ssh 与摄像机列表都用不了。
+  这是**部署前置**，不是本改动引入的。
+* 已知边界：
+  **令牌是全局的**。改一次令牌，所有设备的 `secretKey` 全部重算 —— 这是对的行为
+  （三处必须同值），但如果只改了 exe 这边、设备与 frps 没跟着改，就全线连不上。
+  `remote.ini` 里令牌是明文（和 `frpc.exe` 的 visitor.toml 一样），
+  要防的是"这台 PC 被共用"而不是"文件泄露"。
+
+=== 验证方式与结果
+
+编译：::
+
+----
+sh _deploy/exe/build.sh          # MinGW gcc -std=c11 -Wall -Wextra，零告警
+md5sum 运维箱远程访问.exe         # 760febd0df0bdfd9574d1c579567294b
+----
+
+真实端到端（板端 192.168.1.64 自起 frps 0.68.0 + 设备侧 frpc，SN `0A19B4`）：::
+
+----
+运维箱远程访问.exe --selftest        # 退出码 0
+[PASS] secretKey 推导（黄金向量 0B2CC1）  a13db1c3eb45118f
+[PASS] 不同 SN 推出不同 secretKey  ffc56e7771ee0ef3
+[PASS] 切到 0A19B4 后 visitor.toml 跟着换
+[PASS] 切回原 SN 后 visitor.toml 还原
+[PASS] 带引号的非法 SN 被拒
+[PASS] frpc 通道就绪（16000）
+[PASS] ssh 免密登录设备  SELFTEST-OK
+[PASS] 探测结果  第1路 192.168.1.200 state=0 / 第2路 192.168.1.106 state=0
+[PASS] 建隧道
+[PASS] 隧道可访问摄像机 Web  code=200
+[PASS] 列 SD 卡目录  17 项
+[PASS] 下载文件并核对大小  channel0_080029.mp4   本地 144877 / 远端 144877
+[PASS] 下载文件并核对大小  channel0_082515.mp4   本地 30399986 / 远端 30399986
+===== 自检结束：全部通过（失败 0 项）=====
+----
+
+反向证伪（换成本板不存在的 SN，必须连不上）：::
+
+----
+运维箱远程访问.exe --sn 0B2CC1 --selftest     # 退出码 1
+[PASS] secretKey 推导（黄金向量 0B2CC1）  a13db1c3eb45118f
+[PASS] frpc 通道就绪（16000）
+[FAIL] ssh 免密登录设备  kex_exchange_identification: read: Unknown error
+----
+
+界面：`--shot` 截图核对设备条 / 状态行 / 列表 / 日志排版，`--openset --shot`
+核对「服务器设置」框，提示文字完整不截断。
+
+=== 教训
+
+**"打包时的常量"与"运行时的参数"，分界要早点划。** `secretKey` 是个纯函数
+（SN、令牌 → 16 个 hex），只要这两个输出来源可换，这个工具就能管全部设备；
+上一版把结果打包进去，等于把函数的值域写死成定义域的一个点。
+
+**改了配置不换个进程，等于没改。** frpc 只在启动时读 toml。第一版只重写了文件，
+现象是"切了 SN 还是连老设备"——和设备侧 `frp.sh` 那个"配置比 PID 新才重启"是同一个坑，
+两边都踩了一遍。所以这次把"配置代数"显式记下来（`g_frpcGen` vs `g_frpcProcGen`），
+不靠 mtime 猜。
+
+**自检要能用真实设备跑出"全新通过"，也要能跑出"该红就红"。** 0 字节样本那条误判，
+只有在真设备上跑才会遇到；而"换错 SN 必须连不上"这条反向断言，
+才是"切换真的生效了"的证据 —— 否则改个显示字符串也能让正向断言全绿。
+

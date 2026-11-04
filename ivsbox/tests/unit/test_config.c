@@ -1579,7 +1579,8 @@ static void case_dir_recursive_create(void)
 static void cleanup(void)
 {
     static const char *const files[] = {
-        "ivsbox.json",      "ivsbox.json.tmp", "ivsbox.stage",   "unrelated.json",
+        "ivsbox.json",      "ivsbox.json.tmp", "ivsbox.json.bak", "ivsbox.json.bak.tmp",
+        "ivsbox.json.bad",  "ivsbox.stage",    "unrelated.json",
         "h1.json",          "h2.json",         "h3.json",        "h4.json",
         "h9.json",          "auto/ivsbox.json", "deep/mid/ivsbox.json",
     };
@@ -1924,6 +1925,110 @@ static void case_reset_defaults(void)
     (void)unlink(tmpf);
 }
 
+/* ===========================================================================
+ * §S8.1 ⑳（2026-11-04）主备双份 + 坏文件留证
+ *
+ * 背景：现场启动日志里 `'ivsbox.json' unusable (rc=-10)` 被当成"配置丢了"，
+ * 实际 rc=-10 = ENOENT = 这台设备**还没保存过**（不是坏了）。真正的风险是主文件
+ * 被写坏：原先一律静默回默认值，下一次保存再把现场覆盖掉，用户改过的值就真没了。
+ *
+ * 规则（三条都要钉住）：
+ *   a) 每次保存把上一版复制成 `.bak`；首次保存没有"上一版" ⇒ 不造 .bak；
+ *   b) 主文件读不了 ⇒ 改名 `.bad` 留证 → 从 `.bak` 恢复 → **立刻重建主文件**
+ *      （不重建的话，恢复后、下次保存前重启一次又回到默认值）；
+ *   c) 主文件"不存在"（用户主动删掉＝想回出厂）⇒ **不许**从 `.bak` 复活。
+ *   反向证伪：a 少写 .bak / b 少做重建 / c 从备份复活，对应断言各自会红。
+ * ========================================================================= */
+static void case_backup_and_recover(void)
+{
+    char          pf[200];
+    char          bak[220];
+    char          bad[220];
+    iv_config_t  *c;
+    iv_cfg_stat_t st;
+    int64_t       iv = 0;
+    int64_t       def = 0;
+    iv_cfg_type_t dt = IV_CFG_T_INT;
+    char          dtxt[IV_CFG_STR_MAX];
+
+    cfg_path(pf, sizeof(pf));
+    path_of(bak, sizeof(bak), "ivsbox.json.bak");
+    path_of(bad, sizeof(bad), "ivsbox.json.bad");
+    (void)unlink(pf);
+    (void)unlink(bak);
+    (void)unlink(bad);
+    (void)iv_config_default_get(IV_CFG_NAME, "sys.report.interval_s", &dt, dtxt, sizeof(dtxt));
+    def = (int64_t)strtoll(dtxt, NULL, 10);
+
+    /* ---- a) 保存两版：第二次才应该出现 .bak ---- */
+    c = reopen_cfg();
+    chk(c != NULL, "c50a: open on empty dir");
+    if (c == NULL)
+        return;
+    chk(iv_config_set_int(c, "sys.report.interval_s", 111) == IV_OK, "c50b: set v1");
+    chk(iv_config_save(c, NULL, 0u) == IV_OK, "c50c: save v1");
+    chk(access(bak, F_OK) != 0, "c50d: no .bak before there is a previous version");
+    chk(iv_config_set_int(c, "sys.report.interval_s", 222) == IV_OK, "c50e: set v2");
+    chk(iv_config_save(c, NULL, 0u) == IV_OK, "c50f: save v2");
+    chk(access(bak, F_OK) == 0, "c50g: .bak holds the previous version after 2nd save");
+    iv_config_close(c);
+
+    /* ---- b) 主文件写坏：留证 + 从备份恢复 + 重建主文件 ---- */
+    chk(write_file(pf, "{ \"sys\": { \"report\": ", 0644) == 0, "c50h: corrupt the main file");
+    c = reopen_cfg();
+    chk(c != NULL, "c50i: open with a corrupt main file");
+    if (c == NULL)
+        return;
+    chk(iv_config_stat(c, &st) == IV_OK, "c50j: stat");
+    chk(st.loaded == 1, "c50k: recovered => loaded == 1");
+    chk(st.from_backup == 1, "c50l: flagged as recovered from backup");
+    chk(iv_config_get_int(c, "sys.report.interval_s", &iv) == IV_OK && iv == 111,
+        "c50m: value is the previous version's 111, not the default");
+    chk(access(bad, F_OK) == 0, "c50n: unreadable file kept as .bad");
+    chk(access(pf, F_OK) == 0, "c50o: main file rebuilt right away");
+    iv_config_close(c);
+
+    /* 重建是否真的落地：再开一次，走的是正常主文件路径（from_backup == 0） */
+    c = reopen_cfg();
+    chk(c != NULL, "c50p: reopen after recovery");
+    if (c == NULL)
+        return;
+    chk(iv_config_stat(c, &st) == IV_OK && st.loaded == 1, "c50q: loads the rebuilt main file");
+    chk(st.from_backup == 0, "c50r: no longer needs the backup (rebuild really happened)");
+    chk(iv_config_get_int(c, "sys.report.interval_s", &iv) == IV_OK && iv == 111,
+        "c50s: recovered value survives a restart");
+    iv_config_close(c);
+
+    /* ---- c) 主文件被删（＝想回出厂默认）时**不许**从 .bak 复活 ---- */
+    (void)unlink(pf);
+    chk(access(bak, F_OK) == 0, "c50t: .bak still there before the delete test");
+    c = reopen_cfg();
+    chk(c != NULL, "c50u: open with only .bak left");
+    if (c == NULL)
+        return;
+    chk(iv_config_stat(c, &st) == IV_OK, "c50v: stat");
+    chk(st.loaded == 0, "c50w: a deleted main file means factory defaults");
+    chk(st.from_backup == 0, "c50x: backup must NOT resurrect a deliberately deleted file");
+    chk(iv_config_get_int(c, "sys.report.interval_s", &iv) == IV_OK && iv == def,
+        "c50y: value is the built-in default, not the old 111");
+    iv_config_close(c);
+
+    /* ---- d) 主坏 + 备坏：两条都不行才回落默认值 ---- */
+    (void)write_file(pf, "not json at all", 0644);
+    (void)write_file(bak, "still not json", 0644);
+    c = reopen_cfg();
+    chk(c != NULL, "c50z: open with both copies broken");
+    if (c == NULL)
+        return;
+    chk(iv_config_stat(c, &st) == IV_OK && st.loaded == 0 && st.from_backup == 0,
+        "c50aa: both copies unusable => built-in defaults");
+    iv_config_close(c);
+
+    (void)unlink(pf);
+    (void)unlink(bak);
+    (void)unlink(bad);
+}
+
 int main(void)
 {
     char   tmpl[] = "/tmp/ivcfg_XXXXXX";
@@ -1967,6 +2072,7 @@ int main(void)
     case_snmp_oid_keys();
     case_ip_keys();
     case_reset_defaults();
+    case_backup_and_recover();
 
     cleanup();
 
@@ -1976,6 +2082,6 @@ int main(void)
     }
     printf("test_config passed (S8 F1-F7 + S8.1 single-file/8-class/array/double/"
            "comment-roundtrip/per-class transaction + G20 dir-recursive-create + "
-           "S4.3 snmp-oid-slots + ip-literal validation)\n");
+           "S4.3 snmp-oid-slots + ip-literal validation + bak quarantine/recover)\n");
     return 0;
 }

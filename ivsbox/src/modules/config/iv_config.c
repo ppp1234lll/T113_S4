@@ -544,6 +544,7 @@ struct iv_config {
     char name[IV_CFG_NAME_MAX];
     char path[IV_CFG_PATH_MAX];
     char tmppath[IV_CFG_PATH_MAX];
+    char bakpath[IV_CFG_PATH_MAX]; /* `<path>.bak`：上一次成功保存前的版本 */
     dev_t dir_dev;
     ino_t dir_ino;
     int   dir_id_valid;
@@ -551,6 +552,9 @@ struct iv_config {
     uint32_t schema;
     uint64_t version;
     int      loaded;
+    int      from_backup; /* 1 = 本次是主文件读不了、从 .bak 恢复的 */
+    int      disk_untrusted; /* 1 = 外部把盘上那份改坏了（热重载已拒绝）：
+                              *     此时**不许**拿它覆盖 .bak，否则最后一份好备份就没了 */
     int      crc_mismatch;
     int      invalid;
     int      dirty;
@@ -1716,7 +1720,11 @@ static void notify_subscribers(iv_config_t *c, uint32_t changed_mask)
  * 成功时 `c->invalid` 被置为**本次加载中因值非法而回退默认的键数**（调用方据此
  * 决定要不要整份拒绝：启动路径接受、重载路径拒绝）。
  */
-static int load_from_disk(iv_config_t *c)
+/* 从指定路径加载（主文件与备份共用同一套解析与补齐口径）。
+ * 2026-11-04 由 `load_from_disk()` 改名而来：备份恢复要读的是 `.bak`，
+ * 两份逻辑必须**同源**，否则"从备份恢复出来的配置"和被主文件加载的配置
+ * 可能走不同的补齐规则，变成两套事实。 */
+static int load_from_path(iv_config_t *c, const char *path)
 {
     long     n;
     uint32_t schema;
@@ -1726,7 +1734,7 @@ static int load_from_disk(iv_config_t *c)
     int      invalid = 0;
     int      rc;
 
-    n = file_read_all(c->path, s_read_buf, sizeof(s_read_buf));
+    n = file_read_all(path, s_read_buf, sizeof(s_read_buf));
     if (n < 0)
         return (int)n;
     if (n == 0)
@@ -1749,6 +1757,12 @@ static int load_from_disk(iv_config_t *c)
     c->invalid   = invalid;
     c->cls_bad   = s_cls_bad; /* 解析期累积的"哪个分类有非法值" */
     return IV_OK;
+}
+
+/* 主文件（`<dir>/<名>.json`） */
+static int load_from_disk(iv_config_t *c)
+{
+    return load_from_path(c, c->path);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2239,6 +2253,167 @@ static void watch_drain(iv_config_t *c)
  * 公开 API：F1
  * ------------------------------------------------------------------------- */
 
+/* ---------------------------------------------------------------------------
+ * 落盘辅助（2026-11-04）：主文件与备份共用"写完再 fsync"
+ * ------------------------------------------------------------------------- */
+
+/* 把 buf 全写进 fd 并 fsync。唤醒中断重试；失败区分 ENOSPC 与其它 IO 错误。 */
+static int write_all_fsync(int fd, const char *buf, size_t n)
+{
+    size_t off = 0u;
+
+    while (off < n) {
+        ssize_t w = write(fd, buf + off, n - off);
+
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            return (errno == ENOSPC) ? IV_ENOSPC : IV_EIO;
+        }
+        off += (size_t)w;
+    }
+    return (fsync(fd) == 0) ? IV_OK : IV_EIO;
+}
+
+/* 返回码的人话名字：日志里写 `rc=-10 (ENOENT)`，不要只丢一个数字 ——
+ * 现场看到 "-10" 没人能判断是"文件不存在"还是"读坏了"。 */
+static const char *ret_name(int rc)
+{
+    switch (rc) {
+    case IV_OK:
+        return "OK";
+    case IV_ENOENT:
+        return "ENOENT";
+    case IV_ECORRUPT:
+        return "ECORRUPT";
+    case IV_ERANGE:
+        return "ERANGE";
+    case IV_EIO:
+        return "EIO";
+    case IV_EAUTH:
+        return "EAUTH";
+    case IV_ENOMEM:
+        return "ENOMEM";
+    default:
+        return "?";
+    }
+}
+
+/* 没加载到文件时的公共起手式：清零加载态并用内置默认值补齐。
+ * 与"文件不存在"、"文件坏且备份也坏"两条路共用，保证两条路的初始状态一致。 */
+static void start_from_defaults(iv_config_t *c)
+{
+    c->loaded       = 0;
+    c->from_backup  = 0;
+    /* 走到这里说明"盘上那份没被采用"（不存在 / 坏 / 读不了）：在成功保存写出新文件
+     * 之前，一律不许拿它当"上一版"备份 —— 否则可能用坏文件盖掉唯一一份好 .bak。 */
+    c->disk_untrusted = 1;
+    c->crc_mismatch = 0;
+    c->invalid      = 0;
+    c->version      = 0u;
+    c->n_items      = 0u;
+    c->camera_count = 0u;
+    (void)fill_missing_defaults(c, NULL);
+    (void)cross_fix_by_default(c);
+}
+
+/* 坏文件留证：改名成 `<path>.bad`。
+ * 为什么必须改名：加载失败后内存里是默认值，用户下一次在网页上点保存就把这份
+ * 坏文件**原地覆盖**了，事后谁也说不清当时坏在哪。改名只挪不删，现场还在。 */
+static void quarantine_bad(iv_config_t *c)
+{
+    char   bad[IV_CFG_PATH_MAX + 4u];
+    size_t pl = strlen(c->path);
+
+    if (pl + 4u + 1u > sizeof(bad))
+        return;
+    memcpy(bad, c->path, pl);
+    memcpy(bad + pl, ".bad", 5u);
+    if (rename(c->path, bad) == 0) {
+        IV_LOG_W(CFG_MOD, "%s: unreadable file kept as '%s'", c->name, bad);
+    } else {
+        IV_LOG_W(CFG_MOD, "%s: keep the unreadable '%s' failed: %s", c->name, c->path,
+                 strerror(errno));
+    }
+}
+
+/* 备份上一版：把当前主文件复制成 `<path>.bak`。
+ * 为什么是"复制"而不是"重命名"：重命名会让"主文件已挪走、新文件还没 rename 到位"
+ * 这段窗口里主文件**不存在** —— 正好这时掉电就变成"配置没了"，比不备份更糟。
+ * 只在 `loaded` 为真时备份：盘上那份要是根本没被采用（坏文件/不存在），备份它没意义。 */
+static int backup_current(iv_config_t *c)
+{
+    char   btmp[IV_CFG_PATH_MAX + 4u];
+    size_t pl;
+    long   n;
+    int    fd;
+    int    rc;
+
+    if (!c->loaded || c->disk_untrusted)
+        return IV_OK;
+    n = file_read_all(c->path, s_read_buf, sizeof(s_read_buf));
+    if (n < 0)
+        return (int)n;
+    if (n == 0)
+        return IV_OK; /* 空文件没有备份价值 */
+
+    pl = strlen(c->bakpath);
+    if (pl + 4u + 1u > sizeof(btmp))
+        return IV_ERANGE;
+    memcpy(btmp, c->bakpath, pl);
+    memcpy(btmp + pl, ".tmp", 5u);
+
+    fd = open(btmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return IV_EIO;
+    (void)fchmod(fd, 0644);
+    rc = write_all_fsync(fd, s_read_buf, (size_t)n);
+    (void)close(fd);
+    if (rc != IV_OK) {
+        (void)unlink(btmp);
+        return rc;
+    }
+    if (rename(btmp, c->bakpath) != 0) {
+        (void)unlink(btmp);
+        return IV_EIO;
+    }
+    return IV_OK;
+}
+
+/* 从备份把主文件重建出来（复制，不重新渲染）。
+ * 为什么必须重建：`quarantine_bad()` 已经把主文件改名挪走，如果只把内容装进内存，
+ * 那么"恢复之后、用户下一次保存之前"这段时间里主文件仍然不存在 —— 中间重启一次
+ * 就又回到默认值，备份形同虚设。重建之后两份内容一致，下次开机走正常主文件路径。
+ * 用 tmp→fsync→rename：重建中途掉电只会留下 .tmp，主文件要么没有、要么是完整的，
+ * 不会出现半截主文件。 */
+static int rebuild_main_from_backup(iv_config_t *c)
+{
+    long n;
+    int  fd;
+    int  rc;
+
+    n = file_read_all(c->bakpath, s_read_buf, sizeof(s_read_buf));
+    if (n < 0)
+        return (int)n;
+    if (n == 0)
+        return IV_ECORRUPT; /* 空备份不该进到这里；按损坏处理 */
+    fd = open(c->tmppath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return IV_EIO;
+    (void)fchmod(fd, 0644);
+    rc = write_all_fsync(fd, s_read_buf, (size_t)n);
+    (void)close(fd);
+    if (rc != IV_OK) {
+        (void)unlink(c->tmppath);
+        return rc;
+    }
+    if (rename(c->tmppath, c->path) != 0) {
+        (void)unlink(c->tmppath);
+        return IV_EIO;
+    }
+    return (fsync_dir(c->dir) == 0) ? IV_OK : IV_EIO;
+}
+
 iv_config_t *iv_config_open(const char *dir, const char *name)
 {
     const char  *d = (dir != NULL && dir[0] != '\0') ? dir : IV_CFG_DIR_DEFAULT;
@@ -2332,6 +2507,14 @@ iv_config_t *iv_config_open(const char *dir, const char *name)
 
             memcpy(c->tmppath, c->path, pl);
             memcpy(c->tmppath + pl, ".tmp", 5u); /* 含结尾 NUL */
+            /* `.bak` 同样要留出 ".tmp" 的余量：备份也是"写临时文件再 rename" */
+            if (pl + 4u + 4u + 1u > sizeof(c->bakpath)) {
+                memset(c, 0, sizeof(*c));
+                c->ifd = -1;
+                return NULL;
+            }
+            memcpy(c->bakpath, c->path, pl);
+            memcpy(c->bakpath + pl, ".bak", 5u); /* 含结尾 NUL */
         }
     }
 
@@ -2340,18 +2523,50 @@ iv_config_t *iv_config_open(const char *dir, const char *name)
         c->loaded = 1;
         IV_LOG_I(CFG_MOD, "%s: loaded %u keys (invalid=%d), version=%llu", c->name, c->n_items,
                  c->invalid, (unsigned long long)c->version);
+    } else if (rc == IV_ENOENT) {
+        /* **出厂/从未保存过**：盘上就没有这份文件，跑内置默认值照常启动。
+         * 这是正常状态，不是"配置坏了" —— 原先与真损坏共用一句
+         * `unusable (rc=-10)`，现场照着日志排查只会查到"文件不存在"这条死路。
+         * 不在这里主动落盘：文件不存在＝默认值会随固件升级一起更新；
+         * 一旦替用户写出一份快照，以后改默认值就再也到不了这台设备了。 */
+        start_from_defaults(c);
+        IV_LOG_I(CFG_MOD,
+                 "%s: no '%s' yet (never saved), start with %u built-in default keys",
+                 c->name, c->path, c->n_items);
     } else {
-        /* 文件不在 / 空 / 坏 / 无权限：一律用内置默认值照常启动 */
-        c->loaded       = 0;
-        c->crc_mismatch = 0;
-        c->invalid      = 0;
-        c->version      = 0u;
-        c->n_items      = 0u;
-        c->camera_count = 0u;
-        (void)fill_missing_defaults(c, NULL);
-        (void)cross_fix_by_default(c);
-        IV_LOG_W(CFG_MOD, "%s: '%s' unusable (rc=%d), start with %u default keys", c->name,
-                 c->path, rc, c->n_items);
+        int brc;
+
+        /* 文件在、但读不了（空/坏/超限/无权限）：先留证，再看备份 */
+        quarantine_bad(c);
+        brc = load_from_path(c, c->bakpath);
+        if (brc == IV_OK) {
+            int rrc;
+
+            c->loaded      = 1;
+            c->from_backup = 1;
+            IV_LOG_W(CFG_MOD,
+                     "%s: '%s' unreadable (rc=%d %s), recovered from '%s' "
+                     "(%u keys, version=%llu)",
+                     c->name, c->path, rc, ret_name(rc), c->bakpath, c->n_items,
+                     (unsigned long long)c->version);
+            rrc = rebuild_main_from_backup(c);
+            if (rrc == IV_OK) {
+                IV_LOG_W(CFG_MOD, "%s: main file rebuilt from backup, unreadable file kept "
+                                  "as '%s.bad'", c->name, c->path);
+            } else {
+                IV_LOG_W(CFG_MOD,
+                         "%s: rebuild main file failed (rc=%d %s); in-memory values are the "
+                         "recovered ones, next successful save will rewrite it",
+                         c->name, rrc, ret_name(rrc));
+            }
+        } else {
+            start_from_defaults(c);
+            IV_LOG_W(CFG_MOD,
+                     "%s: '%s' unusable (rc=%d %s) and backup '%s' also unusable "
+                     "(rc=%d %s), start with %u default keys",
+                     c->name, c->path, rc, ret_name(rc), c->bakpath, brc, ret_name(brc),
+                     c->n_items);
+        }
     }
     return c;
 }
@@ -2643,6 +2858,7 @@ int iv_config_stat(const iv_config_t *c, iv_cfg_stat_t *out)
     out->version      = c->version;
     out->items        = c->n_items;
     out->loaded       = c->loaded;
+    out->from_backup  = c->from_backup;
     out->crc_mismatch = c->crc_mismatch;
     out->dirty        = c->dirty;
     out->invalid      = (uint32_t)c->invalid;
@@ -2696,7 +2912,18 @@ int iv_config_save(iv_config_t *c, char *detail, size_t detail_cap)
     if (n < 0)
         return (int)n;
 
-    /* 3) tmp → fsync → rename → fsync(目录) */
+    /* 3) 先把"当前这份"复制成 .bak（上一版），再写新文件。
+     * 顺序不能反：新文件 rename 到位后，原内容就只剩这份备份了。
+     * 备份失败不阻断保存 —— 用户要改的值比历史版本重要，但必须留痕。 */
+    {
+        int brc = backup_current(c);
+
+        if (brc != IV_OK && brc != IV_ENOENT)
+            IV_LOG_W(CFG_MOD, "%s: keep previous version as '%s' failed (rc=%d %s)", c->name,
+                     c->bakpath, brc, ret_name(brc));
+    }
+
+    /* 4) tmp → fsync → rename → fsync(目录) */
     fd = open(c->tmppath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) {
         IV_LOG_E(CFG_MOD, "%s: open tmp failed: %s", c->name, strerror(errno));
@@ -2704,22 +2931,8 @@ int iv_config_save(iv_config_t *c, char *detail, size_t detail_cap)
     }
     (void)fchmod(fd, 0644); /* 不受 umask 影响：配置非机密，固定 0644 */
     {
-        size_t off = 0u;
-        int    rc  = IV_OK;
+        int rc = write_all_fsync(fd, s_render_buf, (size_t)n);
 
-        while (off < (size_t)n) {
-            ssize_t w = write(fd, s_render_buf + off, (size_t)n - off);
-
-            if (w < 0) {
-                if (errno == EINTR)
-                    continue;
-                rc = (errno == ENOSPC) ? IV_ENOSPC : IV_EIO;
-                break;
-            }
-            off += (size_t)w;
-        }
-        if (rc == IV_OK && fsync(fd) != 0)
-            rc = IV_EIO;
         (void)close(fd);
         if (rc != IV_OK) {
             (void)unlink(c->tmppath);
@@ -2734,6 +2947,7 @@ int iv_config_save(iv_config_t *c, char *detail, size_t detail_cap)
     }
     c->version = nver;
     c->loaded  = 1;
+    c->from_backup  = 0; /* 主文件已经重建，"从备份恢复"这个状态到此结束 */
     c->crc_mismatch = 0;
     if (fsync_dir(c->dir) != 0) {
         /* rename 已经发生，不能假装“旧文件仍在”；保留 dirty 让调用方知道需要重试，
@@ -2746,6 +2960,7 @@ int iv_config_save(iv_config_t *c, char *detail, size_t detail_cap)
 
     c->dirty         = 0;
     c->dirty_classes = 0u;
+    c->disk_untrusted = 0; /* 盘上这份是我们刚写出来的，重新可信 */
     IV_LOG_I(CFG_MOD, "%s: saved %u keys, version=%llu", c->name, c->n_items,
              (unsigned long long)c->version);
 
@@ -2977,14 +3192,18 @@ int iv_config_watch_poll(iv_config_t *c, uint32_t *reloads)
         rc = load_from_disk(c);
         if (rc != IV_OK) {
             snap_restore(c, &snap);
-            IV_LOG_W(CFG_MOD, "%s: reload rejected (rc=%d, unparsable), keep previous", c->name,
-                     rc);
+            /* 盘上那份现在是坏的：内存照样用旧值，但**不许**再把它当"上一版"备份，
+             * 否则下一次保存会用坏文件覆盖掉唯一一份好的 .bak。 */
+            c->disk_untrusted = 1;
+            IV_LOG_W(CFG_MOD, "%s: reload rejected (rc=%d %s, unparsable), keep previous",
+                     c->name, rc, ret_name(rc));
             if (reloads != NULL)
                 *reloads = 0u;
             return IV_OK;
         }
 
         /* 逐分类：被标 bad 的分类整块回退旧值 */
+        c->disk_untrusted = 0; /* 文件本身能解析，盘上那份重新可信 */
         if (c->cls_bad != 0u) {
             unsigned cls;
 

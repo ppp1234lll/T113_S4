@@ -14065,3 +14065,98 @@ md5sum 运维箱远程访问.exe         # 760febd0df0bdfd9574d1c579567294b
 只有在真设备上跑才会遇到；而"换错 SN 必须连不上"这条反向断言，
 才是"切换真的生效了"的证据 —— 否则改个显示字符串也能让正向断言全绿。
 
+== 2026-11-04 21:54 修「一机一档 → 搜索摄像机」平台收不到信息：发现报文绑错出口网口
+
+=== 干了什么事
+
+改了两处代码、加了一组用例：
+
+- `ivsbox/src/modules/device/iv_device.c` 的 `open_udp()`：UDP 发现 socket 建好后，
+  先 `setsockopt(SOL_SOCKET, SO_BINDTODEVICE, d->cfg.ifname)` 把它**钉在配置的网口**上，
+  再 `setsockopt(IPPROTO_IP, IP_MULTICAST_IF, d->cfg.local_ip_be)` 把组播出口地址补上。
+  绑不上只打 WARN（`bind discovery socket to %s failed (errno=%d), multicast/broadcast
+  may leave via wrong interface`），行为退回旧版，不致命。
+- `ivsbox/include/ivsbox/iv_device.h`：`iv_device_cfg_t::ifname` 的注释从"SADP 二层收发
+  绑定的网口"改成"**发现报文的出口网口**"，把 SADP 与 UDP 广播/组播两条路都说清楚。
+- `ivsbox/tests/unit/test_device.c`：`io_setsockopt` 替身记录 `SO_BINDTODEVICE` 与
+  `IP_MULTICAST_IF`；新增 `d17_socket_bound_to_if()`。
+
+数据流本身没变：`0xE4` 到达 → `iv_agent_device_search()` 起重开发现相位机 → 相位机
+`send_round()` 往 239.255.255.250/251、255.255.255.255 发探测 → 应答单播回到 `fd4` →
+档案（`d->item`）→ `ipc_reply_tick()` 拼 JSON 发出。**变的只是这些探测包从哪块网卡出去。**
+
+=== 解决什么问题
+
+用户报「一机一档搜索摄像机功能，平台收不到信息」。板端证据表明**不是"收不到帧"**：
+
+[source,text]
+----
+11:18:08 rx 22 bytes: f0f0110a000a19b4e4ffffffffffffffff010017ffff   <- 平台下发 0xE4
+11:18:08 search start (hik-sadp)
+11:18:09 phase -> hik-udp / dahua-5050 / dahua-mcast
+11:18:10 phase -> unv
+11:18:11 phase -> onvif
+11:18:11 search done, 0 found                                        <- 一台也没搜到
+11:18:11 E4 reply: {"code":0,...,"cmd":"E4","num":0,...}              <- 帧发了，清单是空的
+----
+
+空表的根因在出口网卡（板端 `ip route get` 原始输出）：
+
+[source,text]
+----
+multicast 239.255.255.250 dev usb0 src 10.178.62.143 uid 0   <- 海康 UDP / ONVIF
+multicast 239.255.255.251 dev usb0 src 10.178.62.143 uid 0   <- 大华组播
+broadcast 255.255.255.255 dev usb0 src 10.178.62.143 uid 0   <- 大华 5050 广播
+192.168.1.106 dev eth0 src 192.168.1.64 uid 0                <- 单播走对了
+----
+
+`usb0` 是 4G 拨号网口，插上 4G 后它的 `default` 路由排在 `eth0` 前面；组播地址与受限广播
+**都没有直连路由**，内核按默认路由选口 ⇒ 六个相位的探测包全从 4G 发出去，摄像机在
+`eth0` 的 `192.168.1.0/24` 上一包都收不到。
+
+这个故障最容易被误判成"摄像机不响应"：**单播好、组播全灭**。`192.168.1.106` 有直连路由，
+按 IP 的定向探测（上一版加的）一直能用，于是现象看着像"设备只答单播"。
+
+=== 影响范围
+
+- 影响所有走 `iv_device` 的 UDP 发现：开机自检一轮、平台 `0xE4`、ctl `camera.search`；
+  以及按 IP 的定向单播探测（目标都在同一网段，绑定后行为不变）。
+- `SO_BINDTODEVICE` 需 root；`ivsboxd` 以 root 运行，满足。非 root 场景降级为旧行为并留 WARN。
+- `cfg.ifname` 仍来自 `wan_name[IV_WAN_WIRED]`（有线网口），与 SADP 同源，没有新增配置键。
+- **未做**：摄像机挂在其它网口时不会自动切（需另配 `ifname`）；SADP 的 0.5 s 窗口未调
+  （本次实测 4 台海康全部在窗口内应答）。
+
+=== 验证方式与结果
+
+- **反向证伪**：把绑定改成 `if (0 && io->setsockopt(...))`（等价删除），`test_device` 当场报
+  `FAIL: d17 SO_BINDTODEVICE called once` 与 `FAIL: d17 bound to eth0`；还原后全绿。
+  这一步是必须的 —— 既有用例全都 `ifname = NULL`，删掉绑定**没有任何用例会变红**。
+- `make test`：**56 项 0 FAILED**；`make arm`：0 error 0 warning；`make analyze`：通过。
+- **板端 192.168.1.64 实测**（换二进制后）：
+
+[source,text]
+----
+11:29:46 search start (hik-sadp)
+11:29:46 device found: brand=hikvision model=HS-AFS-MAGE20    by=hik-sadp (0/1 total)
+11:29:46 device found: brand=hikvision model=DS-2DC4425DW-D   by=hik-sadp
+11:29:46 device found: brand=hikvision model=DS-IPC-T12HV3-IA by=hik-sadp
+11:29:46 device found: brand=hikvision model=DS-2CD3T27EDWD-L by=hik-sadp
+11:29:48 device found: brand=dahua model=DH-IPC-HFW1433M-A-IL2 by=dahua-mcast
+11:29:48 device found: brand=dahua model=DH-SD6223-DGQ-i       by=dahua-mcast
+11:29:49 search done, 6 found
+----
+
+  同一动作修复前是 `search done, 0 found`。大华两台走的是 **`dahua-mcast`（组播）** ——
+  正是修前 0 应答的那条路径，修后 1 s 内两台全部应答。
+- `device.list` 档案 6 条，`ip` 全非空：`192.168.2.101` / `192.168.1.200` / `192.168.2.18` /
+  `192.168.1.78` / `192.168.1.108` / `192.168.1.106`。
+
+=== 教训
+
+**"多网口设备上的广播/组播"不能交给路由表。** 单播有目的地址、能匹配直连路由；组播和
+受限广播没有，内核只能用默认路由兜底，而默认路由在多 WAN 设备上**随时会变**（插上 4G 就变）。
+凡是"我发出去、不知道谁会答"的探测，一律要显式绑出口网卡。
+
+**"设备不响应"这种结论要先证伪自己。** 上一版把"大华回 841 B 单播、对广播/组播 0 应答"
+写进了文档和代码注释，据此绕道去做定向探测。真实原因是我方从 4G 网口发出去了 ——
+大华一直有在答。**差异出现在自己这边时，症状长得和对端不配合一模一样。**

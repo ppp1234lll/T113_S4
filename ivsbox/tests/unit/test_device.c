@@ -55,12 +55,32 @@ static int io_bind(int fd, const struct sockaddr *a, socklen_t l) {
     (void)l;
     return 0;
 }
+/* 出口网卡绑定的记录（2026-11-04 现场故障的回归钉子）。
+ *
+ * 故障：UDP 发现 socket 没绑网口 ⇒ 组播 239.255.255.x 与受限广播
+ * 255.255.255.255 没有直连路由，内核按默认路由从 4G 网口发出，摄像机一包
+ * 收不到，平台「一机一档 → 搜索摄像机」（0xE4）永远拿到 `"num":0`。
+ * 这条**必须由用例钉住**：绑定的删除/写错网口名不会让任何既有用例变红。 */
+static int      g_bind_dev_calls;
+static char     g_bind_dev_name[64];
+static int      g_mcast_if_calls;
+static uint32_t g_mcast_if_addr;
+
 static int io_setsockopt(int fd, int lv, int on, const void *v, socklen_t l) {
     (void)fd;
-    (void)lv;
-    (void)on;
-    (void)v;
     (void)l;
+    if (lv == SOL_SOCKET && on == SO_BINDTODEVICE) {
+        g_bind_dev_calls++;
+        if (v != NULL) {
+            size_t n = strlen((const char *)v);
+            if (n >= sizeof g_bind_dev_name) n = sizeof g_bind_dev_name - 1u;
+            memcpy(g_bind_dev_name, v, n);
+            g_bind_dev_name[n] = '\0';
+        }
+    } else if (lv == IPPROTO_IP && on == IP_MULTICAST_IF && v != NULL) {
+        g_mcast_if_calls++;
+        g_mcast_if_addr = ((const struct in_addr *)v)->s_addr;
+    }
     return 0;
 }
 static ssize_t io_sendto(int fd, const void *buf, size_t len, int flags,
@@ -125,6 +145,10 @@ static void io_reset(void) {
     g_queue_fd = -1;
     g_from_ip = 0;
     g_now = 0;
+    g_bind_dev_calls = 0;
+    g_bind_dev_name[0] = '\0';
+    g_mcast_if_calls = 0;
+    g_mcast_if_addr = 0u;
 }
 static void io_push(const void *data, size_t len) {
     if (g_queue_n < (int)(sizeof g_queue / sizeof g_queue[0])) {
@@ -763,6 +787,51 @@ static void d16_probe_ip(void) {
     iv_device_close(&d);
 }
 
+/* ---------------------------------------------------------------------------
+ * d17：发现 socket 必须绑到配置的出口网口（2026-11-04 现场故障回归）
+ *
+ * 现场故障：板上插了 4G 后路由表有两条 default，`usb0`（4G 拨号）那条排在前面
+ * ⇒ `ip route get 239.255.255.250` 回 `dev usb0`，六个相位的组播/广播探测
+ * **全从 4G 网口发出去**，摄像机在 eth0 的 192.168.1.0/24 上一包收不到 ⇒
+ * `search done, 0 found` ⇒ 平台「一机一档 → 搜索摄像机」（0xE4）拿到
+ * `"num":0` ⇒ 界面"收不到信息"。
+ * 修复＝`SO_BINDTODEVICE` 绑 eth0 ＋ `IP_MULTICAST_IF` 指向该口地址。
+ *
+ * 这条用例存在的意义：**删掉绑定不会有任何既有用例变红**（既有用例全都
+ * `ifname = NULL`），所以必须专门钉住，否则同样的故障会静默复发。
+ * ------------------------------------------------------------------------- */
+static void d17_socket_bound_to_if(void) {
+    iv_device_t     d;
+    iv_device_cfg_t cfg;
+    uint32_t        eth0_be = inet_addr("192.168.1.64");
+
+    /* ① 配了 ifname：必须绑上去，且组播出口地址＝该口本机 IP */
+    io_reset();
+    iv_device_cfg_default(&cfg);
+    cfg.iops = &g_io;
+    cfg.ifname = "eth0";
+    cfg.local_ip_be = eth0_be;
+    iv_device_init(&d, &cfg);
+    chk(iv_device_open(&d, &cfg, 0) == IV_OK, "d17 open ok");
+    chk(g_bind_dev_calls == 1, "d17 SO_BINDTODEVICE called once");
+    chk(strcmp(g_bind_dev_name, "eth0") == 0, "d17 bound to eth0");
+    chk(g_mcast_if_calls == 1, "d17 IP_MULTICAST_IF set once");
+    chk(g_mcast_if_addr == eth0_be, "d17 multicast out = eth0 addr");
+    iv_device_close(&d);
+
+    /* ② 没配 ifname（无 SADP 的场景）：不绑，退回靠路由 —— 老行为不能变坏 */
+    io_reset();
+    iv_device_cfg_default(&cfg);
+    cfg.iops = &g_io;
+    cfg.ifname = NULL;
+    cfg.local_ip_be = 0u;
+    iv_device_init(&d, &cfg);
+    chk(iv_device_open(&d, &cfg, 0) == IV_OK, "d17 open without ifname ok");
+    chk(g_bind_dev_calls == 0, "d17 no bind when ifname is NULL");
+    chk(g_mcast_if_calls == 0, "d17 no mcast-if when local ip unknown");
+    iv_device_close(&d);
+}
+
 int main(void) {
     d01_sadp_checksum();
     d02_sadp_build_parse();
@@ -780,6 +849,7 @@ int main(void) {
     d14_hik_udp_xml();
     d15_brand_no_downgrade();
     d16_probe_ip();
+    d17_socket_bound_to_if();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_device FAILED (%d)\n", g_fail);
@@ -788,6 +858,6 @@ int main(void) {
     printf("test_device passed (sadp csum/build/parse, hik probe, dahua probe/parse, "
            "onvif probe/parse, discovery time-window fsm, archive dedup/full/clear, malformed, "
            "peer-ip fallback, hik-udp xml model/ip, brand no-downgrade, "
-           "unicast probe by ip)\n");
+           "unicast probe by ip, discovery socket bound to ifname)\n");
     return 0;
 }

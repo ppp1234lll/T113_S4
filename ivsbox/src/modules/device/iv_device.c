@@ -619,7 +619,25 @@ void iv_device_init(iv_device_t *d, const iv_device_cfg_t *cfg) {
     d->phase = IV_DEV_PHASE_IDLE;
 }
 
-/* 建一个 UDP 收发 socket：广播使能 + 绑定临时端口。失败返回负码。 */
+/* 建一个 UDP 收发 socket：广播使能 + 绑定临时端口 + **绑定到摄像机所在网口**。
+ *
+ * 为什么必须显式绑设备，不能交给路由（2026-11-04 现场实证）：
+ * 组播 `239.255.255.x` 与受限广播 `255.255.255.255` **都没有直连路由**，内核按
+ * 默认路由选出口。板上插 4G 后路由表是
+ *      default via 10.178.62.1  dev usb0     ← 4G 抢在最前
+ *      default via 192.168.1.1  dev eth0
+ * 于是 `ip route get 239.255.255.250` 回 `dev usb0`，六个发现相位的探测包**全从
+ * 4G 网口发出去**，而摄像机在 eth0 的 192.168.1.0/24 上 —— 一包也收不到，
+ * 档案恒 0 条，平台「一机一档 → 搜索摄像机」（`0xE4`）永远拿到 `"num":0`。
+ *
+ * 这个故障最难查的地方是**单播好、组播全灭**：`192.168.1.106` 有直连路由所以
+ * 按 IP 的定向探测能成，人一看"能探到"就去怀疑摄像机不回广播/组播了（本工程
+ * 2026-10-27 就是这么误判过一次）。真正的差异在出口网卡，不在对端。
+ *
+ * `SO_BINDTODEVICE` 需 root（ivsboxd 以 root 运行）；失败只降级、不致命 ——
+ * 退回"靠路由选口"的老行为，但现场会继续搜不到，所以留 WARN 作为排查线索。
+ * 另外补 `IP_MULTICAST_IF`：万一绑设备被拒（非 root/容器），组播至少还有一次
+ * 机会走对地址；广播没有等价选项，只能依赖绑设备。 */
 static int open_udp(iv_device_t *d) {
     const iv_device_iops_t *io = d->cfg.iops;
     struct sockaddr_in a;
@@ -628,6 +646,21 @@ static int open_udp(iv_device_t *d) {
     if (fd < 0) return IV_EIO;
     io->setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     io->setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+    /* ★ 组播/广播的出口网卡：显式绑定，见函数头注释。 */
+    if (d->cfg.ifname != NULL && d->cfg.ifname[0] != '\0') {
+        if (io->setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, d->cfg.ifname,
+                           (socklen_t)(strlen(d->cfg.ifname) + 1u)) != 0) {
+            IV_LOG_W(DEV_MOD,
+                     "bind discovery socket to %s failed (errno=%d),"
+                     " multicast/broadcast may leave via wrong interface",
+                     d->cfg.ifname, errno);
+        }
+    }
+    if (d->cfg.local_ip_be != 0u) {
+        struct in_addr mc;
+        mc.s_addr = d->cfg.local_ip_be;
+        io->setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &mc, sizeof(mc));
+    }
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -996,8 +1029,15 @@ static int send_round(iv_device_t *d) {
  * ------------------------------------------------------------------------- */
 
 /* 发一轮定向探测：同一个 IP 上并列问三条路，谁先答算谁。
- * 只发单播，**不发广播/组播** —— 这正是它能覆盖大华的原因：大华对 5050 广播与
- * 239.255.255.251 组播不应答（2026-11-04 板端两次实测 0 应答），只答单播 DHIP。 */
+ * 只发单播，**不发广播/组播** —— 单播有明确目的地址，不依赖"出口网卡选对了"，
+ * 因此对以下两类现场特别有用：① 设备关掉了组播/广播发现；② 目标不在本网段、
+ * 组播本身过不去。
+ *
+ * **2026-11-04 21:54 更正一条历史结论**：此前本函数注释与文档写的是"大华对 5050
+ * 广播与 239.255.255.251 组播不应答，只答单播 DHIP"。那是错的 —— 真因是 UDP 发现
+ * socket 没绑出口网卡，组播/广播按默认路由从 4G 网口（usb0）出去了，大华根本没收到。
+ * 修好绑定后同一台大华在 `dahua-mcast` 相位 1 s 内就应答（见 `open_udp()` 注释）。
+ * 定向探测本身仍然保留：它解决的是"不知道对端在不在本网段"这一类问题，与本条无关。 */
 static void probe_send_round(iv_device_t *d) {
     char            ip[INET_ADDRSTRLEN];
     char            buf[IV_DEV_PROBE_MAX];

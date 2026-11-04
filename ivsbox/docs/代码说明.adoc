@@ -13845,3 +13845,100 @@ md5 `2f33db53bc4bfbdb0e459dfe57a4edbb`。）
 * Web 上的「远程通道」页没有做"连通性测试"按钮（点一下让设备去连 frps 并回报结果）；
   现在只能看状态卡的开关 + `frpc.log`。
 * F8 密钥分离未实现：`<secure>` 目录不是真正的机密存储，与 `camera.ch.N.pass` 同类欠账。
+== 2026-11-04 19:12 摄像机品牌自动关联：按 IP 定向单播探测
+
+=== 干了什么事
+
+用户报「平台配置 IP 后，IP 和品牌没有自动关联」。改动分两层，缺一层都不成立。
+
+**① `libivmodules/iv_device`：新增"只问一个 IP"的定向探测**
+
+- `iv_device.h`：`iv_device_t` 增加 `probe_on/probe_done/probe_ip_be/probe_deadline_ms/
+  probe_next_ms/probe_round/probe_res`；新增四个接口
+  `iv_device_probe_ip()` / `iv_device_probe_poll()` / `iv_device_probe_cancel()` /
+  `iv_device_probe_active()`。
+- `iv_device.c`：
+  - `probe_send_round()`：对目标 IP **同时**发三路单播 —— ONVIF WS-Discovery `:3702`、
+    大华 DHIP `:37810/:37820/:8087`（`k=0` 的 5050 帧是广播专用，跳过）、海康 UDP `:37020`。
+  - `probe_hit()`：命中后"具体厂商优先"—— 海康/大华/宇视直接结束探测；只回泛 ONVIF 时先记着，
+    等私有协议那一轮给更具体的结论。
+  - `handle_packet()`：解析成功、IP 兜底之后，判"是不是目标 IP 发来的"（对端地址优先、
+    报文字段兜底），是才交给 `probe_hit()`。**同时开着的全网搜索不会张冠李戴**。
+  - `iv_device_tick()`：`drain_fd` 之后先推 `probe_tick()`（补发/超时），再决定要不要走搜索状态机；
+    `iv_device_close()` 一并 `cancel`，避免把过期目标带过夜。
+- 节奏常量：3 轮 × 400 ms、1.2 s 出结论（`IV_DEV_PROBE_ROUNDS/GAP_MS/TIMEOUT_MS`）。
+
+**② `src/app/main.c`：把探测接到两条写 IP 的路径上**
+
+- 品牌表 `k_cam_brands[]` 与前端 `CAM_BRAND` 逐项对齐（品牌/端口/主码流/子码流路径）；
+  `cam_url_build()` 按「品牌＋账号＋密码＋IP＋码流」拼 RTSP，`cam_url_host_eq()` 只比较主机段
+  （`1.10` 不会命中 `1.106`）。
+- `cam_probe_on_config_changed()`：比对 6 路快照，**IP 变了且品牌没同时变**才
+  `cam_probe_queue()`；用户手选过（本次提交带了 vendor）就打一行
+  `vendor also set by user`，跳过。
+- `cam_probe_tick()`：串行消费队列（`iv_device` 同时只支持一个目标），`poll` 拿到结论后走
+  `cam_probe_apply()`；还有欠账就重挂 200 ms 一次性定时器。
+- `cam_probe_apply()`：写 `camera.ch.N.vendor`（泛 ONVIF/未知**不写**）＋ 重算仍指着旧 IP 的
+  `camera.ch.N.url`（主机已是当前 IP 的手调地址不动）＋ `iv_config_save()` ＋
+  `cam_apply_dependents()`（录像源表、SNMP 目标）。
+- 触发点两处：`on_cfg_committed()` 的 CAMERA 分支（网页保存）与 `on_plat_camera_ip()`
+  （平台 0xF7，载荷只有路号＋IP，本来就没有品牌字段）。
+- 兜底：开机 `cam_probe_snapshot_all()` 建基线 ＋ `cam_snap_timer_arm()` 挂 2 s 常驻巡检。
+
+=== 解决什么问题
+
+三层一起断，现场表现都是"品牌没跟 IP 走"：
+
+1. **发现档案里没有这台**：大华不回 5050 广播与 `239.255.255.251` 组播（板端两次实测 0 应答），
+   只答单播 DHIP，于是它永远进不了 `/api/devices`；前端按 IP 匹配必然落空。
+2. **平台 0xF7 从不写品牌**：只写 `camera.ch.N.ip`，`vendor` 保持旧值。
+3. **前端查不到就静默**：`tryMatch()` 找不到档案直接返回，界面上没有任何反馈。
+
+本改动把 1、2 补上（3 未动，见"影响范围"）。
+
+=== 影响范围
+
+- `iv_device` 新增状态字段，`iv_device_t` 体积略增（几十字节），不影响既有调用方；
+  搜索状态机与档案逻辑未改。
+- 依赖 `dev_enable`：发现模块未开（`iv_device_is_open()==false`）时探测直接跳过并打
+  `device discovery not open`，不会伪装成"已关联"。
+- 同一时刻只支持一个探测目标：6 路同时改 IP 会串行排队，每路 ≤1.2 s。
+- **未做**：`app.js` 的"查不到就静默"未改（会动既有 jsdom 用例 v05）；
+  从未被发现、且单播也不应答的设备仍需手选品牌（日志留 `no answer`）。
+- 依赖 `camera.ch.N.vendor` 的消费方（SNMP OID 表、平台 0xE7 品牌列、录像源）在写回后
+  都走 `cam_apply_dependents()` 热更，不需要重启。
+
+=== 验证方式与结果
+
+- `make test`：**0 FAILED**；`test_device` 新增 `d16_probe_ip()` 12 条（DHIP 单播立即出结论、
+  别的 IP 的应答不采纳、泛 ONVIF 等到超时、cancel 后 poll 无结论）。
+- `make arm`：0 error 0 warning，`ivsboxd` md5 `f6a1eedee22257648230684f0ce66665`。
+- `platcmd_e2e.py`（VM，root）：**全部通过**，新增 `C11e 0xF7 配 IP 后排了一次品牌定向探测` PASS。
+- **板端 192.168.1.64**（换 `f6a1eede…` 后）：
+
+[source,text]
+----
+清空第 2 路品牌，只改 IP 106 -> 108：
+08:47:45 INFO [app] camera ch2 ip 192.168.1.108 changed (config apply), brand probe queued
+08:47:45 INFO [device] probe 192.168.1.108: unicast onvif:3702 + dahua:37810/37820/8087 + hik:37020
+08:47:46 INFO [device] probe 192.168.1.108 -> dahua (model Dahua)
+08:47:46 INFO [app] camera ch2 vendor: "" -> "dahua" (probe 192.168.1.108)
+08:47:46 INFO [app] camera ch2 url rebuilt for 192.168.1.108:
+       rtsp://admin:TESTfnwlw@192.168.1.108:554/cam/realmonitor?channel=1&subtype=1
+----
+
+反向证伪（同一块板）：
+
+- 改成不存在的 `192.168.1.250` ⇒ 2 s 后 `vendor` 仍为 `dahua`（探测失败不瞎写）；
+- 同时改 IP 与品牌（`vendor=hik`）⇒ 日志 `vendor also set by user`，探测被跳过，品牌保持 `hik`；
+- 恢复 `106/dahua` 后 URL 自动重算回 106。
+
+=== 教训
+
+**"设备发现"不等于"知道这台设备是谁"。** 发现是广播/组播问全域，很多机型（这次是大华）
+压根不答；但现场是按"我配了这个 IP"来要品牌的，那就必须能对**一个** IP 单播问一次。
+两个能力不是一回事，之前只有前者。
+
+**单点回调靠不住。** 第一版只把比对挂在 `on_cfg_committed()` 的 CAMERA 分支上，
+板端用 ctl `config.apply` 改 IP 时那条分支里读到的还是旧值（`reloaded … 0 class(es) changed`），
+品牌没跟。加 2 s 巡检兜底后同一动作 1 s 内完成 —— 兜底不是冗余，是这条链路必须有。

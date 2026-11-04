@@ -681,6 +681,88 @@ static void d14_hik_udp_xml(void) {
     chk(memcmp(out.mac, "\xE0\xBA\xAD\xDA\xAB\xDD", 6) == 0, "d14 mac dash form");
 }
 
+/* ---------------------------------------------------------------------------
+ * d16：定向单播探测（按 IP 认品牌，2026-11-04）
+ *
+ * 现场场景：平台配了 IP，品牌不关联。根因之一是大华**不回**广播/组播，只答单播
+ * DHIP:37810（板端实测 841 B），所以它永远进不了发现档案。这里钉四件事：
+ *   ① 目标 IP 发来的大华 DHIP 应答 ⇒ 直接判 dahua 并结束（不等超时）；
+ *   ② 别的 IP 发来的应答 ⇒ **不采纳**（同时开着全网搜索时不能张冠李戴）；
+ *   ③ 只答泛 ONVIF ⇒ 不急着结束，超时后如实回 onvif（前端据此"不填下拉"）；
+ *   ④ cancel 之后 poll 不再给结论。
+ * ------------------------------------------------------------------------- */
+static void d16_probe_ip(void) {
+    iv_device_t d;
+    iv_device_cfg_t cfg;
+    iv_dev_desc_t r;
+    uint8_t pkt[256];
+    const char *js;
+    size_t jl;
+    int rc;
+
+    iv_device_cfg_default(&cfg);
+    cfg.iops = &g_io;
+    cfg.ifname = NULL;
+
+    /* ① 大华 DHIP 单播应答 */
+    io_reset();
+    iv_device_init(&d, &cfg);
+    iv_device_open(&d, &cfg, 0);
+    chk(iv_device_probe_ip(&d, inet_addr("192.168.1.106"), 0) == IV_OK,
+        "d16 probe start");
+    chk(iv_device_probe_active(&d) == 1, "d16 probe active");
+    js = "{\"mac\":\"40:7a:a4:86:95:62\",\"method\":\"client.notifyDevInfo\","
+         "\"params\":{\"DeviceType\":\"IPC-HFW1230\"}}";
+    jl = strlen(js);
+    memset(pkt, 0, sizeof pkt);
+    pkt[0] = 0x20;
+    memcpy(&pkt[4], "DHIP", 4);
+    memcpy(&pkt[32], js, jl);
+    g_from_ip = inet_addr("192.168.1.106");
+    io_push(pkt, 32 + jl);
+    iv_device_tick(&d, 10);
+    rc = iv_device_probe_poll(&d, 10, &r);
+    chk(rc == 1, "d16 dahua answer ends probe immediately");
+    chk(r.brand == IV_DEV_BRAND_DAHUA, "d16 brand dahua from DHIP unicast");
+    chk(r.ip_be == inet_addr("192.168.1.106"), "d16 result ip = target");
+    chk(iv_device_probe_active(&d) == 0, "d16 cleared after poll");
+    iv_device_close(&d);
+
+    /* ② 别的 IP 的应答不能被算到这一路头上 */
+    io_reset();
+    iv_device_init(&d, &cfg);
+    iv_device_open(&d, &cfg, 0);
+    iv_device_probe_ip(&d, inet_addr("192.168.1.106"), 0);
+    g_from_ip = inet_addr("192.168.1.200");
+    js = "<ProbeMatch><MAC>3a:82:b4:1d:3c:bf</MAC>"
+         "<XAddrs>http://192.168.1.200/onvif/device_service</XAddrs>"
+         "<DeviceType>DS-2CD3T27</DeviceType></ProbeMatch>";
+    io_push(js, strlen(js));
+    iv_device_tick(&d, 10);
+    chk(iv_device_probe_poll(&d, 10, &r) == 0, "d16 other-ip answer ignored");
+    iv_device_probe_cancel(&d);
+    chk(iv_device_probe_active(&d) == 0, "d16 cancel clears");
+    chk(iv_device_probe_poll(&d, 20, &r) < 0, "d16 poll after cancel = no probe");
+    iv_device_close(&d);
+
+    /* ③ 只答泛 ONVIF：先不结束，超时如实回 onvif */
+    io_reset();
+    iv_device_init(&d, &cfg);
+    iv_device_open(&d, &cfg, 0);
+    iv_device_probe_ip(&d, inet_addr("192.168.1.108"), 0);
+    g_from_ip = inet_addr("192.168.1.108");
+    js = "<ProbeMatches xmlns=\"http://schemas.xmlsoap.org/ws/2005/04/discovery\">"
+         "<ProbeMatch><Types>NetworkVideoTransmitter</Types>"
+         "<XAddrs>http://192.168.1.108/onvif/device_service</XAddrs>"
+         "</ProbeMatch></ProbeMatches>";
+    io_push(js, strlen(js));
+    iv_device_tick(&d, 10);
+    chk(iv_device_probe_poll(&d, 10, &r) == 0, "d16 generic onvif waits for specific");
+    chk(iv_device_probe_poll(&d, 1300, &r) == 1, "d16 timeout gives a conclusion");
+    chk(r.brand == IV_DEV_BRAND_ONVIF, "d16 generic onvif reported as onvif");
+    iv_device_close(&d);
+}
+
 int main(void) {
     d01_sadp_checksum();
     d02_sadp_build_parse();
@@ -697,6 +779,7 @@ int main(void) {
     d13_peer_ip_fallback();
     d14_hik_udp_xml();
     d15_brand_no_downgrade();
+    d16_probe_ip();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_device FAILED (%d)\n", g_fail);
@@ -704,6 +787,7 @@ int main(void) {
     }
     printf("test_device passed (sadp csum/build/parse, hik probe, dahua probe/parse, "
            "onvif probe/parse, discovery time-window fsm, archive dedup/full/clear, malformed, "
-           "peer-ip fallback, hik-udp xml model/ip, brand no-downgrade)\n");
+           "peer-ip fallback, hik-udp xml model/ip, brand no-downgrade, "
+           "unicast probe by ip)\n");
     return 0;
 }

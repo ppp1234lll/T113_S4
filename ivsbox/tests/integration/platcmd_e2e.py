@@ -898,6 +898,13 @@ def main():
             chk(wait_log(r'camera ch2 ip -> %s \(saved \+ applied\)'
                          % re.escape(tgt), start=start) is not None,
                 'C11d 日志有 "camera ch2 ip -> ... (saved + applied)"')
+            # C11e：品牌自动关联（2026-11-04）。平台 0xF7 的载荷里**没有品牌**，
+            # 所以设备端必须自己按 IP 问一次；这条路径与网页保存共用
+            # `cam_probe_queue()`，这里只钉"平台这条入口确实挂上了探测"。
+            # 结论写回 `vendor` 已在板端用真实大华验过（config.apply 同一条链路）。
+            chk(wait_log(r'camera ch2 ip %s changed \(platform 0xF7\), brand probe queued'
+                         % re.escape(tgt), start=start) is not None,
+                'C11e 0xF7 配 IP 后排了一次品牌定向探测（平台载荷载荷无品牌字段）')
 
             print('C12 0xF7 同值重发 ⇒ ack 0x01 且不动探测（unchanged 早返回）')
             plat.clear()

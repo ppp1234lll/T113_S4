@@ -60,6 +60,15 @@
 #define UNV_BCAST_ADDR "255.255.255.255"
 #define UNV_PORT       3702u
 #define DAHUA_BCAST_ADDR "255.255.255.255"
+
+/* ---- 定向单播探测节奏（2026-11-04 板端实测）----
+ * 大华 DHIP 单播（.106:37810）应答 841 B、海康 ONVIF 单播（.200:3702）3314 B，
+ * 都在 50 ms 内回；3 轮 × 400 ms 只为覆盖丢包，1.2 s 必须出结论（调用方在 200 ms
+ * 节拍上轮询，不能拖住主循环）。 */
+#define IV_DEV_PROBE_ROUNDS     3u
+#define IV_DEV_PROBE_GAP_MS     400u
+#define IV_DEV_PROBE_TIMEOUT_MS 1200u
+
 #define DAHUA_MCAST_ADDR "239.255.255.251"
 
 /* 参考 onvif.c:34 的固定 Probe 报文（逐字照抄，MessageID 固定）。
@@ -679,6 +688,7 @@ void iv_device_close(iv_device_t *d) {
     d->fd_pkt = -1;
     d->sadp_ok = 0;
     d->searching = 0;
+    iv_device_probe_cancel(d); /* 定向探测不带过期目标过夜 */
     d->opened = 0;
     d->phase = IV_DEV_PHASE_IDLE;
 }
@@ -764,6 +774,9 @@ static void peer_ip_be(const struct sockaddr_storage *from, uint32_t *out) {
     }
 }
 
+/* 定向探测命中（定义在下面的探测段；handle_packet 先用到）。 */
+static void probe_hit(iv_device_t *d, const iv_dev_desc_t *desc);
+
 /* 解析一包并尝试入档；返回 1=入档/更新，0=丢弃，负码=解析失败。 */
 static int handle_packet(iv_device_t *d, const uint8_t *buf, size_t len,
                          const struct sockaddr_storage *from) {
@@ -795,6 +808,16 @@ static int handle_packet(iv_device_t *d, const uint8_t *buf, size_t len,
         return 0;
     }
     desc.found_by = d->phase;
+    /* 定向探测命中判定：**只认目标 IP 发来的包**。对端地址优先（报文里可能不带
+     * IP），报文里的 IP 兜底；否则同时开着的全网搜索会把隔壁设备的应答算到这一路。 */
+    if (d->probe_on && !d->probe_done) {
+        uint32_t pip = 0;
+        peer_ip_be(from, &pip);
+        if ((pip != 0u && pip == d->probe_ip_be) ||
+            (desc.ip_be != 0u && desc.ip_be == d->probe_ip_be)) {
+            probe_hit(d, &desc);
+        }
+    }
     if (add_item(d, &desc) > 0) {
         /* 留一笔原始报文头：海康 UDP 的型号实测是 `46672`/`12345`/`148040` 这种
          * 数字（正文里没有 DeviceType 可取，`extract_after_key()` 抓到了别的字段），
@@ -968,6 +991,144 @@ static int send_round(iv_device_t *d) {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * 定向单播探测：只问一个 IP（2026-11-04）
+ * ------------------------------------------------------------------------- */
+
+/* 发一轮定向探测：同一个 IP 上并列问三条路，谁先答算谁。
+ * 只发单播，**不发广播/组播** —— 这正是它能覆盖大华的原因：大华对 5050 广播与
+ * 239.255.255.251 组播不应答（2026-11-04 板端两次实测 0 应答），只答单播 DHIP。 */
+static void probe_send_round(iv_device_t *d) {
+    char            ip[INET_ADDRSTRLEN];
+    char            buf[IV_DEV_PROBE_MAX];
+    struct in_addr  ia;
+    int             n;
+    int             k;
+
+    if (d->fd4 < 0 || d->probe_ip_be == 0u) return;
+    ia.s_addr = d->probe_ip_be;
+    if (inet_ntop(AF_INET, &ia, ip, sizeof ip) == NULL) return;
+
+    /* ① ONVIF WS-Discovery 单播：海康/宇视/多数 ONVIF 设备会答
+     *    （2026-11-04 实测 192.168.1.200 → 3314 B ProbeMatches）。 */
+    n = iv_onvif_probe_build(buf, sizeof buf);
+    if (n > 0) (void)send_udp(d, ip, (uint16_t)ONVIF_PORT, buf, (size_t)n);
+
+    /* ② 大华 DHIP 单播：**关键一路**。k=0 的 5050 是广播专用帧，这里从 1 起。 */
+    n = iv_dahua_probe_build(1, (uint8_t *)buf, sizeof buf);
+    if (n > 0)
+        for (k = 1; k < (int)IV_DAHUA_PORT_N; k++)
+            (void)send_udp(d, ip, k_dahua_ports[k], buf, (size_t)n);
+
+    /* ③ 海康 UDP 探测单播兜底（个别固件只认 37020 的那套 XML）。 */
+    n = iv_hik_probe_build(buf, sizeof buf, NULL);
+    if (n > 0) (void)send_udp(d, ip, (uint16_t)HIK_UDP_PORT, buf, (size_t)n);
+}
+
+/* 记一次命中。**具体厂商优先于泛 ONVIF**：同一台设备会先回 ONVIF ProbeMatches
+ * （只认得出"这是台 ONVIF 设备"），再回私有协议；泛结论先记着，但不结束探测，
+ * 等更具体的结论。与 `add_item()` 的"不得降级"规则同口径。 */
+static void probe_hit(iv_device_t *d, const iv_dev_desc_t *desc) {
+    int specific = (desc->brand == IV_DEV_BRAND_HIKVISION ||
+                    desc->brand == IV_DEV_BRAND_DAHUA ||
+                    desc->brand == IV_DEV_BRAND_UNV);
+    char ip[INET_ADDRSTRLEN];
+    struct in_addr ia;
+
+    if (specific) {
+        d->probe_res = *desc;
+        d->probe_res.ip_be = d->probe_ip_be;
+        d->probe_done = 1;
+        ia.s_addr = d->probe_ip_be;
+        if (inet_ntop(AF_INET, &ia, ip, sizeof ip) == NULL) ip[0] = '\0';
+        IV_LOG_I(DEV_MOD, "probe %s -> %s (model %s)", ip,
+                 iv_dev_brand_name(desc->brand),
+                 (desc->model[0] != '\0') ? desc->model : "-");
+        return;
+    }
+    if (d->probe_res.brand == IV_DEV_BRAND_UNKNOWN) {
+        d->probe_res = *desc;
+        d->probe_res.ip_be = d->probe_ip_be;
+    }
+}
+
+/* 推进探测（由 tick / poll 驱动）：到期补发、到点收尾。 */
+static void probe_tick(iv_device_t *d, uint64_t now_ms) {
+    if (!d->probe_on || d->probe_done) return;
+    if (now_ms >= d->probe_deadline_ms) {
+        d->probe_done = 1;
+        if (d->probe_res.brand == IV_DEV_BRAND_UNKNOWN) {
+            char ip[INET_ADDRSTRLEN];
+            struct in_addr ia;
+            ia.s_addr = d->probe_ip_be;
+            if (inet_ntop(AF_INET, &ia, ip, sizeof ip) == NULL) ip[0] = '\0';
+            IV_LOG_W(DEV_MOD, "probe %s: no answer (%u rounds), brand unknown",
+                     ip, (unsigned)d->probe_round);
+        }
+        return;
+    }
+    if (now_ms >= d->probe_next_ms) {
+        if (d->probe_round < IV_DEV_PROBE_ROUNDS) {
+            probe_send_round(d);
+            d->probe_round++;
+        }
+        d->probe_next_ms = now_ms + IV_DEV_PROBE_GAP_MS;
+    }
+}
+
+int iv_device_probe_ip(iv_device_t *d, uint32_t ip_be, uint64_t now_ms) {
+    char           ip[INET_ADDRSTRLEN];
+    struct in_addr ia;
+
+    if (d == NULL) return IV_EINVAL;
+    if (!d->opened || d->fd4 < 0) return IV_ESTATE;
+    if (ip_be == 0u) return IV_EINVAL;
+
+    memset(&d->probe_res, 0, sizeof d->probe_res);
+    d->probe_on = 1;
+    d->probe_done = 0;
+    d->probe_ip_be = ip_be;
+    d->probe_round = 0;
+    d->probe_next_ms = now_ms;
+    d->probe_deadline_ms = now_ms + IV_DEV_PROBE_TIMEOUT_MS;
+    d->probe_res.ip_be = ip_be;
+
+    probe_send_round(d);
+    d->probe_round = 1;
+    d->probe_next_ms = now_ms + IV_DEV_PROBE_GAP_MS;
+
+    ia.s_addr = ip_be;
+    if (inet_ntop(AF_INET, &ia, ip, sizeof ip) == NULL) ip[0] = '\0';
+    IV_LOG_I(DEV_MOD, "probe %s: unicast onvif:3702 + dahua:%u/%u/%u + hik:%u",
+             ip, (unsigned)k_dahua_ports[1], (unsigned)k_dahua_ports[2],
+             (unsigned)k_dahua_ports[3], (unsigned)HIK_UDP_PORT);
+    return IV_OK;
+}
+
+int iv_device_probe_poll(iv_device_t *d, uint64_t now_ms, iv_dev_desc_t *out) {
+    if (d == NULL) return IV_EINVAL;
+    if (!d->probe_on) return IV_ESTATE;
+    probe_tick(d, now_ms);
+    if (!d->probe_done) return 0;
+    if (out != NULL) *out = d->probe_res;
+    d->probe_on = 0;
+    d->probe_done = 0;
+    return 1;
+}
+
+void iv_device_probe_cancel(iv_device_t *d) {
+    if (d == NULL) return;
+    d->probe_on = 0;
+    d->probe_done = 0;
+    d->probe_ip_be = 0u;
+    d->probe_round = 0;
+    memset(&d->probe_res, 0, sizeof d->probe_res);
+}
+
+int iv_device_probe_active(const iv_device_t *d) {
+    return (d != NULL && d->probe_on && !d->probe_done) ? 1 : 0;
+}
+
 int iv_device_start_search(iv_device_t *d, uint64_t now_ms) {
     if (d == NULL) return IV_EINVAL;
     if (!d->opened) return IV_ESTATE;
@@ -1001,6 +1162,9 @@ int iv_device_tick(iv_device_t *d, uint64_t now_ms) {
     /* 每拍先排空两个 fd（不依赖 Reactor 是否已注册）。 */
     n += drain_fd(d, d->fd_pkt);
     n += drain_fd(d, d->fd4);
+
+    /* 定向探测与 searches 无关：先推进它，再决定要不要走搜索状态机。 */
+    probe_tick(d, now_ms);
 
     if (!d->searching) return n;
 

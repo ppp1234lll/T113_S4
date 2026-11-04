@@ -698,6 +698,11 @@ static int agent_sync_server_cfg(int force)
  * 开机装配与热更共用同一段，避免"开机一套、改配置另一套"。 */
 static void cfg_snmp_targets(iv_agent_snmp_cfg_t *sc);
 static int  cfg_rec_url_table(char (*buf)[IV_CFG_STR_MAX], int cap);
+/* 摄像机品牌自动关联（定义在 `on_plat_camera_ip()` 旁边，`on_cfg_committed()`
+ * 与平台 0xF7 两条写 IP 的路径共用）。 */
+static void cam_probe_snapshot_all(void);
+static void cam_probe_on_config_changed(void);
+static void cam_probe_queue(int ch, uint32_t ip_be, const char *why);
 /* 本机地址热生效（定义在 `apply_saved_local_net()` 旁边，那里才有完整的取值/校验
  * 逻辑）。`on_cfg_committed()` 只负责"触发"，不重复一遍判定。 */
 static void schedule_local_net_apply(void);
@@ -856,6 +861,11 @@ static void on_cfg_committed(iv_config_t *c, const char *name, uint32_t mask, vo
         apply_thresh_cfg();
     }
     if ((mask & IV_CFG_CLASS_MASK(IV_CFG_CLS_CAMERA)) != 0u) {
+        /* 摄像机品牌自动关联（2026-11-04）：网页保存 / 平台 0xF7 两条路径都会
+         * 落到"配置已提交"这里，统一在入口处比一次快照 —— IP 变了而品牌没被
+         * 同时改过（＝用户没手选）就排一次定向探测，结论写回 `vendor`。
+         * 必须在下面那堆热更之前：探测是异步的，只登记目标，不阻塞这一拍。 */
+        cam_probe_on_config_changed();
         /* `camera.detect.mode` / `camera.detect.rtt_ms` / `camera.ch.N.ip` 原先只在
          * `agent_setup()` 里读一次、交给 `iv_agent_open()` 定初始状态 —— 网页上改
          * 「检测方式」或摄像机 IP 都必须重启主控才生效（参考 web 那个下拉是保存即
@@ -3192,6 +3202,457 @@ static void on_plat_reboot(const iv_proto_frame_t *f, void *arg)
  *
  * 顺序：**不碰链路**（只改通道表），所以"落盘 → 生效 → ACK"，与 `0xF8` 同构。
  * ------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+ * 摄像机品牌自动关联（2026-11-04）
+ * ---------------------------------------------------------------------------
+ * 用户现场："我在平台配置 IP 后，IP 和品牌没有自动关联。"
+ *
+ * 查下来是三层一起断的，不是界面没写联动：
+ *   ① 发现档案（`/api/devices`）里**根本没有这台**：大华只答单播 DHIP，
+ *      对 5050 广播与 239.255.255.251 组播一概不应（2026-11-04 板端两次实测
+ *      0 应答），于是 `.106/.108` 永远进不了档案 ⇒ 前端按 IP 匹配必然落空；
+ *   ② 平台 0xF7 只写 `camera.ch.N.ip`，**整段不碰 `vendor`**；
+ *   ③ 档案只在内存，进程一重启就空（这块板 usb0 每 8 s 抖动、ivsboxd 反复重起）。
+ *
+ * 这里补的是"配完 IP 自己问一次那台设备"：
+ *   IP 变了、而品牌没被同时改过（＝用户没手选）⇒ 排队一次单播探测
+ *   （`iv_device_probe_ip()`：ONVIF:3702 ＋ 大华 DHIP:37810/37820/8087 ＋ 海康 37020）
+ *   ⇒ 结论是具体厂商就写 `camera.ch.N.vendor`，并把**还指着旧 IP 的**拉流地址重算。
+ *
+ * 三条不变量（现场会因此骂人的点）：
+ *   · 用户手选过品牌（本次提交里 vendor 也变了）⇒ 一律不覆盖；
+ *   · 只认"IP 变了"这一件事，同值早返回的路径（平台重复下发同一 IP）不触发；
+ *   · 手调过的拉流地址不动：只有"空"或"主机名还是别的 IP"时才重算。
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    const char *vendor;    /* `camera.ch.N.vendor` 取值域 */
+    const char *label;     /* 日志用人话 */
+    uint16_t    port;
+    const char *main_path;
+    const char *sub_path;
+} cam_brand_t;
+
+/* 与 `web/static/app.js` 的 `CAM_BRAND` **逐项对齐**（品牌/端口/路径），
+ * 两边要改一起改；这里多一个 `label`，只用于日志。 */
+static const cam_brand_t k_cam_brands[] = {
+    { "hik",      "Hikvision", 554,  "/Streaming/Channels/101",
+      "/Streaming/Channels/102" },
+    { "dahua",    "Dahua",     554,  "/cam/realmonitor?channel=1&subtype=0",
+      "/cam/realmonitor?channel=1&subtype=1" },
+    { "uniview",  "Uniview",   554,  "/media/video1", "/media/video2" },
+    { "huawei",   "Huawei",    554,  "/LiveMedia/ch1/Media1",
+      "/LiveMedia/ch1/Media2" },
+    { "jovision", "Jovision",  8554, "/live0.264", "/live1.264" }
+};
+#define CAM_BRAND_N ((int)(sizeof k_cam_brands / sizeof k_cam_brands[0]))
+
+/* 发现品牌 → 配置取值。**泛 ONVIF / 未知返回 NULL**：没有这一项，硬填只能猜一家，
+ * 一半概率拉不通 —— 与前端 `DEV_BRAND_VENDOR` 同一口径（那里也是故意不映射）。 */
+static const char *cam_vendor_from_brand(iv_dev_brand_t b)
+{
+    switch (b) {
+        case IV_DEV_BRAND_HIKVISION: return "hik";
+        case IV_DEV_BRAND_DAHUA:     return "dahua";
+        case IV_DEV_BRAND_UNV:       return "uniview";
+        default:                     return NULL;
+    }
+}
+
+/* 空品牌/认不出的品牌回落海康（与 `snmp_brand_seg()`、前端拼地址同一口径）。 */
+static const cam_brand_t *cam_brand_of(const char *vendor)
+{
+    int i;
+
+    if (vendor != NULL && vendor[0] != '\0') {
+        for (i = 0; i < CAM_BRAND_N; i++)
+            if (strcmp(k_cam_brands[i].vendor, vendor) == 0)
+                return &k_cam_brands[i];
+    }
+    return &k_cam_brands[0];
+}
+
+/* 按「品牌＋账号＋IP＋码流」拼 RTSP 地址（与前端 `camUrlOf()` 同一条规则）。
+ * 账号密码**原样拼**、不做百分号编码：多数 IPC 不认 `%XX` 反而认证失败。 */
+static int cam_url_build(int ch, const char *vendor, char *out, size_t cap)
+{
+    const cam_brand_t *b = cam_brand_of(vendor);
+    char        key[48];
+    char        s_ip[24] = "";
+    char        s_user[64] = "";
+    char        s_pass[64] = "";
+    char        s_stream[16] = "";
+    char        auth[136];
+    const char *p = NULL;
+
+    (void)snprintf(key, sizeof key, "camera.ch.%d.ip", ch);
+    if (iv_config_get_str(g_cfg, key, &p) == IV_OK && p != NULL)
+        (void)snprintf(s_ip, sizeof s_ip, "%s", p);
+    if (s_ip[0] == '\0') return IV_EINVAL; /* 不生成半截地址，免得被当成"已配好" */
+
+    (void)snprintf(key, sizeof key, "camera.ch.%d.user", ch);
+    if (iv_config_get_str(g_cfg, key, &p) == IV_OK && p != NULL)
+        (void)snprintf(s_user, sizeof s_user, "%s", p);
+    (void)snprintf(key, sizeof key, "camera.ch.%d.pass", ch);
+    if (iv_config_get_str(g_cfg, key, &p) == IV_OK && p != NULL)
+        (void)snprintf(s_pass, sizeof s_pass, "%s", p);
+    (void)snprintf(key, sizeof key, "camera.ch.%d.stream", ch);
+    if (iv_config_get_str(g_cfg, key, &p) == IV_OK && p != NULL)
+        (void)snprintf(s_stream, sizeof s_stream, "%s", p);
+
+    auth[0] = '\0';
+    if (s_user[0] != '\0') {
+        if (s_pass[0] != '\0')
+            (void)snprintf(auth, sizeof auth, "%s:%s@", s_user, s_pass);
+        else
+            (void)snprintf(auth, sizeof auth, "%s@", s_user);
+    }
+    (void)snprintf(out, cap, "rtsp://%s%s:%u%s", auth, s_ip, (unsigned)b->port,
+                   (strcmp(s_stream, "sub") == 0) ? b->sub_path : b->main_path);
+    return IV_OK;
+}
+
+/* 取 RTSP 地址里的主机段（跳过 `rtsp://` 与可选的 `user:pass@`）。 */
+static const char *cam_url_host(const char *url)
+{
+    const char *p;
+    const char *at;
+
+    if (url == NULL) return NULL;
+    p = strstr(url, "://");
+    if (p == NULL) return NULL;
+    p += 3;
+    at = strchr(p, '@');
+    if (at != NULL) p = at + 1;
+    return p;
+}
+
+/* 地址的主机是不是这个 IP（`:` `/` 或串尾为界，避免 `1.10` 命中 `1.106`）。 */
+static int cam_url_host_eq(const char *url, const char *ip)
+{
+    const char *h = cam_url_host(url);
+    size_t      n;
+
+    if (h == NULL || ip == NULL || ip[0] == '\0') return 0;
+    n = strlen(ip);
+    if (strncmp(h, ip, n) != 0) return 0;
+    return (h[n] == ':' || h[n] == '/' || h[n] == '\0') ? 1 : 0;
+}
+
+/* ---- 待探测队列 ---------------------------------------------------------- */
+/* `iv_device` 同一时刻只支持一个探测目标 ⇒ 这里串行排队：want[] 非 0 就是这一路
+ * 还欠一次探测，`g_camprobe_cur` 是正在问的那一路（-1＝当前没有在问的）。 */
+static uint32_t    g_camprobe_want[IV_CAMDET_CH_N];
+/* 排队那一刻的品牌值：探测回来时若用户已经手改过品牌（提交里带了 vendor），
+ * 就不能拿 1.2 s 前的结论去覆盖他刚选的值。 */
+static char        g_camprobe_want_vendor[IV_CAMDET_CH_N][16];
+static int         g_camprobe_cur = -1;
+static iv_timer_t *g_camprobe_timer;
+
+/* 上一次看到的 IP / 品牌快照：判"IP 变了没""品牌是不是用户刚手选的"。 */
+static int      g_cam_snap_ready;
+static uint32_t g_cam_snap_ip[IV_CAMDET_CH_N];
+static char     g_cam_snap_vendor[IV_CAMDET_CH_N][16];
+
+static void cam_snap_read(int ch, uint32_t *ip, char *vendor, size_t cap)
+{
+    char        key[48];
+    const char *p = NULL;
+
+    (void)snprintf(key, sizeof key, "camera.ch.%d.ip", ch);
+    *ip = cfg_ip_be(key);
+    (void)snprintf(key, sizeof key, "camera.ch.%d.vendor", ch);
+    vendor[0] = '\0';
+    if (iv_config_get_str(g_cfg, key, &p) == IV_OK && p != NULL)
+        (void)snprintf(vendor, cap, "%s", p);
+}
+
+static void cam_snap_store(int ch, uint32_t ip, const char *vendor)
+{
+    g_cam_snap_ip[ch] = ip;
+    (void)snprintf(g_cam_snap_vendor[ch], sizeof g_cam_snap_vendor[ch], "%s",
+                   (vendor != NULL) ? vendor : "");
+}
+
+static void cam_snap_take(int ch)
+{
+    uint32_t ip = 0;
+    char     v[16];
+
+    cam_snap_read(ch, &ip, v, sizeof v);
+    cam_snap_store(ch, ip, v);
+}
+
+static void cam_probe_snapshot_all(void)
+{
+    int ch;
+
+    for (ch = 0; ch < IV_CAMDET_CH_N; ch++)
+        cam_snap_take(ch);
+    g_cam_snap_ready = 1;
+}
+
+/* 品牌/地址变了之后，把依赖它们的模块热更一遍（与 `on_cfg_committed()` 的
+ * CAMERA 分支同一条口径：录像源表 ＋ SNMP 目标）。 */
+static void cam_apply_dependents(void)
+{
+    {
+        char        ubuf[IV_RECCTL_CH_N][IV_CFG_STR_MAX];
+        const char *urls[IV_RECCTL_CH_N];
+        int64_t     rv = 0;
+        uint32_t    rh = 0u;
+        uint32_t    rd = 0u;
+        int         rn;
+        int         ri;
+        int         rc;
+
+        rn = cfg_rec_url_table(ubuf, IV_RECCTL_CH_N);
+        for (ri = 0; ri < IV_RECCTL_CH_N; ri++)
+            urls[ri] = ubuf[ri];
+        if (iv_config_get_int(g_cfg, "camera.rec.hold_ms", &rv) == IV_OK && rv > 0)
+            rh = (uint32_t)rv;
+        if (iv_config_get_int(g_cfg, "camera.rec.debounce_ms", &rv) == IV_OK && rv > 0)
+            rd = (uint32_t)rv;
+        rc = iv_agent_reload_rec(&g_agent, urls, rn, rh, rd);
+        if (rc != IV_OK && rc != IV_ESTATE)
+            IV_LOG_W(APP_MOD, "camera rec sources not applied after probe (%d)", rc);
+    }
+    {
+        iv_agent_snmp_cfg_t traps[IV_AGENT_SNMP_TARGET_N];
+        int                 src;
+
+        memset(traps, 0, sizeof(traps));
+        cfg_snmp_targets(traps);
+        src = iv_agent_reload_snmp(&g_agent, traps);
+        if (src != IV_OK && src != IV_ESTATE)
+            IV_LOG_W(APP_MOD, "snmp.* not applied after probe (%d)", src);
+    }
+}
+
+/* 结论文落配置：写 vendor ＋ 必要时重算 url。 */
+static void cam_probe_apply(int ch, const iv_dev_desc_t *desc)
+{
+    const char *nv = cam_vendor_from_brand(desc->brand);
+    char        key[48];
+    char        ip[24];
+    char        url_now[IV_CFG_STR_MAX];
+    char        url_new[IV_CFG_STR_MAX];
+    struct in_addr ia;
+    const char *cur = NULL;
+    int         changed = 0;
+
+    memset(url_now, 0, sizeof url_now);
+    memset(url_new, 0, sizeof url_new);
+    ia.s_addr = desc->ip_be;
+    if (inet_ntop(AF_INET, &ia, ip, sizeof ip) == NULL) ip[0] = '\0';
+
+    /* 排队之后用户又手选了品牌 ⇒ 尊重用户，不拿 1.2 s 前的旧结论覆盖。
+     * 判据是"当前 vendor ≠ 排队那一刻的 vendor"。 */
+    {
+        char        vkey[48];
+        const char *nowv = NULL;
+        char        nowbuf[16];
+
+        (void)snprintf(vkey, sizeof vkey, "camera.ch.%d.vendor", ch);
+        nowbuf[0] = '\0';
+        if (iv_config_get_str(g_cfg, vkey, &nowv) == IV_OK && nowv != NULL)
+            (void)snprintf(nowbuf, sizeof nowbuf, "%s", nowv);
+        if (strcmp(nowbuf, g_camprobe_want_vendor[ch]) != 0) {
+            IV_LOG_I(APP_MOD, "camera ch%d brand changed by user while probing "
+                     "(\"%s\" -> \"%s\"), auto result dropped",
+                     ch + 1, g_camprobe_want_vendor[ch], nowbuf);
+            return;
+        }
+    }
+
+    if (nv == NULL) {
+        /* 只答了泛 ONVIF / 认不出：如实留痕，**不动下拉**（与前端同一条边界） */
+        IV_LOG_I(APP_MOD, "camera ch%d probe %s -> %s (no vendor mapping, keep as-is)",
+                 ch + 1, ip, iv_dev_brand_name(desc->brand));
+        return;
+    }
+
+    (void)snprintf(key, sizeof key, "camera.ch.%d.vendor", ch);
+    if (iv_config_get_str(g_cfg, key, &cur) != IV_OK || cur == NULL) cur = "";
+    {
+        char vendor_now[16];
+
+        /* 先拷出来：`cur` 指向配置模块内部缓冲，紧接着的 set 会改写它，
+         * 之后再用它打日志就是"拿新值冒充旧值"。 */
+        (void)snprintf(vendor_now, sizeof vendor_now, "%s", cur);
+        if (strcmp(vendor_now, nv) != 0) {
+            if (iv_config_set_str(g_cfg, key, nv) == IV_OK) {
+                IV_LOG_I(APP_MOD, "camera ch%d vendor: \"%s\" -> \"%s\" (probe %s)",
+                         ch + 1, vendor_now, nv, ip);
+                changed = 1;
+            } else {
+                IV_LOG_W(APP_MOD, "camera ch%d vendor set failed, keep \"%s\"",
+                         ch + 1, vendor_now);
+            }
+        }
+    }
+
+    /* 拉流地址：只有"空"或"主机还指着别的 IP"才重算 —— 现场手调好的地址不能冲掉。 */
+    (void)snprintf(key, sizeof key, "camera.ch.%d.url", ch);
+    if (iv_config_get_str(g_cfg, key, &cur) != IV_OK) cur = NULL;
+    if (cur != NULL) (void)snprintf(url_now, sizeof url_now, "%s", cur);
+
+    if (cam_url_build(ch, nv, url_new, sizeof url_new) == IV_OK &&
+        (url_now[0] == '\0' || !cam_url_host_eq(url_now, ip))) {
+        if (strcmp(url_now, url_new) != 0 &&
+            iv_config_set_str(g_cfg, key, url_new) == IV_OK) {
+            IV_LOG_I(APP_MOD, "camera ch%d url rebuilt for %s: %s", ch + 1, ip,
+                     url_new);
+            changed = 1;
+        }
+    }
+
+    if (changed) {
+        int rc = iv_config_save(g_cfg, NULL, 0);
+
+        if (rc != IV_OK)
+            IV_LOG_W(APP_MOD, "camera ch%d brand/url saved failed (%d)", ch + 1, rc);
+        cam_apply_dependents();
+    }
+    cam_snap_take(ch); /* 刚写的值就是新基线，别让下一次提交把它当"用户改的" */
+}
+
+static void cam_probe_tick(void *arg)
+{
+    iv_device_t *d;
+    uint64_t     now = iv_clock_monotonic_ms();
+    int          ch;
+
+    (void)arg;
+    g_camprobe_timer = NULL;
+    if (g_reactor == NULL) return; /* 无 reactor 模式：不推进，探测状态挂着无害 */
+
+    d = iv_agent_device(&g_agent);
+    if (d == NULL || !iv_device_is_open(d)) {
+        /* `dev_enable=0` 或 socket 没建起来：如实说清，不假装"关联过了" */
+        IV_LOG_W(APP_MOD, "camera brand probe skipped: device discovery not open");
+        memset(g_camprobe_want, 0, sizeof g_camprobe_want);
+        g_camprobe_cur = -1;
+        return;
+    }
+
+    if (g_camprobe_cur < 0) {
+        for (ch = 0; ch < IV_CAMDET_CH_N; ch++)
+            if (g_camprobe_want[ch] != 0u) { g_camprobe_cur = ch; break; }
+        if (g_camprobe_cur >= 0) {
+            if (iv_device_probe_ip(d, g_camprobe_want[g_camprobe_cur], now) != IV_OK) {
+                IV_LOG_W(APP_MOD, "camera ch%d probe start failed", g_camprobe_cur + 1);
+                g_camprobe_want[g_camprobe_cur] = 0u;
+                g_camprobe_cur = -1;
+            }
+        }
+    }
+
+    if (g_camprobe_cur >= 0) {
+        iv_dev_desc_t desc;
+        int           prc = iv_device_probe_poll(d, now, &desc);
+
+        if (prc == 1) {
+            cam_probe_apply(g_camprobe_cur, &desc);
+            g_camprobe_want[g_camprobe_cur] = 0u;
+            g_camprobe_cur = -1;
+        } else if (prc < 0) {
+            g_camprobe_want[g_camprobe_cur] = 0u;
+            g_camprobe_cur = -1;
+        }
+    }
+
+    /* 还有欠账就续一拍（iv_timer_add 是一次性语义，见 iv_reactor.h）：
+     * 「当前这一路还在问」或「队列里还有别的路」都要重挂，全都清空了才收手。 */
+    if (g_camprobe_cur >= 0) {
+        g_camprobe_timer = iv_timer_add(g_reactor, 200u, cam_probe_tick, NULL);
+        return;
+    }
+    for (ch = 0; ch < IV_CAMDET_CH_N; ch++) {
+        if (g_camprobe_want[ch] != 0u) {
+            g_camprobe_timer = iv_timer_add(g_reactor, 200u, cam_probe_tick, NULL);
+            return;
+        }
+    }
+}
+
+static void cam_probe_arm(void)
+{
+    if (g_reactor == NULL) return;
+    if (g_camprobe_timer != NULL) return;
+    g_camprobe_timer = iv_timer_add(g_reactor, 200u, cam_probe_tick, NULL);
+    if (g_camprobe_timer == NULL)
+        IV_LOG_W(APP_MOD, "camera brand probe timer add failed");
+}
+
+static void cam_probe_queue(int ch, uint32_t ip_be, const char *why)
+{
+    char           ip[24];
+    struct in_addr ia;
+
+    if (ch < 0 || ch >= IV_CAMDET_CH_N || ip_be == 0u) return;
+    ia.s_addr = ip_be;
+    if (inet_ntop(AF_INET, &ia, ip, sizeof ip) == NULL) ip[0] = '\0';
+    g_camprobe_want[ch] = ip_be;
+    (void)snprintf(g_camprobe_want_vendor[ch], sizeof g_camprobe_want_vendor[ch],
+                   "%s", g_cam_snap_vendor[ch]);
+    IV_LOG_I(APP_MOD, "camera ch%d ip %s changed (%s), brand probe queued",
+             ch + 1, ip, why);
+    cam_probe_arm();
+}
+
+/* 配置提交后比对快照：IP 变了且品牌没同时变 ⇒ 排队探测。
+ *
+ * 两条驱动（都调本函数）：
+ *   · `on_cfg_committed()` 的 CAMERA 分支 —— 快路径，提交即比对；
+ *   · 2 s 常驻定时器 `on_cam_snap_timer()` —— 兜底。板端实测过一条路径
+ *     （ctl `config.apply` 改 `camera.ch.1.ip`）提交后 CAMERA 分支里本函数没拿到
+ *     新值，靠回调单点会漏；定时器只读 6 个键，代价可以忽略，但"改了 IP 品牌没跟"
+ *     这种漏一次就是一次现场投诉。 */
+static void cam_probe_on_config_changed(void)
+{
+    int ch;
+
+    if (!g_cam_snap_ready) {
+        cam_probe_snapshot_all();
+        return;
+    }
+    for (ch = 0; ch < IV_CAMDET_CH_N; ch++) {
+        uint32_t ip = 0;
+        char     v[16];
+
+        cam_snap_read(ch, &ip, v, sizeof v);
+        if (ip != g_cam_snap_ip[ch]) {
+            if (strcmp(v, g_cam_snap_vendor[ch]) == 0)
+                cam_probe_queue(ch, ip, "config apply");
+            else
+                IV_LOG_I(APP_MOD,
+                         "camera ch%d ip changed but vendor also set by user (%s), "
+                         "auto probe skipped", ch + 1, v);
+        }
+        cam_snap_store(ch, ip, v);
+    }
+}
+
+/* 兜底巡检：2 s 一次，只看 6 路 IP/品牌。 */
+static iv_timer_t *g_cam_snap_timer;
+
+static void on_cam_snap_timer(void *arg)
+{
+    (void)arg;
+    g_cam_snap_timer = NULL;
+    if (g_reactor == NULL) return;
+    cam_probe_on_config_changed();
+    g_cam_snap_timer = iv_timer_add(g_reactor, 2000u, on_cam_snap_timer, NULL);
+}
+
+static void cam_snap_timer_arm(void)
+{
+    if (g_reactor == NULL || g_cam_snap_timer != NULL) return;
+    g_cam_snap_timer = iv_timer_add(g_reactor, 2000u, on_cam_snap_timer, NULL);
+}
+
+
 static void on_plat_camera_ip(const iv_proto_frame_t *f, void *arg)
 {
     char        val[INET_ADDRSTRLEN];
@@ -3307,6 +3768,13 @@ static void on_plat_camera_ip(const iv_proto_frame_t *f, void *arg)
 
     IV_LOG_I(APP_MOD, "platform set camera ch%d ip -> %s (saved + applied)",
              num, (val[0] != '\0') ? val : "none (cleared)");
+    /* 品牌自动关联（2026-11-04）：平台 0xF7 的载荷只有 5 字节（通道号＋IP），
+     * **没有品牌字段** ⇒ 不补这一步，"平台配完 IP、品牌还是旧的"永远成立。
+     * 清除该路（全 0）不探测：没有目标 IP 可问，品牌保留原值（恢复时还能用）。 */
+    if (ip_be != 0u) {
+        cam_snap_take(ch); /* 新 IP 已是基线；避免下一次网页保存把它当"用户改的" */
+        cam_probe_queue(ch, ip_be, "platform 0xF7");
+    }
     (void)iv_proto_ack(&g_agent.rp.pf, f->cmd, IV_PROTO_ACK_OK);
 }
 
@@ -4017,6 +4485,13 @@ static int agent_setup(void)
         IV_LOG_E(APP_MOD, "agent open failed");
         return -1;
     }
+
+    /* 摄像机品牌自动关联的基线（2026-11-04）：开机先把 6 路的 IP/品牌记下来，
+     * 之后 `on_cfg_committed()` 与平台 0xF7 靠它与新值比"到底变没变"。
+     * 必须早于任何写配置的路径，否则第一次提交会被当成"没有变化"。
+     * 再挂一条 2 s 兜底巡检：提交回调是快路径，漏了它还能补上。 */
+    cam_probe_snapshot_all();
+    cam_snap_timer_arm();
 
     /* 平台下行 0xF5「配置定时上报间隔」——**建链之后**注册（路由表挂在 rp.pf 上，
      * 而 pf 是 iv_agent_open → iv_report_open 里才初始化的）。查询类的 0xE2/0xE3

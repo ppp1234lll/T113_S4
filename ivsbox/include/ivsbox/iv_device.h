@@ -242,6 +242,19 @@ typedef struct {
     uint64_t        sent;         /* 累计发包数（诊断） */
     uint64_t        rx_pkts;      /* 累计收包数（诊断） */
     uint64_t        dup;          /* 重复/无效应答计数（诊断） */
+
+    /* ---- 定向单播探测（2026-11-04，「配了 IP 但品牌不关联」）----
+     * 与 searching 状态机**互不影响**：搜索是"全网广播/组播"，探测是"只问一个 IP"。
+     * 存在的理由：大华（.106/.108）**不回** 5050 广播与 239.255.255.251 组播，
+     * 只答单播 DHIP:37810（2026-11-04 板端实测 841 B），于是它永远进不了发现档案，
+     * 前端按 IP 匹配自然永远落空。 */
+    int             probe_on;      /* 1＝有一个定向探测在进行/已结束待取 */
+    int             probe_done;    /* 1＝已出结论（成功或超时），等 poll 取走 */
+    uint32_t        probe_ip_be;   /* 目标 IP（网络序） */
+    uint64_t        probe_deadline_ms;
+    uint64_t        probe_next_ms; /* 下一轮发包时刻 */
+    uint8_t         probe_round;   /* 已发轮数 */
+    iv_dev_desc_t   probe_res;     /* 结论（brand==UNKNOWN ⇒ 没认出来） */
 } iv_device_t;
 
 /* ---------------------------------------------------------------------------
@@ -275,6 +288,31 @@ int iv_device_on_readable(iv_device_t *d, int fd, uint64_t now_ms);
 
 /* 周期驱动（装配层 200 ms）：推进阶段/轮次，发出到期探测，排空收包。 */
 int iv_device_tick(iv_device_t *d, uint64_t now_ms);
+
+/* ---------------------------------------------------------------------------
+ * 定向探测（单个 IP 认品牌）
+ * ------------------------------------------------------------------------- */
+
+/* 对一个具体 IP 发单播探测：ONVIF WS-Discovery（:3702）＋ 大华 DHIP
+ * （:37810/:37820/:8087）＋ 海康 UDP（:37020），共 3 轮、每轮 400 ms、
+ * 1.2 s 出结论。**不进入 searching 状态机、不依赖广播/组播**。
+ *
+ * 为什么要它：大华设备不回 5050 广播与 239.255.255.251 组播，只答单播 DHIP，
+ * 现场表现就是"IP 配了大华，发现列表里没有它，品牌永远关联不上"。
+ *
+ * 同一时刻只支持一个目标；已有探测在进行时再次调用会**替换**目标（返回 IV_OK）。
+ * 未 open / fd4 不可用 → IV_ESTATE。 */
+int iv_device_probe_ip(iv_device_t *d, uint32_t ip_be, uint64_t now_ms);
+
+/* 取结论：1＝已出结论（*out 有效；brand==UNKNOWN 表示"问过了但没认出来"）；
+ * 0＝还在等；IV_ESTATE＝当前没有探测。取走后状态复位，可再 probe_ip。 */
+int iv_device_probe_poll(iv_device_t *d, uint64_t now_ms, iv_dev_desc_t *out);
+
+/* 放弃当前探测（不等结论）。幂等。 */
+void iv_device_probe_cancel(iv_device_t *d);
+
+/* 1＝有探测正在进行（未出结论）。 */
+int iv_device_probe_active(const iv_device_t *d);
 
 /* ---------------------------------------------------------------------------
  * 查询

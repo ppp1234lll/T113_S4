@@ -1,4 +1,8 @@
 #!/bin/sh
+# OTA 发布公钥（与 ota-pkg/keys/ed25519.pem 配对）。**联调期走环境变量，
+# 量产必须改写成 src/modules/ota/iv_ota_pubkey.c 里的内置公钥并删掉这一行**
+# —— 否则等于把"验签根"交给运行环境。
+export IVSBOX_OTA_PUBKEY=0f6b988a12d45ecf4e2bc85e4c3e2d97aa90c0e4fe00d84c536493c846d8fec1
 # IVSBox 主控服务 sysvinit 脚本（M1-S10）
 # 不用 procd：板端没有 procd，用 start-stop-daemon 后台拉起。
 # 2026-09-30（F1 修正）：start() 只拉起 monitor.sh，**主控由 monitor 唯一拉起**
@@ -40,6 +44,16 @@ start() {
 
     # 属主交给运行用户（当前未建 ivsbox 用户时默认 root）
     chown -R "$IVSBOX_USER:$IVSBOX_GROUP" "$IVSBOX_APP" "$IVSBOX_HOME" /var/run/ivsbox 2>/dev/null || true
+
+    # 首次启动自动收养裸布局（2026-11-04）：出厂镜像里 /opt/ivsbox 是**裸布局**
+    # （bin/scripts/web 直接铺在下面，没有 releases/ 与 current），
+    # 而 boot-begin / 自动回滚 / OTA 安装都依赖"版本目录 + current 软链"。
+    # 没有这一步，烧完镜像虽然能跑，但状态停在"裸布局"、升级与回滚不可用。
+    # 幂等：current 已存在就整段跳过；adopt 自身也判过（已有 current 直接返回 0）。
+    if [ ! -e "$IVSBOX_APP/current" ] && [ -x "$IVSBOX_APP/bin/ivsbox-updater" ]; then
+        "$IVSBOX_APP/bin/ivsbox-updater" adopt \
+            --app-root "$IVSBOX_APP" --data-root "$IVSBOX_HOME" >/dev/null 2>&1
+    fi
 
     # 只拉起 monitor 守护循环，由它做主控的唯一拉起方（开机后至多晚一个轮询周期，
     # 默认 5 s）。**不在这里直接 start-stop-daemon 主控**：开机直启会绕过 monitor

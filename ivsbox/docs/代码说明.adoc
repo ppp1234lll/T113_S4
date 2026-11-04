@@ -12933,3 +12933,72 @@ state: 2026-11-03 14 1047598          (12 秒；改前 1 MiB = 1024 片，上百
 
 
 
+
+== 2026-11-04 10:00 出厂镜像自带程序：版本回到 1.0.0、S65 自动 adopt、MAC 交还核心板
+
+=== 干了什么事
+
+* `include/ivsbox/ivsbox.h`：`IVSBOX_VERSION_PATCH` `7 → 0`。
+* `scripts/init.d/S65ivsboxd`：
+  ** 顶部 `export IVSBOX_OTA_PUBKEY=...`（与 `ota-pkg/keys/ed25519.pem` 配对）。
+  ** `start()` 在 `chown` 之后、拉起 `monitor.sh` 之前，插一段幂等 `adopt`：
++
+[source,sh]
+----
+if [ ! -e "$IVSBOX_APP/current" ] && [ -x "$IVSBOX_APP/bin/ivsbox-updater" ]; then
+    "$IVSBOX_APP/bin/ivsbox-updater" adopt \
+        --app-root "$IVSBOX_APP" --data-root "$IVSBOX_HOME" >/dev/null 2>&1
+fi
+----
+* `scripts/init.d/S50lighttpd`（新增，**覆盖天嵌原文件**）：`[ -x /opt/ivsbox/bin/ivsbox-web ]`
+  即 `exit 0`，把 `:80` 让给 ivsbox-web。
+* `scripts/init.d/S61mount_sdcard`（新增）：`/dev/mmcblk1p1` → `/mnt/sdcard`，最多等 10 s，
+  无卡只打 `SKIP` 不返错（空卡不能挡住启动）。
+* `scripts/{tun,cams,camstat,checkcam}.py`（新增）：此前只存在于板端。`tun.py` 是
+  `S75ivtunnel` 的运行期依赖，其余三个是现场摄像机排障工具。
+* `Makefile` 的 `package-copy`：把上面 2 个 init 脚本与 4 个 py 纳入 `packaging/`，
+  否则"重建镜像"这条路永远漏文件。
+* 出厂镜像：`target/` 里铺 `/opt/ivsbox/{bin,scripts,init.d,web/static}` ＋
+  `etc/init.d/{S50lighttpd,S61mount_sdcard,S65,S66,S67}`，并把
+  `opt/EmbedSky/config/EmbedSkyProgress.ini` 的 `mac` 字段清空。
+
+=== 解决什么问题
+
+* **镜像里没有 ivsbox**：此前 `/opt/ivsbox`、`S65/S66/S67` 全是现场手工 `cp` 上去的，
+  整片重刷即丢，新板必须再跑一遍部署脚本。现在烧完开箱即跑。
+* **镜像里没有公钥**：`S65` 的公钥行只在板端被手工加过 ⇒ 新板走平台升级必判
+  `bad-signature`，而命令行只回一个 `bad-package`，极难定位。
+* **裸布局没有 releases**：`boot-begin` 找不到 `current` 时退回裸布局仍能跑，但
+  `ivsbox-updater status` 是空的、自动回滚与 OTA 安装全部不可用。首次 `adopt` 把
+  `bin/scripts` 收养成 `releases/<updater 编译期版本>`，从此升级链路成立。
+* **MAC 被写死**：`mac_mode=fixed` ＋ `mac=2E:A2:9E:EF:43:43` ⇒ 多块板同网段必冲突。
+
+=== 影响范围
+
+* 版本串：平台「设备详情」与 `--version` 变为 `1.0.0.20261104` / `1.0.0+g<sha>`。
+  **OTA 判据不变**（包版本严格大于本机）：本机 `1.0.0`，服务器上的 `1.0.7` 会被正常推下来。
+* `adopt` 的版本号来自 **updater 二进制的编译期宏**，与 `ivsboxd` 的版本同源（同一个
+  `ivsbox.h`）；本次两者一起重编，所以 `releases/1.0.0` 名实相符。
+* `S50lighttpd` 是**覆盖**天嵌原文件：以后想回到天嵌演示页，要先把
+  `/opt/ivsbox/bin/ivsbox-web` 改名，脚本才会走原路径。
+* 没有覆盖到的：`S62usb4g`（4G 常驻看护）**未装** —— 板端一直靠 udev 自动拨号，装上会
+  改变现有 4G 行为，留作独立决策；产线写 SN（`/dev/by-name/private`）仍必须单独做，
+  否则 `devid=0`、平台认不出。
+
+=== 验证方式与结果
+
+* 门禁（VM）：`make test` 全绿（`test_version passed (version=1.0.0+nogit)`）；
+  `make test GIT_VER=50fd5f0` 全绿（`1.0.0+g50fd5f0`）。
+* MAC 真机：清空 `mac` 后 `eth0 = 3a:82:b4:1d:3c:bf`、`addr_assign_type=0`，
+  **两次重启一致**，IP 保持 `192.168.1.120`。
+* 镜像取证（`grep -ac` 在 .img 上直接数）：`ivsbox-updater` 16、`ivsbox-web` 49、
+  `IVSBOX_OTA_PUBKEY` 5、`S61mount_sdcard` 2、`ivsbox-web owns :80` 2、
+  旧 MAC `2E:A2:9E:EF:43:43` **0**、`1.0.7.2026` **0**。
+* `rootfs.ext4`：601,842,412 → 605,074,564 B（+3.2 MB，与 `/opt/ivsbox` 体积吻合）。
+* 未验：真机烧这块新镜像（唯一一块板在跑现场，烧了会丢环境）。
+
+=== 教训
+
+**"能跑"与"装得上"是两回事**：裸布局能跑，但 `current` 不存在时升级与回滚这两条
+最需要它的路径恰好是断的，而且断得没有任何报错。凡是"首次开机"才走到的分支，
+必须在镜像里就自愈，不能指望人记得补一条命令。

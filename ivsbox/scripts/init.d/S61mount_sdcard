@@ -1,0 +1,71 @@
+#!/bin/sh
+#
+# 2026-10-17：把 SD 卡挂到 /mnt/sdcard
+#
+# 板上 SD（/dev/mmcblk1p1）默认由 udev 自动挂到 /run/media/mmcblk1p1，而 ivsboxd
+# 的 storage 根（IV_STORAGE_ROOT_DEFAULT）与抓拍目录（IV_MEDIA_SNAP_DIR_DEFAULT）
+# 都是硬编码 /mnt/sdcard。这里在 S60（UDISK）之后、S65（ivsboxd）之前再挂一次，
+# 代码零改动。同一块 vfat 设备会被内核复用同一个 superblock，两处看到的是一份数据。
+#
+# SD 未插 / 未枚举时静默跳过（最多等 10 s），ivsboxd 走"未挂载"故障路径 —— 那是
+# 有意行为（拒新＋停录＋告警），不是 bug。
+
+SD_DEV=/dev/mmcblk1p1
+SD_MNT=/mnt/sdcard
+WAIT_MAX=10
+
+is_mounted() {
+    grep -q " $SD_MNT " /proc/mounts 2>/dev/null
+}
+
+start() {
+    printf "Mount sdcard to %s: " "$SD_MNT"
+    mkdir -p "$SD_MNT"
+    if is_mounted; then
+        echo "already mounted"
+        return 0
+    fi
+
+    i=0
+    while [ "$i" -lt "$WAIT_MAX" ]; do
+        if [ -b "$SD_DEV" ]; then
+            if mount -t vfat -o rw,utf8,noatime "$SD_DEV" "$SD_MNT" 2>/dev/null; then
+                echo "OK"
+                return 0
+            fi
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+
+    echo "SKIP (no $SD_DEV)"
+    return 0
+}
+
+stop() {
+    printf "Umount %s: " "$SD_MNT"
+    if is_mounted; then
+        umount "$SD_MNT" 2>/dev/null && echo "OK" || echo "FAIL"
+    else
+        echo "not mounted"
+    fi
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0

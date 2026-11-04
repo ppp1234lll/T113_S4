@@ -272,12 +272,21 @@ package-copy:
 	@cp scripts/ivsbox-run.sh packaging/scripts/
 	# 受控远程通道的 frpc 起停脚本（M8；monitor.sh 按标记文件调它）
 	@cp scripts/frp.sh packaging/scripts/
+	# 运行期 python 辅助（2026-11-04 收进仓库，出厂镜像要用）：
+	#   tun.py      —— S75ivtunnel 开/关受控通道时调它
+	#   cams/camstat/checkcam —— 现场排障用的摄像机探测小工具
+	@cp scripts/tun.py scripts/cams.py scripts/camstat.py scripts/checkcam.py packaging/scripts/
 	@cp scripts/init.d/S62usb4g scripts/init.d/S65ivsboxd scripts/init.d/S66ivsboxweb scripts/init.d/S67ivsboxmedia packaging/init.d/
+	# 出厂镜像要带的两个"非 ivsbox 自身"的启动脚本（2026-11-04 收进仓库）：
+	#   S50lighttpd  —— **覆盖天嵌原文件**：有 ivsbox-web 就让出 :80，否则两者抢 80
+	#   S61mount_sdcard —— 把 SD 挂到 /mnt/sdcard（ivsboxd 的 storage 根写死在那儿，
+	#                      而 udev 默认挂 /run/media/mmcblk1p1，不挂就 storage fault）
+	@cp scripts/init.d/S50lighttpd scripts/init.d/S61mount_sdcard packaging/init.d/
 	# Web 静态资源（M5-S5.3）：模板与数据分离，页面改版不必重编固件。
 	@rm -rf packaging/web
 	@mkdir -p packaging/web/static
 	@cp -r web/static/. packaging/web/static/ 2>/dev/null || true
-	@chmod +x packaging/scripts/start_ivsbox.sh packaging/scripts/monitor.sh packaging/scripts/monitor-web.sh packaging/scripts/monitor-media.sh packaging/scripts/ivsbox-run.sh packaging/scripts/frp.sh packaging/init.d/S62usb4g packaging/init.d/S65ivsboxd packaging/init.d/S66ivsboxweb packaging/init.d/S67ivsboxmedia
+	@chmod +x packaging/scripts/start_ivsbox.sh packaging/scripts/monitor.sh packaging/scripts/monitor-web.sh packaging/scripts/monitor-media.sh packaging/scripts/ivsbox-run.sh packaging/scripts/frp.sh packaging/scripts/tun.py packaging/scripts/cams.py packaging/scripts/camstat.py packaging/scripts/checkcam.py packaging/init.d/S62usb4g packaging/init.d/S65ivsboxd packaging/init.d/S66ivsboxweb packaging/init.d/S67ivsboxmedia packaging/init.d/S50lighttpd packaging/init.d/S61mount_sdcard
 	@for bin in $(BINS); do \
 		LC_ALL=C $(CROSS)readelf -h "$$bin" | grep -q "Machine:.*ARM" || { \
 			echo "package: ERROR, not ARM ELF: $$bin"; exit 1; \

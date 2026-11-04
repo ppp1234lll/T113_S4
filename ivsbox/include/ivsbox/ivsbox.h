@@ -21,7 +21,7 @@
  * `releases/1.0.6` 恢复成官方内容、新构建独占 `1.0.7`。 */
 #define IVSBOX_VERSION_MAJOR 1
 #define IVSBOX_VERSION_MINOR 0
-#define IVSBOX_VERSION_PATCH 7
+#define IVSBOX_VERSION_PATCH 0
 
 #ifdef __cplusplus
 extern "C" {

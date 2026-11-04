@@ -13081,3 +13081,68 @@ fi
 自激就在协议层等着的；只关 `IP_MULTICAST_LOOP` 挡得住本机，挡不住同网段的另一台设备。
 真正的判据只能来自报文内容 —— 请求与应答必须能被区分。
 
+== 2026-11-04 14:50 update_mac 实测：写盘成功，但应答仍回旧 tid（`own_tid` 被当成缓存）
+
+=== 干了什么事
+
+`tools/provision/src/main.c` 的 `run_device()`：
+
+* 新增局部标志 `int tid_pinned = 0;`，`--tid` 分支里置 1。
+* 收包循环**每轮开头**（`if (g_stop)` 之前）执行：
+
+[source,c]
+----
+if (!tid_pinned && *id_valid)
+    iv_prov_tid_from_u32(id->devid, own_tid);
+----
+
+=== 解决什么问题
+
+真机实测 `update_mac`：写盘成功（`private-write=ok`）、应答 `result=success`、
+分区字节 XOR 解码后 `devid=0x001234FF`、`mac=86:4c:be:da:a1:ef` 全部正确 ——
+**但紧接着的 `search` 应答里 `tid` 还是 `000000`**，只有重启服务才变成新值。
+
+原因：`own_tid` 在 `run_device()` 启动时从身份记录算出来，之后按值传给
+`handle_request()`。`update_mac` 写盘成功后更新了 `*id` / `*id_valid`，但
+`own_tid` 是这个函数的局部数组，**没有任何代码回写它**。而 `search` 应答里的
+`tid` 正是取自 `own_tid` ⇒ 继续回开机时的值。MAC 看着是新的，是因为应答的
+`mac` 取自已经更新的 `*id` —— 两个字段来源不同，所以只有 tid 是错的。
+
+产线上的后果不是"看起来不对劲"而是"看起来没生效"：操作员配完设备 ID、点刷新、
+仍显示旧值，于是反复下发，甚至怀疑设备坏了。
+
+=== 影响范围
+
+* 只影响**同一次进程生命周期内**的后续应答：现在写完身份，下一次 `search` 立刻回新值。
+* `--tid` 显式指定时行为不变（`tid_pinned` 跳过派生）——那是人为钉死的覆盖值，
+  不该被盘上的身份记录覆盖。
+* `update_mac` 那一条应答本来就用 `new_tid` 单独填，不走 `own_tid`，不受影响。
+* **仍未覆盖**：`ivsboxd` 的身份缓存只在启动时读一次（`device_identity()` 的
+  `loaded` 标志），provision 写盘后不重启主控，上报的 `devid` 仍是旧值。
+  产线流程"配置完重启设备"能覆盖，本次不改代码，登记在案。
+
+=== 验证方式与结果
+
+. 备份身份分区前 4 KiB（原全 `00`，md5 `620f0b67a91f7f74151bc5be745b7110`）。
+. 工装侧发 `update_mac tid=1234FF mac=86:4c:be:da:a1:ef`：应答 `success`；
+   分区字节 `13 f6 6a 81 ...` XOR 解码为 `IVSB / ver1 / suite5 / 0x001234FF /
+   86:4c:be:da:a1:ef`，逐字段正确；日志 `private-write=ok`。
+. **修复前复现**：写 `1234FF` 成功后搜索仍回 `tid=000000`。
+. **修复后**（换二进制、**不重启服务**）：写 `5678AB` → 成功；立刻搜索 →
+   `tid=5678AB`。
+. **默认超时**：裸跑（不带 `--timeout`）7 秒后进程仍在，日志无 `listen timeout`。
+. **重启**：S68 自动拉起（pid 1842）；搜索仍 `5678AB`；分区解码 `0x005678AB`；
+   `ivsboxd` 日志 `report layer up: devid=5678ab`（重启前是 `devid=0`），
+   tunnel 告警由 `no device identity` 变为 `token file absent`（＝身份已读到）。
+
+=== 教训
+
+**派生值不要缓存，除非你能说清什么时候失效**。`own_tid` 是 `id->devid` 的纯函数
+结果，存一份就要维护一份失效逻辑；这次的失效点正好藏在"另一个函数修改了源数据"
+里 —— 编译不报错、单测不覆盖（单测里没有"写盘后继续跑同一进程"的时序），
+只有真机按产线顺序操作才暴露。
+
+**跨进程/跨模块的状态同步要显式**。同一块盘，provision 写、ivsboxd 读，
+两者各有各的缓存时机；"写完要不要重启"必须写进操作手册，不能靠人猜。
+
+

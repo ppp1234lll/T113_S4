@@ -458,6 +458,7 @@ static int run_device(const opts_t *o, const char *own_tid_opt, iv_prov_id_t *id
     int                fd;
     time_t             t0 = time(NULL);
     int                handled = 0;
+    int                tid_pinned = 0; /* --tid 显式钉死 ⇒ 不按身份记录重新派生 */
 
     if (own_tid_opt != NULL && own_tid_opt[0] != '\0') {
         uint32_t v = 0u;
@@ -467,6 +468,7 @@ static int run_device(const opts_t *o, const char *own_tid_opt, iv_prov_id_t *id
             return 1;
         }
         (void)snprintf(own_tid, sizeof(own_tid), "%s", own_tid_opt);
+        tid_pinned = 1;
     } else if (*id_valid) {
         iv_prov_tid_from_u32(id->devid, own_tid);
     } else {
@@ -497,6 +499,15 @@ static int run_device(const opts_t *o, const char *own_tid_opt, iv_prov_id_t *id
         char               reply[IV_PROV_JSON_MAX];
         ssize_t            n;
         int                reply_len = 0;
+
+        /* own_tid 是身份记录的**派生值**，每轮重新派生 —— 不能开机算一次就缓存：
+         * update_mac 写盘后 `*id / *id_valid` 已更新，若 own_tid 还是旧值，紧接着的
+         * search 应答会回**旧 tid**（2026-11-04 真机实测：写 tid=1234FF 成功、
+         * 分区解码正确，但下一次 search 仍回 000000，只有重启服务才对）。
+         * 产线上这表现为"配置完设备 ID，刷新还是旧值"，操作员会反复写。
+         * `--tid` 显式指定时不派生（那是人为钉死的覆盖值）。 */
+        if (!tid_pinned && *id_valid)
+            iv_prov_tid_from_u32(id->devid, own_tid);
 
         if (g_stop)
             break;

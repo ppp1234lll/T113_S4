@@ -831,7 +831,7 @@ static void read_dt_string(const char *path, char *out, size_t cap)
 #define IV_CTL_SN_DEFAULT "1"
 
 typedef struct {
-    int  loaded;                  /* 只尝试一次：产线写入需重启，运行期重试无意义 */
+    int  loaded;                  /* 每次读都置 1（字段保留仅为兼容既有断言） */
     int  from_factory;            /* 1＝读过工厂分区；0＝用的是默认值 */
     char sn[IV_PROV_TID_MAX];
     char mac[IV_PROV_MAC_MAX];    /* 空串＝没有身份 MAC */
@@ -845,8 +845,17 @@ static const dev_identity_t *device_identity(void)
 {
     iv_prov_id_t raw;
 
-    if (g_dev_id.loaded)
-        return &g_dev_id;
+    /* ============================ 为什么不做缓存 ============================
+     * 工装（`ivsbox-provision`，**另一个进程**）会在运行期直接写这个分区，主控这边
+     * 收不到任何通知。2026-11-04 现场：软件点「写入SN和MAC」写成功、组播应答已经
+     * 是新 ID `0A19B4`，而 Web 总览页还显示旧 SN —— 就是这里"只读一次"造成的。
+     *
+     * 想靠分区 mtime 判断有没有变也不行：**实测写 56 字节不更新块设备 inode 时间**
+     * （`stat -c %Y.%s /dev/by-name/private` 写前写后完全一样）。
+     * 剩下的办法就是每次重读：一次 open ＋ 读 56 字节，相对一次 HTTP 请求可忽略。
+     *
+     * 原注释"产线写入需重启，运行期重试无意义"的前提是错的 —— 现场就是运行期写的。 */
+    memset(&g_dev_id, 0, sizeof g_dev_id);
     g_dev_id.loaded = 1;
     if (iv_prov_private_read(NULL, &raw) == IV_OK) {
         static const uint8_t zero_mac[6] = {0, 0, 0, 0, 0, 0};

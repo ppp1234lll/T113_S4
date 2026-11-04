@@ -560,7 +560,19 @@ static int handle_request(const opts_t *o, const char *buf, size_t len,
         return 0;
     }
     if (plan.act == IV_PROV_ACT_NONE) {
-        /* 未实现的指令 / 不是给我的：静默丢弃（协议要求不回复）。 */
+        /* 未实现的指令 / 不是给我的：协议要求**不回复**，但**必须留痕**。
+         * 2026-11-04 现场：点「写入SN和MAC」设备毫无动静，而这里原本是纯静默
+         * —— 事后分不清"软件压根没发"和"发了但我们丢掉了"（后者尤其容易发生在
+         * tid 不是 6 位 HEX 时，见 iv_prov_decide 的最后一个 else）。
+         * 应答报文照旧不记：组播组里每台设备的应答都会飘过来，记了全是噪声。 */
+        iv_prov_msg_t m;
+
+        if (iv_prov_msg_parse(buf, len, &m) == IV_OK && !m.is_reply) {
+            printf("ignored %zu-byte request from %s: types=%s tid=%s data: ",
+                   len, inet_ntoa(from->sin_addr), m.types, m.tid);
+            log_esc(buf, len);
+            printf("\n");
+        }
         return 0;
     }
 
@@ -1079,12 +1091,16 @@ int main(int argc, char *argv[])
         return 1;
     }
     if (o.set_id) {
-        uint32_t v = 0u;
+        static char nrm[IV_PROV_TID_MAX];
 
-        if (iv_prov_tid_to_u32(o.tid, &v) != IV_OK) {
-            fprintf(stderr, "bad --set-id (want 6 hex digits): %s\n", o.tid);
+        /* 长度放宽到 1~6 位（平台 SN 可能只有 5 位，如 `A19B4`），但**发出去一律
+         * 归一化成 6 位大写** —— 设备侧、身份记录、界面三处用同一个字符串形态。
+         * `o.tid` 是指针（直接指向 argv），所以归一化结果放 static 缓冲。 */
+        if (iv_prov_tid_normalize(o.tid, nrm) != IV_OK) {
+            fprintf(stderr, "bad --set-id (want 1-6 hex digits): %s\n", o.tid);
             return 1;
         }
+        o.tid = nrm;
     }
 
     (void)iv_log_init("ivsbox-provision");

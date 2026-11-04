@@ -95,23 +95,42 @@ static int hex_val(char c)
     return -1;
 }
 
+/* 设备 ID 的**长度是浮动的**：协议文档与软件都写 6 位，但现场平台下发的 SN
+ * 是流水号，实际只有 5 位（实测 `A19B4`）。原先"必须正好 6 位"直接把这条报文
+ * 判成"不是给我的"、静默丢弃 —— 2026-11-04 现场点「写入SN和MAC」设备毫无动静
+ * 就是这么来的。现在按**数值**认：1~6 位十六进制都收，`A19B4` 与 `0A19B4`
+ * 是同一台设备；7 位以上、非 HEX、空串仍然拒。 */
 int iv_prov_tid_to_u32(const char *tid, uint32_t *out)
 {
     uint32_t v = 0u;
-    int      i;
+    int      n = 0;
 
     if (tid == NULL || out == NULL)
         return IV_EINVAL;
-    for (i = 0; i < 6; i++) {
-        int h = hex_val(tid[i]);
+    while (tid[n] != '\0') {
+        int h;
 
+        if (n >= 6)
+            return IV_EINVAL; /* 超 6 位：不可能是 24 位设备 ID */
+        h = hex_val(tid[n]);
         if (h < 0)
             return IV_EINVAL;
         v = (v << 4) | (uint32_t)h;
+        n++;
     }
-    if (tid[6] != '\0')
-        return IV_EINVAL;
+    if (n == 0)
+        return IV_EINVAL; /* 空串不是设备 ID */
     *out = v;
+    return IV_OK;
+}
+
+int iv_prov_tid_normalize(const char *tid, char out[IV_PROV_TID_MAX])
+{
+    uint32_t v;
+
+    if (out == NULL || iv_prov_tid_to_u32(tid, &v) != IV_OK)
+        return IV_EINVAL;
+    iv_prov_tid_from_u32(v, out);
     return IV_OK;
 }
 
@@ -628,7 +647,15 @@ int iv_prov_msg_parse(const char *json, size_t len, iv_prov_msg_t *out)
  * -------------------------------------------------------------------------- */
 static int tid_is_bcast(const char *tid)
 {
-    return (tid != NULL && strcmp(tid, IV_PROV_TID_BROADCAST) == 0);
+    uint32_t v;
+
+    if (tid == NULL)
+        return 0;
+    if (strcmp(tid, IV_PROV_TID_BROADCAST) == 0)
+        return 1;
+    /* "0" / "0000" 这类**数值为 0** 的写法同样当广播：平台下发时不一定补满 6 位，
+     * 按字面比会漏，按数值比不会。 */
+    return (iv_prov_tid_to_u32(tid, &v) == IV_OK && v == 0u) ? 1 : 0;
 }
 
 static int tid_equal_ci(const char *a, const char *b)
@@ -649,6 +676,20 @@ static int tid_equal_ci(const char *a, const char *b)
             return 0;
     }
     return (a[i] == '\0' && b[i] == '\0') ? 1 : 0;
+}
+
+/* 是不是同一台设备：**能按数值比就按数值比**（`A19B4` == `0A19B4`、大小写无关），
+ * 都比不了才退回逐字符（防止将来出现非 HEX 的设备 ID 形态时行为突变）。 */
+static int tid_same(const char *a, const char *b)
+{
+    uint32_t va = 0u;
+    uint32_t vb = 0u;
+
+    if (a == NULL || b == NULL || a[0] == '\0' || b[0] == '\0')
+        return 0;
+    if (iv_prov_tid_to_u32(a, &va) == IV_OK && iv_prov_tid_to_u32(b, &vb) == IV_OK)
+        return (va == vb) ? 1 : 0;
+    return tid_equal_ci(a, b);
 }
 
 static void copy_str(char *dst, size_t cap, const char *src)
@@ -684,7 +725,7 @@ int iv_prov_decide(const char *json, size_t len, const char *own_tid,
 
     if (strcmp(m.types, IV_PROV_TYPE_SEARCH) == 0) {
         /* 广播搜索，或点我的名 */
-        if (tid_is_bcast(m.tid) || tid_equal_ci(m.tid, own_tid)) {
+        if (tid_is_bcast(m.tid) || tid_same(m.tid, own_tid)) {
             out->act = IV_PROV_ACT_SEARCH;
             copy_str(out->new_tid, sizeof(out->new_tid),
                      (own_tid != NULL && own_tid[0] != '\0') ? own_tid : m.tid);
@@ -693,19 +734,18 @@ int iv_prov_decide(const char *json, size_t len, const char *own_tid,
     }
 
     if (strcmp(m.types, IV_PROV_TYPE_UPDATE_MAC) == 0) {
-        uint32_t v = 0u;
-
         out->act    = IV_PROV_ACT_UPDATE_MAC;
         out->mac_ok = (m.has_mac && m.mac[0] != '\0' &&
                        iv_prov_mac_parse(m.mac, out->new_mac) == IV_OK) ? 1 : 0;
 
-        if (tid_is_bcast(m.tid) || tid_equal_ci(m.tid, own_tid)) {
+        if (tid_is_bcast(m.tid) || tid_same(m.tid, own_tid)) {
             /* 广播 / 点自己的名 ⇒ 只改 MAC，不动设备 ID */
             copy_str(out->new_tid, sizeof(out->new_tid),
                      (own_tid != NULL && own_tid[0] != '\0') ? own_tid : m.tid);
-        } else if (iv_prov_tid_to_u32(m.tid, &v) == IV_OK) {
-            /* tid 即要写入的新设备 ID（口径见 iv_provision.h 文件头） */
-            copy_str(out->new_tid, sizeof(out->new_tid), m.tid);
+        } else if (iv_prov_tid_normalize(m.tid, out->new_tid) == IV_OK) {
+            /* tid 即要写入的新设备 ID（口径见 iv_provision.h 文件头）。
+             * **归一化成 6 位大写**再往下走：平台 SN 可能是 5 位（`A19B4`），
+             * 落盘与应答统一成 `0A19B4`，否则界面和身份记录对不上。 */
         } else {
             /* 既不是广播、又不像设备 ID ⇒ 不是发给我的，静默 */
             out->act = IV_PROV_ACT_NONE;

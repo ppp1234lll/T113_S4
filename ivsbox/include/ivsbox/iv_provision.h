@@ -207,9 +207,17 @@ void iv_prov_tid_from_u32(uint32_t devid, char out[IV_PROV_TID_MAX]);
  */
 int iv_prov_tsn(char out[IV_PROV_TSN_MAX]);
 
-/* "1234FF" → 0x1234FF（大小写皆可；**必须恰 6 位 HEX**）。
+/* "1234FF" → 0x1234FF（大小写皆可；**1~6 位 HEX**，按数值认）。
+ * 为什么不是"必须恰 6 位"：平台下发的 SN 是流水号，现场实测只有 5 位
+ * （`A19B4`）。按长度卡死会把这条报文判成"不是给我的"静默丢掉 ——
+ * 2026-11-04「写入SN和MAC 点下去没反应」的根因就是这个。
+ * 空串、7 位以上、非 HEX ⇒ IV_EINVAL。
  * 返回 IV_OK / IV_EINVAL。 */
 int iv_prov_tid_to_u32(const char *tid, uint32_t *out);
+
+/* 归一化成 6 位大写 HEX（左补零）：`A19B4` / `a19b4` / `0A19B4` 都 → `0A19B4`。
+ * out 容量至少 IV_PROV_TID_MAX。返回 IV_OK / IV_EINVAL。 */
+int iv_prov_tid_normalize(const char *tid, char out[IV_PROV_TID_MAX]);
 
 /* "aa-bb-cc-dd-ee-ff" / "aa:bb:cc:dd:ee:ff" / "aabbccddeeff" → 6 字节。
  * 返回 IV_OK / IV_EINVAL。 */

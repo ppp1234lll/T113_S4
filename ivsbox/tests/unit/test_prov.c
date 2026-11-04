@@ -17,7 +17,8 @@
  *   · 把 update_mac 的"tid 即新 ID"改成恒保留本机 ID ⇒ p04a 变红；
  *   · 解析器去掉"未知键跳过"或改成截断超长值 ⇒ p02d / p02c 变红；
  *   · 组包把 result 恒写 "success"          ⇒ p06d 变红；
- *   · 记录里 devid 改用 memcpy 本机序       ⇒ p07c 的小端断言变红。
+ *   · 记录里 devid 改用 memcpy 本机序       ⇒ p07c 的小端断言变红；
+ *   · 把 tid 解析改回"必须恰 6 位"（2026-11-04 现场根因）⇒ p01f / p04i 变红。
  */
 #include <fcntl.h>
 #include <stdio.h>
@@ -120,10 +121,20 @@ int main(void)
             "p01d: tid parse upper");
         chk(iv_prov_tid_to_u32("12deff", &v) == IV_OK && v == 0x12DEFFu,
             "p01e: tid parse lower");
-        chk(iv_prov_tid_to_u32("1234F", &v) == IV_EINVAL, "p01f: 5 digits rejected");
+        chk(iv_prov_tid_to_u32("1234F", &v) == IV_OK && v == 0x1234Fu,
+            "p01f: 5 digits accepted (platform SN is a serial, not 6-digit)");
         chk(iv_prov_tid_to_u32("1234FG", &v) == IV_EINVAL, "p01g: non-hex rejected");
         chk(iv_prov_tid_to_u32("1234567", &v) == IV_EINVAL, "p01h: 7 digits rejected");
         chk(iv_prov_tid_to_u32(NULL, &v) == IV_EINVAL, "p01i: NULL rejected");
+        chk(iv_prov_tid_to_u32("", &v) == IV_EINVAL, "p01i2: empty rejected");
+        chk(iv_prov_tid_normalize("A19B4", t) == IV_OK && strcmp(t, "0A19B4") == 0,
+            "p01i3: 5-digit SN normalised to 6 uppercase");
+        chk(iv_prov_tid_normalize("a19b4", t) == IV_OK && strcmp(t, "0A19B4") == 0,
+            "p01i4: lower case normalised");
+        chk(iv_prov_tid_normalize("0A19B4", t) == IV_OK && strcmp(t, "0A19B4") == 0,
+            "p01i5: already normalised stays");
+        chk(iv_prov_tid_normalize("12G4", t) == IV_EINVAL,
+            "p01i6: normalise rejects non-hex");
 
         chk(iv_prov_mac_parse("3a:82:b4:1d:3c:bf", b) == IV_OK &&
             b[0] == 0x3Au && b[5] == 0xBFu, "p01j: mac colon form");
@@ -313,6 +324,8 @@ int main(void)
                            "\"data\":{\"types\":\"search\"}}";
         const char *other = "{\"info\":{\"tid\":\"ABCDEF\"},"
                             "\"data\":{\"types\":\"search\"}}";
+        const char *short_mine = "{\"info\":{\"tid\":\"19B4\"},"
+                                 "\"data\":{\"types\":\"search\"}}";
 
         chk(decide_act(bcast, "1234FF", &p) == (int)IV_PROV_ACT_SEARCH,
             "p03a: broadcast search answered");
@@ -325,6 +338,8 @@ int main(void)
             "p03d: broadcast answered even without own tid");
         chk(decide_act(bcast, "", &p) == (int)IV_PROV_ACT_SEARCH,
             "p03e: broadcast answered with empty own tid");
+        chk(decide_act(short_mine, "0019B4", &p) == (int)IV_PROV_ACT_SEARCH,
+            "p03f: addressed search matches BY VALUE (5-digit tid vs 0019B4)");
     }
 
     /* ---------------- p04 决策：update_mac ---------------- */
@@ -340,8 +355,15 @@ int main(void)
                              "\"data\":{\"types\":\"update_mac\",\"mac\":\"gg:00:00:44:6c:40\"}}";
         const char *nomac = "{\"info\":{\"tid\":\"1234FF\"},"
                             "\"data\":{\"types\":\"update_mac\"}}";
-        const char *badtid = "{\"info\":{\"tid\":\"12345\"},"
+        const char *badtid = "{\"info\":{\"tid\":\"1234G\"},"
                              "\"data\":{\"types\":\"update_mac\",\"mac\":\"02:00:00:44:6c:40\"}}";
+        /* 现场实测报文（2026-11-04 17:1x，来源「设备配置软件」）：
+         * tid 只有 5 位、mac 用冒号。旧代码按"恰 6 位 HEX"判成"不是给我的"，
+         * 静默丢弃 ⇒ 点「写入SN和MAC」设备毫无反应。 */
+        const char *field = "{\"info\":{\"tid\":\"A19B4\",\"date\":\"20261104\"},"
+                            "\"data\":{\"types\":\"update_mac\",\"mac\":\"18:66:96:70:05:b1\"}}";
+        const char *short_self = "{\"info\":{\"tid\":\"19B4\"},"
+                                 "\"data\":{\"types\":\"update_mac\",\"mac\":\"02:00:00:44:6c:40\"}}";
 
         chk(decide_act(doc, "1234FF", &p) == (int)IV_PROV_ACT_UPDATE_MAC,
             "p04a: doc sample -> update_mac");
@@ -362,7 +384,13 @@ int main(void)
         chk(decide_act(nomac, "1234FF", &p) == (int)IV_PROV_ACT_UPDATE_MAC && p.mac_ok == 0,
             "p04g: missing mac -> mac_ok=0");
         chk(decide_act(badtid, "1234FF", &p) == (int)IV_PROV_ACT_NONE,
-            "p04h: malformed tid -> ignored (not broadcast, not an id)");
+            "p04h: non-hex tid -> ignored (not broadcast, not an id)");
+        chk(decide_act(field, "5678AB", &p) == (int)IV_PROV_ACT_UPDATE_MAC &&
+            p.mac_ok == 1 && strcmp(p.new_tid, "0A19B4") == 0,
+            "p04i: field sample (5-digit SN) accepted, normalised to 0A19B4");
+        chk(decide_act(short_self, "0019B4", &p) == (int)IV_PROV_ACT_UPDATE_MAC &&
+            strcmp(p.new_tid, "0019B4") == 0,
+            "p04j: short tid equal to own id BY VALUE -> keep own id");
     }
 
     /* ---------------- p05 其余指令未实现：一律静默 ---------------- */

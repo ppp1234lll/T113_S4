@@ -13547,3 +13547,82 @@ INFO [agent] agent up: … server=47.104.250.225:6012
 **改默认值 = 改一条已经写进文档的结论，必须同时改文档。** D-12 当初的推理
 （6012 是蓝本值、6013 是现场手改）在两端口都通的前提下是自洽的；现在用户给出
 "平台默认就是 6013"，结论反转，**原处标注作废**比删掉更负责。
+
+== 2026-11-04 18:10 解析器「帧内重锁」：平台开机短帧不再吞后续命令
+
+=== 干了什么事
+
+`modules/proto/iv_proto.c` 的 `iv_proto_parser_feed()` 增加一条规则：
+
+[source,c]
+----
+/* 帧内再次出现帧头 ⇒ 上一帧的 LEN 把我们带偏了，就地重新锁定 */
+if (ps->got_head && ps->pos >= 2u && d == (uint8_t)IV_PROTO_VER &&
+    ps->buf[ps->pos - 2u] == 0xF0u && ps->buf[ps->pos - 1u] == 0xF0u) {
+    ps->buf[0] = 0xF0u; ps->buf[1] = 0xF0u; ps->buf[2] = d;
+    ps->pos = 3u; ps->want = 0u; ps->tail = 0xFFFFu;
+    ps->head = (uint16_t)IV_PROTO_HEAD_DOWN; ps->got_head = 1;
+    continue;
+}
+----
+
+`tests/unit/test_proto.c` 新增 3b 组：帧体用现场真帧原样抄入。
+
+=== 解决什么问题
+
+现场「设备在线，平台上点指令没反应」。取证结论：**设备回了该回的，但有一类窗口里
+连命令都没解析出来** —— 平台刚连上时发的那几条广播帧会把解析器带到"等 233 字节"。
+
+[source,text]
+----
+# 平台一连上就发 7 条：20 字节，比标准 22 字节少 2 字节
+rx 20 bytes: f0f011000000ffffffffffffffffff0101d4ffff
+             head ver  type    devid     ...   LEN 被读成 0xd4=212
+
+# 2 分半后平台发 0xE2 立即上报：rx 有、应答没有
+rx 22 bytes: f0f0110a000a19b4e2ffffffffffffffffff010055ffff
+WARN [proto] downlink frame dropped: bad crc (cmd 0xFF len 212, got 0xA6 want 0x19)
+----
+
+最后那行 WARN 是"被吞的那一帧终于凑够 233 字节"时的校验失败记录。它同时也是
+`tr_on_rx()` 存在的理由：**"收到字节"与"字节被当成一帧"是两件事**，只有两行都在，
+才分得清是平台没发、我们丢了、还是算错了 CRC。
+
+=== 为什么这么修，不按短帧布局去迁就
+
+那条 20 字节帧本身不符合 22 字节布局（少 2 字节），给它单开一条解析分支等于把
+平台的一个 bug 固化进协议层；而且我们**并不需要解析它**（devtype=0、devid=0 的广播
+心跳，收了也是丢）。所以只在"LEN 明显带偏"时刹车，恢复能力与帧内内容无关。
+
+判据为什么安全：本协议 DATA 全部是 JSON 文本（`##…##`）或定长几字节二进制，
+同一处凑出 `F0 F0 11` 的概率可忽略；并且**必须是 `F0 F0` 后紧跟 `0x11` 才触发**，
+DATA 里单纯出现 `F0 F0` 不受影响（单测 3b 有一条专门反证）。
+
+=== 验证方式与结果
+
+. 反向证伪：把分支改成 `if (0 && …)` 重编 ⇒ `test_proto` 红 4 条（广播帧后那条命令
+  一条都收不到），恢复后全绿。**这条用例的价值全在"拆掉修复会红"**。
+. VM `make test` 与 `make test GIT_VER=84d7461` 两种门禁都通过；`make arm` 零告警，
+  `ivsboxd` md5 `4ba126863ac7b33fe8f83cbdccad9370`。
+. 板端（192.168.1.64，`releases/1.0.0`）换新二进制，旧件留 `ivsboxd.bak-3c9773ce`；
+  `/proc/<pid>/exe` 指向 `releases/1.0.0/bin/ivsboxd`、`--version = 1.0.0+nogit`、
+  `agent up … server=47.104.250.225:6013`、`transport state -> 2`。
+
+=== 教训
+
+**"设备不理我"要先分清是"没收到"还是"收到了没认"。** 这次三行日志各自成立：
+`rx` 有（字节到了）、WARN 有（当成帧了但 CRC 不对）、应答无（命令没执行）。
+只看最后一行永远查不出来 —— 是"多打一行原始字节"救的。
+
+**别人给的短帧不该由被解析方去猜。** 平台少 2 字节是它的问题，我们要做的是
+"别被它拖住"，而不是照着它的错误布局再写一套解析。
+
+=== 遗留
+
+同一现场还暴露两条会放大"看着像没反应"的问题，与本次改动无关，待专项：
+
+* 板子反复重启：`/mnt/UDISK/log/ivsbox-boot.log` 里 `boot-begin` 多条、
+  `.monitor.state` 计数 41，`/proc/uptime` 长期 < 100 s。
+* 4G 模组每 ~8 s 注销/重注册：`wan usb0 ifindex re-resolved 85 -> 86 -> 87`、
+  `cell: AT port error/hup (events 0x301)`，每次都触发 `transport reconnect`，
+  平台连接被反复重建。

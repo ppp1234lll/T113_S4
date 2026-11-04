@@ -6,6 +6,7 @@
  *   2) 二进制解析：完整帧 → 字段全对；半包逐字节喂 → 同样交付；
  *   3) 粘包：两帧一次 feed 各自交付；帧头噪声前置 → 仍交付；
  *   4) 坏 CRC/帧尾整帧丢弃且不影响后续帧；LEN 撒谎不误交付；
+ *   4b) 平台开机的 20 字节广播帧（LEN 位被读成 212）不得吞掉后续真实命令；
  *   5) ## 文本帧组包黄金校验（含样例回归：长度域 4 位、CRC 2 位小写 hex）；
  *   6) ## 文本帧长度探测与 IV_ERANGE；
  *   7) 路由：命中 handler、未命中自动 ACK(0x01)、重注册 IV_EEXIST、表满 IV_EFULL；
@@ -249,6 +250,61 @@ int main(void)
         f1[17] = 0xFE; /* 撒谎 LEN=254 */
         iv_proto_parser_feed(&ps, f1, l1, on_frame, NULL);
         chk(g_rx.n == 0, "lying LEN: no delivery");
+    }
+
+    /* ---- 3b) 现场真帧：平台开机的 20 字节广播帧不得吞掉后续命令 ----
+     * 2026-11-04 板端 08:00:13~16，平台一连上就发 7 条（这里是原样抄下来的
+     * 一条 20 字节真帧，比标准 22 字节**少 2 字节**）：
+     *   f0f0 11 0000 000000 ff*7 01 01 d4 ffff
+     * 我们的 OFF_LEN=17 把它读成"长度 0xD4=212"，于是开始等 233 字节一整帧，
+     * 紧接着 08:02:51 平台发的 `0xE2 立即上报` 被当成这半截假帧的 DATA 吞掉 ——
+     * 日志里 `rx 22 bytes … e2` 有、应答没有，只剩一行
+     * `downlink frame dropped: bad crc (cmd 0xFF len 212)`。
+     * 平台侧看到的就是"设备在线，点了指令没反应"。
+     *
+     * 反向证伪：删掉 `iv_proto.c` 里那段"帧内重锁"⇒ 本组断言变红。 */
+    {
+        static iv_proto_parser_t ps;
+        static const uint8_t bcast[20] = {
+            0xF0, 0xF0, 0x11, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x01, 0xD4, 0xFF, 0xFF
+        };
+        uint8_t  e2[64];
+        uint8_t  d1[1] = { 0x01 };
+        uint8_t  d3[3] = { 0xF0, 0xF0, 0x00 }; /* DATA 里的 F0 F0，不该被误判 */
+        uint8_t  both[160];
+        uint8_t  f3[64];
+        size_t   l2, l3;
+        size_t   n = 0;
+
+        l2 = mk_down(e2, 0x0A00u, 0x0A19B4u, 0xE2u, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                     d1, 1);
+
+        /* 两条广播帧 + 一条 E2：E2 必须照常交付 */
+        rec_reset();
+        iv_proto_parser_init(&ps);
+        memcpy(&both[n], bcast, sizeof(bcast)); n += sizeof(bcast);
+        memcpy(&both[n], bcast, sizeof(bcast)); n += sizeof(bcast);
+        memcpy(&both[n], e2, l2);               n += l2;
+        iv_proto_parser_feed(&ps, both, n, on_frame, NULL);
+        chk(g_rx.n == 1, "3b: 20B broadcast frames must not swallow next cmd");
+        chk(g_rx.n == 1 && g_rx.f[0].cmd == 0xE2u, "3b: cmd survives");
+        chk(g_rx.n == 1 && g_rx.f[0].devid == 0x0A19B4u, "3b: devid survives");
+
+        /* 同一件事换个切法：广播帧单独一段、E2 后到一段 */
+        rec_reset();
+        iv_proto_parser_init(&ps);
+        iv_proto_parser_feed(&ps, bcast, sizeof(bcast), on_frame, NULL);
+        iv_proto_parser_feed(&ps, e2, l2, on_frame, NULL);
+        chk(g_rx.n == 1 && g_rx.f[0].cmd == 0xE2u, "3b: split feed still delivers");
+
+        /* 反证：DATA 里出现 F0 F0（后面不是 0x11）不得被当成新帧头 */
+        rec_reset();
+        iv_proto_parser_init(&ps);
+        l3 = mk_down(f3, 0x0A00u, 0x0A19B4u, 0xE2u, 0u, 0u, d3, 3);
+        iv_proto_parser_feed(&ps, f3, l3, on_frame, NULL);
+        chk(g_rx.n == 1 && g_rx.f[0].cmd == 0xE2u, "3b: F0 F0 inside DATA is not a header");
+        chk(g_rx.n == 1 && g_rx.f[0].len == 3u, "3b: DATA len kept");
     }
 
     /* ---- 4) ## 上报帧黄金校验（CRC 只覆盖 &&数据区&&，长度=整段） ---- */
@@ -497,7 +553,7 @@ int main(void)
     }
 
     if (g_fail == 0)
-        printf("test_proto passed (build/parse/sticky/crc/tail/text/route/ack/hb/null)\n");
+        printf("test_proto passed (build/parse/sticky/crc/tail/resync/text/route/ack/hb/null)\n");
     else
         printf("test_proto FAILED (%d)\n", g_fail);
     return g_fail ? 1 : 0;

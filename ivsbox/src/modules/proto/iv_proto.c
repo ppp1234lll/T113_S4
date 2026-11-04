@@ -235,6 +235,33 @@ void iv_proto_parser_feed(iv_proto_parser_t *ps, const uint8_t *buf, size_t len,
     for (i = 0; i < len; i++) {
         uint8_t d = buf[i];
 
+        /* ---- 帧内重锁：上一帧的 LEN 把我们带偏时必须就地刹车 ----
+         * 现场真帧（2026-11-04 板端 08:00:13~16，平台刚连上时连发 7 条的广播帧）：
+         *   f0f0 11 0000 000000 ff ff*7 01 01 d4 ffff   ＝ **20 字节**
+         * 它比标准 22 字节**少 2 字节** ⇒ 按 OFF_LEN=17 取到的"长度"其实是 CRC
+         * 位 0xd4=212 ⇒ 解析器开始等"233 字节一整帧"，接下来 212 字节的真实命令
+         * 全被当成它的 DATA **静默吞掉**。08:02:51 的 `0xE2 立即上报`就是这么丢的：
+         * 日志里 `rx 22 bytes … e2` 有、应答没有，只留下一行
+         * `downlink frame dropped: bad crc (cmd 0xFF len 212)` —— 平台侧看到的就是
+         * "设备在线，点了指令没反应"。
+         *
+         * 判据＝缓冲末尾已是 `F0 F0` 且本字节是数据版本 0x11：DATA 全是 JSON 文本
+         * 或几个字节的二进制，同一处凑出 `F0 F0 11` 的概率可以忽略。命中即丢掉
+         * 那半截假帧、从这两个 F0 重新锁定 —— **新帧的第一个字节不丢**。
+         */
+        if (ps->got_head && ps->pos >= 2u && d == (uint8_t)IV_PROTO_VER &&
+            ps->buf[ps->pos - 2u] == 0xF0u && ps->buf[ps->pos - 1u] == 0xF0u) {
+            ps->buf[0] = 0xF0u;
+            ps->buf[1] = 0xF0u;
+            ps->buf[2] = d;
+            ps->pos     = 3u;
+            ps->want    = 0u;
+            ps->tail    = 0xFFFFu;
+            ps->head    = (uint16_t)IV_PROTO_HEAD_DOWN;
+            ps->got_head = 1;
+            continue;
+        }
+
         /* 帧头滑动窗口：未锁定前只找 0xF0F0 */
         ps->head = (uint16_t)((ps->head << 8) | d);
         if (!ps->got_head) {

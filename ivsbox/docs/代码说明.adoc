@@ -13739,3 +13739,109 @@ md5 `2f33db53bc4bfbdb0e459dfe57a4edbb`。）
 挂在"用户下一次保存"上；中间重启一次就白恢复了（这一点是写完第一版才想明白的，
 单测 c50p~c50s 就是钉它的）。
 
+
+== 2026-11-04 18:50 远程通道可配：令牌进 Web、保存即生效、注入防线与运维侧生成器
+
+=== 干了什么事
+
+一条纵切：模块层加校验、ctl 加一个复合方法、装配层落盘、Web 加四条路由与一个页面、脚本加日志、工具与文档各有新增。
+
+* `include/ivsbox/iv_tunnel.h` / `src/modules/tunnel/iv_tunnel.c`
+  * 新增 `iv_tunnel_token_valid()` ＋ 内部 `token_char_ok()`：令牌白名单
+    `0-9A-Za-z-_.~+/=@`、1..63 字节，`why` 出人话。
+  * `iv_tunnel_set_identity()` 与 `iv_tunnel_render()` 各挡一次（早失败 ＋ 纵深防御）；
+    `render()` 另对 frps 地址做字符集校验（域名 / IPv4 / IPv6 字面量需要的字符之外一律拒）。
+* `include/ivsbox/iv_ctl.h` / `src/modules/ctl/iv_ctl.c`
+  * `iv_ctl_ctx_t` 增加 `do_set_token(token, arg)` ＋ `set_token_arg`：本模块**仍然不碰文件**，
+    只负责校验与话术（边界不变，见文件头）。
+  * 新增 `tunnel.configure`：入参 `{token?, ttl?, enable?}`，顺序固定"令牌 → 有效期 → 开关"。
+  * 新增 `param_bool()`：只认 JSON 布尔，不收 `1`/`"true"`。
+  * `tunnel.status` 增加 `token_set` / `token_len`（**仍然不回令牌本身**）。
+* `src/app/main.c`
+  * 新增 `tunnel_token_path()` / `tunnel_fsync_dir()` / `tunnel_write_token_file()` / `app_set_tunnel_token()`。
+  * 落盘：`tmp → fsync → rename → fsync(目录)`、0600（`chmod` 补一次，umask 会削 `open` 的 mode）、
+    缺 `<secure>` 目录时自建 0700。
+  * 写完用**有效值**（环境变量优先）重读再 `set_identity`，随后 `iv_tunnel_invalidate()`。
+* `web/src/iv_web_api.c`：`GET /api/tunnel`、`POST /api/tunnel/config|enable|disable`（写路径只收 POST）。
+* `web/static/app.js`：`PAGES` 增加「远程通道」；新增 `pageTunnel()`；`pageConfig` 的 skip 加 `sys.tunnel.*`
+  （同一批键只能有一个编辑器，否则两个表单拿同一个 `st.ver`，后提交的必撞 `e=-3`）。
+* `scripts/frp.sh`：frpc 输出从 `/dev/null` 改到 `/mnt/UDISK/log/frpc.log`（>256 KiB 截断），`IVSBOX_FRPC_LOG` 可覆盖。
+* 新增 `tools/tunnel-keygen.html`（离线单文件：生成令牌 → 算 secretKey → 出 `visitor.toml` / `connect.bat`）、
+  `docs/远程通道使用说明.md`、`tests/web/ui_tunnel.mjs`、`tests/web/tool_tunnel_keygen.mjs`；
+  `tests/unit/test_tunnel.c` 增 `t10_token_charset()`。
+
+=== 解决什么问题
+
+四件事同时卡着"用运维箱访问设备"这条路：
+
+. **令牌只能由工厂写文件。** Web 想让人填一个令牌，就得"先写文件再 enable"两步；
+  两步之间失败会留下半生效状态——令牌换了、通道还拿着旧 secretKey 在跑。
+. **frps 地址改了要重启。** 地址本身是热更新的，但令牌不是，"配完还得重启"是现场最反感的动作。
+. **令牌会被原样拼进 `frpc.toml` 的双引号里。** 带 `"` 提前闭合、带换行能注入任意键
+  （把 `localPort = 22` 改掉）、带 `#` 让后面整段变注释。三种都不报"令牌非法"，
+  只表现为"frpc 起不来"或"转发了不该转的端口"。
+. **frpc 的日志被丢进 `/dev/null`。** "标记在、进程在、PC 连不上"时，现场完全无法区分
+   是 frps 没起、`auth.token` 不对，还是 secretKey 算错——这三者的日志表现完全不同，
+   但一个都看不到。
+
+=== 为什么这么修
+
+**令牌不进配置键。** 配置是明文 JSON，`config.all` 会整份导出给前端；令牌进去等于
+把钥匙写进"本来就给前端看"的地方。所以它留在 `<secure>/tunnel.token`，只在 Web 上
+**写入**，读回来只有"有没有配 / 几位"。
+
+**写令牌放在装配层，而不是 ctl 或 tunnel 模块。** 令牌的唯一读者是
+`main.c: tunnel_read_token()`；写与读分家就会出现"文件改了、内存里的 `t->token`
+还是旧的"——那正是"界面显示已保存、enable 出来却是旧钥匙"的经典坑。回调签名与既有的
+`do_reboot` / `do_settime` 同构，不引入新风格。
+
+**`enable` 缺省 ≠ `enable:false`。** "只改令牌、通道该怎么开还怎么开"是常见操作；
+把缺字段当成 false 会在用户没注意时把通道关掉，而界面上只会显示"已保存"。
+
+**改令牌必须重开通道。** 令牌变 ⇒ secretKey 变 ⇒ 正在跑的 frpc 配置过期。
+不作废的后果不是"连不上"，而是"照旧连得上、握手永远失败"，且两侧都不报错
+（stcp 的语义），是最难查的一类。
+
+**白名单而不是黑名单。** 令牌是我们自己生成的随机串，没有任何理由需要白名单以外的
+字符；黑名单则永远漏一个（`'`、`` ` ``、`$`、`\t`…）。
+
+**工具用内联 MD5。** Web Crypto 不提供 MD5（只有 SHA 系列），而工具必须断网可用，
+所以不能引 CDN。正确性用设备单测的黄金向量钉死（`md5("A120F"+"bird123")` 前 16 位
+= `1239036bac71d702`），而不是"跑起来没报错"。
+
+=== 验证方式与结果
+
+* `make test`：22 个单测全绿。`test_tunnel` 新增 8 条（引号 / 换行 / `#` / 空格 / 超长 /
+  空串 / `set_identity` 早失败 / `render` 对坏令牌与坏地址都拒）。
+* **反向证伪**：把 `iv_tunnel.c` 里两处 `if (iv_tunnel_token_valid(...) != IV_OK)`
+  改成 `if (0)` ⇒ 立刻 3 条红（`set_identity` 未拒、旧令牌被覆盖、`render` 未拒）；
+  恢复后全绿。说明这 8 条盯的是行为，不是"代码长什么样"。
+* `ui_tunnel.mjs`（jsdom，26 条）：地址回填、令牌不回显、生成 32 位 hex、
+  **地址没改就不发 `config.apply`**（白提交一次会白白推进版本号）、版本号现取、
+  只提交变了的键、**令牌留空时请求体里没有 `token` 键**（留空＝不改，不是清空）、
+  关闭通道、通用配置页没有 `sys.tunnel.*` 输入框。
+* `tool_tunnel_keygen.mjs`（jsdom，21 条）：黄金向量一致；`visitor.toml` 的
+  `serverName` 等于 SN、类型是 `stcp`、`secretKey` 与结果一致；令牌带引号/空格/64 位时
+  **不产出**配置（宁可空着，也不给一份能粘错的文件）。
+* `ivsboxd` 与 `ivsbox-web` 在 `-Werror` 下零告警。
+
+=== 教训
+
+**"能配"和"配了生效"是两件事，中间隔着一次落盘。** 原先的设计里令牌只能由外部写文件，
+于是"界面配好了"与"通道真用上了"之间有一段没人负责的路。把写、读、作废三件事收在
+同一次调用里，半生效状态才消失。
+
+**校验要放在"值会变成语法"的地方。** 令牌不是"一个字符串参数"，它是 TOML 里的一个
+双引号值 —— 校验点必须贴着渲染点，而不是贴着入口。
+
+**日志丢 `/dev/null` 等于把排查成本转嫁给现场。** 这次只是把 fd 换了个去处，
+但它决定了"连不上"是查 5 分钟还是查 2 小时。
+
+=== 遗留
+
+* 摄像机仍然只能靠访问端 `ssh -L`（S8.5 受控代理未落地）。设备侧只转发 22 是刻意的，
+  但也意味着"在浏览器里直接看摄像机"还要再做一层。
+* 平台自动下发 frps 地址/令牌仍未接（D 系列 D-11「frps」）。
+* Web 上的「远程通道」页没有做"连通性测试"按钮（点一下让设备去连 frps 并回报结果）；
+  现在只能看状态卡的开关 + `frpc.log`。
+* F8 密钥分离未实现：`<secure>` 目录不是真正的机密存储，与 `camera.ch.N.pass` 同类欠账。

@@ -4,6 +4,8 @@
  * 2026-10-30 起本模块**按 BIRD 运维箱（bird_20260623）逐条对齐**：一条 stcp 代理、
  * 转发本机 22、密钥 md5(sn+token) 前 8 字节、/etc/frp/frpc.toml、/tmp/frp.enabled。
  * 所以本文件钉的是"与 BIRD 字节级一致"这件事，不再问"某个服务名该不该放行"：
+ * （2026-11-04 起**多一行** `loginFailExit = false` —— frpc 0.68 默认"连不上就退出"，
+ *   见 t02；这一行是现场教训，不是风格差异。）
  *
  *   t01 secretKey 黄金向量（与 GO 的 GenerateSTCPKey 同一个值）
  *   t02 frpc.toml 逐字钉（含空行位置，与 GO 的 fmt.Sprintf 产物逐字对比）
@@ -13,6 +15,8 @@
  *   t06 到期自动关（tick）与"不过期不会自己关"
  *   t07 身份/服务端变更 ⇒ invalidate（STOP_RECONF）
  *   t08 caps / stat / last_session
+ *   t09 重启后可认领已开的通道（restore）
+ *   t10 令牌/地址字符集：引号、换行、`#` 三条注入向量必须被拒（2026-11-04）
  *
  * 反向证伪：把 iv_tunnel.c 里对应实现改坏（localPort 改成 23、secretKey 少取一字节、
  * 标记不落盘、disable 不删标记），下面必有一条转红。
@@ -112,7 +116,7 @@ static void t01_secret(void)
 }
 
 /* ---------------------------------------------------------------------------
- * t02 frpc.toml 逐字钉（与 GO writeFrpConfig 的产物逐字一致）
+ * t02 frpc.toml 逐字钉（BIRD `writeFrpConfig()` 的产物 ＋ 2026-11-04 多一行 loginFailExit）
  * ------------------------------------------------------------------------- */
 static void t02_render(void)
 {
@@ -120,6 +124,10 @@ static void t02_render(void)
         "serverAddr = \"frp.example.com\"\n"
         "serverPort = 7000\n"
         "auth.token = \"" TOKEN "\"\n"
+        /* 2026-11-04：frpc 0.68 的 loginFailExit 默认 true，第一次连不上就退出
+         * （板上实测：开机 4G 未通 / frps 恰好在重启 ⇒ 通道要等 monitor 下一轮）。
+         * 这一行把"重试"交给 frpc 自己，进程留在原地退避重连。 */
+        "loginFailExit = false\n"
         "\n"
         "[[proxies]]\n"
         "name = \"" SN "\"\n"
@@ -410,6 +418,65 @@ static void t09_restore(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * t10 令牌/地址字符集（2026-11-04：Web 可以填令牌之后新增）
+ *
+ * 钉的是"外部字符串不会被拼成非法 TOML"这件事。三种注入各一条：
+ *   引号提前闭合、换行注入新键、# 把后面整段变成注释。
+ * 反向证伪：把 iv_tunnel_token_valid() 里的字符循环注释掉，下面第 4~6 条必红；
+ * 把 render 里的 server_addr 循环注释掉，第 9 条必红。
+ * ------------------------------------------------------------------------- */
+static void t10_token_charset(void)
+{
+    char why[96];
+    char buf[IV_TUNNEL_TXT_MAX];
+    size_t len = 0;
+    iv_tunnel_t t;
+    iv_tunnel_reason_t rwhy = IV_TUNNEL_OK;
+
+    chk(iv_tunnel_token_valid("abc123", why, sizeof why) == IV_OK, "t10: plain token ok");
+    chk(iv_tunnel_token_valid("a-b_c.d~e+f/g=h@i", why, sizeof why) == IV_OK,
+        "t10: whitelist punctuation ok");
+    chk(iv_tunnel_token_valid("", why, sizeof why) == IV_EINVAL, "t10: empty rejected");
+    chk(iv_tunnel_token_valid(NULL, why, sizeof why) == IV_EINVAL, "t10: NULL rejected");
+
+    /* 63 收、64 拒（IV_TUNNEL_TOKEN_MAX=64 含 NUL） */
+    {
+        char big[80];
+        memset(big, 'a', sizeof big);
+        big[63] = '\0';
+        chk(iv_tunnel_token_valid(big, why, sizeof why) == IV_OK, "t10: 63 chars ok");
+        big[63] = 'a';
+        big[64] = '\0';
+        chk(iv_tunnel_token_valid(big, why, sizeof why) == IV_ERANGE, "t10: 64 chars rejected");
+    }
+
+    /* 三条注入向量 */
+    chk(iv_tunnel_token_valid("ab\"cd", why, sizeof why) == IV_EPROTO,
+        "t10: quote rejected");
+    chk(why[0] != '\0', "t10: reason text present");
+    chk(iv_tunnel_token_valid("ab\nlocalPort = 1234", why, sizeof why) == IV_EPROTO,
+        "t10: newline rejected");
+    chk(iv_tunnel_token_valid("ab#cd", why, sizeof why) == IV_EPROTO,
+        "t10: hash rejected");
+    chk(iv_tunnel_token_valid("ab cd", why, sizeof why) == IV_EPROTO,
+        "t10: space rejected");
+
+    /* set_identity 早失败：坏令牌进不了句柄 */
+    mk_rig(&t);
+    chk(iv_tunnel_set_identity(&t, SN, "ab\"cd") == IV_EINVAL,
+        "t10: set_identity refuses bad token");
+    chk(strcmp(t.token, TOKEN) == 0, "t10: previous token kept intact");
+
+    /* render 也拒（纵深防御：就算有人绕过 set_identity 直接调 render） */
+    chk(iv_tunnel_render(SN, "ab#cd", "frp.example.com", 7000u, buf, sizeof buf, &len,
+                         &rwhy) == IV_EPROTO, "t10: render rejects bad token");
+    chk(iv_tunnel_render(SN, TOKEN, "frp\"evil", 7000u, buf, sizeof buf, &len,
+                         &rwhy) == IV_EPROTO, "t10: render rejects bad host");
+    chk(iv_tunnel_render(SN, TOKEN, "frp.example.com", 7000u, buf, sizeof buf, &len,
+                         &rwhy) == IV_OK, "t10: good inputs still render");
+}
+
+/* ---------------------------------------------------------------------------
  * main
  * ------------------------------------------------------------------------- */
 int main(void)
@@ -432,6 +499,7 @@ int main(void)
     t07_invalidate();
     t08_caps_stat();
     t09_restore();
+    t10_token_charset();
 
     (void)unlink(g_conf);
     (void)unlink(g_flag);
@@ -443,6 +511,6 @@ int main(void)
     }
     printf("test_tunnel passed (BIRD secret golden, toml byte-exact, deny paths, "
            "0600 atomic write/idempotent, flag empty-when-no-ttl, ttl expire, "
-           "invalidate, caps/stat, adopt-on-restart)\n");
+           "invalidate, caps/stat, adopt-on-restart, token charset/injection)\n");
     return 0;
 }

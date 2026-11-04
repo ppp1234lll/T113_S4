@@ -218,6 +218,35 @@ typedef struct {
      * 0600 的 `frpc.toml` 里）、**不**把令牌回给调用方。 */
     iv_tunnel_t *tunnel;
 
+    /* 写设备令牌（2026-11-04，`tunnel.configure` 用）。
+     *
+     * 为什么走回调而不是让本模块写文件：令牌的**唯一读者**是装配层
+     * （`main.c: tunnel_read_token()`），写与读放同一个地方才不会出现"文件改了、
+     * 内存里的 `t->token` 还是旧的"这种半生效状态 —— 那正是 `tunnel.enable` 会
+     * 渲染出旧 secretKey、而界面显示"已保存"的经典坑。
+     *
+     * 实现方（装配层）必须做完三件事才算成功：① 原子写 `<secure>/tunnel.token`
+     * （0600）② `iv_tunnel_set_identity()` 更新内存 ③ `iv_tunnel_invalidate()`
+     * 作废用旧钥匙开着的会话。返回 IV_OK 表示三件都成了。
+     * 可空 ⇒ `tunnel.configure` 只接受"不改令牌"的请求。 */
+    int (*do_set_token)(const char *token, void *arg);
+    void *set_token_arg;
+
+    /* 同步重读一次隧道相关配置（2026-11-04，`tunnel.configure` 开头调）。
+     *
+     * 为什么需要：`config.apply` 改完 `sys.tunnel.server.host` 之后，装配层是靠
+     * **配置事件**（`on_config_event`）把新地址喂给 `iv_tunnel_set_server()` 的，
+     * 而事件是异步送达的。Web「远程通道」页的"保存并生效"是 apply 紧接着 configure，
+     * 实测（板端 2026-11-04）这一次 configure 读到的仍是**旧地址**：界面显示保存成功、
+     * `frpc.toml` 里却还是老服务器 —— 用户得点第二次才生效。
+     *
+     * 有了这个回调，`tunnel.configure` 一进来就先同步拉一次配置，再动令牌与开关，
+     * 把"保存"和"生效"之间的那道缝抹平。实现方（装配层）就是 `tunnel_apply_cfg()`，
+     * 幂等、只读配置、不碰文件。
+     * 可空 ⇒ 退回"依赖事件送达"的老行为（仅测试装配用）。 */
+    int (*do_reload_cfg)(void *arg);
+    void *reload_cfg_arg;
+
     /* 恢复出厂（2026-10-22）：擦除目标的两个根。空 ⇒ 对应的擦除位返回 IV_ENOTSUP
      * （"能调但没接"，与 media / reboot 同一口径）。
      *   factory_data_root  —— `<data_root>`（`/mnt/UDISK/ivsbox`），擦 `<它>/log`

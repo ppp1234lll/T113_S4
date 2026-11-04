@@ -901,6 +901,53 @@ int iv_web_api_handle(iv_web_ctx_t *ctx, const iv_web_req_t *req,
         return api_p_call(ctx, "system.reboot",
                           (req->body != NULL) ? req->body : "{}",
                           out, cap, out_len, rsp);
+    /* 远程通道（M8，2026-11-04）。
+     *
+     * GET  `/api/tunnel`         → `tunnel.status`（只读：状态/SN/frps/令牌"有没有配"）
+     * POST `/api/tunnel/config`  → `tunnel.configure`：**存令牌 + 设有效期 + 开/关一次交付**
+     * POST `/api/tunnel/enable` / `/api/tunnel/disable` → 单独开关（现场脚本沿用）
+     *
+     * 三条写路径都只收 POST —— 与 relay.set / device.identity.set 同一条口径：
+     * "开一条远程入口"这种动作绝不能被浏览器预取或刷新重放。
+     *
+     * **令牌只进不出**：body 里带上来，响应里永远不出现（只有 token_set/token_len）。
+     * 运维需要的令牌是他自己生成、自己保存的那一份；设备能不能读出来不是便利性问题，
+     * 而是"任何登录者都能把通道搬走"的安全问题。 */
+    if (strcmp(req->path, "/api/tunnel") == 0)
+        return api_simple_call(ctx, "tunnel.status", out, cap, out_len, rsp);
+    if (strcmp(req->path, "/api/tunnel/config") == 0) {
+        if (strcmp(req->method, "POST") != 0) {
+            *out_len = api_err(out, cap, IV_EINVAL, "POST required");
+            rsp->status = 405;
+            rsp->len = *out_len;
+            return IV_OK;
+        }
+        return api_p_call(ctx, "tunnel.configure",
+                          (req->body != NULL) ? req->body : "{}",
+                          out, cap, out_len, rsp);
+    }
+    if (strcmp(req->path, "/api/tunnel/enable") == 0) {
+        if (strcmp(req->method, "POST") != 0) {
+            *out_len = api_err(out, cap, IV_EINVAL, "POST required");
+            rsp->status = 405;
+            rsp->len = *out_len;
+            return IV_OK;
+        }
+        return api_p_call(ctx, "tunnel.enable",
+                          (req->body != NULL) ? req->body : "{}",
+                          out, cap, out_len, rsp);
+    }
+    if (strcmp(req->path, "/api/tunnel/disable") == 0) {
+        if (strcmp(req->method, "POST") != 0) {
+            *out_len = api_err(out, cap, IV_EINVAL, "POST required");
+            rsp->status = 405;
+            rsp->len = *out_len;
+            return IV_OK;
+        }
+        return api_p_call(ctx, "tunnel.disable",
+                          (req->body != NULL) ? req->body : "{}",
+                          out, cap, out_len, rsp);
+    }
     /* 升级状态：**只读**（`ota.status` 不写盘）。真正的安装由 monitor.sh 拉起
      * ivsbox-updater 执行，Web 侧只把状态显示出来——"谁改版本"永远只有一个写者。 */
     if (strcmp(req->path, "/api/ota") == 0)

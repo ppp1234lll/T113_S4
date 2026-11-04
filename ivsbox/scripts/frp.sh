@@ -47,11 +47,13 @@
 #   IVSBOX_FRPC_BIN    frpc 二进制（默认 /usr/bin/frpc）
 #   IVSBOX_FRP_PIDFILE pid 文件（默认 /var/run/frpc.pid）
 #   IVSBOX_TUNNEL_FLAG 标记文件（默认 /tmp/frp.enabled，与 BIRD 同名）
+#   IVSBOX_FRPC_LOG    frpc 输出日志（默认 /mnt/UDISK/log/frpc.log；空＝丢到 /dev/null）
 
 FRP_CONF=${IVSBOX_FRP_CONF:-/etc/frp/frpc.toml}
 FRPC_BIN=${IVSBOX_FRPC_BIN:-/usr/bin/frpc}
 PID_FILE=${IVSBOX_FRP_PIDFILE:-/var/run/frpc.pid}
 ENABLED_FLAG=${IVSBOX_TUNNEL_FLAG:-/tmp/frp.enabled}
+FRPC_LOG=${IVSBOX_FRPC_LOG-/mnt/UDISK/log/frpc.log}
 
 frpc_alive() {
     # `-o comm` 只看进程名；frpc 是 ELF 二进制，判定可靠（对 shell 脚本会看到解释器，
@@ -86,6 +88,18 @@ stop_process_only() {
 }
 
 do_up() {
+    # 配置比进程新 ⇒ 必须重启（2026-11-04）。
+    # 判据：pid 文件在进程启动那一刻写（`echo $! > $PID_FILE`，mtime≈启动时刻），
+    # `FRP_CONF` 由 `iv_tunnel_enable()` 原子重写（rename，mtime＝重写时刻）。
+    # 没有这一条，"在 Web 上改了 frps 地址/令牌"之后 frpc 会一直按老配置跑 ——
+    # 下面的幂等短路看到一个活着的进程就什么都不做，monitor 也一样；现场表现是
+    # "界面改了没用，重启板子才好"。改配置时 `iv_tunnel_invalidate()` 虽然会清标记，
+    # 但 `tunnel.configure` 里 disable→enable 是同一瞬间完成的，5 s 一轮的 monitor
+    # 根本看不到标记短暂消失。
+    if frpc_alive && [ -f "$PID_FILE" ] && [ "$FRP_CONF" -nt "$PID_FILE" ]; then
+        echo "frp.sh: 配置比进程新，重启 frpc"
+        stop_process_only
+    fi
     # 幂等短路：进程在、标记在、没过期 ⇒ 什么都不做。BIRD 的 start 不具备幂等性
     # （它无条件 stop+start，由 monitor 的 `! is_running` 保证不被反复调）；本脚本
     # 也可能被 ctl / 人手直接调，所以自带这一层，避免每调一次就把通道重连一次。
@@ -111,9 +125,20 @@ do_up() {
     # （在起进程之前，让 monitor 看到标记后即使进程还没起来也不会误删）。
     # **只在标记不存在时建** —— 已有内容就是到期时刻，覆盖等于把 TTL 闸门冲掉。
     [ -f "$ENABLED_FLAG" ] || : > "$ENABLED_FLAG"
+    # 日志落盘（2026-11-04）：原先 `>/dev/null` —— 标记在、进程在、运维 PC 却连不上时
+    # 现场**完全无据可查**，只能靠猜是 frps 没起、auth.token 不对，还是 secretKey 算错。
+    # 截断而不是删除：板端没有 logrotate，`/mnt/UDISK/log` 也没有配额，但"最近一段"
+    # 比"什么都没有"有用得多；256 KiB 够放几千行连接日志。
+    if [ -n "$FRPC_LOG" ] && [ -d "$(dirname "$FRPC_LOG")" ]; then
+        FRPC_OUT=$FRPC_LOG
+        SZ=$(wc -c < "$FRPC_LOG" 2>/dev/null || echo 0)
+        [ "$SZ" -gt 262144 ] 2>/dev/null && : > "$FRPC_LOG"
+    else
+        FRPC_OUT=/dev/null
+    fi
     # `( ... ) &` + exec：让 $! 就是 frpc 自己的 pid（写成 `cmd &` 时若 cmd 是
     # 复合列表，$! 可能拿到子 shell；这里 exec 保证 pid 与进程一一对应）。
-    ( exec "$FRPC_BIN" -c "$FRP_CONF" >/dev/null 2>&1 ) &
+    ( exec "$FRPC_BIN" -c "$FRP_CONF" >>"$FRPC_OUT" 2>&1 ) &
     echo $! > "$PID_FILE" 2>/dev/null || true
     return 0
 }

@@ -18,6 +18,8 @@
  *   3) 状态从 off 翻到 on，且响应里**从不出现** secretKey 与令牌；
  *   4) 重复开启被 IV_ESTATE 拒掉；
  *   5) `tunnel.disable` ⇒ 标记消失、配置保留（0600 不因关闭而丢）。
+ *   6) `tunnel.configure` ⇒ 令牌**真的落到 0600 文件**且不回显；坏令牌被拒、不顶掉旧令牌
+ *      （这一段证明的是装配层的 `ctx->do_set_token` 接对了 —— 单测碰不到）。
  *
  * ============================ 用法 ============================
  *   test_tunnel_e2e [socket_path] [conf_path] [flag_path]
@@ -169,6 +171,55 @@ int main(int argc, char *argv[])
     rc = round_trip(fd, "{\"m\":\"tunnel.status\"}", body, sizeof body, NULL);
     if (rc == IV_OK)
         chk(strstr(body, "\"on\":false") != NULL, "channel starts closed");
+
+    /* 2b) tunnel.configure：存令牌（2026-11-04 新增）
+     *
+     * 这是本改动**唯一**的装配层证据。单测能证明 `iv_tunnel_token_valid()` 会拒坏令牌，
+     * 也能证明 `set_identity` 会早失败，但证明不了 `ctx->do_set_token` 真的被接上 ——
+     * 而那正是"界面显示已保存、frpc 用的还是旧钥匙"的根因所在（接线在装配层）。
+     *
+     * 令牌落点由 `IVSBOX_TUNNEL_TOKEN_FILE` 指定；没设就跳过文件断言（只验协议外形），
+     * 免得测试往真的 `/mnt/UDISK/ivsbox/secure/` 里写东西。 */
+    {
+        const char *tokfile = getenv("IVSBOX_TUNNEL_TOKEN_FILE");
+        int         ok;
+
+        ok = expect_ok(fd, "{\"m\":\"tunnel.configure\",\"p\":{\"token\":\"e2etok123\"}}",
+                       body, sizeof body);
+        chk(ok, "tunnel.configure {token} accepted (do_set_token is wired)");
+        if (ok) {
+            chk(strstr(body, "\"token_set\":true") != NULL,
+                "configure reports token_set");
+            chk(strstr(body, "e2etok123") == NULL,
+                "configure never echoes the token back");
+        }
+        /* 坏令牌必须被拒，且**不能**把旧令牌顶掉 */
+        chk(!expect_ok(fd, "{\"m\":\"tunnel.configure\",\"p\":{\"token\":\"ab\\\"cd\"}}",
+                      body, sizeof body),
+            "tunnel.configure rejects a token with a quote");
+
+        if (tokfile != NULL) {
+            struct stat st;
+            char        got[128];
+            FILE       *fp;
+            size_t      n;
+
+            chk(stat(tokfile, &st) == 0, "token file was written");
+            if (stat(tokfile, &st) == 0)
+                chk((st.st_mode & 0777u) == 0600u, "token file mode is 0600");
+            got[0] = '\0';
+            fp = fopen(tokfile, "r");
+            if (fp != NULL) {
+                n = fread(got, 1u, sizeof got - 1u, fp);
+                got[n] = '\0';
+                (void)fclose(fp);
+            }
+            chk(strstr(got, "e2etok123") != NULL,
+                "token file carries the new token (order: write -> identity)");
+            chk(strchr(got, '"') == NULL,
+                "rejected token did not overwrite the good one");
+        }
+    }
 
     /* 3) 开通道 */
     chk(expect_ok(fd, "{\"m\":\"tunnel.enable\",\"p\":{\"svcs\":[\"web\"],\"ttl\":120}}",

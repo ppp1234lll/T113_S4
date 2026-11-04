@@ -85,7 +85,8 @@ static const char *const k_methods[] = {
     "ota.request",
     "tunnel.status",
     "tunnel.enable",
-    "tunnel.disable"
+    "tunnel.disable",
+    "tunnel.configure"
 };
 
 int iv_ctl_method_count(void)
@@ -193,6 +194,23 @@ static int param_i64(json_object *p, const char *k, int64_t *out)
     if (!json_object_is_type(v, json_type_int))
         return IV_EPROTO;
     *out = (int64_t)json_object_get_int64(v);
+    return IV_OK;
+}
+
+/* 取布尔参数。命中 IV_OK；缺失 IV_ENOENT；类型不符 IV_EPROTO。
+ * 只认真正的 JSON 布尔（`true`/`false`）—— 收 `1`/`"true"` 会让"传错了"看起来
+ * 像"传对了"，而本参数决定"要不要立刻开远程入口"，误判代价太大。 */
+static int param_bool(json_object *p, const char *k, int *out)
+{
+    json_object *v = NULL;
+
+    if (p == NULL || k == NULL || out == NULL)
+        return IV_EINVAL;
+    if (!json_object_object_get_ex(p, k, &v) || v == NULL)
+        return IV_ENOENT;
+    if (!json_object_is_type(v, json_type_boolean))
+        return IV_EPROTO;
+    *out = json_object_get_boolean(v) ? 1 : 0;
     return IV_OK;
 }
 
@@ -3146,6 +3164,11 @@ static int m_tunnel_status(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size_
     json_object_object_add(d, "enabled", json_object_new_boolean(
                                    (caps & IV_TUNNEL_CAP_ENABLED) != 0u ? 1 : 0));
     json_object_object_add(d, "sn", json_object_new_string(t->sn));
+    /* 令牌**不回给调用方**（模块边界，见文件头与 iv_ctl.h 的 ctx 注释）：只报
+     * "有没有配"与长度。运维需要的令牌是在 Web 上**填进去**的那一份（自己生成、
+     * 自己保存），不是从设备读出来的 —— 读得到就等于任何登录者都能把通道搬走。 */
+    json_object_object_add(d, "token_set", json_object_new_boolean(t->token[0] != '\0'));
+    json_object_object_add(d, "token_len", json_object_new_int((int)strlen(t->token)));
     json_object_object_add(d, "server", json_object_new_string(t->server_addr));
     json_object_object_add(d, "server_port", json_object_new_int((int)t->server_port));
     json_object_object_add(d, "conf", json_object_new_string(t->conf_path));
@@ -3244,8 +3267,116 @@ static int m_tunnel_disable(const iv_ctl_ctx_t *ctx, char *out, size_t cap, size
     return rsp_data(d, out, cap, out_len);
 }
 
-/* ============================ 入口 ============================ */
+/*
+ * tunnel.configure —— 一次调用交付"存令牌 + 设有效期 + 开/关"（2026-11-04）
+ *
+ * ============================ 为什么还要这个方法 ============================
+ * `tunnel.enable` 只能开，开之前令牌必须已经在文件里 —— 而令牌原先只有工厂/平台
+ * 能写（本模块被明令"不碰文件"，见 iv_ctl.h 的 ctx 注释）。结果 Web 界面想让人
+ * 填一个令牌，就得先"写文件"再"调 enable"，两步之间任何一步失败都留下半生效状态：
+ * 令牌换了、通道还拿着旧 secretKey 在跑；或者通道开了、令牌其实没落盘。
+ *
+ * 本方法把三件事收在一次请求里，并且**顺序固定**：令牌 → 有效期 → 开关。
+ * 令牌写成功会由装配层作废正在开的会话（旧钥匙配新配置只会"连得上但连不通"），
+ * 所以"改令牌 + 保持开启"必须重新 enable —— 这也是这里先判 `ON` 就 `disable` 的原因。
+ *
+ * 入参（全部可空，只处理出现的字段）：
+ *   token  : 字符串，1..63 字节，白名单字符（见 iv_tunnel_token_valid）
+ *   ttl    : 整数秒，0＝不过期，上限 IV_TUNNEL_TTL_MAX
+ *   enable : 布尔，true＝开（按 ttl），false＝关；**不传则不动通道状态**
+ *
+ * 令牌**不会**出现在响应里（模块边界）：只回 token_set / token_len。
+ */
+static int m_tunnel_configure(const iv_ctl_ctx_t *ctx, json_object *p, char *out, size_t cap,
+                              size_t *out_len)
+{
+    iv_tunnel_t       *t = ctx->tunnel;
+    const char        *tok;
+    char               twhy[96];
+    int64_t            ttl = 0;
+    int                en = 0;
+    int                has_enable = 0;
+    int                rc;
+    json_object       *d;
 
+    if (t == NULL)
+        return IV_ENOTSUP;
+
+    /* ⓪ 先把配置同步拉一遍（2026-11-04）。
+     * `config.apply` 之后装配层是靠**配置事件**更新 `iv_tunnel_set_server()` 的，而事件
+     * 异步送达：Web 的"保存并生效"是 apply 紧接着 configure，实测这一次 configure 读到的
+     * 还是旧地址 ⇒ 界面说保存成功、`frpc.toml` 里仍是老服务器，用户要点第二次。
+     * 这里同步调一次装配层的 apply_cfg（幂等、只读配置），把缝抹平。 */
+    if (ctx->do_reload_cfg != NULL)
+        (void)ctx->do_reload_cfg(ctx->reload_cfg_arg);
+
+    /* ① 令牌（可空＝不动）。校验在这里做，装配层只管落盘与生效 —— 报错话术要
+     * 能直接显示在 Web 上，所以用 iv_tunnel 的那一句人话，不另编一套。 */
+    tok = param_str(p, "token");
+    if (tok != NULL) {
+        rc = iv_tunnel_token_valid(tok, twhy, sizeof twhy);
+        if (rc != IV_OK)
+            return rsp_err(IV_EINVAL, twhy, out, cap, out_len);
+        if (ctx->do_set_token == NULL)
+            return rsp_err(IV_ENOTSUP, "token write not wired", out, cap, out_len);
+        rc = ctx->do_set_token(tok, ctx->set_token_arg);
+        if (rc != IV_OK)
+            return rsp_err(rc, "write token failed", out, cap, out_len);
+    }
+
+    /* ② 有效期（可空＝按现有 ttl_s / 默认不过期） */
+    if (param_i64(p, "ttl", &ttl) == IV_OK) {
+        if (ttl < 0 || ttl > (int64_t)IV_TUNNEL_TTL_MAX)
+            return rsp_err(IV_ERANGE, "ttl out of range (0 = never expires)",
+                           out, cap, out_len);
+    } else {
+        ttl = 0;
+    }
+
+    /* ③ 开关（可空＝不动）。`has_enable` 与 `en` 分开存：缺字段和 false 的处置不同 ——
+     * "只改令牌、通道该怎么开还怎么开"不能被当成"请求关闭"。 */
+    has_enable = (param_bool(p, "enable", &en) == IV_OK);
+
+    if (has_enable && en) {
+        if (iv_tunnel_state(t) == IV_TUNNEL_ON) {
+            /* 换钥匙/改有效期都必须重开；旧会话留着只会让运维"连得上但连不通" */
+            (void)iv_tunnel_disable(t, (uint64_t)time(NULL), IV_TUNNEL_STOP_RECONF);
+        }
+        {
+            uint32_t            uttl = (ttl > 0) ? (uint32_t)ttl : t->ttl_s;
+            iv_tunnel_reason_t  why = IV_TUNNEL_OK;
+
+            /* 不传 ttl 时沿用上次的有效期（重新 enable 时 t->ttl_s 还留着）；
+             * 第一次开且没给 ttl ⇒ 0 ＝不过期，与 m_tunnel_enable 同口径。 */
+            rc = iv_tunnel_enable(t, uttl, (uint64_t)time(NULL), &why);
+            if (rc != IV_OK)
+                return rsp_err(rc, iv_tunnel_reason_name(why), out, cap, out_len);
+        }
+    } else if (has_enable && !en) {
+        if (iv_tunnel_state(t) == IV_TUNNEL_ON)
+            (void)iv_tunnel_disable(t, (uint64_t)time(NULL), IV_TUNNEL_STOP_LOCAL);
+    }
+
+    d = json_object_new_object();
+    if (d == NULL)
+        return IV_ENOMEM;
+    json_object_object_add(d, "on", json_object_new_boolean(
+                                   iv_tunnel_state(t) == IV_TUNNEL_ON ? 1 : 0));
+    json_object_object_add(d, "token_set", json_object_new_boolean(t->token[0] != '\0'));
+    json_object_object_add(d, "token_len", json_object_new_int((int)strlen(t->token)));
+    json_object_object_add(d, "ttl_s", json_object_new_int((int)t->ttl_s));
+    json_object_object_add(d, "remain_s", json_object_new_int(
+                                  (int)iv_tunnel_remain_s(t, (uint64_t)time(NULL))));
+    json_object_object_add(d, "sn", json_object_new_string(t->sn));
+    json_object_object_add(d, "server", json_object_new_string(t->server_addr));
+    json_object_object_add(d, "server_port", json_object_new_int((int)t->server_port));
+    json_object_object_add(d, "conf", json_object_new_string(t->conf_path));
+    json_object_object_add(d, "note", json_object_new_string(
+        "令牌已落盘即生效（无需重启）；frpc 由 monitor.sh 按标记 /tmp/frp.enabled 拉起"));
+    return rsp_data(d, out, cap, out_len);
+}
+
+/* ============================ 入口 ============================ */
 int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
                   char *out, size_t out_cap, size_t *out_len)
 {
@@ -3362,6 +3493,8 @@ int iv_ctl_handle(const iv_ctl_ctx_t *ctx, const char *in, size_t in_len,
         rc = m_tunnel_enable(ctx, params, out, out_cap, out_len);
     else if (strcmp(method, "tunnel.disable") == 0)
         rc = m_tunnel_disable(ctx, out, out_cap, out_len);
+    else if (strcmp(method, "tunnel.configure") == 0)
+        rc = m_tunnel_configure(ctx, params, out, out_cap, out_len);
     else
         rc = IV_ENOTSUP; /* **不写 out**，由调用方静默丢弃 */
 

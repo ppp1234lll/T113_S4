@@ -86,6 +86,48 @@ static void to_hex(const uint8_t *b, size_t n, char *out)
     out[n * 2u] = '\0';
 }
 
+/* 令牌字符白名单（见头文件 iv_tunnel_token_valid 处"为什么必须有这一关"）。
+ * 判定与"能不能安全写进 TOML 的双引号值里"**等价**：只留不会改变语法的字符。 */
+static int token_char_ok(unsigned char c)
+{
+    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+        return 1;
+    switch (c) {
+    case '-': case '_': case '.': case '~': case '+': case '/': case '=': case '@':
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int iv_tunnel_token_valid(const char *token, char *why, size_t why_cap)
+{
+    size_t i, n;
+
+    if (why != NULL && why_cap > 0u) why[0] = '\0';
+    if (token == NULL || token[0] == '\0') {
+        if (why != NULL && why_cap > 0u) (void)snprintf(why, why_cap, "令牌为空");
+        return IV_EINVAL;
+    }
+    n = strlen(token);
+    if (n >= IV_TUNNEL_TOKEN_MAX) {
+        if (why != NULL && why_cap > 0u)
+            (void)snprintf(why, why_cap, "令牌超长（上限 %u 字符）",
+                           (unsigned)(IV_TUNNEL_TOKEN_MAX - 1u));
+        return IV_ERANGE;
+    }
+    for (i = 0; i < n; i++) {
+        if (!token_char_ok((unsigned char)token[i])) {
+            if (why != NULL && why_cap > 0u)
+                (void)snprintf(why, why_cap,
+                               "令牌第 %u 个字符不合法（只允许 0-9 A-Z a-z - _ . ~ + / = @）",
+                               (unsigned)(i + 1u));
+            return IV_EPROTO;
+        }
+    }
+    return IV_OK;
+}
+
 /*
  * MD5 派生：hex( MD5(a + b)[0..8) ) → 16 个小写字符 + NUL。
  * 与 BIRD `internal/utils/md5.go: GenerateSTCPKey()` 逐字同源：
@@ -148,6 +190,7 @@ int iv_tunnel_render(const char *sn, const char *token, const char *server_addr,
     char    secret[IV_TUNNEL_SECRET_MAX];
     char    name[IV_TUNNEL_NAME_MAX];
     size_t  pos = 0;
+    size_t  i;
     int     w;
 
     if (out == NULL || cap == 0u || out_len == NULL) {
@@ -165,6 +208,21 @@ int iv_tunnel_render(const char *sn, const char *token, const char *server_addr,
         if (why != NULL) *why = IV_TUNNEL_ENOSERVER;
         return IV_ENOENT;
     }
+    /* frps 地址同样是"外部字符串写进双引号值"，与令牌同一条口径（2026-11-04）。
+     * 域名 / IPv4 / IPv6 字面量需要 `[` `]` `:`，其余字符没有存在理由。 */
+    for (i = 0; server_addr[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)server_addr[i];
+
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) &&
+            c != '.' && c != '-' && c != ':' && c != '[' && c != ']' && c != '_') {
+            if (why != NULL) *why = IV_TUNNEL_EBADARG;
+            return IV_EPROTO;
+        }
+    }
+    if (iv_tunnel_token_valid(token, NULL, 0u) != IV_OK) {
+        if (why != NULL) *why = IV_TUNNEL_EBADARG;
+        return IV_EPROTO;
+    }
     w = snprintf(name, sizeof name, "%s", sn);
     if (w < 0 || (size_t)w >= sizeof name) {
         if (why != NULL) *why = IV_TUNNEL_ENOIDENT;
@@ -176,10 +234,20 @@ int iv_tunnel_render(const char *sn, const char *token, const char *server_addr,
     }
 
     /* 逐字对齐 BIRD `writeFrpConfig()` 的 fmt.Sprintf 产物（含空行位置与结尾换行）：
-     * serverAddr / serverPort / auth.token ＋ 空行 ＋ 唯一的 [[proxies]] 段。 */
+     * serverAddr / serverPort / auth.token ＋ 空行 ＋ 唯一的 [[proxies]] 段。
+     *
+     * `loginFailExit = false` 是 2026-11-04 现场加的一行（BIRD 那份没有）：
+     * frpc 0.68 这个键**默认 true** —— 第一次连不上 frps 就**直接退出**，不是重试。
+     * 板上实测：开机时 4G 还没拨通 / frps 恰好重启，frpc 打一行
+     * `login to the server failed ... With loginFailExit enabled, no additional retries`
+     * 就没了，通道要等 monitor 下一轮（甚至熔断窗口之后）才重新拉一次；
+     * 每拉一次又重新登录一次，现场表现为"远程时好时坏"。
+     * 关掉它 ⇒ 进程留在原地按退避重连，monitor 看到"活着"就不会反复重启，
+     * 也不会因为一次瞬时断网把通道判死。 */
     if (app(out, cap, &pos, "serverAddr = \"%s\"\n", server_addr) != 0 ||
         app(out, cap, &pos, "serverPort = %u\n", (unsigned)server_port) != 0 ||
         app(out, cap, &pos, "auth.token = \"%s\"\n", token) != 0 ||
+        app(out, cap, &pos, "loginFailExit = false\n") != 0 ||
         app(out, cap, &pos, "\n[[proxies]]\n") != 0 ||
         app(out, cap, &pos, "name = \"%s\"\n", name) != 0 ||
         app(out, cap, &pos, "type = \"stcp\"\n") != 0 ||
@@ -300,6 +368,10 @@ int iv_tunnel_set_identity(iv_tunnel_t *t, const char *sn, const char *token)
     if (t == NULL || sn == NULL || token == NULL) return IV_EINVAL;
     if (sn[0] == '\0' || token[0] == '\0') return IV_EINVAL; /* fail-closed */
     if (strlen(sn) >= sizeof t->sn || strlen(token) >= sizeof t->token) return IV_ERANGE;
+    /* 字符集在这里先挡一次（2026-11-04）：令牌从前只由工厂/平台写入，现在 Web 也能填，
+     * 于是"带引号/换行"的令牌会一路存到 `t->token` 里，直到 enable 渲染 TOML 才爆。
+     * 早失败＝Web 当场看到"第 N 个字符不合法"，而不是"frpc 起不来"（见 render 的注释）。 */
+    if (iv_tunnel_token_valid(token, NULL, 0u) != IV_OK) return IV_EINVAL;
     snprintf(t->sn, sizeof t->sn, "%s", sn);
     snprintf(t->token, sizeof t->token, "%s", token);
     return IV_OK;

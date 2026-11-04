@@ -136,6 +136,26 @@ const char *iv_tunnel_stop_reason_name(int r);
 int iv_tunnel_secret(const char *sn, const char *token, char *out, size_t cap);
 
 /*
+ * 令牌字符集校验（2026-11-04，Web 可填令牌后新增）。
+ *
+ * ============================ 为什么必须有这一关 ============================
+ * `iv_tunnel_render()` 是 `sprintf` 风格手工拼 TOML，令牌是**唯一一个来自外部、
+ * 要写进双引号值里的字符串**。放任它只能靠"用户不会填怪字符"：
+ *   token = `ab"cd`      ⇒ 引号提前闭合，后面 `cd"` 变成键名 ⇒ frpc 解析失败；
+ *   token = `ab\nlocalPort = 1234` ⇒ **注入任意键**，把"只转发 22"改成转发别的端口；
+ *   token = `ab#cd`      ⇒ `#` 之后被当注释，secretKey 行整段失效。
+ * 三种都不报"令牌非法"，只表现为"frpc 起不来"或"转发了不该转的端口"。
+ *
+ * 判据＝**白名单**：只收 `[0-9A-Za-z-_.~+/=@]`，长度 1..(IV_TUNNEL_TOKEN_MAX-1)。
+ * 白名单而不是黑名单：黑名单永远漏一个（`'`、`` ` ``、`$`、`\t`…），而令牌是
+ * 我们自己生成的随机串，没有任何理由需要白名单以外的字符。
+ *
+ * 返回 IV_OK / IV_EINVAL（参数或空串）/ IV_ERANGE（超长）/ IV_EPROTO（含非法字符），
+ * `why`（可空）收到人话原因，供 Web 直接显示。
+ */
+int iv_tunnel_token_valid(const char *token, char *why, size_t why_cap);
+
+/*
  * 渲染 frpc.toml 文本（**不落盘**，纯拼装，便于单测逐字钉内容）。
  * 产物与 BIRD `writeFrpConfig()` 的输出**逐字一致**（含空行位置）：
  *

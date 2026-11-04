@@ -1048,6 +1048,142 @@ static void tunnel_read_sn(char *out, size_t cap)
     (void)snprintf(out, cap, "%s", tid);
 }
 
+/* ---------------------------------------------------------------------------
+ * 写令牌（2026-11-04：Web「远程通道」页可填，保存即生效）
+ *
+ * ============================ 为什么写在这里 ============================
+ * 令牌的唯一读者是本文件的 `tunnel_read_token()`。**读与写必须在同一处**，否则
+ * 会出现"文件已改、`g_tunnel->token` 还是旧的"这种半生效状态：界面上提示"已保存"，
+ * 实际 enable 出来的是旧 secretKey，症状是运维端"连上 frps 却握不上手"，两边都不
+ * 报"钥匙错"（stcp 的语义）。
+ *
+ * `iv_ctl` 侧只做参数校验与人话报错，落盘与生效由这里负责（见 iv_ctl.h 的
+ * `do_set_token` 注释：本模块不碰文件是刻意的边界）。
+ *
+ * ============================ 落盘口径 ============================
+ * tmp → fsync(文件) → rename → fsync(目录)：与 `iv_config_save()` 同一套，
+ * 掉电要么是旧令牌、要么是新令牌，不会是半行（半行令牌会派生出一把谁也连不上的
+ * 钥匙，比"没改成"更难查）。权限 0600 + 显式 chmod（open 的 mode 会被 umask 削）。
+ * ------------------------------------------------------------------------- */
+
+/* 令牌文件路径：允许环境变量覆盖（单测 / 联调用，与 tunnel_read_token 同口径）。 */
+static void tunnel_token_path(char *out, size_t cap)
+{
+    const char *env = getenv("IVSBOX_TUNNEL_TOKEN_FILE");
+
+    (void)snprintf(out, cap, "%s",
+                   (env != NULL && env[0] != '\0') ? env : TUNNEL_TOKEN_FILE_DEFAULT);
+}
+
+static void tunnel_fsync_dir(const char *path)
+{
+    char  dir[IV_TUNNEL_PATH_MAX];
+    char *slash;
+    int   fd;
+
+    (void)snprintf(dir, sizeof dir, "%s", path);
+    slash = strrchr(dir, '/');
+    if (slash == NULL) return;
+    if (slash == dir) slash[1] = '\0';
+    else *slash = '\0';
+
+    fd = open(dir, O_RDONLY);
+    if (fd < 0) return;
+    (void)fsync(fd);
+    (void)close(fd);
+}
+
+static int tunnel_write_token_file(const char *token)
+{
+    char        path[IV_TUNNEL_PATH_MAX];
+    char        dir[IV_TUNNEL_PATH_MAX];
+    char        tmp[IV_TUNNEL_PATH_MAX + 8];
+    char       *slash;
+    const char *src = token;
+    size_t      len;
+    int         fd;
+
+    tunnel_token_path(path, sizeof path);
+    (void)snprintf(tmp, sizeof tmp, "%s.tmp", path);
+
+    /* 目录不存在就建（0700）：新板首次从 Web 填令牌时 `<secure>` 可能还没被
+     * 工厂工具创建过。不建的话 open 直接 ENOENT，而界面上只会显示"写令牌失败"，
+     * 现场很难联想到"是目录不在"。已存在时 mkdir 返回 EEXIST，忽略即可。 */
+    (void)snprintf(dir, sizeof dir, "%s", path);
+    slash = strrchr(dir, '/');
+    if (slash != NULL && slash != dir) {
+        *slash = '\0';
+        (void)mkdir(dir, 0700);
+    }
+
+    len = strlen(src);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        IV_LOG_W(APP_MOD, "tunnel: token tmp create failed (%s): %s", tmp, strerror(errno));
+        return IV_EIO;
+    }
+    /* 结尾补一个换行：既方便现场 cat，也与"平台下发多半带换行"的读入口径一致。 */
+    if (write(fd, src, len) != (ssize_t)len || write(fd, "\n", 1u) != 1) {
+        IV_LOG_W(APP_MOD, "tunnel: token write failed: %s", strerror(errno));
+        (void)close(fd);
+        (void)unlink(tmp);
+        return IV_EIO;
+    }
+    if (fsync(fd) != 0) {
+        IV_LOG_W(APP_MOD, "tunnel: token fsync failed: %s", strerror(errno));
+        (void)close(fd);
+        (void)unlink(tmp);
+        return IV_EIO;
+    }
+    (void)close(fd);
+    (void)chmod(tmp, 0600); /* umask 可能把 open 的 0600 削小，这里补回精确权限 */
+    if (rename(tmp, path) != 0) {
+        IV_LOG_W(APP_MOD, "tunnel: token rename failed: %s", strerror(errno));
+        (void)unlink(tmp);
+        return IV_EIO;
+    }
+    tunnel_fsync_dir(path);
+    return IV_OK;
+}
+
+/* 写令牌 + 立刻生效（ctx->do_set_token 的实现）。
+ * 用"有效值"重读一次再 set_identity：`IVSBOX_TUNNEL_TOKEN` 环境变量优先于文件，
+ * 若直接拿入参去设，调试用的覆盖会被这次写入悄悄改掉（现场最难查的一类"改了没用"）。 */
+static int app_set_tunnel_token(const char *token, void *arg)
+{
+    char sn[IV_TUNNEL_SN_MAX];
+    char eff[IV_TUNNEL_TOKEN_MAX];
+    int  rc;
+
+    (void)arg;
+    if (g_tunnel == NULL || token == NULL)
+        return IV_EINVAL;
+    if (iv_tunnel_token_valid(token, NULL, 0u) != IV_OK)
+        return IV_EINVAL; /* ctl 侧已经报过人话原因，这里是兜底 */
+    if (tunnel_write_token_file(token) != IV_OK)
+        return IV_EIO;
+
+    tunnel_read_sn(sn, sizeof sn);
+    tunnel_read_token(eff, sizeof eff);
+    if (sn[0] == '\0' || eff[0] == '\0') {
+        IV_LOG_W(APP_MOD, "tunnel: token written but identity still incomplete "
+                          "(sn=%s token=%s) - channel stays closed",
+                sn[0] != '\0' ? "ok" : "missing", eff[0] != '\0' ? "ok" : "missing");
+        return IV_ESTATE;
+    }
+
+    rc = iv_tunnel_set_identity(g_tunnel, sn, eff);
+    if (rc != IV_OK)
+        return rc;
+
+    /* 钥匙换了 ⇒ 用旧钥匙开着的会话必须作废。不作废的后果不是"连不上"，
+     * 而是"照旧连得上、但访问端算的 secretKey 跟设备不一致，握手永远失败"。 */
+    (void)iv_tunnel_invalidate(g_tunnel);
+    IV_LOG_I(APP_MOD, "tunnel: token updated (%u bytes), open session invalidated",
+             (unsigned)strlen(eff));
+    return IV_OK;
+}
+
 /* 读配置：服务端落点 ＋ 本机三个代理端口 ＋ 摄像机代理开关。
  * 单独成函数是为了**配置热更新**也走同一条路（on_config_event）。 */
 static void tunnel_apply_cfg(void)
@@ -1068,6 +1204,17 @@ static void tunnel_apply_cfg(void)
     }
     if (host != NULL)
         (void)iv_tunnel_set_server(g_tunnel, host, port);
+}
+
+/* 给 `tunnel.configure` 用的同步重读（见 iv_ctl.h 的 `do_reload_cfg` 注释）。
+ * 就是 `tunnel_apply_cfg()` 本尊 —— 它本来就幂等、只读配置、不碰文件，包一层只为签名。 */
+static int app_reload_tunnel_cfg(void *arg)
+{
+    (void)arg;
+    if (g_tunnel == NULL)
+        return IV_ESTATE;
+    tunnel_apply_cfg();
+    return IV_OK;
 }
 
 /* 周期巡检：到期自关。**回调内重挂**（iv_timer_add 是一次性语义，见 iv_reactor.h）。 */
@@ -1102,6 +1249,11 @@ static void tunnel_setup(void)
 
     tunnel_apply_cfg();
     g_ctl_ctx.tunnel = g_tunnel;
+    /* 令牌写入回调（2026-11-04）：ctl 侧只管校验，落盘与生效在这里，读写同源。 */
+    g_ctl_ctx.do_set_token = app_set_tunnel_token;
+    g_ctl_ctx.set_token_arg = NULL;
+    g_ctl_ctx.do_reload_cfg = app_reload_tunnel_cfg;
+    g_ctl_ctx.reload_cfg_arg = NULL;
 
     /* 认领上一条还开着的通道（BIRD 语义：通道是独立于主控进程的事实，见退出处注释）。
      * IV_ENOENT ＝ 本来就没开，正常；IV_ESTATE ＝ 标记里的到期时刻已过，restore 顺手

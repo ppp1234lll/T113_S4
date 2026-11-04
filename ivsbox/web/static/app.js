@@ -119,6 +119,7 @@
     { id: 'switch', name: '交换机' },
     { id: 'snmp', name: 'SNMP' },
     { id: 'media', name: '媒体' },
+    { id: 'tunnel', name: '远程通道' },
     { id: 'config', name: '配置' },
     { id: 'maint', name: '运维' }
   ];
@@ -401,6 +402,7 @@
       board: pageBoard,
       camera: pageCamera,
       devices: pageDevices, switch: pageSwitch, snmp: pageSnmp, media: pageMedia,
+      tunnel: pageTunnel,
       config: pageConfig, maint: pageMaint
     }[page] || pageOverview;
     c.appendChild(builder());
@@ -3050,6 +3052,240 @@
     return root;
   }
 
+  /* ==================== 远程通道（M8，2026-11-04） ====================
+   * 这一页把"开一条应急远程入口"从命令行搬进界面。四步的顺序是**固定**的：
+   *   ① 服务器落点  → 普通配置（`sys.tunnel.server.*`，main.c 的热更新回调会把
+   *                    正在开的会话作废 —— 换了 frps 还留着旧会话只会"连得上连不通"）
+   *   ② 令牌        → `tunnel.configure`（落盘 → 换钥匙 → 作废旧会话）
+   *   ③ 有效期      → 同上
+   *   ④ 开关        → 同上
+   * ①②不能合成一步：令牌**不是配置键**（配置是明文 JSON，`config.all` 会整份导出给
+   * 前端），它有自己的文件和字符集校验。混进配置等于把钥匙写进会给前端看的 JSON。
+   *
+   * 令牌框是 password 且**不回显**：后端也不给（见 `iv_ctl.c` 的 `m_tunnel_status`
+   * 注释），要换就重填一份。这不是省事，是"任何登录者都能把通道搬走"的安全边界。
+   */
+  var TTL_OPT = [
+    ['3600', '1 小时'], ['28800', '8 小时'], ['86400', '24 小时（上限）'], ['0', '不过期']
+  ];
+
+  function fmtRemain(sec) {
+    sec = Number(sec) || 0;
+    if (sec <= 0) return '不过期';
+    var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+    return (h > 0 ? h + ' 小时 ' : '') + m + ' 分钟';
+  }
+
+  /* 前端就地生成令牌（32 位小写 hex）。为什么不逼运维去开那个生成工具：
+   * 现场常常只有一台笔记本连着设备，能少一个文件就少一个。
+   * 用 crypto.getRandomValues 而不是 Math.random —— 后者在浏览器里是可预测的
+   * PRNG，"看起来随机"的钥匙等于没钥匙。老浏览器没有 crypto 就留空，让用户用工具。 */
+  function genToken() {
+    var buf = new Uint8Array(16), out = '', i;
+    if (!window.crypto || !window.crypto.getRandomValues) return '';
+    window.crypto.getRandomValues(buf);
+    for (i = 0; i < buf.length; i++) out += ('0' + buf[i].toString(16)).slice(-2);
+    return out;
+  }
+
+  function pageTunnel() {
+    var root = document.createDocumentFragment();
+    root.appendChild(el('h2', 'page-title', '远程通道'));
+
+    var cur = { ver: 0, host: '', port: 0, ttl_s: 3600, on: false };
+
+    /* ---------- 状态卡 ---------- */
+    var stCard = el('div', 'card');
+    stCard.appendChild(el('h3', null, '通道状态'));
+    var statBox = el('div');
+    stCard.appendChild(statBox);
+    root.appendChild(stCard);
+
+    /* ---------- 参数卡 ---------- */
+    var cfgCard = el('div', 'card');
+    cfgCard.appendChild(el('h3', null, 'frpc 参数'));
+    cfgCard.appendChild(el('p', 'hint',
+      '保存后立刻生效，不需要重启设备。令牌单独存放（secure/tunnel.token，0600），' +
+      '页面上不回显设备已有的令牌：要换就重填一份，不改就留空。'));
+
+    var grid = el('div', 'grid');
+    cfgCard.appendChild(grid);
+
+    var inHost = el('input'); inHost.type = 'text'; inHost.placeholder = 'frps 域名或 IP';
+    var inPort = el('input'); inPort.type = 'number'; inPort.min = '0'; inPort.max = '65535';
+    inPort.placeholder = '0 = 7000';
+    var inTok  = el('input'); inTok.type = 'password'; inTok.placeholder = '留空＝不改';
+    inTok.autocomplete = 'new-password';
+    var selTtl = el('select');
+    TTL_OPT.forEach(function (o) {
+      var op = el('option', null, o[1]); op.value = o[0]; selTtl.appendChild(op);
+    });
+    var chkEn = document.createElement('input'); chkEn.type = 'checkbox';
+
+    /* 与 configCard 生成的字段同一个 DOM 形状（label.field > span + input），
+     * 这样颜色/间距/窄屏折行不用在这里再写一套样式。 */
+    function fld(label, node, hint, chk) {
+      var lab = el('label', chk ? 'field chk' : 'field');
+      lab.appendChild(el('span', null, label));
+      lab.appendChild(node);
+      if (hint) lab.appendChild(el('span', 'hint', hint));
+      grid.appendChild(lab);
+      return lab;
+    }
+    fld('frps 地址', inHost, '运维箱/服务器的地址，空＝开不了通道');
+    fld('frps 端口', inPort, '0 表示用默认 7000');
+    fld('令牌', inTok, '1~63 位，只允许 0-9 A-Z a-z - _ . ~ + / = @');
+    fld('有效期', selTtl, '到期自动关闭（设备侧与 frp.sh 各判一次）');
+    fld('启用通道', chkEn, '勾上＝保存后立刻开', true);
+
+    var bar = el('div', 'actions');
+    var bGen = el('button', 'ghost', '生成随机令牌');
+    bGen.type = 'button';
+    var bSave = el('button', null, '保存并生效');
+    bSave.type = 'button';
+    var bOff = el('button', 'danger', '关闭通道');
+    bOff.type = 'button';
+    var bReload = el('button', 'ghost', '刷新');
+    bReload.type = 'button';
+    [bGen, bSave, bOff, bReload].forEach(function (b) { bar.appendChild(b); });
+    cfgCard.appendChild(bar);
+    root.appendChild(cfgCard);
+
+    /* ---------- 说明卡 ---------- */
+    var docCard = el('div', 'card');
+    docCard.appendChild(el('h3', null, '怎么用'));
+    var ol = el('div');
+    function step(n, txt) {
+      var p = el('p', 'hint');
+      p.textContent = n + '. ' + txt;
+      ol.appendChild(p);
+    }
+    step(1, '在这里填 frps 地址/端口与令牌，勾"启用通道"，点"保存并生效"。');
+    step(2, '通道只转发设备本机 sshd（22）。frps 的 auth.token 必须与这里的令牌相同。');
+    step(3, '运维 PC 用同一个令牌 + 设备 SN 算 secretKey（md5(sn+token) 前 8 字节 hex），' +
+            '写进 stcp visitor 配置：name/secretKey/serverName 填 SN。');
+    step(4, '连上后：ssh 用 -P <bindPort>；传文件用 pscp -P <bindPort>；' +
+            '要看摄像机再加 ssh -L 9090:192.168.1.200:554。');
+    step(5, '令牌生成/换算工具见交付包 tools/tunnel-keygen.html（离线网页，不用装东西）。');
+    docCard.appendChild(ol);
+    root.appendChild(docCard);
+
+    /* ---------- 数据刷新 ---------- */
+    function renderStat(d) {
+      statBox.innerHTML = '';
+      var t = el('table');
+      function row(k, v, cls) {
+        var tr = el('tr');
+        tr.appendChild(el('th', null, k));
+        var td = el('td', cls, v);
+        tr.appendChild(td);
+        t.appendChild(tr);
+      }
+      row('通道', d.on ? '已开启' : '未开启', d.on ? 'ok' : 'dim');
+      row('剩余有效期', d.on ? fmtRemain(d.remain_s) : '—');
+      row('设备 SN', d.sn || '（未读到工厂身份）');
+      row('frps', d.server ? (d.server + ':' + (d.server_port || 7000)) : '（未配置 = 开不了）');
+      row('令牌', d.token_set ? ('已配置（' + d.token_len + ' 位）') : '未配置', d.token_set ? 'ok' : 'err');
+      row('本地转发', '127.0.0.1:' + (d.local_port || 22));
+      row('配置落点', d.conf || '—');
+      row('标记文件', d.flag || '—');
+      if (d.stat) {
+        row('累计开启/拒绝', (d.stat.opens || 0) + ' / ' + (d.stat.denies || 0));
+      }
+      if (d.last) {
+        row('上次会话', fmtRemain(d.last.secs) + '，结束原因 ' + (d.last.stop || '—'));
+      }
+      statBox.appendChild(t);
+    }
+
+    function loadStatus() {
+      api('/api/tunnel').then(function (r) {
+        if (!r.ok) { statBox.appendChild(el('p', 'msg', r.msg || '读取失败')); return; }
+        var d = r.d || {};
+        cur.on = !!d.on;
+        cur.ttl_s = Number(d.ttl_s) || 0;
+        renderStat(d);
+        chkEn.checked = cur.on;
+        /* 有效期下拉跟随设备现值：不清空就等于"保存时悄悄把 ttl 改成 1 小时" */
+        for (var i = 0; i < selTtl.options.length; i++) {
+          if (Number(selTtl.options[i].value) === cur.ttl_s) { selTtl.value = selTtl.options[i].value; break; }
+        }
+      }).catch(function () { statBox.appendChild(el('p', 'msg', '无法连接服务')); });
+    }
+
+    /* 落点走普通配置：先读 sys 类拿**当前版本号**（配置是乐观锁，带过期版本提交
+     * 必然撞 e=-3），只提交确实变了的键 —— 不提交就是不动，别拿"空值"覆盖别的项。 */
+    function loadCfg() {
+      api('/api/config?cls=sys').then(function (r) {
+        if (!r.ok) return;
+        cur.ver = r.d.version;
+        var it = r.d.items || {};
+        cur.host = it['sys.tunnel.server.host'] || '';
+        cur.port = Number(it['sys.tunnel.server.port']) || 0;
+        inHost.value = cur.host;
+        inPort.value = String(cur.port);
+      });
+    }
+
+    function saveAll() {
+      var wantHost = inHost.value.trim();
+      var wantPort = Number(inPort.value) || 0;
+      var tok = inTok.value.trim();
+      var items = {};
+
+      if (wantHost !== cur.host) items['sys.tunnel.server.host'] = wantHost;
+      if (wantPort !== cur.port) items['sys.tunnel.server.port'] = wantPort;
+
+      var chain = Promise.resolve(true);
+      if (Object.keys(items).length > 0) {
+        chain = api('/api/config/apply', { method: 'POST', body: { ver: cur.ver, items: items } })
+          .then(function (r) {
+            if (!r.ok) {
+              toast(r.e === -3 ? '配置已被别处改动，请刷新后重试' : ('服务器地址保存失败：' + (r.msg || r.e)), 'err');
+              return false;
+            }
+            cur.ver = r.d.version;
+            cur.host = wantHost;
+            cur.port = wantPort;
+            return true;
+          });
+      }
+
+      return chain.then(function (ok) {
+        if (!ok) return;
+        var body = { ttl: Number(selTtl.value), enable: chkEn.checked };
+        if (tok) body.token = tok;
+        return api('/api/tunnel/config', { method: 'POST', body: body }).then(function (r) {
+          if (!r.ok) { toast('通道设置失败：' + (r.msg || r.e), 'err'); return; }
+          inTok.value = '';
+          toast(r.d.on ? ('通道已开启（' + fmtRemain(r.d.remain_s) + '）') : '已保存，通道未开启', 'ok');
+          loadStatus();
+        });
+      }).catch(function () { toast('请求失败', 'err'); });
+    }
+
+    bGen.addEventListener('click', function () {
+      var t = genToken();
+      if (!t) { toast('本浏览器不支持安全随机数，请用 tools/tunnel-keygen.html', 'err'); return; }
+      inTok.value = t;
+      inTok.type = 'text';   /* 刚生成的要看得见，方便抄到运维 PC */
+      toast('已生成令牌，记得同时配到 frps 与运维 PC', 'ok');
+    });
+    bSave.addEventListener('click', saveAll);
+    bReload.addEventListener('click', function () { loadCfg(); loadStatus(); });
+    bOff.addEventListener('click', function () {
+      if (!window.confirm('确认关闭远程通道？正在使用的运维连接会立刻断开。')) return;
+      api('/api/tunnel/disable', { method: 'POST', body: {} }).then(function (r) {
+        toast(r.ok ? '通道已关闭' : ('关闭失败：' + (r.msg || r.e)), r.ok ? 'ok' : 'err');
+        loadStatus();
+      });
+    });
+
+    loadCfg();
+    loadStatus();
+    return root;
+  }
+
   function pageConfig() {
     var root = document.createDocumentFragment();
     root.appendChild(el('h2', 'page-title', '全部配置'));
@@ -3059,8 +3295,9 @@
     root.appendChild(configCard('八个一级分类（全量）',
       ['sys', 'net', 'probe', 'camera', 'switch', 'elec', 'netthr', 'sensor'],
       '这一页是原始视图（含未归入专用页的阈值项）。改动后保存会带版本号提交。' +
-      '摄像机 MAC 由发现过程自动获取，此处不提供配置项。',
-      null, ['camera.ch.*.mac']));
+      '摄像机 MAC 由发现过程自动获取，此处不提供配置项。' +
+      '远程通道的 frps 地址/端口由「远程通道」页管（那里要和令牌一起保存才生效），此处不画。',
+      null, ['camera.ch.*.mac', 'sys.tunnel.*']));
 
     var card = el('div', 'card');
     card.appendChild(el('h3', null, '出厂默认值对照'));

@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IVSBox 远程通道 —— 令牌与访问端配置生成器</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --line: #d9dde3; --text: #1f2328;
+    --dim: #6b7280; --accent: #1f6feb; --ok: #17803d; --warn: #b45309;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  .sub { color: var(--dim); margin: 0 0 20px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  label { display: block; margin: 10px 0 4px; font-size: 13px; color: var(--dim); }
+  input[type=text], input[type=number], textarea, select {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+    font: inherit; color: var(--text); background: #fff;
+  }
+  textarea { font-family: ui-monospace, Consolas, "Courier New", monospace; font-size: 12.5px; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  button {
+    padding: 8px 14px; border: 1px solid var(--accent); background: var(--accent);
+    color: #fff; border-radius: 6px; font: inherit; cursor: pointer;
+  }
+  button.ghost { background: #fff; color: var(--accent); }
+  button.mini { padding: 4px 10px; font-size: 12px; }
+  .actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .hint { color: var(--dim); font-size: 12.5px; margin: 6px 0 0; }
+  .kv { font-family: ui-monospace, Consolas, monospace; background: #f3f4f6;
+        padding: 8px 10px; border-radius: 6px; word-break: break-all; }
+  .ok { color: var(--ok); }
+  .warn { color: var(--warn); }
+  ol, ul { margin: 6px 0 0; padding-left: 20px; }
+  li { margin: 4px 0; }
+  code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px;
+         font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+  .full { grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+
+<h1>IVSBox 远程通道 —— 令牌与访问端配置生成器</h1>
+<p class="sub">
+  离线单文件：不联网、不装东西，双击本文件即可。填两样（设备 SN、令牌），
+  它算出 <code>secretKey</code> 并生成运维 PC 要用的 <code>visitor.toml</code> 与 <code>connect.bat</code>。
+</p>
+
+<div class="grid">
+  <div>
+    <div class="card">
+      <h2>1. 设备与令牌</h2>
+      <label>设备 SN（设备 Web「远程通道」页上的 SN，6 位十六进制，如 0A19B5）</label>
+      <input id="sn" type="text" placeholder="0A19B5" autocomplete="off" spellcheck="false">
+
+      <label>令牌（1~63 位，只允许 0-9 A-Z a-z - _ . ~ + / = @）</label>
+      <div class="row">
+        <input id="tok" type="text" placeholder="点右边按钮生成，或粘贴平台下发的令牌" autocomplete="off" spellcheck="false">
+        <button class="ghost" id="gen" type="button" style="flex:0 0 auto">生成</button>
+      </div>
+      <p class="hint">
+        同一份令牌要填三处：<b>设备 Web</b>、<b>frps 的 auth.token</b>、<b>这里的 visitor.toml</b>。
+        少一处都连不上，而且失败现象各不相同（见下方排错）。
+      </p>
+
+      <div class="actions">
+        <button id="calc" type="button">计算并生成配置</button>
+        <button class="ghost" id="reset" type="button">清空</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>2. 服务器与端口</h2>
+      <label>frps 地址（运维箱 / 服务器）</label>
+      <input id="host" type="text" placeholder="例如 47.104.250.225" autocomplete="off">
+      <label>frps 端口（默认 7000）</label>
+      <input id="port" type="number" value="7000" min="1" max="65535">
+      <label>本机 SSH 隧道端口（visitor 的 bindPort，默认 2022）</label>
+      <input id="bind" type="number" value="2022" min="1" max="65535">
+      <p class="hint">
+        设备侧固定只转发本机 <code>sshd:22</code>；摄像机/文件都在这条 SSH 通道里做。
+      </p>
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h2>3. 结果</h2>
+      <label>secretKey（= md5(SN + 令牌) 前 8 字节，16 位小写 hex）</label>
+      <div class="kv" id="secret">—</div>
+
+      <label>设备 Web 上要填的三项</label>
+      <div class="kv" id="devfill">—</div>
+    </div>
+
+    <div class="card">
+      <h2>4. 运维 PC：visitor.toml</h2>
+      <textarea id="toml" rows="14" spellcheck="false"></textarea>
+      <div class="actions">
+        <button class="mini" id="cpToml" type="button">复制</button>
+        <button class="mini ghost" id="dlToml" type="button">下载 visitor.toml</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>5. 运维 PC：connect.bat</h2>
+      <textarea id="bat" rows="12" spellcheck="false"></textarea>
+      <div class="actions">
+        <button class="mini" id="cpBat" type="button">复制</button>
+        <button class="mini ghost" id="dlBat" type="button">下载 connect.bat</button>
+      </div>
+      <p class="hint">
+        把 <code>frpc.exe</code> 与 <code>visitor.toml</code> 放在同一个目录再双击 <code>connect.bat</code>。
+        frpc 不需要安装。
+      </p>
+    </div>
+  </div>
+
+  <div class="card full">
+    <h2>顺序（顺序错了会"连上了但用不了"）</h2>
+    <ol>
+      <li><b>frps 服务端</b>：起 frps，<code>auth.token</code> 设成本页这个令牌，端口 7000。</li>
+      <li><b>设备</b>：浏览器进设备 Web →「远程通道」→ 填 frps 地址/端口 + 粘贴令牌 → 勾「启用通道」→「保存并生效」。
+          保存后 5 秒内 <code>monitor.sh</code> 会拉起设备侧 frpc（日志 <code>/mnt/UDISK/log/frpc.log</code>）。</li>
+      <li><b>运维 PC</b>：本目录放 <code>frpc.exe</code> + <code>visitor.toml</code>，跑 <code>connect.bat</code>。</li>
+      <li><b>连设备</b>：<code>ssh -p 2022 root@127.0.0.1</code>；传文件 <code>pscp -P 2022 root@127.0.0.1:/mnt/sdcard/snap/a.jpg .</code></li>
+      <li><b>看摄像机</b>：<code>ssh -p 2022 root@127.0.0.1 -L 9090:192.168.1.200:554</code>，
+          然后本机 <code>rtsp://127.0.0.1:9090/...</code>。摄像机 IP 是设备所在内网的地址，不是公网。</li>
+    </ol>
+
+    <h2 style="margin-top:16px">排错：三种"连不上"分得开</h2>
+    <ul>
+      <li><b>设备侧 frpc 没起</b>：设备 Web 状态卡显示「未开启」，或 <code>ps</code> 里没有 frpc。
+          看 <code>/mnt/UDISK/log/frpc.log</code> 与 <code>/etc/frp/frpc.toml</code> 是否存在。</li>
+      <li><b>设备 frpc 起了但连不上 frps</b>：<code>frpc.log</code> 里是 <code>connect to server error</code> /
+          <code>authorization failed</code> ⇒ frps 地址、端口、或 <code>auth.token</code> 不一致。</li>
+      <li><b>visitor 连上了却"连不通"</b>：<code>serverName</code> 与 <code>secretKey</code> 两侧不一致。
+          <code>serverName</code> 必须等于设备的 SN，<code>secretKey</code> 必须等于本页算出的那 16 位。</li>
+    </ul>
+
+    <h2 style="margin-top:16px">安全说明</h2>
+    <ul>
+      <li>令牌 + SN 就能算出 secretKey，<b>等同于远程入口的一半钥匙</b>，不要贴到群里/工单里。</li>
+      <li>通道只转发设备的 sshd(22)，frps 上不暴露任何端口给公网扫描（stcp 类型）。</li>
+      <li>设备侧有有效期闸门：到期由 <code>ivsboxd</code> 与 <code>frp.sh</code> 各自判一次，主控挂了也会关。</li>
+      <li>本页所有计算都在浏览器里完成，<b>不会把令牌发到任何服务器</b>（可断网使用）。</li>
+    </ul>
+  </div>
+</div>
+
+<script>
+/* ---------------- 最小 MD5（RFC 1321） ----------------
+ * 为什么自己写：secretKey 是 md5(sn+token) 前 8 字节，而 Web Crypto 不提供 MD5
+ * （SubtleCrypto 只有 SHA 系列）。本页必须离线可用，所以不能引 CDN。
+ * 输入只有 ASCII 的 SN 与令牌（字符集已在页面上校验），故按 UTF-8 编码后逐字节处理。
+ * 正确性用已知向量钉过：md5("")=d41d8cd98f00b204e9800998ecf8427e、
+ * md5("abc")=900150983cd24fb0d6963f7d28e17f72、
+ * md5("A120F" + "bird123") 前 16 位 = 1239036bac71d702（与设备单测 test_tunnel t01 同一个值）。
+ */
+function md5hex(str) {
+  function add(x, y) {
+    var l = (x & 0xFFFF) + (y & 0xFFFF);
+    var m = (x >> 16) + (y >> 16) + (l >> 16);
+    return (m << 16) | (l & 0xFFFF);
+  }
+  function rol(n, c) { return (n << c) | (n >>> (32 - c)); }
+  function cmn(q, a, b, x, s, t) { return add(rol(add(add(a, q), add(x, t)), s), b); }
+  function ff(a, b, c, d, x, s, t) { return cmn((b & c) | (~b & d), a, b, x, s, t); }
+  function gg(a, b, c, d, x, s, t) { return cmn((b & d) | (c & ~d), a, b, x, s, t); }
+  function hh(a, b, c, d, x, s, t) { return cmn(b ^ c ^ d, a, b, x, s, t); }
+  function ii(a, b, c, d, x, s, t) { return cmn(c ^ (b | ~d), a, b, x, s, t); }
+  function toBlocks(s) {
+    var n = s.length, words = [], i;
+    for (i = 0; i < n * 8; i += 8)
+      words[i >> 5] = (words[i >> 5] || 0) | (s.charCodeAt(i / 8) << (i % 32));
+    words[n * 8 >> 5] = (words[n * 8 >> 5] || 0) | (0x80 << (n * 8 % 32));
+    var len = ((n * 8 + 64) >>> 9 << 4) + 14;
+    words[len] = n * 8;
+    words.length = len + 1;
+    return words;
+  }
+  var x = toBlocks(unescape(encodeURIComponent(str)));
+  var a = 1732584193, b = -271733879, c = -1732584194, d = 271733878, i;
+  for (i = 0; i < x.length; i += 16) {
+    var oa = a, ob = b, oc = c, od = d;
+    a = ff(a, b, c, d, x[i] | 0, 7, -680876936);        d = ff(d, a, b, c, x[i + 1] | 0, 12, -389564586);
+    c = ff(c, d, a, b, x[i + 2] | 0, 17, 606105819);    b = ff(b, c, d, a, x[i + 3] | 0, 22, -1044525330);
+    a = ff(a, b, c, d, x[i + 4] | 0, 7, -176418897);    d = ff(d, a, b, c, x[i + 5] | 0, 12, 1200080426);
+    c = ff(c, d, a, b, x[i + 6] | 0, 17, -1473231341);  b = ff(b, c, d, a, x[i + 7] | 0, 22, -45705983);
+    a = ff(a, b, c, d, x[i + 8] | 0, 7, 1770035416);    d = ff(d, a, b, c, x[i + 9] | 0, 12, -1958414417);
+    c = ff(c, d, a, b, x[i + 10] | 0, 17, -42063);      b = ff(b, c, d, a, x[i + 11] | 0, 22, -1990404162);
+    a = ff(a, b, c, d, x[i + 12] | 0, 7, 1804603682);   d = ff(d, a, b, c, x[i + 13] | 0, 12, -40341101);
+    c = ff(c, d, a, b, x[i + 14] | 0, 17, -1502002290); b = ff(b, c, d, a, x[i + 15] | 0, 22, 1236535329);
+    a = gg(a, b, c, d, x[i + 1] | 0, 5, -165796510);    d = gg(d, a, b, c, x[i + 6] | 0, 9, -1069501632);
+    c = gg(c, d, a, b, x[i + 11] | 0, 14, 643717713);   b = gg(b, c, d, a, x[i] | 0, 20, -373897302);
+    a = gg(a, b, c, d, x[i + 5] | 0, 5, -701558691);    d = gg(d, a, b, c, x[i + 10] | 0, 9, 38016083);
+    c = gg(c, d, a, b, x[i + 15] | 0, 14, -660478335);  b = gg(b, c, d, a, x[i + 4] | 0, 20, -405537848);
+    a = gg(a, b, c, d, x[i + 9] | 0, 5, 568446438);     d = gg(d, a, b, c, x[i + 14] | 0, 9, -1019803690);
+    c = gg(c, d, a, b, x[i + 3] | 0, 14, -187363961);   b = gg(b, c, d, a, x[i + 8] | 0, 20, 1163531501);
+    a = gg(a, b, c, d, x[i + 13] | 0, 5, -1444681467);  d = gg(d, a, b, c, x[i + 2] | 0, 9, -51403784);
+    c = gg(c, d, a, b, x[i + 7] | 0, 14, 1735328473);   b = gg(b, c, d, a, x[i + 12] | 0, 20, -1926607734);
+    a = hh(a, b, c, d, x[i + 5] | 0, 4, -378558);       d = hh(d, a, b, c, x[i + 8] | 0, 11, -2022574463);
+    c = hh(c, d, a, b, x[i + 11] | 0, 16, 1839030562);  b = hh(b, c, d, a, x[i + 14] | 0, 23, -35309556);
+    a = hh(a, b, c, d, x[i + 1] | 0, 4, -1530992060);   d = hh(d, a, b, c, x[i + 4] | 0, 11, 1272893353);
+    c = hh(c, d, a, b, x[i + 7] | 0, 16, -155497632);   b = hh(b, c, d, a, x[i + 10] | 0, 23, -1094730640);
+    a = hh(a, b, c, d, x[i + 13] | 0, 4, 681279174);    d = hh(d, a, b, c, x[i] | 0, 11, -358537222);
+    c = hh(c, d, a, b, x[i + 3] | 0, 16, -722521979);   b = hh(b, c, d, a, x[i + 6] | 0, 23, 76029189);
+    a = hh(a, b, c, d, x[i + 9] | 0, 4, -640364487);    d = hh(d, a, b, c, x[i + 12] | 0, 11, -421815835);
+    c = hh(c, d, a, b, x[i + 15] | 0, 16, 530742520);   b = hh(b, c, d, a, x[i + 2] | 0, 23, -995338651);
+    a = ii(a, b, c, d, x[i] | 0, 6, -198630844);        d = ii(d, a, b, c, x[i + 7] | 0, 10, 1126891415);
+    c = ii(c, d, a, b, x[i + 14] | 0, 15, -1416354905); b = ii(b, c, d, a, x[i + 5] | 0, 21, -57434055);
+    a = ii(a, b, c, d, x[i + 12] | 0, 6, 1700485571);   d = ii(d, a, b, c, x[i + 3] | 0, 10, -1894986606);
+    c = ii(c, d, a, b, x[i + 10] | 0, 15, -1051523);    b = ii(b, c, d, a, x[i + 1] | 0, 21, -2054922799);
+    a = ii(a, b, c, d, x[i + 8] | 0, 6, 1873313359);    d = ii(d, a, b, c, x[i + 15] | 0, 10, -30611744);
+    c = ii(c, d, a, b, x[i + 6] | 0, 15, -1560198380);  b = ii(b, c, d, a, x[i + 13] | 0, 21, 1309151649);
+    a = ii(a, b, c, d, x[i + 4] | 0, 6, -145523070);    d = ii(d, a, b, c, x[i + 11] | 0, 10, -1120210379);
+    c = ii(c, d, a, b, x[i + 2] | 0, 15, 718787259);    b = ii(b, c, d, a, x[i + 9] | 0, 21, -343485551);
+    a = add(a, oa); b = add(b, ob); c = add(c, oc); d = add(d, od);
+  }
+  function hex(n) {
+    var s = '', j;
+    for (j = 0; j < 4; j++)
+      s += ('0' + ((n >> (j * 8 + 4)) & 0x0F).toString(16)).slice(-1) +
+           ('0' + ((n >> (j * 8)) & 0x0F).toString(16)).slice(-1);
+    return s;
+  }
+  return hex(a) + hex(b) + hex(c) + hex(d);
+}
+
+/* ---------------- 令牌字符集（与设备侧 iv_tunnel_token_valid 同一张白名单） ----
+ * 设备端是白名单：0-9 A-Z a-z 和 - _ . ~ + / = @。
+ * 这里提前拦一次，否则用户填了带引号/空格的令牌，会一路存到设备里直到 frpc
+ * 解析 TOML 失败 —— 那个报错在设备日志里，PC 这边完全看不见。 */
+var TOKEN_OK = /^[0-9A-Za-z\-_.~+/=@]{1,63}$/;
+
+function $(id) { return document.getElementById(id); }
+
+function genToken() {
+  var buf = new Uint8Array(16), out = '', i;
+  if (!window.crypto || !window.crypto.getRandomValues)
+    return Array.from({ length: 32 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+  window.crypto.getRandomValues(buf);
+  for (i = 0; i < buf.length; i++) out += ('0' + buf[i].toString(16)).slice(-2);
+  return out;
+}
+
+function download(name, text) {
+  var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+}
+
+function copy(text, btn) {
+  function done() {
+    var old = btn.textContent;
+    btn.textContent = '已复制';
+    setTimeout(function () { btn.textContent = old; }, 1200);
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, function () { fallback(); });
+  } else { fallback(); }
+  function fallback() {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) { /* 让用户手抄 */ }
+    ta.remove();
+  }
+}
+
+/* ---------------- 生成 ---------------- */
+function build() {
+  var sn = ($('sn').value || '').trim().toUpperCase();
+  var tok = ($('tok').value || '').trim();
+  var host = ($('host').value || '').trim();
+  var port = parseInt($('port').value, 10) || 7000;
+  var bind = parseInt($('bind').value, 10) || 2022;
+  var bad = '';
+
+  if (!/^[0-9A-F]{4,8}$/.test(sn)) bad = 'SN 必须是 4~8 位十六进制（设备 Web 上显示 6 位，如 0A19B5）';
+  else if (!tok) bad = '请先填或生成令牌';
+  else if (!TOKEN_OK.test(tok)) bad = '令牌含非法字符或超长：只允许 0-9 A-Z a-z - _ . ~ + / = @，最长 63 位';
+  else if (!host) bad = '请填 frps 地址（运维箱的地址）';
+
+  if (bad) {
+    $('secret').textContent = '—';
+    $('devfill').textContent = '—';
+    $('toml').value = '';
+    $('bat').value = '';
+    $('secret').className = 'kv warn';
+    $('secret').textContent = bad;
+    return;
+  }
+
+  var secret = md5hex(sn + tok).slice(0, 16);
+
+  $('secret').className = 'kv ok';
+  $('secret').textContent = secret;
+  $('devfill').textContent =
+    'frps 地址：' + host + '\nfrps 端口：' + port + '\n令牌：' + tok;
+
+  var toml =
+    '# IVSBox 远程通道 —— 访问端（visitor）配置\n' +
+    '# 由 tools/tunnel-keygen.html 生成；SN=' + sn + '\n' +
+    'serverAddr = "' + host + '"\n' +
+    'serverPort = ' + port + '\n' +
+    '# 与设备侧 frpc.toml 的 auth.token、frps 的 auth.token 必须是同一份\n' +
+    'auth.token = "' + tok + '"\n' +
+    '\n' +
+    '[[visitors]]\n' +
+    '# name 只是本机的标识；serverName 必须等于设备 SN（设备的代理项名就是 SN）\n' +
+    'name = "' + sn + '-visitor"\n' +
+    'type = "stcp"\n' +
+    'serverName = "' + sn + '"\n' +
+    'secretKey = "' + secret + '"\n' +
+    'bindAddr = "127.0.0.1"\n' +
+    'bindPort = ' + bind + '\n';
+  $('toml').value = toml;
+
+  var bat =
+    '@echo off\r\n' +
+    'chcp 65001 >nul\r\n' +
+    'rem IVSBox 远程通道 —— 访问端启动脚本（由 tools/tunnel-keygen.html 生成）\r\n' +
+    'rem 需要与本文件同目录：frpc.exe、visitor.toml\r\n' +
+    'setlocal\r\n' +
+    'if not exist "%~dp0frpc.exe" (\r\n' +
+    '  echo [错误] 找不到 frpc.exe，请把它放到本文件同一目录。\r\n' +
+    '  pause\r\n' +
+    '  exit /b 1\r\n' +
+    ')\r\n' +
+    'echo 正在建立到设备 ' + sn + ' 的通道（Ctrl+C 断开）...\r\n' +
+    'echo 连上后可以另开窗口：\r\n' +
+    'echo   设备 SSH : ssh -p ' + bind + ' root@127.0.0.1\r\n' +
+    'echo   传文件   : pscp -P ' + bind + ' root@127.0.0.1:/mnt/sdcard/snap/xxx.jpg .\r\n' +
+    'echo   看摄像机 : 先 ssh -p ' + bind + ' root@127.0.0.1 -L 9090:192.168.1.200:554\r\n' +
+    'echo.\r\n' +
+    '"%~dp0frpc.exe" -c "%~dp0visitor.toml"\r\n' +
+    'echo.\r\n' +
+    'echo 通道已断开。\r\n' +
+    'pause\r\n';
+  $('bat').value = bat;
+  return { secret: secret, sn: sn, tok: tok, host: host, port: port, bind: bind };
+}
+
+$('gen').addEventListener('click', function () {
+  $('tok').value = genToken();
+  build();
+});
+$('calc').addEventListener('click', build);
+$('reset').addEventListener('click', function () {
+  ['sn', 'tok', 'host'].forEach(function (k) { $(k).value = ''; });
+  $('port').value = '7000';
+  $('bind').value = '2022';
+  build();
+});
+$('cpToml').addEventListener('click', function () { copy($('toml').value, this); });
+$('cpBat').addEventListener('click', function () { copy($('bat').value, this); });
+$('dlToml').addEventListener('click', function () { download('visitor.toml', $('toml').value); });
+$('dlBat').addEventListener('click', function () { download('connect.bat', $('bat').value); });
+['sn', 'tok', 'host', 'port', 'bind'].forEach(function (k) {
+  $(k).addEventListener('change', build);
+});
+
+build();
+</script>
+</body>
+</html>

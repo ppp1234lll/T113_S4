@@ -13317,3 +13317,102 @@ C 之前就把"端口对不对、报文对不对"两件事同时定性了 ——
 
 **对端固定不动的参数（端口、地址）要按对端的行为实现，不是按文档。** 文档写
 "设备→组播"，实际软件只在 65000 上收单播。
+
+== 2026-11-04 16:15 硬件型号走配置：与平台 `0xE1` 同源，不再只有 `--mod` 才有值
+
+=== 干了什么事
+
+* `tools/provision/src/main.c`
+** `#include "ivsbox/iv_config.h"`，新增 `#define PROV_MOD_DEFAULT "FN_RZTY_PY"`。
+** `main()` 里在 `run_device()` 之前补一段取值（只开一次配置）：
+*** `o.mod` 为空 ⇒ 读配置键 `sys.device.model`；仍为空 ⇒ `PROV_MOD_DEFAULT`。
+*** `o.tnam` 为空 ⇒ 读配置键 `sys.device.name`；仍为空 ⇒ **保持空串**。
+** 文件头"字段来源"表同步改：`mod` / `tnam` 从"仅 `--xxx` 覆盖"一栏挪到"有默认来源"一栏。
+
+[source,c]
+----
+if (o.mod == NULL || o.tnam == NULL) {
+    static char   model_buf[64];
+    static char   name_buf[64];
+    iv_config_t  *c = iv_config_open(NULL, IV_CFG_NAME);
+    const char   *v = NULL;
+
+    if (c != NULL) {
+        if (o.mod == NULL &&
+            iv_config_get_str(c, "sys.device.model", &v) == IV_OK &&
+            v != NULL && v[0] != '\0' && strlen(v) < sizeof(model_buf)) {
+            memcpy(model_buf, v, strlen(v) + 1u);
+            o.mod = model_buf;
+        }
+        v = NULL;
+        if (o.tnam == NULL &&
+            iv_config_get_str(c, "sys.device.name", &v) == IV_OK &&
+            v != NULL && v[0] != '\0' && strlen(v) < sizeof(name_buf)) {
+            memcpy(name_buf, v, strlen(v) + 1u);
+            o.tnam = name_buf;
+        }
+        iv_config_close(c);
+    }
+    if (o.mod == NULL)
+        o.mod = PROV_MOD_DEFAULT;
+}
+----
+
+用 `static` 缓冲而不是 `malloc`：进程活得和工具一样长，`o.mod` 是指针，
+指向栈变量会立刻悬空；配置里的值也一定短于 64。
+
+=== 解决什么问题
+
+「设备配置软件」终于能列出设备了，但**「硬件型号」列是空的**。原因是应答里的
+`mod` 只有命令行给 `--mod` 才有值，而 `S68ivsboxprovision` 启动时不带参数 ⇒ 恒空。
+
+更关键的是**同一事实被两处维护**：平台 `0xE1` 版本查询回的就是配置键
+`sys.device.model`（出厂默认 `FN_RZTY_PY`），工装应答却要另给一个 `--mod`。
+两边迟早对不上，于是把工装的来源改成**读同一个配置键** —— 一处改、两处生效。
+
+`tnam` 故意**没有**默认值：`sys.device.name` 的出厂默认就是空串＝"没起名"，
+前端显示"未命名"才是对的。**配置里没有的名字不许编**（编出来的名字会跟着设备
+一路报到平台，比空串更难收拾）。
+
+=== 影响范围
+
+* 只影响工装应答的两个**文本字段**，协议格式、长度、CRC 都不变（`mod`/`tnam`
+  本来就恒在包里，只是值由空变有）。应答长度 234 B → 244 B。
+* `--mod` / `--tnam` 仍然在 main 之前解析，二者优先级不变（给了就不读配置）。
+* 配置文件不可用（`iv_config_open` 失败或 `rc=-10`）时走 `iv_config` 的默认键表，
+  `sys.device.model` 仍返回 `FN_RZTY_PY`；连默认表都拿不到才用 `PROV_MOD_DEFAULT`
+  —— 两条兜底同值，行为一致。
+
+=== 验证方式与结果
+
+板端跑客户端搜索，抓自身应答原文（真机 `192.168.1.64`）：
+
+[source,text]
+----
+$ ivsbox-provision --search --target 239.255.255.249 --port 65000
+  <= tid=5678AB types=search mac=86:4c:be:da:a1:ef
+     {"info":{"tid":"5678AB","date":"19700101"},"data":{"types":"search","tnam":"",
+      "mcu":"","mod":"FN_RZTY_PY","sv":"1.0.0+nogit","mac":"86:4c:be:da:a1:ef",
+      "ip":"192.168.1.64","nm":"255.255.255.0","gw":"192.168.1.1","inip":"",
+      "outip":"","iccid":""}}
+----
+
+. `mod` 有值、`tnam` 按设计为空。
+. 板端 `provision.log` 同时有
+  `WARN [cfg] ivsbox: '.../ivsbox.json' unusable (rc=-10), start with 96 default keys`
+  ⇒ 这台板子配置文件当前不可用，`mod` 取的是 `iv_config` 默认键表里的值，
+  **与 `PROV_MOD_DEFAULT` 同值**；配置正常时 Web 改型号会立刻生效。
+. `make test` 全通过（含 `GIT_VER=deadbeef` 变体，`make_rc=0`）；`make arm` 零告警；
+  `build/arm/ivsbox-provision` md5 `e3a6042ae74d56187057a71220a343da`，
+  与板端 `/opt/ivsbox/current/bin/ivsbox-provision` **同值**（部署的就是这份源码）。
+
+=== 教训
+
+**"某个字段恒为空"要先问"它该由谁提供"，再问"为什么没提供"。** 这次不是解析
+出错，而是从头到尾没人给它赋过值 —— 加一个默认来源就完了。
+
+**同一个事实只有一个权威来源。** 型号在平台报告里是一个键、在工装应答里又是
+一个命令行参数，这种"两处维护"的字段，迟早会一边改一边忘。**能同源就同源。**
+
+**空串是有语义的，不是"没实现"。** `sys.device.name` 为空表示"用户还没起名"，
+给它编一个默认值等于伪造现场数据。**该空的就让它空。**

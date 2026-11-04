@@ -27,8 +27,11 @@
  *   tid   ← `private` 分区身份记录，或 `--tid` 覆盖
  *   mac   ← 身份记录里的 MAC，或 `--mac`
  *   sv    ← `iv_version_string()`，或 `--sv`
+ *   mod   ← 配置键 `sys.device.model`（与平台 0xE1 版本查询同源），读不到用
+ *           `FN_RZTY_PY`，或 `--mod`
+ *   tnam  ← 配置键 `sys.device.name`（出厂默认空串＝没起名，**不编名字**），或 `--tnam`
  *   ip/nm ← `--iface`（默认尝试 eth0）实际地址；gw ← `/proc/net/route` 默认路由
- *   tnam/mcu/mod/inip/outip/iccid/name/password ← 仅 `--xxx` 覆盖，默认空
+ *   mcu/inip/outip/iccid/name/password ← 仅 `--xxx` 覆盖，默认空
  * **未接（登记）**：iccid（需 AT/无卡检测）、mcu（需主板 EEPROM）、inip/outip
  * （需接平台配置键）、name/password（需接 Web 口令）。接上只需在 `fill_devinfo()`
  * 里多写一行，协议侧不用动。
@@ -58,6 +61,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ivsbox/iv_config.h"
 #include "ivsbox/iv_log.h"
 #include "ivsbox/iv_provision.h"
 #include "ivsbox/iv_ret.h"
@@ -220,6 +224,13 @@ static void default_gw(char *out, size_t cap)
     }
     (void)fclose(f);
 }
+
+/* 硬件型号（应答里的 `mod`）：与平台 **0xE1 版本查询同源** —— 配置键
+ * `sys.device.model`。出厂阶段配置文件可能还没生成，读不到就用内置默认
+ * （与 iv_config.c 里该键的默认值一致）。
+ * 为什么不写死成常量：型号是"类别"，量产的箱子不止一种，改 Web 配置就该立刻生效，
+ * 否则只能靠出多个固件分支。 */
+#define PROV_MOD_DEFAULT "FN_RZTY_PY"
 
 static void fill_devinfo(iv_prov_devinfo_t *d, const char *own_tid,
                          const iv_prov_id_t *id, const opts_t *o)
@@ -1117,6 +1128,36 @@ int main(int argc, char *argv[])
             fprintf(stderr, "bad --mac: %s\n", o.set_mac);
             return 1;
         }
+    }
+
+    /* 硬件型号 / 设备名称：与平台版本查询（0xE1 的 `mod`）同源，取值一律走配置，
+     * `--mod` / `--tnam` 优先。
+     * 注意 `sys.device.name` 的出厂默认就是**空串**＝"没起名"，所以读不到就保持空
+     * —— **不替用户编一个名字**（前端显示"未命名"才是对的）。 */
+    if (o.mod == NULL || o.tnam == NULL) {
+        static char   model_buf[64];
+        static char   name_buf[64];
+        iv_config_t  *c = iv_config_open(NULL, IV_CFG_NAME);
+        const char   *v = NULL;
+
+        if (c != NULL) {
+            if (o.mod == NULL &&
+                iv_config_get_str(c, "sys.device.model", &v) == IV_OK &&
+                v != NULL && v[0] != '\0' && strlen(v) < sizeof(model_buf)) {
+                memcpy(model_buf, v, strlen(v) + 1u);
+                o.mod = model_buf;
+            }
+            v = NULL;
+            if (o.tnam == NULL &&
+                iv_config_get_str(c, "sys.device.name", &v) == IV_OK &&
+                v != NULL && v[0] != '\0' && strlen(v) < sizeof(name_buf)) {
+                memcpy(name_buf, v, strlen(v) + 1u);
+                o.tnam = name_buf;
+            }
+            iv_config_close(c);
+        }
+        if (o.mod == NULL)
+            o.mod = PROV_MOD_DEFAULT;
     }
 
     return run_device(&o, o.tid, &id, &id_valid);

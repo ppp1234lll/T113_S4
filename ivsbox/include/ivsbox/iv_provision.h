@@ -228,6 +228,11 @@ typedef struct {
     char types[IV_PROV_TYPE_MAX];/* data.types */
     char mac[IV_PROV_MAC_MAX];   /* data.mac（**原样**保存，由 iv_prov_decide 负责解析） */
     int  has_mac;                /* data.mac 是否存在（空串也算存在） */
+    /* **这条报文是应答而不是请求**（判据：`data` 里出现设备信息字段，见 .c 文件
+     * `data_looks_like_reply()`）。设备之间共用一个组播组，不加这个判据就会
+     * "收到对端的应答 → 按 types 再答一次" 无限自激：板端实测一条 search 在
+     * 30 s 内放大成 26072 条应答。 */
+    int  is_reply;
 } iv_prov_msg_t;
 
 /* 解析一条报文。返回 IV_OK / IV_EINVAL（参数）/ IV_EPROTO（语法或结构不符：

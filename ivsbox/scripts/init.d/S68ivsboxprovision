@@ -1,0 +1,94 @@
+#!/bin/sh
+# IVSBox 出厂组播工装 sysvinit 脚本（M6-S5.5；2026-11-04 补开机自启）
+#
+# **只在工厂标记存在时启动**：
+#   /mnt/UDISK/ivsbox/factory/enable_provision
+# 量产后删除该文件即关闭入口。协议是明文、组播可达就能改设备 ID/MAC，不该在
+# 正常出货的机器上常开 —— 但产线插上网线就该搜得到，所以"有标记即起"。
+#
+# 编号 68 > 60：必须晚于 S60mount_udisk。标记文件在 UDISK 上，挂载没完成时
+# `-f` 判假会把本该启动的产线机跳过（开机自启"偶尔不生效"多半是这条）。
+#
+# **必须带 --reply-unicast**：不带时设备把应答发回组播组（239.255.255.252），
+# 同网段每台设备都会收到；单播回请求方既省流量，也不依赖工装是否 join 了组播组。
+# 协议层的自激防线在 iv_prov_decide()（识别出应答报文就不处置），两者是双重保险。
+
+IVSBOX_USER=${IVSBOX_USER:-root}
+IVSBOX_GROUP=${IVSBOX_GROUP:-root}
+
+IVSBOX_APP=${IVSBOX_APP:-/opt/ivsbox}
+IVSBOX_HOME=${IVSBOX_HOME:-/mnt/UDISK/ivsbox}
+MARKER=$IVSBOX_HOME/factory/enable_provision
+LOG=/mnt/UDISK/log/provision.log
+LOG_MAX=524288
+PIDFILE=/var/run/ivsbox-provision.pid
+
+# 发布布局（releases/<ver>/bin ＋ current 软链）优先；裸布局退回 /opt/ivsbox/bin。
+provision_bin() {
+    if [ -x "$IVSBOX_APP/current/bin/ivsbox-provision" ]; then
+        echo "$IVSBOX_APP/current/bin/ivsbox-provision"
+    else
+        echo "$IVSBOX_APP/bin/ivsbox-provision"
+    fi
+}
+
+start() {
+    if [ ! -f "$MARKER" ]; then
+        echo "Skipping ivsbox-provision (no factory marker: $MARKER)"
+        return 0
+    fi
+
+    BIN=$(provision_bin)
+    if [ ! -x "$BIN" ]; then
+        echo "Skipping ivsbox-provision (binary not found: $BIN)"
+        return 0
+    fi
+
+    echo -n "Starting ivsbox-provision: "
+    mkdir -p /mnt/UDISK/log
+
+    # 每收一条搜索打两行；产线上放一整天也不该把 UDISK 写满，启动时做一次
+    # 单文件轮转（不做定时器：这个进程本来就只在产线短时开着）。
+    if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ]; then
+        mv -f "$LOG" "$LOG.1" 2>/dev/null || true
+    fi
+
+    # 日志由 sh 的重定向接住。
+    # **`--timeout 0` 不可省**：该选项默认 3（给工装侧"收 3 s 应答"用的），设备侧
+    # 拿默认值会在开机 3 秒后自己退出 —— 表现为"服务明明起来了，插上网线却搜不到"，
+    # 而日志末尾只有一行 `listen timeout (3s), exiting`。
+    /sbin/start-stop-daemon --start --background --make-pidfile \
+        --pidfile "$PIDFILE" --startas /bin/sh \
+        --chuid "$IVSBOX_USER:$IVSBOX_GROUP" \
+        -- -c "exec $BIN --reply-unicast --timeout 0 >>$LOG 2>&1" || {
+        echo "FAIL"
+        return 1
+    }
+
+    echo "OK"
+}
+
+stop() {
+    echo -n "Stopping ivsbox-provision: "
+    /sbin/start-stop-daemon --stop --pidfile "$PIDFILE" --signal TERM --retry 5 \
+        2>/dev/null || true
+    rm -f "$PIDFILE"
+    echo "OK"
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart|force-reload)
+        stop
+        start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

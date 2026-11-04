@@ -537,6 +537,34 @@ static int obj_get_object(const char *s, size_t b, size_t e, const char *key,
     return -1;
 }
 
+/* --------------------------------------------------------------------------
+ * 应答识别（自激防线）
+ * --------------------------------------------------------------------------
+ * 设备与工装共用一个组播组，**设备自己也会收到别的设备（以及自己）的应答**。
+ * 若只看 `data.types=="search"` 就回，应答会被当成请求再答一次 —— 实测一条
+ * search 在 30 s 内放大成 26072 条（220 B/条，约 5.7 MB/s），能把板子拖死。
+ *
+ * 判据用"应答独有的设备信息键"：`data` 里只要出现 jw_devinfo() 输出的任意一个
+ * 键（tnam/sv/nm/gw/inip/outip/iccid），这条报文就是应答。查询报文只带
+ * `types`（update_mac 另带 `mac`），永远不会有这些键；**故意不用 `mac`**
+ * 当判据，因为 update_mac 的请求里正带着它。
+ */
+static int data_looks_like_reply(const char *s, size_t b, size_t e)
+{
+    static const char *const keys[] = {
+        "tnam", "sv", "nm", "gw", "inip", "outip", "iccid"
+    };
+    size_t i;
+
+    for (i = 0u; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        size_t colon = 0u;
+
+        if (find_key(s, b, e, keys[i], &colon) >= 0)
+            return 1;
+    }
+    return 0;
+}
+
 int iv_prov_msg_parse(const char *json, size_t len, iv_prov_msg_t *out)
 {
     size_t ib, ie, db, de;
@@ -571,6 +599,7 @@ int iv_prov_msg_parse(const char *json, size_t len, iv_prov_msg_t *out)
     if (obj_get_string(json, db, de, "mac", out->mac, sizeof(out->mac), &found) < 0)
         return IV_EPROTO;
     out->has_mac = found;
+    out->is_reply = data_looks_like_reply(json, db, de);
     return IV_OK;
 }
 
@@ -627,6 +656,11 @@ int iv_prov_decide(const char *json, size_t len, const char *own_tid,
     rc = iv_prov_msg_parse(json, len, &m);
     if (rc != IV_OK)
         return rc;
+
+    /* 应答报文一律不处置：组播组里所有设备都收得到彼此的应答，按 types 再答一次
+     * 就是无限自激（见 data_looks_like_reply 的文件内说明）。 */
+    if (m.is_reply)
+        return IV_OK;
 
     if (strcmp(m.types, IV_PROV_TYPE_SEARCH) == 0) {
         /* 广播搜索，或点我的名 */

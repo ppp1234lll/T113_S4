@@ -539,6 +539,51 @@ int main(void)
         chk(iv_prov_marker_present(NULL) == 0, "p08c: NULL path -> 0 (default absent)");
     }
 
+    /* ---------------- p10 自激防线：应答报文不进决策 ----------------
+     * 板端实测（2026-11-04，192.168.1.64）：一条 search 在 30 s 内被放大成
+     * 26072 条应答 —— 设备把自己的应答当成请求又答一次。判据是"data 里带
+     * 设备信息键即应答"，这里把两侧都钉住：应答必须静默，请求必须照答。 */
+    {
+        static const char *const reply_search =
+            "{\"info\":{\"tid\":\"000000\",\"date\":\"19700101\"},\"data\":{"
+            "\"types\":\"search\",\"tnam\":\"\",\"mcu\":\"\",\"mod\":\"\","
+            "\"sv\":\"1.0.0+g505d191\",\"mac\":\"\",\"ip\":\"192.168.1.64\","
+            "\"nm\":\"255.255.255.0\",\"gw\":\"192.168.1.1\",\"inip\":\"\","
+            "\"outip\":\"\",\"iccid\":\"\"}}";
+        static const char *const query_search =
+            "{\"info\":{\"tid\":\"000000\",\"date\":\"20261104\"},"
+            "\"data\":{\"types\":\"search\"}}";
+        static const char *const query_update =
+            "{\"info\":{\"tid\":\"1234FF\",\"date\":\"20261104\"},"
+            "\"data\":{\"types\":\"update_mac\",\"mac\":\"3a:82:b4:1d:3c:bf\"}}";
+        const char    *own = "1234FF";
+        iv_prov_msg_t  m;
+        iv_prov_plan_t pl;
+
+        chk(iv_prov_msg_parse(reply_search, strlen(reply_search), &m) == IV_OK,
+            "p10a: reply parses");
+        chk(m.is_reply == 1, "p10b: reply detected by devinfo keys");
+        chk(iv_prov_decide(reply_search, strlen(reply_search), own, &pl) == IV_OK &&
+            pl.act == IV_PROV_ACT_NONE,
+            "p10c: search reply is NOT answered (self-amplification guard)");
+
+        chk(iv_prov_msg_parse(query_search, strlen(query_search), &m) == IV_OK,
+            "p10d: query parses");
+        chk(m.is_reply == 0, "p10e: query is not a reply");
+        chk(iv_prov_decide(query_search, strlen(query_search), own, &pl) == IV_OK &&
+            pl.act == IV_PROV_ACT_SEARCH,
+            "p10f: query still answered (no regression)");
+
+        /* update_mac 请求里正带着 `mac` 键 —— 判据绝不能拿 mac 当"应答特征"，
+         * 否则配置设备 ID 的指令会被自己的新防线吃掉。 */
+        chk(iv_prov_msg_parse(query_update, strlen(query_update), &m) == IV_OK,
+            "p10g: update_mac query parses");
+        chk(m.is_reply == 0, "p10h: update_mac query (carries mac) is not a reply");
+        chk(iv_prov_decide(query_update, strlen(query_update), own, &pl) == IV_OK &&
+            pl.act == IV_PROV_ACT_UPDATE_MAC && pl.mac_ok == 1,
+            "p10i: update_mac query still applied");
+    }
+
     /* ---------------- p09 协议常量钉住（文档定稿，改动即需重新核对 xlsx） -------- */
     {
         chk(strcmp(IV_PROV_MCAST_ADDR, "239.255.255.252") == 0,

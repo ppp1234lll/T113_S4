@@ -13002,3 +13002,82 @@ fi
 **"能跑"与"装得上"是两回事**：裸布局能跑，但 `current` 不存在时升级与回滚这两条
 最需要它的路径恰好是断的，而且断得没有任何报错。凡是"首次开机"才走到的分支，
 必须在镜像里就自愈，不能指望人记得补一条命令。
+
+== 2026-11-04 14:40 出厂组播工装：自激风暴根治 ＋ 开机自启（S5.5）
+
+=== 干了什么事
+
+* `src/modules/provision/iv_provision.c`
+** 新增 `data_looks_like_reply(s, b, e)`：在 `data` 对象区间里找 `tnam/sv/nm/gw/inip/outip/iccid`
+   任一键，命中即"这条报文是应答"。
+** `iv_prov_msg_parse()` 末尾填 `out->is_reply`；`iv_prov_decide()` 拿到 `is_reply` 直接
+   `return IV_OK`（`act` 保持 `ACT_NONE`），不写盘、不回包。
+* `include/ivsbox/iv_provision.h`：`iv_prov_msg_t` 增 `int is_reply;`（带成因注释）。
+* `tools/provision/src/main.c`
+** `make_socket()` 在 `join` 分支设 `IP_MULTICAST_LOOP = 0`。
+** `--timeout` 默认值从"3"改为哨兵 `-1`，由 `main()` 按角色落定：`--search` / `--set-id`
+   （工装侧）→ 3 秒收窗口；设备侧 → 0（常驻）。`usage()` 同步说明。
+* `scripts/init.d/S68ivsboxprovision`（新增）：SysV init 脚本，编号 68。
+* `Makefile`：`package-copy` 把 S68 复制进 `packaging/init.d/` 并 `chmod +x`。
+* `tests/unit/test_prov.c`：新增 p10 组 9 条断言。
+
+=== 解决什么问题
+
+用户报"新板子上用设备配置软件（组播 239.255.255.252:37200）搜不到设备"。板端逐层查，
+**四个原因各自独立**，前一个遮住后一个：
+
+. **没有自启入口**。`/etc/init.d/` 只有 `S65ivsboxd`/`S66ivsboxweb`/`S67ivsboxmedia`，
+  `monitor.sh` 也不管它 —— 二进制在，但从来没人起。
+. **工厂标记闸门关着**。设备侧要求 `/mnt/UDISK/ivsbox/factory/enable_provision` 存在，
+  新板上连 `factory/` 目录都没有，手动起也会 `provision disabled: marker not found` 退 2。
+. **起来就是一场自激风暴**。默认把应答发回组播组，而设备自己也 join 了该组 ⇒ 自己的应答
+  被当成 `search` 请求再答一次。板端实测：**一条搜索在 30 s 内放大成 26072 条应答**
+  （26072 次 `recvfrom`＋26072 次 `sendto`，220 B/条），把网卡和 CPU 一起打满。
+   这是"设备配置软件"最可能的另一种失败形态：工装还没来得及解析，网络已经淹了。
+. **`--timeout` 默认值把"常驻"变成了"3 秒后自杀"**。文件头写的是"常驻监听，Ctrl-C 退出"，
+   代码默认 `timeout_s = 3`；日志末尾只有一行 `listen timeout (3s), exiting`，
+   看起来像"服务起来了"，实际上早退了。
+
+=== 影响范围
+
+* **协议行为**：设备不再对"带设备信息字段的报文"做任何处置。正常 `search` 查询
+  （只有 `info.tid/date` ＋ `data.types`）与 `update_mac` 查询（多一个 `mac`）不受影响 ——
+  判据**故意排除 `mac`**，否则配置指令会被自己的防线吃掉。
+* **`--timeout` 语义**：裸跑 `ivsbox-provision`（设备侧）从"3 秒退出"变成"常驻"。
+  产线脚本若依赖旧的 3 秒自退，需显式给 `--timeout 3`。工装侧 `--search` 默认仍是 3 秒。
+* **开机自启**：只有存在 `factory/enable_provision` 才启动，量产后删标记即关闭入口，
+  与 S5.5"不进日常自启"的安全口径一致（不是无条件常开）。
+* **编号依赖**：S68 > S60（`S60mount_udisk`），因为标记文件在 UDISK 上；若将来调整挂载
+  脚本编号，S68 要跟着调。
+* **未覆盖**：`update_mac` 的真机写操作本轮只跑单测；多设备互答没有第二台机器实测，
+  由"注入伪装应答"等价覆盖。
+
+=== 验证方式与结果
+
+* **VM（`tqt113`）**：`make test` **56/56**（新增 p10 组）。
+* **反向证伪**：把防线临时改成 `if (0 && m.is_reply)` 重编 → `test_prov` 输出
+  `FAIL: p10c: search reply is NOT answered (self-amplification guard)`，**只挂这一条**，
+  恢复后全绿 ⇒ 用例确实咬住修复点，且不误伤其他分支。
+* **交叉编译**：`make arm` 零告警，产物 `ELF 32-bit LSB, ARM, EABI5`。
+* **板端（`192.168.1.64`，T113，`1.0.0`）**：
+** 装 S68 后 `ps` 见 `/opt/ivsbox/current/bin/ivsbox-provision --reply-unicast --timeout 0`；
+  `/proc/net/igmp` 的 eth0 出现 `FCFFFFEF`（＝`239.255.255.252`）；`netstat -anu` 有 `0.0.0.0:37200`。
+** **一条搜索 → 恰好 1 条应答**（修复前 26072 条），应答 `sv=1.0.0+nogit`、`ip/nm/gw` 齐备。
+** **注入伪装应答**（带 `tnam/sv/nm` 的 search 应答）→ 设备 **0 条**触发；对照组正常查询仍 1 条。
+** **重启验证**：`reboot` 后 uptime 79 s 时进程已由 S68 自动拉起（pid 1835 ＝ pidfile），
+   再发一条搜索仍 1 条应答。
+
+=== 教训
+
+**"服务在跑"要按"过一段时间还在跑"验**。第一次起服务时 `ps` 明明看到 pid、`sleep 2` 后
+也还在，于是判定"常驻成功"；实际它是 3 秒超时，只差一秒钟就骗过了检查。
+同一类陷阱：`start-stop-daemon --make-pidfile` 不校验进程是否活着，pidfile 会一直指向
+一个已退出的 pid —— 判据必须是 `ps`，不是 pidfile。
+
+**同一份代码里"注释说的"和"默认值做的"可能相反**。文件头写"常驻"，代码默认 3 秒退出，
+两边都没人改过。约定要落在代码里，落在注释里等于没落。
+
+**组播协议必须回答"我为什么不该理自己"**。只要设备既 join 组播组又往组里发应答，
+自激就在协议层等着的；只关 `IP_MULTICAST_LOOP` 挡得住本机，挡不住同网段的另一台设备。
+真正的判据只能来自报文内容 —— 请求与应答必须能被区分。
+

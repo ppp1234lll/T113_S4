@@ -115,7 +115,8 @@ static void usage(const char *argv0)
         "  --keep-id         ignore the new device id in update_mac (MAC only)\n"
         "  --reply-unicast   reply to the sender instead of the group\n"
         "  --once            device: exit after one handled request\n"
-        "  --timeout S       exit/collect window in seconds (0 = forever)\n"
+        "  --timeout S       exit/collect window in seconds (0 = forever;\n"
+        "                    default: device 0 / fixture 3)\n"
         "  --dry-run         decide only, write nothing\n"
         "  --force           ignore the factory marker (verification only)\n"
         "  --search          fixture: send a search query\n"
@@ -313,6 +314,12 @@ static int make_socket(const opts_t *o, int join)
 
     if (join) {
         struct ip_mreq mreq;
+        int             loop = 0;
+
+        /* 关掉组播回环：设备自己的应答不该再回到自己的收包队列。这只是**减负**，
+         * 真正的自激防线在 iv_prov_decide() 的 is_reply 判据 —— 同网段的另一台
+         * 设备照样会收到这条应答，光靠 loop=0 挡不住。 */
+        (void)setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
 
         memset(&mreq, 0, sizeof(mreq));
         (void)inet_aton(o->ip, &mreq.imr_multiaddr);
@@ -654,7 +661,10 @@ int main(int argc, char *argv[])
     o.marker     = IV_PROV_MARKER_DEFAULT;
     o.port       = IV_PROV_MCAST_PORT;
     o.local_port = -1; /* 未指定 ⇒ 与 --port 相同 */
-    o.timeout_s  = 3;
+    /* 超时的默认值**分角色**（见 main 尾部）：设备侧＝0（常驻，与文件头"常驻监听"
+     * 一致），工装侧＝3（收应答窗口）。这里用 -1 当"用户没指定"的哨兵 —— 不能用 0，
+     * 0 本身是"永不超时"的合法取值。 */
+    o.timeout_s  = -1;
     o.mac_sep    = ':';
 
     for (i = 1; i < argc; i++) {
@@ -757,6 +767,12 @@ int main(int argc, char *argv[])
         fprintf(stderr, "  (create it to enter factory mode, or pass --force for verification)\n");
         return 2;
     }
+
+    /* 超时默认值按角色落定（见 opts 初始化处的说明）。**设备侧必须是常驻**：
+     * 默认 3 s 会让服务开机 3 秒后自己退出，现场表现就是"服务起来了却搜不到"，
+     * 日志末尾只留一行 `listen timeout (3s), exiting`（2026-11-04 板端踩过）。 */
+    if (o.timeout_s < 0)
+        o.timeout_s = (o.search || o.set_id) ? 3 : 0;
 
     if (o.search || o.set_id)
         return run_fixture(&o); /* 工装侧：发查询、收应答，设备身份半点不碰 */

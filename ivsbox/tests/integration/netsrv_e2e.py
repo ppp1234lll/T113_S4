@@ -15,7 +15,7 @@ VM/板端以 root 跑真 ivsboxd，2026-10-22
 `iv_report`"。另配 `net.server.* changed -> reload rc=…` 判"有没有发生重连"。
 
 覆盖：
-  A1 基线：四个备份键存在，出厂＝空地址 ＋ 6012 端口；两路主地址仍在
+  A1 基线：四个备份键存在，出厂＝空地址 ＋ 6013 端口；两路主地址仍在
   A2 两口主地址都清空、两口备份给**不同**地址 ⇒ 选中的必须是"活动口自己的备"
      （同一行日志里的 `wan=` 就是活动口，自洽校验 ⇒ 证明「本口备 > 另一口备」）
   A3 给两口同样的主地址 ⇒ 选主（证明「本口主 > 本口备」）
@@ -48,7 +48,7 @@ MAGIC = 0x42535649
 HDR = struct.Struct('<IHHIIQII')
 
 DEFAULT_HOST = '47.104.250.225'
-DEFAULT_PORT = 6012
+DEFAULT_PORT = 6013
 
 fails = []
 rid = 0
@@ -177,7 +177,7 @@ def main():
         r = set_selfheal_off()
         chk(r.get('ok') is True, 'A0a netthr.reboot_max 置 0 成功（连不通也不怕）')
 
-        print('A1 基线：备份键存在且出厂为空地址 / 6012 端口')
+        print('A1 基线：备份键存在且出厂为空地址 / 6013 端口')
         r = apply_net(both(
             {'host': DEFAULT_HOST, 'port': DEFAULT_PORT, 'host_bak': '',
              'port_bak': DEFAULT_PORT},
@@ -187,9 +187,9 @@ def main():
         it = net_items()
         chk(it.get('net.server.wired.host_bak') == '', 'A1b 有线备份地址出厂为空')
         chk(it.get('net.server.wireless.host_bak') == '', 'A1c 无线备份地址出厂为空')
-        chk(it.get('net.server.wired.port_bak') == DEFAULT_PORT, 'A1d 有线备份端口 = 6012')
+        chk(it.get('net.server.wired.port_bak') == DEFAULT_PORT, 'A1d 有线备份端口 = 6013')
         chk(it.get('net.server.wireless.port_bak') == DEFAULT_PORT,
-            'A1e 无线备份端口 = 6012')
+            'A1e 无线备份端口 = 6013')
         # 老的两路主地址没被新键顶掉（键名只多了后缀，前缀不许变）
         chk(it.get('net.server.wired.host') == DEFAULT_HOST, 'A1f 有线主地址仍在')
         chk(it.get('net.server.wireless.host') == DEFAULT_HOST, 'A1g 无线主地址仍在')
@@ -274,7 +274,7 @@ def main():
             'A6c 两路备份地址回空')
         chk(it.get('net.server.wired.port_bak') == DEFAULT_PORT and
             it.get('net.server.wireless.port_bak') == DEFAULT_PORT,
-            'A6d 两路备份端口回 6012')
+            'A6d 两路备份端口回 6013')
     finally:
         p.terminate()
         try:

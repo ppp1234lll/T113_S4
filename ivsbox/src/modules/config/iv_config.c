@@ -187,17 +187,20 @@ static const cfg_default_t s_defaults[] = {
     D_STR(IV_CFG_CLS_NET, "net.gateway", "网关 IP（空＝由 DHCP 分配）", "", NULL),
     /* 平台 / 升级服务器地址。默认值取自现网 GD32F460 主控工程
      * （`General_Version/main/APP/User/inc/save.h`）：
-     *   DEFALUT_LWIP_PLATFORM_URL/PORT  ＝ 47.104.250.225:6012（有线/内网）
-     *   DEFALUT_GSM_PLATFORM_URL/PORT   ＝ 47.104.250.225:6012（无线/4G 外网）
+     *   DEFALUT_LWIP_PLATFORM_URL/PORT  ＝ 47.104.250.225:6013（有线/内网）
+     *   DEFALUT_GSM_PLATFORM_URL/PORT   ＝ 47.104.250.225:6013（无线/4G 外网）
      *   DEFALUT_OTA_IP0..3 / DEFALUT_OTA_PORT ＝ 47.104.98.214:8989（升级）
+     * ⚠ **端口 6013 是 2026-11-04 用户明确的口径**（"平台默认地址是 6013"）：
+     * 出厂默认原为 6012，`docs/功能测试计划.html` 的 D-12 当时按"6012 是蓝本值、
+     * 6013 只是现场手改"定过论，**该结论作废** —— 平台侧的默认监听端口就是 6013。
      * 这里**不能套 `net.ip` 那套"空＝不指定"的口径**：本机 IP 空着还有 DHCP 兜底，
      * 平台地址空着等于"两条都为空 ⇒ 不启平台链路"（main.c: agent_setup），
      * 设备永远不上报、现场只会看到报文一直积压在 queue 里。
      * 换平台时由 Web 改这两组，**不要改这里**（改了固件就把老现场一起带走了）。 */
     D_STR(IV_CFG_CLS_NET, "net.server.wired.host", "有线平台服务器地址", "47.104.250.225", NULL),
-    D_INT(IV_CFG_CLS_NET, "net.server.wired.port", "有线平台服务器端口", 6012, 0, 65535),
+    D_INT(IV_CFG_CLS_NET, "net.server.wired.port", "有线平台服务器端口", 6013, 0, 65535),
     D_STR(IV_CFG_CLS_NET, "net.server.wireless.host", "无线平台服务器地址", "47.104.250.225", NULL),
-    D_INT(IV_CFG_CLS_NET, "net.server.wireless.port", "无线平台服务器端口", 6012, 0, 65535),
+    D_INT(IV_CFG_CLS_NET, "net.server.wireless.port", "无线平台服务器端口", 6013, 0, 65535),
     /* ---- 平台**备份**地址（2026-10-22）----
      * 对齐单片机参考 web「平台配置」卡的 `内网1地址_备份/内网1端口_备份/
      * 外网1地址_备份/外网1端口_备份` 四个字段（`index.shtml` 里的 `ae/af/ag/ah`）。
@@ -216,9 +219,9 @@ static const cfg_default_t s_defaults[] = {
      * 遂用「`_bak` 后缀」而不是「`.backup.` 中间段」—— 这也正好对上参考 web 的
      * 「地址_备份 / 端口_备份」命名。同理换键名时**先数段数**。 */
     D_STR(IV_CFG_CLS_NET, "net.server.wired.host_bak", "有线平台服务器地址（备份）", "", NULL),
-    D_INT(IV_CFG_CLS_NET, "net.server.wired.port_bak", "有线平台服务器端口（备份）", 6012, 0, 65535),
+    D_INT(IV_CFG_CLS_NET, "net.server.wired.port_bak", "有线平台服务器端口（备份）", 6013, 0, 65535),
     D_STR(IV_CFG_CLS_NET, "net.server.wireless.host_bak", "无线平台服务器地址（备份）", "", NULL),
-    D_INT(IV_CFG_CLS_NET, "net.server.wireless.port_bak", "无线平台服务器端口（备份）", 6012, 0, 65535),
+    D_INT(IV_CFG_CLS_NET, "net.server.wireless.port_bak", "无线平台服务器端口（备份）", 6013, 0, 65535),
     D_STR(IV_CFG_CLS_NET, "net.server.upgrade.host", "升级服务器地址", "47.104.98.214", NULL),
     D_INT(IV_CFG_CLS_NET, "net.server.upgrade.port", "升级服务器端口", 8989, 0, 65535),
     D_STR(IV_CFG_CLS_NET, "net.server.log.host", "日志上报服务器地址", "", NULL),

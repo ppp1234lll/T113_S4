@@ -51,7 +51,7 @@ HDR = struct.Struct('<IHHIIQII')
 
 PLAT_PORT = 16099
 DEFAULT_HOST = '47.104.250.225'
-DEFAULT_PORT = 6012
+DEFAULT_PORT = 6013
 
 # 0xB3「更新系统」用例的落点（临时目录，收尾删掉）：设备会往
 # `<root>/ota/download/` 下载、往 `<root>/ota/request` 写安装请求。

@@ -247,26 +247,26 @@ static void case_defaults_startup(void)
     chk(iv_config_get_str(c, "net.server.wired.host", &s) == IV_OK &&
             strcmp(s, "47.104.250.225") == 0,
         "c1: net.server.wired.host default 47.104.250.225");
-    chk(iv_config_get_int(c, "net.server.wired.port", &iv) == IV_OK && iv == 6012,
-        "c1: net.server.wired.port default 6012");
+    chk(iv_config_get_int(c, "net.server.wired.port", &iv) == IV_OK && iv == 6013,
+        "c1: net.server.wired.port default 6013");
     chk(iv_config_get_str(c, "net.server.wireless.host", &s) == IV_OK &&
             strcmp(s, "47.104.250.225") == 0,
         "c1: net.server.wireless.host default 47.104.250.225");
-    chk(iv_config_get_int(c, "net.server.wireless.port", &iv) == IV_OK && iv == 6012,
-        "c1: net.server.wireless.port default 6012");
+    chk(iv_config_get_int(c, "net.server.wireless.port", &iv) == IV_OK && iv == 6013,
+        "c1: net.server.wireless.port default 6013");
     /* 平台**备份**地址（2026-10-22）：出厂**空**地址 —— 备份是"主地址没配时
-     * 才顶上"的第二选择，不是默认通道；端口给 6012（与主地址同值），这样现场
+     * 才顶上"的第二选择，不是默认通道；端口给 6013（与主地址同值），这样现场
      * 只填地址就能用，不会因为忘了改端口而"填了等于没填"。 */
     chk(iv_config_get_str(c, "net.server.wired.host_bak", &s) == IV_OK &&
             s != NULL && s[0] == '\0',
         "c1: net.server.wired.host_bak default is empty");
-    chk(iv_config_get_int(c, "net.server.wired.port_bak", &iv) == IV_OK && iv == 6012,
-        "c1: net.server.wired.port_bak default 6012");
+    chk(iv_config_get_int(c, "net.server.wired.port_bak", &iv) == IV_OK && iv == 6013,
+        "c1: net.server.wired.port_bak default 6013");
     chk(iv_config_get_str(c, "net.server.wireless.host_bak", &s) == IV_OK &&
             s != NULL && s[0] == '\0',
         "c1: net.server.wireless.host_bak default is empty");
-    chk(iv_config_get_int(c, "net.server.wireless.port_bak", &iv) == IV_OK && iv == 6012,
-        "c1: net.server.wireless.port_bak default 6012");
+    chk(iv_config_get_int(c, "net.server.wireless.port_bak", &iv) == IV_OK && iv == 6013,
+        "c1: net.server.wireless.port_bak default 6013");
     /* 段数上限（`IV_CFG_DEPTH_MAX = 4`）**必须在这里钉住**：备份地址最初写成
      * `net.server.wired.backup.host`（5 段），`key_ok()` 判非法 ⇒ 默认表里那条
      * 条目让 `items_check()` 整表不过 ⇒ **每一条 save 全被拒**（现象是 test_config

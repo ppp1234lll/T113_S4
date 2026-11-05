@@ -961,8 +961,19 @@ static void act_check(const job_t *j)
         warnf(L"通道实测：本机 %d 没监听 —— 要么 exe 没开，要么 frpc 登录失败（看 exe 日志）",
               LOCAL_SSH);
 
+    /* 结论只写"本工具确实能看到什么"，别把条件说成结论：
+     * 令牌是"只进不出"的（设备只回 token_set / token_len，值永远读不回来），
+     * 所以本机这一侧**永远**证明不了"值相同"；能当证据的只有登录结果。
+     * 而登录结果只有两种可见形态：本机 16000 在监听（＝本机与 frps 同值），
+     * 以及设备通道打开后设备侧 frpc 能否在 frps 上线（本机看不到这一步）。 */
     plainf(L"");
-    plainf(L"结论：设备与服务器只能证明'长度/地址'，'值是否相同'要看 frpc 是否登录成功（上面那条实测）。");
+    plainf(L"结论：'长度/地址一致'只是必要条件 —— 令牌只进不出，设备不把值回给任何人，"
+           L"所以本机这边证明不了'值相同'。");
+    plainf(L"      能当证据的只有登录结果：本机 %d 在监听 ⇒ 本机与 frps 用的是同一串；"
+           L"设备侧要看它自己的 frpc 有没有在 frps 上线（本机看不到那一步）。", LOCAL_SSH);
+    if (have && !json_bool(js, "on", FALSE))
+        plainf(L"      设备通道现在是关着的（on=false）⇒ 设备 frpc 根本没启动，"
+               L"先点「开通道」，才有设备侧的登录结果可看。");
 }
 
 static BOOL act_devtoken(const job_t *j, const wchar_t *tok)

@@ -1085,21 +1085,44 @@ static HWND mk_group(HWND p, const wchar_t *t, int x, int y, int w, int h)
     return c;
 }
 
-static HWND mk_label(HWND p, const wchar_t *t, int x, int y, int w)
+/* 控件一律建在**主窗口**上，坐标加进分组框的位置 —— 不能挂在分组框下面：
+ * 分组框是 STATIC 类控件，按钮被点出来的 BN_CLICKED 的 WM_COMMAND 是发给
+ * **父窗口**的，而 DefWindowProc(STATIC) 直接把它丢掉 ⇒ 主窗口永远收不到点击，
+ * 表现就是"点按钮没反应、日志一个字都不动"（2026-11-05 用户实测踩到）。
+ * 参考实现里 WinForms 的 GroupBox 可以 Add 子控件，Win32 的 BS_GROUPBOX 不行。 */
+static HWND par_off(HWND grp, int *px, int *py)
 {
+    RECT r;
+    HWND par;
+    if (!grp) return g_hMain;
+    par = GetParent(grp);
+    if (!par) return grp;                 /* 已经是顶层窗口，不改坐标 */
+    if (!GetWindowRect(grp, &r)) return par;
+    MapWindowPoints(HWND_DESKTOP, par, (LPPOINT)&r, 2);
+    *px += r.left;
+    *py += r.top;
+    return par;
+}
+
+static HWND mk_label(HWND grp, const wchar_t *t, int x, int y, int w)
+{
+    int px = S(x), py = S(y);
+    HWND par = par_off(grp, &px, &py);
     HWND c = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                             S(x), S(y), S(w), S(22), p, NULL, g_hi, NULL);
+                             px, py, S(w), S(22), par, NULL, g_hi, NULL);
     SendMessageW(c, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
     return c;
 }
 
-static HWND mk_edit(HWND p, const wchar_t *t, int x, int y, int w, BOOL pw, int id)
+static HWND mk_edit(HWND grp, const wchar_t *t, int x, int y, int w, BOOL pw, int id)
 {
     DWORD st = WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL;
+    int px = S(x), py = S(y);
+    HWND par = par_off(grp, &px, &py);
     HWND c;
     if (pw) st |= ES_PASSWORD;
     c = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", t, st,
-                        S(x), S(y), S(w), S(23), p, (HMENU)(INT_PTR)id, g_hi, NULL);
+                        px, py, S(w), S(23), par, (HMENU)(INT_PTR)id, g_hi, NULL);
     SendMessageW(c, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
     /* 只有口令框才换密码字符。这里曾经无条件发 EM_SETPASSWORDCHAR，
      * 结果地址/端口/设备 IP/配置文件全变成一串圆点（2026-11-05 截图发现）。 */
@@ -1107,11 +1130,13 @@ static HWND mk_edit(HWND p, const wchar_t *t, int x, int y, int w, BOOL pw, int 
     return c;
 }
 
-static HWND mk_btn(HWND p, const wchar_t *t, int x, int y, int w, int h, int id)
+static HWND mk_btn(HWND grp, const wchar_t *t, int x, int y, int w, int h, int id)
 {
+    int px = S(x), py = S(y);
+    HWND par = par_off(grp, &px, &py);
     HWND c = CreateWindowExW(0, L"BUTTON", t,
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                             S(x), S(y), S(w), S(h), p, (HMENU)(INT_PTR)id, g_hi, NULL);
+                             px, py, S(w), S(h), par, (HMENU)(INT_PTR)id, g_hi, NULL);
     SendMessageW(c, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
     return c;
 }
@@ -1352,6 +1377,26 @@ static void save_log(void)
 }
 
 /* ------------------------------------------------------------ 截图自检 */
+
+/* 把一段宽文本按 UTF-8（带 BOM）落盘。--shot 用它把日志框内容也存一份，
+ * 这样"点按钮到底有没有反应"可以直接看文本，不必靠人读截图。 */
+static BOOL dump_text(const wchar_t *path, const wchar_t *s)
+{
+    FILE *f = _wfopen(path, L"wb");
+    if (!f) return FALSE;
+    fwrite("\xEF\xBB\xBF", 1, 3, f);
+    while (s && *s) {
+        wchar_t chunk[1024];
+        char u8[4096];
+        int n = 0;
+        while (*s && n < 1023) chunk[n++] = *s++;
+        chunk[n] = 0;
+        to_u8(chunk, u8, sizeof u8);
+        fwrite(u8, 1, strlen(u8), f);
+    }
+    fclose(f);
+    return TRUE;
+}
 
 /* 只在 --shot 里用：PrintWindow 抓整个窗口（含标题栏），写成 24 位 BMP。
  * 用 BMP 是为了不引 GDI+/WIC —— 验证布局不需要花哨格式。 */
@@ -1784,11 +1829,29 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show)
         DWORD t0 = GetTickCount();
         pump_ms(&msg, 900);
         if (g_shotCheck) {
-            PostMessageW(h, WM_COMMAND, (WPARAM)ID_B_CHECK, 0);
-            while (!g_done && GetTickCount() - t0 < 45000) pump_ms(&msg, 100);
+            /* 必须点**真按钮**（BM_CLICK → 按钮给父窗口发 BN_CLICKED）。
+             * 早先是直接 PostMessage(WM_COMMAND) 到主窗口，那是假通过：
+             * 它绕过了"按钮的父窗口到底是谁"这一环，正好把
+             * "点按钮没反应"的 bug 藏住了（2026-11-05 用户实测踩到）。 */
+            HWND b = GetDlgItem(h, ID_B_CHECK);
+            if (b) SendMessageW(b, BM_CLICK, 0, 0);
+            else plainf(L"[X] 自检：GetDlgItem 找不到「一致性检查」按钮");
+            while (b && !g_done && GetTickCount() - t0 < 45000) pump_ms(&msg, 100);
             pump_ms(&msg, 400);
         }
         save_window_bmp(h, g_shot);
+        {
+            /* 日志框内容另存成同名 .txt：截图只能"看"，文本能"验" */
+            wchar_t txt[MAX_PATH + 8];
+            int n = GetWindowTextLengthW(g_hLog);
+            wchar_t *buf = (wchar_t *)malloc(((size_t)n + 2) * sizeof(wchar_t));
+            if (buf) {
+                GetWindowTextW(g_hLog, buf, n + 1);
+                swprintf(txt, MAX_PATH + 8, L"%s.txt", g_shot);
+                dump_text(txt, buf);
+                free(buf);
+            }
+        }
         DestroyWindow(h);
         LocalFree(argv);
         WSACleanup();

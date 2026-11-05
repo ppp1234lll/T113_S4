@@ -14292,3 +14292,60 @@ PowerShell: (GetVersionInfo).FileVersion  -> 1.1.1.0
 **交付文档要按「读者从零到能用」排，不是按「知识点」排。** 原理写得再细，
 现场要的是第 3 步该点哪个按钮；两者分开写，各自都能短。
 
+== 2026-11-05 08:09 设备 Web「远程通道」报 `no such api`：静态资源与后端二进制不同源
+
+=== 干的事
+
+板端 `192.168.1.64` 把 `/opt/ivsbox/bin/ivsbox-web` 从旧件换成
+`/opt/ivsbox/current/bin/ivsbox-web`（`e2b46a2e…` → `bed2c377…`），重启 `S66ivsboxweb`。
+**仓库代码零改动**，改的是部署件。
+
+=== 为什么会出现 `no such api`
+
+`no such api` 是 `web/src/iv_web_api.c` 末尾的**路由兜底**（`IV_ENOENT` + 404），
+任何未注册路径都回这一句。看到它要先问：**是谁没注册**，而不是"页面写错了"。
+
+- 板上 `ivsbox-web`（旧）:`strings … | grep '^/api'` 只列到 `/api/system/time`，**没有 tunnel 四条**。
+- 板上 `current/bin/ivsbox-web`（新）: 多出 `/api/tunnel`、`/api/tunnel/config`、
+  `/api/tunnel/enable`、`/api/tunnel/disable`。
+- 板上 `web/static/app.js` md5 `fee5ff37…` **等于**仓库 `ivsbox/web/static/app.js`，
+  说明前端是新的、后端是旧的 ⇒ 页面渲染出「远程通道」，一调接口就 404。
+
+**关键结构点**：Web 服务是**独立进程** `ivsbox-web`（不是 `ivsboxd` 内置），
+由 `monitor-web.sh` 以 `cd /opt/ivsbox && exec ./bin/ivsbox-web` 拉起
+（`IVSBOX_APP_DIR` 默认 `/opt/ivsbox`）⇒ **生效路径是 `/opt/ivsbox/bin/ivsbox-web`**，
+不是 `releases/<ver>/bin/`。只更新 release 快照、没同步 `bin/`，页面就会保持旧行为。
+
+=== 自检一条链（换件或部署后必做）
+
+----
+strings /opt/ivsbox/bin/ivsbox-web | grep '^/api' | sort -u   # 必须能看到 /api/tunnel
+readlink -f /proc/$(pidof ivsbox-web)/exe                     # 必须是 /opt/ivsbox/bin/ivsbox-web
+md5sum /opt/ivsbox/bin/ivsbox-web /opt/ivsbox/current/bin/ivsbox-web
+# 未登录取 401 即"路由存在"；404 + no such api 即"二进制还是旧件"
+python3 -c "import urllib.request as u;u.urlopen('http://127.0.0.1/api/tunnel')"
+----
+
+`ivsboxd` 侧对应四条方法同样要查（`tunnel.status/configure/enable/disable`）：
+页面把 `tunnel.configure` 经 ctl 转给主控，**两个二进制都得在，缺一半照样不通**。
+
+=== 顺带记两条现场坑
+
+**令牌框可能被浏览器自动填上密码。** `inTok` 是 `type=password`，
+浏览器会把保存过的站点口令填进去；此时点「保存并生效」提交的不是令牌而是那串密码，
+令牌被改坏、通道随即断。**保存前先清空该框**（留空＝不改）。
+
+**`/opt/ivsbox/bin/ivsboxd` 与正在跑的 `releases/1.0.0/bin/ivsboxd` 不是同一个件。**
+旧件缺 `loginFailExit`（渲染 frpc.toml 时不会写 `loginFailExit = false`），
+一旦 monitor 用 `bin/` 下的旧件重拉主控，frpc 会恢复"登录失败即退出"的行为。
+本轮**未动**主控件，只登记：部署时必须五个二进制**同一批**覆盖，别只换其中一个。
+
+=== 教训
+
+**"接口不存在"和"接口不认我"必须分开。** 401 与 404 的区别就是"没有这条路由"
+与"有但没登录"；排查时先量这个码，能省掉一整轮去翻页面 JS 的时间。
+
+**静态资源与后端二进制是同一个交付单元。** `app.js` 里有的页面，对应的
+`/api/*` 必须在**同一批**部署里就位；否则页面能打开、功能全瘸，而这比整站打不开更难查。
+
+

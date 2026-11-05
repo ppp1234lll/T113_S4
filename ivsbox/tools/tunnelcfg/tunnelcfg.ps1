@@ -26,7 +26,9 @@ param(
     [string]$EcsKey = "",
     [string]$EcsHostKey = "ssh-ed25519 255 SHA256:Uy99qmPWoPgHefIFj1Am23sr0QVoC8RnpS43+ENUID4",
     [string]$IniPath = (Join-Path $env:LOCALAPPDATA "ivsbox-remote\remote.ini"),
-    [int]$LocalSshPort = 16000
+    [int]$LocalSshPort = 16000,
+    # 仅用于自检/出图：把界面画出来截一张 PNG 就退出（不进入交互）
+    [string]$Shot = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -324,94 +326,99 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $F = New-Object System.Windows.Forms.Form
-$F.Text = "运维箱通道配置 1.0  ——  设备 / 本机 / 服务器 三处一处改"
+$F.Text = "运维箱通道配置 1.1  ——  设备 / 本机 / 服务器 三处一处改"
 $F.Size = New-Object System.Drawing.Size(760, 640)
 $F.StartPosition = "CenterScreen"
 $F.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
 
-function New-Label { param($text,$x,$y,$w=90)
+function New-Label { param($parent,$text,$x,$y,$w=90)
     $l = New-Object System.Windows.Forms.Label
     $l.Text = $text; $l.Location = New-Object System.Drawing.Point($x,$y)
     $l.Size = New-Object System.Drawing.Size($w,22); $l.TextAlign = "MiddleLeft"
-    $F.Controls.Add($l); return $l
+    $parent.Controls.Add($l); return $l
 }
-function New-Text { param($text,$x,$y,$w=180,$pw=$false)
+function New-Text { param($parent,$text,$x,$y,$w=180,$pw=$false)
     $t = New-Object System.Windows.Forms.TextBox
     $t.Text = $text; $t.Location = New-Object System.Drawing.Point($x,$y)
     $t.Size = New-Object System.Drawing.Size($w,22)
     if ($pw) { $t.UseSystemPasswordChar = $true }
-    $F.Controls.Add($t); return $t
+    $parent.Controls.Add($t); return $t
 }
-function New-Button { param($text,$x,$y,$w=120,$h=28)
+function New-Button { param($parent,$text,$x,$y,$w=120,$h=28)
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $text; $b.Location = New-Object System.Drawing.Point($x,$y)
     $b.Size = New-Object System.Drawing.Size($w,$h)
-    $F.Controls.Add($b); return $b
+    $parent.Controls.Add($b); return $b
 }
 
-# --- 区域标题
+# 注意：子控件必须加进**各自的分组框**，不能加进窗体 ——
+# WinForms 里后 Add 的控件排在最底层，会被先加的分组框整个盖住，
+# 表现就是"只看到四个框的标题，里面空空"（2026-11-05 首次打开就这样）。
+
+# --- ① 服务器
 $g1 = New-Object System.Windows.Forms.GroupBox
-$g1.Text = "① 服务器（frps）"; $g1.Location = New-Object System.Drawing.Point(10,8)
-$g1.Size = New-Object System.Drawing.Size(724,96); $F.Controls.Add($g1)
+$g1.Text = "① 服务器（frps）"; $g1.Location = New-Object System.Drawing.Point(10,6)
+$g1.Size = New-Object System.Drawing.Size(724,92); $F.Controls.Add($g1)
 
-New-Label "地址" 20 28
-$tbHost = New-Text "" 70 28 150
-New-Label "端口" 232 28
-$tbPort = New-Text "7000" 272 28 60
-New-Label "令牌" 344 28
-$tbTok  = New-Text "" 384 28 200 $true
-New-Label "SSH 口令" 20 58
-$tbPw   = New-Text "" 100 58 120 $true
-New-Label "（只用于 SSH 改 frps，不落盘）" 228 58 260
+[void](New-Label $g1 "地址" 14 24 40)
+$tbHost = New-Text $g1 "" 56 24 150
+[void](New-Label $g1 "端口" 214 24 40)
+$tbPort = New-Text $g1 "7000" 254 24 60
+[void](New-Label $g1 "令牌" 322 24 40)
+$tbTok  = New-Text $g1 "" 360 24 190 $true
+[void](New-Label $g1 "SSH 口令" 14 54 60)
+$tbPw   = New-Text $g1 "" 78 54 110 $true
+[void](New-Label $g1 "（只用于 SSH 改 frps，不落盘）" 194 54 210)
 
-$btnGen   = New-Button "生成新令牌" 596 24 130 26
-$btnCopy  = New-Button "复制服务器命令" 596 54 130 26
+$btnGen   = New-Button $g1 "生成新令牌" 560 20 140 26
+$btnCopy  = New-Button $g1 "复制服务器命令" 560 50 140 26
 
-# --- 设备
+# --- ② 设备
 $g2 = New-Object System.Windows.Forms.GroupBox
-$g2.Text = "② 设备（ivsbox 箱体）"; $g2.Location = New-Object System.Drawing.Point(10,112)
-$g2.Size = New-Object System.Drawing.Size(724,88); $F.Controls.Add($g2)
+$g2.Text = "② 设备（ivsbox 箱体）"; $g2.Location = New-Object System.Drawing.Point(10,104)
+$g2.Size = New-Object System.Drawing.Size(724,62); $F.Controls.Add($g2)
 
-New-Label "设备 IP" 20 28
-$tbIp   = New-Text "192.168.1.64" 90 28 130
-New-Label "账号" 236 28
-$tbUser = New-Text "admin" 276 28 80
-New-Label "口令" 364 28
-$tbDevPw= New-Text "" 404 28 110 $true
-New-Label "（设备 Web 管理口令）" 522 28 190
+[void](New-Label $g2 "设备 IP" 14 24 55)
+$tbIp   = New-Text $g2 "192.168.1.64" 72 24 120
+[void](New-Label $g2 "账号" 202 24 36)
+$tbUser = New-Text $g2 "admin" 240 24 70
+[void](New-Label $g2 "口令" 320 24 36)
+$tbDevPw= New-Text $g2 "" 358 24 100 $true
+[void](New-Label $g2 "（设备 Web 管理口令）" 466 24 240)
 
-# --- 本机
+# --- ③ 本机
 $g3 = New-Object System.Windows.Forms.GroupBox
-$g3.Text = "③ 本机（运维箱远程访问.exe 配置）"; $g3.Location = New-Object System.Drawing.Point(10,208)
-$g3.Size = New-Object System.Drawing.Size(724,72); $F.Controls.Add($g3)
+$g3.Text = "③ 本机（运维箱远程访问.exe 配置）"; $g3.Location = New-Object System.Drawing.Point(10,172)
+$g3.Size = New-Object System.Drawing.Size(724,62); $F.Controls.Add($g3)
 
-New-Label "配置文件" 20 28
-$tbIni = New-Text "" 90 28 590
+[void](New-Label $g3 "配置文件" 14 24 60)
+$tbIni = New-Text $g3 "" 78 24 620
 
-# --- 操作
+# --- ④ 操作
 $g4 = New-Object System.Windows.Forms.GroupBox
-$g4.Text = "④ 操作（都会先问一遍）"; $g4.Location = New-Object System.Drawing.Point(10,286)
-$g4.Size = New-Object System.Drawing.Size(724,86); $F.Controls.Add($g4)
+$g4.Text = "④ 操作（都会先问一遍）"; $g4.Location = New-Object System.Drawing.Point(10,240)
+$g4.Size = New-Object System.Drawing.Size(724,88); $F.Controls.Add($g4)
 
-$btnCheck = New-Button "一致性检查" 20 24 130 30
-$btnDev   = New-Button "下发令牌到设备" 158 24 140 30
-$btnIni   = New-Button "写入本机配置" 306 24 130 30
-$btnOn    = New-Button "开通道" 444 24 80 30
-$btnOff   = New-Button "关通道" 532 24 80 30
-$btnRot   = New-Button "一键轮换（三处同改）" 20 54 278 30
-$btnSave  = New-Button "保存日志" 306 54 130 30
-$btnClr   = New-Button "清空" 444 54 80 30
+$btnCheck = New-Button $g4 "一致性检查" 14 20 130 30
+$btnDev   = New-Button $g4 "下发令牌到设备" 152 20 140 30
+$btnIni   = New-Button $g4 "写入本机配置" 300 20 130 30
+$btnOn    = New-Button $g4 "开通道" 438 20 80 30
+$btnOff   = New-Button $g4 "关通道" 526 20 80 30
+$btnRot   = New-Button $g4 "一键轮换（三处同改）" 14 52 278 30
+$btnSave  = New-Button $g4 "保存日志" 300 52 130 30
+$btnClr   = New-Button $g4 "清空" 438 52 80 30
 
 # --- 输出
 $script:txt = New-Object System.Windows.Forms.TextBox
 $script:txt.Multiline = $true
 $script:txt.ScrollBars = "Vertical"
 $script:txt.ReadOnly = $true
-$script:txt.Location = New-Object System.Drawing.Point(10,382)
-$script:txt.Size = New-Object System.Drawing.Size(724,210)
+$script:txt.Location = New-Object System.Drawing.Point(10,336)
+$script:txt.Size = New-Object System.Drawing.Size(724,252)
 $script:txt.Font = New-Object System.Drawing.Font("Consolas", 9)
 $script:txt.BackColor = [System.Drawing.Color]::FromArgb(250,250,250)
 $F.Controls.Add($script:txt)
+$script:txt.BringToFront()
 
 # --- 初始化：把 ini 灌进界面
 $tbIni.Text = $IniPath
@@ -488,8 +495,34 @@ $btnSave.Add_Click({
 })
 $btnClr.Add_Click({ $script:txt.Clear() })
 
-L "运维箱通道配置 1.0"
+L "运维箱通道配置 1.1"
 L "本机配置：$IniPath"
-L "说明：任何一步改的都是【真实生效】的文件/接口，没有'预演'。要看不动手的结论，点「一致性检查」。"
 L ""
+L "用法（第一次就看这几行）："
+L "  1) 先点「一致性检查」—— 只读，不改任何东西，回答'三处是不是同一串令牌'。"
+L "  2) 要换令牌：点「生成新令牌」→ 按提示点「下发令牌到设备」，再点「写入本机配置」。"
+L "     想让服务器一起换：在「SSH 口令」里填服务器口令，点「一键轮换（三处同改）」，"
+L "     它按 服务器 → 设备 → 本机 的顺序改，任一步失败会停下并说清现在是什么状态。"
+L "  3) 改完关掉并重开「运维箱远程访问.exe」，点「刷新」。"
+L ""
+L "说明：任何一步改的都是【真实生效】的文件/接口，没有'预演'，所以每个按钮都会先问你一遍。"
+L ""
+
+if ($Shot) {
+    # 自检用：把窗口画出来截一张，再关掉。用来确认控件真的在界面上（不是只有分组框框）。
+    $F.Show()
+    $F.Activate()
+    $end = (Get-Date).AddMilliseconds(800)
+    while ((Get-Date) -lt $end) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
+    $bmp = New-Object System.Drawing.Bitmap([int]$F.Width, [int]$F.Height)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.CopyFromScreen([int]$F.Location.X, [int]$F.Location.Y, 0, 0, (New-Object System.Drawing.Size([int]$F.Width, [int]$F.Height)))
+    $g.Dispose()
+    $bmp.Save($Shot, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+    $F.Close()
+    Write-Host "shot saved: $Shot"
+    exit 0
+}
+
 [void]$F.ShowDialog()

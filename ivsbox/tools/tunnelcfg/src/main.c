@@ -600,6 +600,25 @@ static BOOL dev_login(const job_t *j, wchar_t *sid, int sidcap, wchar_t *err, in
     return TRUE;
 }
 
+/* 把设备回的 `{"ok":false,"e":N,"msg":"…"}` 翻成一句人话。
+ *
+ * 原先这里只报 HTTP 状态码，于是 2026-11-05 现场出现这一幕：
+ *   [X] 开关失败（HTTP 409）
+ * 而 409 是 `status_of()` 把 `e=-7(IV_ESTATE)` 映射出来的 —— 意思是"通道**已经**是
+ * 你要的状态"，根本不是失败。丢了 `e`/`msg` 就只能靠人背 HTTP 码表，所以这里
+ * 统一把设备自己那句话带出来。 */
+static void dev_err_text(const char *js, int code, const wchar_t *what,
+                         wchar_t *err, int errcap)
+{
+    wchar_t m[256];
+    int e = json_int(js, "e", 0);
+    if (!json_str(js, "msg", m, 256)) m[0] = 0;
+    if (m[0])
+        swprintf(err, (size_t)errcap, L"%s（HTTP %d, e=%d）：%s", what, code, e, m);
+    else
+        swprintf(err, (size_t)errcap, L"%s（HTTP %d, e=%d）", what, code, e);
+}
+
 static BOOL dev_status(const job_t *j, const wchar_t *sid, char *js, int cap,
                        wchar_t *err, int errcap)
 {
@@ -608,39 +627,49 @@ static BOOL dev_status(const job_t *j, const wchar_t *sid, char *js, int cap,
                   js, cap, &code, err, errcap))
         return FALSE;
     if (code != 200 || !json_bool(js, "ok", FALSE)) {
-        swprintf(err, (size_t)errcap, L"读状态被拒（HTTP %d）", code);
+        dev_err_text(js, code, L"读状态被拒", err, errcap);
         return FALSE;
     }
     return TRUE;
 }
 
+/* `keep_on` 决定 configure 里的 `enable` 字段 —— **必须跟着"现在开着没有"走**，
+ * 不能写死 true。原因在 iv_ctl.c 的 m_tunnel_configure / iv_tunnel_invalidate：
+ * 换令牌会把正在开的会话**关掉**（旧钥匙配新配置＝连得上但连不通），所以"开着"的
+ * 通道必须重新 enable 一次；反过来，本来关着的通道被我们顺手 enable:true 就成了
+ * "点一下下发令牌，远程门自己开了"—— 这是不该有的副作用。 */
 static BOOL dev_set_token(const job_t *j, const wchar_t *sid, const wchar_t *tok,
-                          char *js, int cap, wchar_t *err, int errcap)
+                          BOOL keep_on, char *js, int cap, wchar_t *err, int errcap)
 {
     char t[256], body[512];
     int code = 0;
     to_u8(tok, t, sizeof t);
-    snprintf(body, sizeof body, "{\"token\":\"%s\",\"ttl\":0,\"enable\":true}", t);
+    snprintf(body, sizeof body, "{\"token\":\"%s\",\"ttl\":0,\"enable\":%s}", t,
+             keep_on ? "true" : "false");
     if (!http_req(j->devip, L"POST", L"/api/tunnel/config", body, sid,
                   js, cap, &code, err, errcap))
         return FALSE;
     if (code != 200) {
-        swprintf(err, (size_t)errcap, L"下发失败（HTTP %d）", code);
+        dev_err_text(js, code, L"下发被拒", err, errcap);
         return FALSE;
     }
     return TRUE;
 }
 
+/* HTTP 码回传出去：上层要靠 409+e=-7 区分"本来就是这状态"和真失败。 */
 static BOOL dev_switch(const job_t *j, const wchar_t *sid, BOOL on,
-                       char *js, int cap, wchar_t *err, int errcap)
+                       char *js, int cap, int *code_out,
+                       wchar_t *err, int errcap)
 {
     int code = 0;
+    if (code_out) *code_out = 0;
     if (!http_req(j->devip, L"POST",
                   on ? L"/api/tunnel/enable" : L"/api/tunnel/disable",
                   "{}", sid, js, cap, &code, err, errcap))
         return FALSE;
+    if (code_out) *code_out = code;
     if (code != 200) {
-        swprintf(err, (size_t)errcap, L"开关失败（HTTP %d）", code);
+        dev_err_text(js, code, L"开关被拒", err, errcap);
         return FALSE;
     }
     return TRUE;
@@ -981,6 +1010,7 @@ static BOOL act_devtoken(const job_t *j, const wchar_t *tok)
     wchar_t sid[160], err[512];
     char js[8192];
     int before = g_fail;
+    BOOL was_on;
 
     if (!tok_ok(tok)) {
         badf(L"令牌含非法字符或长度越界（1~63，允许 0-9 A-Z a-z - _ . ~ + / = @）");
@@ -990,7 +1020,22 @@ static BOOL act_devtoken(const job_t *j, const wchar_t *tok)
     if (!dev_login(j, sid, 160, err, 512)) { badf(L"%s", err); return FALSE; }
     okf(L"设备登录成功");
 
-    if (!dev_set_token(j, sid, tok, js, sizeof js, err, 512)) { badf(L"%s", err); return FALSE; }
+    /* 先问一句"现在开着没有"：configure 里的 enable 必须与原状态一致。
+     * 读不到就停 —— 猜一个 enable:true 等于替人把远程入口打开，猜 false 又等于
+     * 悄悄把正在用的通道关掉，两种都不该由本工具自作主张。 */
+    if (!dev_status(j, sid, js, sizeof js, err, 512)) {
+        badf(L"%s", err);
+        plainf(L"        已中止：没读清通道状态，就不动令牌（避免顺手改开关）");
+        return FALSE;
+    }
+    was_on = json_bool(js, "on", FALSE);
+    plainf(L"    设备通道当前：%s（下发令牌时按原状态保持）",
+           was_on ? L"已开启" : L"已关闭");
+
+    if (!dev_set_token(j, sid, tok, was_on, js, sizeof js, err, 512)) {
+        badf(L"%s", err);
+        return FALSE;
+    }
     if (!json_bool(js, "ok", FALSE)) {
         badf(L"下发失败：e=%d", json_int(js, "e", 0));
         return FALSE;
@@ -998,7 +1043,10 @@ static BOOL act_devtoken(const job_t *j, const wchar_t *tok)
     okf(L"设备已接受：令牌长度 %d，通道 on=%s",
         json_int(js, "token_len", 0),
         json_bool(js, "on", FALSE) ? L"true" : L"false");
-    plainf(L"       设备立刻重写 secure/tunnel.token 与 frpc.toml，monitor.sh 拉起 frpc 重连；secretKey 自动重算");
+    if (was_on)
+        plainf(L"       设备立刻重写 secure/tunnel.token 与 frpc.toml，并重开通道（换钥匙必然重连）");
+    else
+        plainf(L"       设备立刻重写 secure/tunnel.token 与 frpc.toml；通道仍关着，要连就点「开通道」");
 
     Sleep(6000);                        /* 给 frpc 重连留时间，再复查一次 */
     if (dev_status(j, sid, js, sizeof js, err, 512) && json_bool(js, "token_set", FALSE))
@@ -1025,14 +1073,44 @@ static BOOL act_initoken(const job_t *j, const wchar_t *tok)
     return TRUE;
 }
 
+/* 设备错误码：与 ivsbox/include/ivsbox/iv_ret.h 对齐（本工具不引设备头文件，
+ * 只抄用得到的那个）。-7 = IV_ESTATE＝"当前状态不允许该操作"，
+ * HTTP 侧由 iv_web_api.c:status_of() 映射成 409。 */
+#define DEV_E_STATE (-7)
+
 static BOOL act_switch(const job_t *j, BOOL on)
 {
     wchar_t sid[160], err[512];
     char js[4096];
+    int code = 0;
 
     stepf(on ? L"把设备通道打开" : L"把设备通道关闭");
     if (!dev_login(j, sid, 160, err, 512)) { badf(L"%s", err); return FALSE; }
-    if (!dev_switch(j, sid, on, js, sizeof js, err, 512)) { badf(L"%s", err); return FALSE; }
+    if (!dev_switch(j, sid, on, js, sizeof js, &code, err, 512)) {
+        /* 409 只说明 status_of() 认出的是"状态类"错误码；其中与开关有关的只有
+         * IV_ESTATE(-7)：iv_tunnel_enable() 的第一个 deny 分支就是 `state == ON`，
+         * disable 侧同理。那就是"已经是你要的状态"，不是故障 —— 现场却看到一行
+         * 红字 [X] 开关失败（HTTP 409），还得人自己再点一次关/开去验证。
+         * 这里改成：复查一次真实状态，一致就报 OK 并说明"没有重复动作"。 */
+        if (code == 409 && json_int(js, "e", 0) == DEV_E_STATE) {
+            char st[4096];
+            wchar_t e2[512];
+            if (!dev_status(j, sid, st, sizeof st, e2, 512)) {
+                badf(L"设备报 e=-7（状态冲突），复查又失败：%s", e2);
+                return FALSE;
+            }
+            if (json_bool(st, "on", FALSE) == on) {
+                okf(on ? L"本来就是开着的（e=-7）—— 这次没有重复动作"
+                       : L"本来就是关着的（e=-7）—— 这次没有重复动作");
+                return TRUE;
+            }
+            badf(L"设备报 e=-7，但复查是 on=%s —— 前后不一致，请再点一次",
+                 json_bool(st, "on", FALSE) ? L"true" : L"false");
+            return FALSE;
+        }
+        badf(L"%s", err);
+        return FALSE;
+    }
     if (!json_bool(js, "ok", FALSE)) {
         badf(L"失败：e=%d", json_int(js, "e", 0));
         return FALSE;

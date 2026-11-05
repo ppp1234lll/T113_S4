@@ -70,6 +70,103 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 |===
 
 
+== 2026-11-05 17:05 HTTP 409 不是"失败"：开关语义 ＋ 「下发令牌」不该动开关
+
+现场日志只有三行，却混着两个问题：
+
+....
+== 把设备通道打开 ==
+[X]    开关失败（HTTP 409）
+== 把设备通道关闭 ==
+[OK]   已关闭：on=false
+== 把设备通道打开 ==
+[OK]   已开启：on=true
+....
+
+=== 409 是谁给的：`status_of()` ＋ `IV_ESTATE`
+
+`iv_web_api.c:status_of()` 把响应体里的 `"e"` 映射成 HTTP 状态码，其中
+`IV_ESTATE(-7)` → **409**。而 `iv_tunnel.c:iv_tunnel_enable()` 的第一个拒绝分支是：
+
+[source,c]
+----
+if (t->state == IV_TUNNEL_ON) { r = IV_TUNNEL_ESTATE; goto deny; }   /* → rc_of(7) = IV_ESTATE */
+----
+
+也就是说：**409 ＝ "通道已经是你要的状态"，不是故障。** 工具原先只印 HTTP 码、把响应体
+（内含设备自己那句 `e`/`msg`）丢掉，于是"已经开着"在人眼里长成了"开关失败"，
+只能靠"关一次再开一次"反推。
+
+=== 第一下就撞上"已经开着"的真因：`configure` 的 `enable:true`
+
+`dev_set_token()` 原先把请求体写死成
+`{"token":"…","ttl":0,"enable":true}`；而 `iv_ctl.c:m_tunnel_configure()` 收到
+`enable:true` 会**真的把通道开起来**（判 ON 先 disable 再 enable）。所以
+「下发令牌」/「一键轮换」收尾之后通道**已经是 on**，紧跟着点「把设备通道打开」必然 409。
+
+为什么"改令牌"要重开：`app_set_tunnel_token()` 写完令牌会 `iv_tunnel_invalidate()` ——
+把用旧钥匙开着的会话**关掉**（旧钥匙配新配置的症状是"连得上但握手永远失败"）。
+所以"开着"的通道必须重新 enable 一次；但"本来关着"的通道被顺手 enable 就等于
+**点一下下发令牌，远程门自己开了**，这是不该有的副作用。
+
+=== 现在的做法
+
+[cols="1,3"]
+|===
+|位置 |行为
+
+|`dev_err_text()`（新增）
+|把 `{"ok":false,"e":N,"msg":"…"}` 翻成 `开关被拒（HTTP 409, e=-7）：…`；
+`dev_status` / `dev_set_token` / `dev_switch` 三处统一用它，不再只报 HTTP 码
+
+|`dev_switch()` 
+|HTTP 码回传给上层（新增 `code_out` 出参）
+
+|`act_switch()`
+|`409 ＋ e=-7` ⇒ **复查一次** `GET /api/tunnel`：与请求一致报
+`[OK] 本来就是开着的（e=-7）—— 这次没有重复动作`；不一致才报"前后不一致，请再点一次"；
+其余错误码照原样 `badf`
+
+|`dev_set_token(…, keep_on, …)` / `act_devtoken()`
+|**先 GET 状态再下发**，请求体 `enable` 跟着当前 `on` 走；读不到状态就中止
+（猜 true 等于替人开门，猜 false 等于悄悄关门）；文案改成"通道仍关着，要连就点「开通道」"
+|===
+
+=== 教训：做"同值下发"验证，必须先读现场现值
+
+本次验证时我拿**文档里记录的旧令牌**当"现值"下发，而现场半小时前刚轮换过 ——
+结果不是"验证通过"，而是**把设备令牌改回了旧值**，设备 frpc 立刻登录不上。
+判据不在工具里，在设备自己的日志：
+
+....
+[E] [client/service.go:363] token in login doesn't match token from configuration
+[I] [client/service.go:370] [77ddda8b260b781b] login to server success, get run id [...]
+....
+
+- `token in login doesn't match token from configuration` ＝ **两侧令牌不同**（硬证据，
+  比"长度一致/地址一致"强得多；`tunnel.status` 只给 `token_set`/`token_len`，永远证明不了值）；
+- `login to server success` ＋ `proxy added: [SN]` ＋ `start proxy success` ＝ 三处同值且通道真的通了。
+
+所以：**"同值"这种验证一律先读现值再回写**；文档/记忆里的令牌只是历史，不是现值。
+
+=== 验证方法（可复用的临时实例套路）
+
+设备现场口令已改、不该为验证去动它，于是另起一个只供本地验证的 Web 实例：
+
+[source,sh]
+----
+ivsbox-web --port 18081 --cam-port 0 --user admin --pass Tc12345678 --pass-file ""
+# 工具侧：--ip 192.168.1.64:18081（http_req 支持 host:port）
+----
+
+两个必须知道的点：
+
+1. **`--pass` 不能再用出厂默认对**（`admin/88888888`）。`iv_web_pass_init()` 见默认对就置
+   `must_change=1`，此后除改密外一律 `403 must change password` —— 现场会看到
+   `开关被拒（HTTP 403, e=-7）：must change password`，很容易误判成权限/接口问题。
+2. `--cam-port` 必须换（真机 8081 已占用，不改新实例会直接退出）；`--pass-file ""`
+   ＝ 口令只在内存，不落盘、不碰 `secure/web.passwd`。
+
 == 2026-11-05 16:52 「值是否相同」到底能证明到哪一步
 
 `一致性检查` 原来最后一句是「设备与服务器只能证明'长度/地址'，'值是否相同'要看 frpc

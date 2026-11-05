@@ -6,7 +6,10 @@ cd "$(dirname "$0")"
 
 GCC=${GCC:-/c/mingw64/bin/gcc.exe}
 WINDRES=${WINDRES:-/c/mingw64/bin/windres.exe}
-OUT="运维箱通道配置.exe"
+# 输出名可覆盖：用户正开着 exe 时，Windows 会对该文件加独占锁，
+# ld 直接报 `cannot open output file … Permission denied`。此时
+# `OUT=build/tc_new.exe ./build.sh` 先产出，再关掉旧窗口换名即可。
+OUT=${OUT:-运维箱通道配置.exe}
 
 [ -x "$GCC" ]     || { echo "缺 gcc：$GCC"; exit 1; }
 [ -x "$WINDRES" ] || { echo "缺 windres：$WINDRES"; exit 1; }

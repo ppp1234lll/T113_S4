@@ -14348,4 +14348,55 @@ python3 -c "import urllib.request as u;u.urlopen('http://127.0.0.1/api/tunnel')"
 **静态资源与后端二进制是同一个交付单元。** `app.js` 里有的页面，对应的
 `/api/*` 必须在**同一批**部署里就位；否则页面能打开、功能全瘸，而这比整站打不开更难查。
 
+== 2026-11-05 08:35 运维箱远程访问.exe 1.1.2：通道起不来时先问 frpc，别抛通用话术
+
+=== 干的事
+
+`do_probe_all()` 的 `ensure_frpc()` 失败分支不再直接吐三条通用提示，而是先回读
+`frpc.log` 末尾 8 KiB（新增 `frpc_log_has()`），按 frpc 自己的措辞分四类：
+
+----
+if 日志有 "token in login doesn't match"   -> 令牌和服务器不一致（列出三处 + 原话）
+else if 日志有 "token in login"            -> 服务器拒绝了本机登录
+else if 日志有 "start visitor success"     -> visitor 建了但本地端口没监听（残留进程占端口）
+else                                       -> 原来的三条（网络 / 4G / tun.py on）
+----
+
+每类都写 `g_note`，由 `update_status_line()` 带进状态条。
+
+=== 解决什么问题
+
+现场把令牌只改了两处（设备 Web 点了「生成随机令牌」并保存 + exe「服务器设置」填同一串），
+**没改服务器 frps**。结果是两侧都 `token in login doesn't match token from configuration`、
+通道 20 秒起不来；而 exe 只说"本机能上网吗 / 设备通电吗 / 跑 tun.py on"——
+这三条现场全对，等于把人往网络上带，白查一轮。
+
+**frpc 早就把原因写在日志里了，只是界面没去读。** 现在界面读它，并把"三处必须同值"
+（frps 的 `auth.token`、设备 `secure/tunnel.token`、exe `remote.ini`）直接说出来。
+
+=== 验证
+
+----
+# 反向证伪：remote.ini 填 b8218…（设备与 exe 都有、frps 没有的那串）
+[X] 通道没起来：令牌和服务器不一致
+    frpc 原话：token in login doesn't match token from configuration
+    也就是说 47.95.22.96:7000 那台 frps 的 auth.token，与这里填的不是同一个值。
+    令牌必须三处同值：服务器 frps / 设备「远程通道」/ 本程序「服务器设置」。
+    ⇒ 自检退出码 1
+
+# 正向：改回 6a8fdb6b…（frps 现值）
+[PASS] frpc 通道就绪（16000）  [PASS] ssh 免密登录设备
+[PASS] 读到摄像机列表  2 路 state=0  [PASS] 隧道 code=200  [PASS] SD 17 项
+[FAIL] 下载 30 MB 录像   ← 既有问题（公网 14 KB/s、无续传），不是本次回归
+----
+
+=== 教训
+
+**通用话术会把"已经查明的结论"埋掉。** "网络通吗/通电吗/开关开了吗"在没有任何信息时是有用的
+排序，但在日志已经写明"令牌不是我这个"时就是噪音。**先读自己手里那份日志，再决定说什么。**
+
+**失败分流要按"证据"排，不按"可能性"排。** 命中的是日志里的原句，不是猜测；
+给用户的每个结论都要能指到一行日志，否则下次还是猜。
+
+
 

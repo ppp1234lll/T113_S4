@@ -392,12 +392,33 @@ static BOOL http_req(const wchar_t *host, const wchar_t *method, const wchar_t *
 {
     HINTERNET hs = NULL, hc = NULL, hr = NULL;
     wchar_t hdr[640];
+    wchar_t hbuf[128];
+    unsigned short port = 80;
     BOOL got = FALSE;
     DWORD clen = 0, status = 0, slen = sizeof(status);
 
     if (out && cap > 0) out[0] = 0;
     if (code) *code = 0;
     if (err && errcap > 0) err[0] = 0;
+
+    /* 允许在「设备 IP」里写 `host:port`：现场排障时常常要对着另一台机器上
+     * 用临时口令文件起的实例验一遍（`ivsbox-web --port 18081 --pass-file …`），
+     * 那种实例不在 80 上，而界面没有单独的端口框。IPv4 才这么写，别塞 IPv6。 */
+    {
+        const wchar_t *colon = NULL, *q;
+        for (q = host; q && *q; q++) if (*q == L':') colon = q;
+        if (colon) {
+            size_t n = (size_t)(colon - host);
+            unsigned long pv;
+            if (n > 127) n = 127;
+            memcpy(hbuf, host, n * sizeof(wchar_t));
+            hbuf[n] = 0;
+            pv = wcstoul(colon + 1, NULL, 10);
+            if (pv > 0 && pv <= 65535) port = (unsigned short)pv;
+        } else {
+            swprintf(hbuf, 128, L"%s", host ? host : L"");
+        }
+    }
 
     hs = WinHttpOpen(L"ivsbox-tunnelcfg/1.1", WINHTTP_ACCESS_TYPE_NO_PROXY,
                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -408,9 +429,9 @@ static BOOL http_req(const wchar_t *host, const wchar_t *method, const wchar_t *
     /* 设备在局域网，绝不走代理；连接/发送 6 s，接收 20 s（写令牌要重写配置+拉起 frpc） */
     WinHttpSetTimeouts(hs, 6000, 6000, 15000, 20000);
 
-    hc = WinHttpConnect(hs, host, 80, 0);
+    hc = WinHttpConnect(hs, hbuf, (INTERNET_PORT)port, 0);
     if (!hc) {
-        if (err) swprintf(err, (size_t)errcap, L"连不上 %s:80（%lu）", host, GetLastError());
+        if (err) swprintf(err, (size_t)errcap, L"连不上 %s:%u（%lu）", hbuf, port, GetLastError());
         goto done;
     }
     hr = WinHttpOpenRequest(hc, method, path, NULL, WINHTTP_NO_REFERER,
@@ -564,8 +585,12 @@ static BOOL dev_login(const job_t *j, wchar_t *sid, int sidcap, wchar_t *err, in
         return FALSE;
     if (code != 200 || !json_bool(js, "ok", FALSE)) {
         int e = json_int(js, "e", 0);
+        /* e=-23 就是 IV_EAUTH：设备认的这个 (账号,口令) 不成立。
+         * 注意"体没解析成"与"口令错"在设备侧是同一句（见 api_login），单看这条区分不了，
+         * 所以话术只报事实，并给出下一步——比猜"是不是网络不通"有用。 */
         swprintf(err, (size_t)errcap,
-                 L"设备登录被拒（HTTP %d, e=%d）—— 口令不对，或该 IP 打不开", code, e);
+                 L"设备登录被拒（HTTP %d, e=%d）—— 账号或口令不对。"
+                 L"出厂默认 admin/88888888 只在新机器上有效，这台可能已改过口令", code, e);
         return FALSE;
     }
     if (!json_str(js, "token", sid, sidcap)) {
@@ -1218,6 +1243,16 @@ static void get_text(HWND e, wchar_t *o, int cap)
     }
 }
 
+/* 口令框不清尾空格：口令里若真有空格，trim 掉就等于"帮你改了个错口令"。
+ * 其余字段（IP/账号/路径/令牌）照旧去掉首尾空白 —— 手输常常带空格。 */
+static void get_text_raw(HWND e, wchar_t *o, int cap)
+{
+    if (o && cap > 0) {
+        GetWindowTextW(e, o, cap);
+        o[cap - 1] = 0;
+    }
+}
+
 static job_t *job_from_ui(int action)
 {
     job_t *j = (job_t *)calloc(1, sizeof(job_t));
@@ -1226,10 +1261,10 @@ static job_t *job_from_ui(int action)
     j->action = action;
     get_text(g_hIp, j->devip, 64);
     get_text(g_hUser, j->devuser, 64);
-    get_text(g_hDevPw, j->devpass, 128);
+    get_text_raw(g_hDevPw, j->devpass, 128);
     get_text(g_hIni, j->ini, MAX_PATH);
     get_text(g_hHost, j->ecshost, 128);
-    get_text(g_hSshPw, j->ecspass, 128);
+    get_text_raw(g_hSshPw, j->ecspass, 128);
     get_text(g_hTok, j->token, 128);
     get_text(g_hPort, tmp, 64);
     return j;

@@ -57,7 +57,8 @@ static const char *const k_live_nosim[] = {
     "\r\n+CGATT: 0\r\n\r\nOK\r\n",                                     /* CGATT? */
     "\r\n+QENG: \"servingcell\",\"LIMSRV\",\"LTE\",\"FDD\",460,01,9435290,"
     "394,300,1,5,5,5277,-85,-9,-57,69,30\r\n\r\nOK\r\n",               /* QENG */
-    "\r\nOK\r\n"                                                       /* CGCONTRDP */
+    "\r\nOK\r\n",                                                      /* CGCONTRDP */
+    "\r\n+CME ERROR: 3\r\n"                                            /* CCLK?（未注册，取不到网络时间）*/
 };
 
 /* ---------------------------------------------------------------------------
@@ -77,7 +78,9 @@ static const char *const k_ok_sim[] = {
     "\r\n+QENG: \"servingcell\",\"NOCONN\",\"LTE\",\"FDD\",460,01,9435290,"
     "394,300,1,5,5,5277,-85,-9,-57,20,30\r\n\r\nOK\r\n",
     "\r\n+CGCONTRDP: 1,5,\"cmnet\",\"10.158.0.108.255.255.255.0\",\"10.158.0.1\","
-    "\"8.8.8.8,114.114.114.114\"\r\n\r\nOK\r\n"
+    "\"8.8.8.8,114.114.114.114\"\r\n\r\nOK\r\n",
+    /* 板端实测格式：本地时间 + 时区（+32 = UTC+8，单位 15 分钟）*/
+    "\r\n+CCLK: \"26/11/05,09:12:34+32\"\r\n\r\nOK\r\n"
 };
 
 /* ---------------------------------------------------------------------------
@@ -99,7 +102,8 @@ static const char *const k_live_simfail[] = {
     "\r\n+CEREG: 0,0\r\n\r\nOK\r\n",                                   /* CEREG? */
     "\r\n+CGATT: 0\r\n\r\nOK\r\n",                                     /* CGATT? */
     "\r\n+CME ERROR: 3\r\n",                                           /* QENG */
-    "\r\nOK\r\n"                                                       /* CGCONTRDP */
+    "\r\nOK\r\n",                                                      /* CGCONTRDP */
+    "\r\n+CME ERROR: 3\r\n"                                            /* CCLK? */
 };
 
 /* CPIN 一条都没回（只有裸 OK）：本轮无结论。QSIMSTAT 的第一字段决定采不采。 */
@@ -370,7 +374,9 @@ static void c08_cmd_table(void)
     chk(strcmp(iv_cell_cmd_text(IV_CELL_CMD_QENG), "AT+QENG=\"servingcell\"") == 0,
         "c08 QENG text");
     chk(strcmp(iv_cell_cmd_text(IV_CELL_CMD_CGCONTRDP), "AT+CGCONTRDP") == 0,
-        "c08 last command is PDP query");
+        "c08 PDP query text");
+    chk(strcmp(iv_cell_cmd_text(IV_CELL_CMD_CCLK), "AT+CCLK?") == 0,
+        "c08 last command is the network-time query");
     for (i = 1; i < (int)IV_CELL_CMD_LAST; i++)
         chk(iv_cell_cmd_text((iv_cell_cmd_id_t)i)[0] != '\0', "c08 every command has text");
 }
@@ -592,7 +598,7 @@ static void c12_qsimstat_enable_gate(void)
         "\r\n+CME ERROR: 50\r\n", "\r\n+CME ERROR: 10\r\n",
         "\r\n+CSQ: 99,99\r\n\r\nOK\r\n", "\r\n+COPS: 1\r\n\r\nOK\r\n",
         "\r\n+CEREG: 0,0\r\n\r\nOK\r\n", "\r\n+CGATT: 0\r\n\r\nOK\r\n",
-        "\r\n+CME ERROR: 3\r\n", "\r\nOK\r\n"
+        "\r\n+CME ERROR: 3\r\n", "\r\nOK\r\n", "\r\n+CME ERROR: 3\r\n"
     };
     static const char *const k_cpin_silent_ins1_0[] = {
         "Quectel\r\nEC200G\r\nRevision: EC200GCNLER01A13M04\r\n\r\nOK\r\n",
@@ -602,7 +608,7 @@ static void c12_qsimstat_enable_gate(void)
         "\r\n+CME ERROR: 50\r\n", "\r\n+CME ERROR: 10\r\n",
         "\r\n+CSQ: 99,99\r\n\r\nOK\r\n", "\r\n+COPS: 1\r\n\r\nOK\r\n",
         "\r\n+CEREG: 0,0\r\n\r\nOK\r\n", "\r\n+CGATT: 0\r\n\r\nOK\r\n",
-        "\r\n+CME ERROR: 3\r\n", "\r\nOK\r\n"
+        "\r\n+CME ERROR: 3\r\n", "\r\nOK\r\n", "\r\n+CME ERROR: 3\r\n"
     };
     iv_cell_t      c;
     iv_cell_snap_t s;
@@ -626,6 +632,38 @@ static void c12_qsimstat_enable_gate(void)
     chk(strstr(s.reason, "未插入") != NULL, "c12 reason: not inserted");
 }
 
+/* 13) 网络时间（`AT+CCLK?`）：本地时间 + 时区 ⇒ UTC epoch
+ *
+ * 这是"板子断电回 1970"的唯一兜底（`rtc@7090000` 在设备树里 disabled）。
+ * 期望值写死而不是在测试里再算一遍 —— 换算要是错了，两端一起错就发现不了。
+ *   `26/11/05,09:12:34+32` ⇒ 2026-11-05 09:12:34 (UTC+8) ⇒ 2026-11-05T01:12:34Z
+ *   ⇒ 1793841154
+ */
+static void c13_cclk_to_epoch(void)
+{
+    iv_cell_t      c;
+    iv_cell_snap_t s;
+    uint64_t       t = 1000;
+
+    iv_cell_init(&c, 30000);
+    iv_cell_snapshot(&c, &s);
+    chk(s.time_valid == 0, "c13 time unknown before any CCLK");
+
+    (void)run_round(&c, k_ok_sim, k_cmd_n, &t);
+    iv_cell_snapshot(&c, &s);
+    chk(s.time_valid == 1, "c13 +CCLK sets time_valid");
+    chk(s.wall_sec == 1793841154, "c13 +32 => UTC, exactly 1793841154");
+
+    /* 取不到（未注册时模组回 CME ERROR）**不许清掉已有值、也不许设成 0**：
+     * 设成 1970 会让录像目录名变 `19700101`，比"没对上"更难查。 */
+    iv_cell_init(&c, 30000);
+    t = 1000;
+    (void)run_round(&c, k_live_nosim, k_cmd_n, &t);
+    iv_cell_snapshot(&c, &s);
+    chk(s.time_valid == 0, "c13 CCLK error leaves time unknown (not 1970)");
+    chk(s.wall_sec == 0, "c13 CCLK error leaves wall_sec untouched");
+}
+
 int main(void)
 {
     c01_init_unknown();
@@ -640,6 +678,7 @@ int main(void)
     c10_redial();
     c11_sim_failure_not_absent();
     c12_qsimstat_enable_gate();
+    c13_cclk_to_epoch();
 
     if (g_fail != 0) {
         fprintf(stderr, "test_cellular: %d check(s) FAILED\n", g_fail);

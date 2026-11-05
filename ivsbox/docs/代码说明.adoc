@@ -65,7 +65,71 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | Web 界面「会话过期」不再伪装成设备故障（401 统一接管 ＋ 会话滑动续期） | 已实现（`app.js:api()` 遇 401 回登录卡片并写明原因；`iv_web_api.c:iv_web_sess_check()` 命中即续期；新增 `tests/web/ui_session_401.mjs` 11 条断言、反向证伪 3 条 FAIL；前端 11 个 jsdom 用例全绿、`make test` 49 passed、`itest` 16＋1 SKIP、`arm` 0 告警；**已上板**：`ivsbox-web` `c0ce9634…`＋`app.js` `d8633d71…`） | 2026-10-29 08:53 | 页面放过一夜后满屏"未获取到…/读取失败：unauthorized"，实际只是 8 h 会话过期。详见本文件文末 2026-10-29 08:53 节。 |
 | 摄像机**品牌自动匹配**（发现结果按 IP 回填 `camera.ch.N.vendor` ＋ 修复品牌认错） | 已实现（`iv_onvif_parse()` 厂商自报名字优先于 `hardware`/`MacAddress` 等通用字段；`add_item()` 合并档案时泛 ONVIF 不得覆盖已认出的具体厂商；`app.js` 新增 `DEV_BRAND_VENDOR` 映射 ＋ `devicesByIp()`（5 s 缓存＋飞行中复用）＋ 进页面/IP 提交时自动选品牌并重算地址；新增 `tests/web/ui_camera_vendor.mjs` 16 条、`test_device` 新增 d15 与 d07 三段；`make test`/`asan`/`tsan` 各 49 passed、`itest` 16＋1 SKIP、`analyze` 0、`arm` 0 告警、前端 13 用例全绿；反向证伪 3＋1 条 FAIL；**已上板**：发现结果由 4 台 `onvif` 变为 `hikvision`/`dahua`，`ivsboxd` `bfd17f60…`＋`app.js` `7a83e3a5…`） | 2026-10-29 15:22 | 用户问"搜到了、也解析出品牌了，配完 IP 为什么不自动匹配"。三层原因：页面没接线 / 前后端品牌命名两套 / 发现侧把厂商判成泛 ONVIF 且合并时被降级覆盖。详见本文件文末 2026-10-29 15:22 节。 |
 | 配置启动日志误报「unusable (rc=-10)」＋ 主备双份兜底 | 已实现（`iv_config_open()` 按失败原因分流：`ENOENT` → INFO「no … yet (never saved)」，只有"文件在但读不了"才 WARN 且打人话返回码名；坏文件改名 `.bad` 留证；`iv_config_save()` 先复制上一版成 `.bak`；主文件读不了 → 从 `.bak` 恢复 → **立刻重建主文件**；`iv_cfg_stat_t` 加 `from_backup`；`test_config` 新增 `case_backup_and_recover()` 24 条断言；VM `make test` 56 RUN rc=0、`GIT_VER` 变体 rc=0、`arm` 0 告警、`tsan` 0 报告；**板端实测四条全过**，ARM 原生 `test_config` rc=0，`ivsboxd` md5 `09873626…`） | 2026-11-04 18:23 | 现场把 `rc=-10` 读成"配置坏了、改的设置重启就丢"；实测设置并没丢（干净重启与 `reboot -f` 后 md5 不变、`config.apply` 后重启值仍在），真问题是日志把"文件不存在"与"读坏了"混为一谈，且文件真坏时静默回默认值、下次保存还覆盖现场。详见本文件文末 2026-11-04 18:23 节。 |
+| SD 自动清理时钟基准修复 ＋ 4G 开机对时 | 已实现（`iv_storage_run_once()` 改传墙钟 `time(NULL)` 给 `decide`（`now_ms` 只留 interval/`last_round_ms`）；`iv_store_decide()` 对 `mtime > now + 2×keep + 60s` 的"未来条目"取消 keep_youngest 保护；`iv_cell` 命令表末尾加纯查询 `AT+CCLK?`，`parse_cclk()` 用 `timegm` 减时区偏移换 UTC epoch；`iv_agent` 新增 `cfg.settime_fn` ＋ `cell_time_sync()`（容差 30 s、成功/失败均冷却 60 s）；`main.c` 新增 `app_settime()`/`app_rtc_write()`；`test_storage` c05 补 3 组反向用例、`test_cellular` 新增 c13；VM `make test` 56/56、`GIT_VER=1b86570` 56/56、`arm` 0 告警；**板端实测**：设 1970 后 100 ms 内被 4G 纠回，腾空间后 `reject -> ok (62%)` 与两路开录同秒，`video/20261105/` 持续增长） | 2026-11-05 09:35 | 现场"没有录像"两条根因：清理把单调毫秒当 epoch 秒 ⇒ `mtime + keep > now` 恒成立 ⇒ 一条不删、卡涨到 91% 被闸门拒；板子无可用 RTC ⇒ 每次上电 1970、目录名 `19700101`。详见本文件文末 2026-11-05 09:35 节。 |
 |===
+
+
+== 2026-11-05 09:35 SD 自动清理时钟基准修复 ＋ 4G 开机对时
+
+=== 干了什么事
+
+* `src/modules/storage/iv_storage.c`
+ ** `iv_storage_run_once()`：传给 `iv_store_decide()` 的 `now_s` 由 `now_ms / 1000`
+    改为 `(uint64_t)time(NULL)`（墙钟）。`now_ms` 仍只用于 interval 与 `last_round_ms`。
+ ** `iv_store_decide()`：`keep_youngest` 保护加"未来条目"例外 —— 当
+    `f->mtime_s > now_s + keep_young*2 + 60` 时**不再跳过**，按可删处理（时钟回退、
+    卡从别的设备拔过来都会造成这种 mtime）。
+* `include/ivsbox/iv_cellular.h` / `src/modules/cellular/iv_cellular.c`
+ ** 命令枚举末尾加 `IV_CELL_CMD_CCLK`，命令文本 `AT+CCLK?`（纯查询，不改模块状态）。
+ ** 快照加 `time_valid` / `wall_sec`（UTC epoch 秒）。
+ ** 新增 `parse_cclk()`：`+CCLK: "26/11/05,09:12:34+32"` → 先 `timegm()` 把本地日期字段
+    当 UTC 解开，再减 `±zz × 15 min`。**刻意不用 `mktime()`**：它按进程 TZ 解释，
+    开机瞬间 TZ 可能没配好，同一串 CCLK 会解出不同时刻。
+* `include/ivsbox/iv_agent.h` / `src/modules/agent/iv_agent.c`
+ ** `iv_agent_cfg_t` 加 `settime_fn` / `settime_arg`（默认 NULL ⇒ 不对时）。
+ ** 新增 `cell_time_sync()`：每拍比较 `snap.wall_sec` 与 `time(NULL)`，差值超过
+    `IV_AGENT_TIME_TOL_S`(30 s) 才回调；成功与失败都记 `time_sync_ms` 冷却
+    `IV_AGENT_TIME_RETRY_MS`(60 s)。调用点放在 `cell_drive()` 开头（早于
+    "AT 口没开就 return"），因为 CCLK 是上一轮读到的。
+* `src/app/main.c`
+ ** 新增 `app_settime()`：`clock_settime(CLOCK_REALTIME)` ＋ 调 `app_rtc_write()`。
+ ** 新增 `app_rtc_write()`：`gmtime_r` → `RTC_SET_TIME`（Linux RTC 子系统按 UTC）；
+    打不开 `/dev/rtc0` 返回 `IV_ENOENT`，**静默跳过**（当前板子就是这种状态）。
+ ** 装配处设 `ac.settime_fn = app_settime`。
+
+=== 解决什么问题
+
+1. **SD 清理永久失效**：`now_s` 是开机秒（几万），`mtime_s` 是 epoch（≈1.79e9）⇒
+   `mtime + 120 > now` 恒真 ⇒ 每条都被当成"正在写的分片"跳过，一条也删不掉。
+   现场表现是卡涨到 27 G/91%，90% 起闸门拒新任务 ⇒ **不再录像**，而日志里
+   只有 `clean -> reject`，看不出"清理根本没动"。单测没抓到是因为 c05 用的是
+   `now=9001 / mtime=9000` 这种小值，两边都"小"。
+2. **断电回 1970**：`rtc@7090000` 在设备树 `disabled`、镜像无 hwclock/ntp 脚本，
+   录像目录名按 `%Y%m%d` 生成 ⇒ 新片段落在 `19700101/`，按日期根本找不到。
+   4G 对时把"能上网就有正确时间"变成每次开机自愈的能力。
+
+=== 影响范围
+
+* `iv_store_decide()` 是纯函数，语义不变（`now_s` 仍是"墙钟秒"），只多一条例外；
+  单测可直接喂任意 `now_s`，`now_s == 0` 仍表示关闭保护。
+* `iv_cell` 每轮多一条 `AT+CCLK?`（13 条命令、每轮约多 100 ms），仍严格"一问一答"；
+  未注册时模组回 `CME ERROR`，解析失败**不动已有值**（绝不把时间设成 0）。
+* `cfg.settime_fn` 为 NULL 时行为与改前一致 ⇒ 单测、无 4G 的板子零影响。
+* 与 GPS 校时并存：两者都是"差值大才设"，互不冲突；GPS 默认仍是关闭的。
+
+=== 验证方式与结果
+
+* VM：`make test` **56/56**（含新增 `test_cellular c13`、`test_storage c05` 三组反向用例）、
+  `make test GIT_VER=1b86570` **56/56**、`make arm` **0 告警**出 ARM ELF。
+* c13 的期望值写死为 `1793841154`（2026-11-05T01:12:34Z）。实现过程中被它抓出一个真 bug：
+  `tm_year` 写成 `2000 + yy` 得到 3926 年（实际值 `61751985154`），改为
+  `(yy >= 70) ? yy : (100 + yy)` 后通过 —— 这类"年份基准"错，靠"再算一遍"是发现不了的。
+* 板端 1.64（`ivsboxd` `b72e8620…`）：
+ ** 手动把时钟设到 1970 后 **100 ms 内**被 4G 纠正回 `2026-11-05 09:2x`；
+    改前（容差 5 s）会在同一秒连发 5 条 `diff −6 s` 的 `time synced`，改后不再重复。
+ ** 腾空间后 `storage level reject -> ok (used=62%)` 与两路 `record start` 同一秒发生，
+    `video/20261105/channel*.mp4` 持续增长（26 s 涨 2.88 MB）。
+* 未做：设备树 `rtc@7090000` 仍是 `disabled`，启用需改 dts 重编 dtb（本轮不动内核）。
 
 
 == 2026-10-15 10:21 M8-S8.3 受控远程通道装配接线

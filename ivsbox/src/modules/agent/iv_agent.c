@@ -175,6 +175,10 @@ void iv_agent_cfg_default(iv_agent_cfg_t *cfg)
     cfg->cell_path     = IV_AGENT_CELL_PATH_DEFAULT;
     cfg->cell_period_ms = 0;   /* 0 => IV_CELL_PERIOD_MS (30s) */
     cfg->cell_dial_cmd  = NULL; /* NULL => IV_AGENT_CELL_DIAL_DEFAULT（空串=关闭） */
+    /* 4G 对时默认关：agent 不该自己决定改全机时钟，由装配层挂 `app_settime()`。
+     * NULL 时 `cell_time_sync()` 直接返回，单测与无 4G 的板子行为不变。 */
+    cfg->settime_fn  = NULL;
+    cfg->settime_arg = NULL;
 }
 
 void iv_agent_init(iv_agent_t *a)
@@ -4890,6 +4894,50 @@ static void cell_link_drop(iv_agent_t *a)
     iv_cell_reset(&a->cell);
 }
 
+/* 4G 网络对时（2026-11-05）：`iv_cell` 每轮末尾查一次 `AT+CCLK?`，已把模组报的
+ * 本地时间＋时区换算成 `snap.wall_sec`（UTC epoch）。这里只判"该不该设"。
+ *
+ * 为什么放在每拍而不是"读到 CCLK 的事件里"：解析发生在 `iv_cell_feed()` 的深路径，
+ * 那里没有 now_ms、也不该反向依赖 agent 的配置；而这里只比两个整数，100 ms 一次的
+ * 代价可忽略。
+ *
+ * 为什么不会反复设：设过去之后两边同步走时，差值恒在容差内。真正需要重设的场景
+ * （模组重新同步了网络时间、或有人手动改了时钟）差值会重新拉开。
+ *
+ * 这条对时是"板子断电回 1970"的兜底：`rtc@7090000` 在设备树里是 disabled，
+ * 没有任何开机校时脚本，而日志目录、上报 `DT=`、录像目录名全吃系统时间。 */
+static void cell_time_sync(iv_agent_t *a, uint64_t now_ms)
+{
+    iv_cell_snap_t s;
+    long long      diff;
+    time_t         now;
+
+    if (a->cfg.settime_fn == NULL)
+        return;
+    if (a->time_sync_ms != 0 && now_ms - a->time_sync_ms < IV_AGENT_TIME_RETRY_MS)
+        return;
+
+    iv_cell_snapshot(&a->cell, &s);
+    if (!s.time_valid)
+        return;
+
+    now  = time(NULL);
+    diff = (long long)s.wall_sec - (long long)now;
+    if (diff <= IV_AGENT_TIME_TOL_S && diff >= -IV_AGENT_TIME_TOL_S)
+        return;
+
+    if (a->cfg.settime_fn(s.wall_sec, a->cfg.settime_arg) == IV_OK) {
+        /* 成功也要冷却：模组时间是"上次网络同步 + 本地走时"，与主机差几秒是常态，
+         * 差值恰在容差边缘时会一拍一跳（板端实测一秒内 5 条同样的日志）。 */
+        a->time_sync_ms = now_ms;
+        IV_LOG_I(AG_MOD, "time synced from 4G: %lld -> %lld (diff %+lld s)",
+                 (long long)now, (long long)s.wall_sec, diff);
+    } else {
+        a->time_sync_ms = now_ms;
+        IV_LOG_W(AG_MOD, "time sync from 4G failed (clock_settime refused?)");
+    }
+}
+
 /* 推进状态机并把"下一条该问的"写出去。
  * **一拍只发一条**：AT 是严格的请求-响应，连发会把响应搅在一起，
  * 解析器看到的是"上一条的答案配这一条的字段"，比查不到更糟。 */
@@ -4900,6 +4948,9 @@ static void cell_drive(iv_agent_t *a, uint64_t now_ms)
 
     if (a == NULL)
         return;
+
+    /* 对时先于"口开没开"：CCLK 是上一轮读到的，口刚好断掉时照样该把时间设过去。 */
+    cell_time_sync(a, now_ms);
 
     if (a->cell_fd < 0) {
         /* 口没开：**不要**推状态机。`iv_cell_tick()` 起轮不看 fd，起完轮

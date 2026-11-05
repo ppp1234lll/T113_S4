@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/vfs.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ivsbox/iv_log.h"
@@ -267,10 +268,20 @@ int iv_store_decide(const iv_storage_cfg_t *cfg, const iv_store_probe_t *pr,
         for (i = 0; i < n_ord && (uint32_t)out->n_delete < max_del && freed < need; i++) {
             const iv_store_file_t *f = &pr->files[order[i]];
 
-            /* 太新的切片不删：正在写的分片 mtime 就是"现在" */
-            if (now_s != 0u && f->mtime_s != 0u &&
-                f->mtime_s + (uint64_t)keep_young > now_s)
-                continue;
+            /* 太新的切片不删：正在写的分片 mtime 就是"现在"。
+             *
+             * **mtime 落在未来**的条目不能算"正在写"：板子没有 RTC 备份电池时
+             * 断电回 1970、或卡是从别的设备拔过来的，mtime 会比 now 大几十亿秒，
+             * 按原判据就被永久保护 ⇒ 水位卡死、清理一条也删不掉（2026-11-05 板端
+             * 现场：SD 91%、日志只有 clean→reject、free 只减不增）。区分办法：
+             * 超出保护窗两倍以上（含 60 s 余量）就当"时钟错乱"，照删。 */
+            if (now_s != 0u && f->mtime_s != 0u) {
+                uint64_t bogus = (uint64_t)keep_young * 2u + 60u;
+                int      future = (f->mtime_s > now_s + bogus) ? 1 : 0;
+
+                if (!future && f->mtime_s + (uint64_t)keep_young > now_s)
+                    continue;
+            }
             out->del[out->n_delete] = f;
             out->n_delete++;
             freed += f->size;
@@ -306,7 +317,19 @@ int iv_storage_run_once(iv_storage_t *s, uint64_t now_ms)
     if (s->ops.scan(s->ops.arg, &s->cfg, &s->probe) != IV_OK)
         s->probe.io_err = 1u; /* scan 自己报错也走同一条故障路径 */
 
-    rc = iv_store_decide(&s->cfg, &s->probe, now_ms / 1000u, s->level, &plan);
+    /* 传给 decide 的 `now_s` 必须是**墙钟**（epoch 秒）：它与 `probe.files[].mtime_s`
+     * （`stat.st_mtime`）比较，决定"这条分片是不是正在写、要不要保护"。
+     *
+     * 2026-11-05 板端实证的坑：这里原先直接把 `now_ms / 1000` 交出去，而调用方
+     * （`iv_agent` 的 `on_nm_timer()`）给的是 `iv_clock_monotonic_ms()` —— 开机毫秒。
+     * 于是 `now_s` 是"开机第几秒"（几万），`mtime_s` 是 epoch（≈1.79e9），
+     * `mtime + keep_young > now` **恒成立** ⇒ 每一条都被当成"正在写的分片"跳过
+     * ⇒ **清理从上线起一条都没删过**，SD 一路涨到 91% 才被现场发现（表现为
+     * "不再录像"，因为 90% 起闸门拒新任务）。
+     *
+     * `now_ms` 仍只用于 interval 与`last_round_ms`（单调才不受对时/手动改时影响）；
+     * 墙钟只在这一处取，decide 依旧是纯函数（单测可直接喂任意 now_s）。 */
+    rc = iv_store_decide(&s->cfg, &s->probe, (uint64_t)time(NULL), s->level, &plan);
     if (rc != IV_OK)
         return rc;
 

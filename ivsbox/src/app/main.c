@@ -14,11 +14,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <linux/rtc.h>
 #include <netpacket/packet.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -431,6 +433,69 @@ static int ctl_do_settime(int64_t wall_sec, void *arg)
     ts.tv_nsec = 0;
     if (clock_settime(CLOCK_REALTIME, &ts) != 0)
         return IV_EIO;
+    return IV_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * 开机/运行期对时（2026-11-05）
+ *
+ * 现场问题：板子断电后系统时间是 1970-01-01。原因不是"没有 RTC 芯片"，而是
+ * T113 的 `rtc@7090000` 在设备树里是 **status = "disabled"**（驱动本身已编进
+ * 内核，符号都在），且镜像里没有任何 hwclock / ntp 开机脚本 ⇒ 每次上电都从
+ * 1970 起跳。后果不只是日志时间难看：录像目录名按 `%Y%m%d` 生成，会写成
+ * `19700101/`；上报帧 `DT=` 也全是 1970。
+ *
+ * 所以两件事都做：
+ *   1) **4G 网络时间**：`iv_cell` 轮询里带 `AT+CCLK?`，差值超容差就调本函数
+ *      （agent 负责判定，见 `cell_time_sync()`）。这条路不依赖 RTC 是否启用，
+ *      只要 4G 能注册上网络就有正确时间 —— 属于"每次开机都能自愈"的兜底。
+ *   2) **写回 RTC**：RTC 一旦在设备树里启用（`/dev/rtc0` 出现），对时成功就
+ *      顺手写进去；下次断电重开，`hwclock -s`（或本函数读回）能立刻得到正确
+ *      时间，不必等 4G 上网。RTC 不存在时 `open` 返回 ENOENT，**不算错误**，
+ *      静默跳过 —— 这正是当前板子的状态。 */
+#define APP_RTC_DEV "/dev/rtc0"
+
+static int app_rtc_write(time_t wall)
+{
+    struct rtc_time rt;
+    struct tm      tm;
+    int            fd;
+    int            rc;
+
+    if (gmtime_r(&wall, &tm) == NULL)
+        return IV_EIO;
+    fd = open(APP_RTC_DEV, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        return IV_ENOENT; /* RTC 未启用：交给 4G 每次开机对时兜底 */
+    memset(&rt, 0, sizeof(rt));
+    rt.tm_sec  = tm.tm_sec;
+    rt.tm_min  = tm.tm_min;
+    rt.tm_hour = tm.tm_hour;
+    rt.tm_mday = tm.tm_mday;
+    rt.tm_mon  = tm.tm_mon + 1;
+    rt.tm_year = tm.tm_year + 1900;
+    rc = ioctl(fd, RTC_SET_TIME, &rt);
+    (void)close(fd);
+    return (rc == 0) ? IV_OK : IV_EIO;
+}
+
+/* 装配层给 agent 的 `settime_fn`。**只做"把时间设过去"**，不判断该不该设
+ * （那是 agent 的差值容差决定）；RTC 写失败不影响返回值 —— 系统时间已经对了，
+ * 下次开机 4G 会再对一次。 */
+static int app_settime(int64_t wall_sec, void *arg)
+{
+    struct timespec ts;
+    int             rc;
+
+    (void)arg;
+    ts.tv_sec  = (time_t)wall_sec;
+    ts.tv_nsec = 0;
+    if (clock_settime(CLOCK_REALTIME, &ts) != 0)
+        return IV_EIO;
+
+    rc = app_rtc_write((time_t)wall_sec);
+    if (rc != IV_OK && rc != IV_ENOENT)
+        IV_LOG_W(APP_MOD, "rtc write failed (%d); 4G sync will redo it next boot", rc);
     return IV_OK;
 }
 
@@ -4429,6 +4494,12 @@ static int agent_setup(void)
         if (dcmd != NULL)
             ac.cell_dial_cmd = dcmd;
     }
+
+    /* 4G 网络对时（2026-11-05）：AT 轮询里带了 `AT+CCLK?`，agent 判"差值超容差"
+     * 后回调这里；真正设时间＋写 RTC 在 `app_settime()`。板子没有可用的 RTC
+     * （设备树 disabled），所以这条是**每次开机把时间纠正过来**的唯一路径。 */
+    ac.settime_fn  = app_settime;
+    ac.settime_arg = NULL;
 
     /* 设备 ID（TID）＝工厂身份分区里的 `devid`，**不进配置**（架构 §10.2）。
      *

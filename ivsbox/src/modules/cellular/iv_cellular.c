@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define CELL_MOD "cell"
 
@@ -205,7 +206,8 @@ static const char *const k_cmd_text[IV_CELL_CMD_LAST] = {
     "AT+CEREG?",
     "AT+CGATT?",
     "AT+QENG=\"servingcell\"",
-    "AT+CGCONTRDP"
+    "AT+CGCONTRDP",
+    "AT+CCLK?"
 };
 
 const char *iv_cell_cmd_text(iv_cell_cmd_id_t id)
@@ -565,6 +567,73 @@ static void parse_cgcontrdp(iv_cell_t *c, const char *resp)
     c->snap.pdp_active = (c->snap.pdp_ip[0] != '\0') ? 1 : 0;
 }
 
+/* AT+CCLK? → `+CCLK: "26/11/05,09:12:34+32"`
+ *
+ * 字段是**本地时间 ＋ 时区**（`zz` 以 15 分钟为单位）。要落成 UTC epoch：
+ * 先用 `timegm()` 把"本地日期字段"当 UTC 解出，再减时区偏移。
+ *
+ * 为什么不用 `mktime()`：它按**本进程的 TZ** 解释，而开机那一刻 TZ 可能还没
+ * 配好、现场也可能改成别的时区 ⇒ 同一条 CCLK 在不同机器上解出不同时刻。
+ * `timegm()` 不读 TZ，唯一变量就是模组给的偏移，结果可复现、可单测。
+ *
+ * 解析失败（没注册上时模组回 `ERROR` / 空串）**不动现有值**：宁可继续用上一次
+ * 的时间，也不要把时间设成 0 —— 设成 1970 会让录像目录名变成 `19700101`，
+ * 比"没对上"更难查。
+ */
+static void parse_cclk(iv_cell_t *c, const char *resp)
+{
+    const char *p;
+    struct tm   tm;
+    int         yy = 0, mo = 0, dd = 0, hh = 0, mi = 0, ss = 0;
+    int         tzq = 0, n;
+    char        sign = '+';
+    long long   tz_sec;
+    time_t      t;
+
+    p = strstr(resp, "+CCLK:");
+    if (p == NULL)
+        return;
+    p += 6;
+    while (*p == ' ' || *p == '\t' || *p == '"')
+        p++;
+
+    n = sscanf(p, "%d/%d/%d,%d:%d:%d%c%d", &yy, &mo, &dd, &hh, &mi, &ss,
+               &sign, &tzq);
+    if (n < 6)
+        return;
+    if (n < 8) { /* 没给时区：按 UTC 记，比瞎猜 +8 稳 */
+        sign = '+';
+        tzq  = 0;
+    }
+    if (yy < 0 || yy > 99 || mo < 1 || mo > 12 || dd < 1 || dd > 31 ||
+        hh < 0 || hh > 23 || mi < 0 || mi > 59 || ss < 0 || ss > 59 ||
+        tzq < 0 || tzq > 56)
+        return;
+
+    memset(&tm, 0, sizeof(tm));
+    /* `tm_year` 是"自 1900 起"，**不是**四位年份：CCLK 的 `26` 要落成 126。
+     * 这里写成 `2000 + yy` 会得到 3926 年（实测值 61751985154 = 3926-01-01 附近），
+     * 单测 c13 就是钉这个的。 */
+    tm.tm_year  = (yy >= 70) ? yy : (100 + yy);
+    tm.tm_mon   = mo - 1;
+    tm.tm_mday  = dd;
+    tm.tm_hour  = hh;
+    tm.tm_min   = mi;
+    tm.tm_sec   = ss;
+    tm.tm_isdst = 0;
+
+    t = timegm(&tm);
+    if (t == (time_t)-1)
+        return;
+
+    tz_sec = (long long)tzq * 15 * 60;
+    if (sign == '-')
+        tz_sec = -tz_sec;
+
+    c->snap.wall_sec   = (int64_t)t - (int64_t)tz_sec;
+    c->snap.time_valid = 1;
+}
+
 /* 按当前命令分派解析。`resp` 含终结行。 */
 static void parse_current(iv_cell_t *c)
 {
@@ -581,6 +650,7 @@ static void parse_current(iv_cell_t *c)
     case IV_CELL_CMD_CGATT:     parse_cgatt(c, c->resp); break;
     case IV_CELL_CMD_QENG:      parse_qeng(c, c->resp); break;
     case IV_CELL_CMD_CGCONTRDP: parse_cgcontrdp(c, c->resp); break;
+    case IV_CELL_CMD_CCLK:      parse_cclk(c, c->resp); break;
     default: break;
     }
 }

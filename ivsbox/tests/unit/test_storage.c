@@ -344,6 +344,31 @@ static void case_youngest(void)
     (void)iv_store_decide(&cfg, &pr, 9001u, (uint8_t)IV_STORE_OK, &pl);
     chk(pl.n_delete == 1 && strcmp(nth_del(&pl, 0), "rec_nomtime.mp4") == 0,
         "c05: unknown mtime is deletable");
+
+    /* ---- 时钟基准的反向用例（2026-11-05 板端现场）----
+     * `now_s` 必须是**墙钟秒**。生产路径曾把 `iv_clock_monotonic_ms()/1000`
+     * （开机第几秒，几万）传进来，而 mtime 是 epoch（≈1.79e9）⇒ 每条都落在
+     * "未来" ⇒ 全部被当正在写的分片 ⇒ 清理一条没删、SD 涨到 91% 停录。
+     * 这一条把"量纲必须同源"钉死：now 是开机秒时，epoch 文件必须可删。 */
+    probe_reset(&pr, 1000000u, 95u);
+    probe_add(&pr, "rec_epoch_a.mp4", (uint8_t)IV_STORE_CLS_REC, 1000u, 1793000000u);
+    probe_add(&pr, "rec_epoch_b.mp4", (uint8_t)IV_STORE_CLS_REC, 1000u, 1792999000u);
+    (void)iv_store_decide(&cfg, &pr, 52800u, (uint8_t)IV_STORE_OK, &pl);
+    chk(pl.n_delete == 2, "c05: epoch mtime is deletable even if now is uptime seconds");
+
+    /* 单条 mtime 明显在未来（断电回 1970、卡来自别的设备）：同样不许被永久保护 */
+    probe_reset(&pr, 1000000u, 95u);
+    probe_add(&pr, "rec_future.mp4", (uint8_t)IV_STORE_CLS_REC, 1000u, 3793000000u);
+    (void)iv_store_decide(&cfg, &pr, 1793000000u, (uint8_t)IV_STORE_OK, &pl);
+    chk(pl.n_delete == 1, "c05: future mtime is not protected forever");
+
+    /* 正常时钟下的保护窗仍要成立（别为了修 bug 把保护整个去掉） */
+    probe_reset(&pr, 1000000u, 95u);
+    probe_add(&pr, "rec_now.mp4", (uint8_t)IV_STORE_CLS_REC, 1000u, 1793000000u - 30u);
+    probe_add(&pr, "rec_hour.mp4", (uint8_t)IV_STORE_CLS_REC, 1000u, 1793000000u - 3600u);
+    (void)iv_store_decide(&cfg, &pr, 1793000000u, (uint8_t)IV_STORE_OK, &pl);
+    chk(pl.n_delete == 1 && strcmp(nth_del(&pl, 0), "rec_hour.mp4") == 0,
+        "c05: wall-clock window still protects the slice being written");
 }
 
 /* ---------------- c06 单轮上限 ---------------- */

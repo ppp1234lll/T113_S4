@@ -195,6 +195,16 @@ extern "C" {
 #define IV_AGENT_CELL_NOREPLY_RESCAN 3u
 #define IV_AGENT_CELL_RESCAN_GAP_MS  ((uint64_t)30000u)
 
+/* ---- 4G 网络对时（2026-11-05）----
+ * 容差 30 s：目的只有"别从 1970 起步"，不是给系统当授时源。模组报的 `+CCLK`
+ * 是"上次网络同步的时刻 + 本地走时"，与主机差 5~10 s 是常态 —— 容差取 5 s
+ * 时会在边界上反复触发（板端实测：一秒内连发 5 条 `time synced`，diff −6 s
+ * 来回跳）。30 s 既容得下这个抖动，又远小于"断电回 1970"的 17 亿秒。
+ * 冷却 60 s：成功后同样要冷却 —— 否则差值恰在容差边缘时仍会反复跳；
+ * 失败也等这么久再试（`clock_settime` 需要权限，非 root 会一直失败）。 */
+#define IV_AGENT_TIME_TOL_S     30
+#define IV_AGENT_TIME_RETRY_MS  ((uint64_t)60000u)
+
 /* **卡读不到时的自愈**：连续这么多轮 `sim_present != 1` ⇒ 给模组发一次
  * `AT+CFUN=1,1`（软复位，USB 会重枚举）。
  * 为什么要它：读卡子系统会挂住 —— 2026-10-29 板端实测，同一张卡在槽里、
@@ -465,6 +475,19 @@ typedef struct {
      * 参数按出场脚本的固定形态给（vid pid 网卡名），不开放成配置细节。 */
     const char *cell_dial_cmd;
 
+    /* ---- 4G 网络对时（2026-11-05）----
+     * 轮询里已经带了 `AT+CCLK?`；读到之后若与本机墙钟差超过
+     * `IV_AGENT_TIME_TOL_S`，就调 `settime_fn` 把系统时间设过去。
+     *
+     * 为什么由装配层执行：`clock_settime()` 影响全机（日志目录、上报 `DT=`、
+     * 录像目录名都吃它），和 ctl 的"对时"一样，只有主控该做；agent 只负责
+     * "发现该设了"。`settime_fn == NULL` ⇒ 不对时（单测、无 4G 的板子）。
+     *
+     * 板子断电回 1970 的根因是 `rtc@7090000` 在设备树里 `disabled`、且没有
+     * 任何开机校时脚本；这一条是"能上网就有正确时间"的兜底。 */
+    int (*settime_fn)(int64_t wall_sec, void *arg);
+    void *settime_arg;
+
     /* ---- 日志上报（平台 0xB2，2026-11-02）----
      * `logup_host`：日志服务地址；**空串/NULL ⇒ 用活动出口的平台地址**
      *   （用户口径「地址是一样的」：日志服务与平台同一个 IP）。
@@ -575,6 +598,9 @@ typedef struct {
      * 去读那个错的路径，把好不容易探对的口又扔了。 */
     char         cell_dev[IV_AGENT_CELL_DEV_N];
     uint64_t     cell_rescan_ms;    /* 上次因"整轮无响应"而重探的时刻；防风暴 */
+    /* 4G 对时的失败退避。成功不节流（差值回到容差内自然不再设），
+     * 失败才等 `IV_AGENT_TIME_RETRY_MS` 再试 —— 免得无权限时每拍刷一条日志。 */
+    uint64_t     time_sync_ms;
     /* 卡读不到时的自愈（见 iv_cellport.h 与 `cell_sim_recover_tick()`）。
      * `cell_sim_bad_rounds` 只在"完整跑完一轮"时结算，所以卡在某一轮中间不会被误计。 */
     uint32_t     cell_sim_bad_rounds;  /* 连续"读不到卡"的轮数；读到 READY 即清零 */

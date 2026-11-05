@@ -96,6 +96,10 @@ typedef enum {
     IV_CELL_CMD_CGATT,
     IV_CELL_CMD_QENG,
     IV_CELL_CMD_CGCONTRDP,
+    /* 网络时间（开机对时用，2026-11-05）。放在最后：它是"每秒级不重要"的信息，
+     * 排在其他状态之后，模组忙时先牺牲它也不影响 4G 可用性判定。
+     * `AT+CCLK?` 是**纯查询**，不改模块状态、不碰 PDP，符合本模块的三条边界。 */
+    IV_CELL_CMD_CCLK,
     IV_CELL_CMD_LAST
 } iv_cell_cmd_id_t;
 
@@ -149,6 +153,18 @@ typedef struct {
     char     apn[IV_CELL_TXT];
     char     dns1[IV_CELL_IP_N];
     char     dns2[IV_CELL_IP_N];
+
+    /* ---- 网络时间（`AT+CCLK?`；开机对时的来源，2026-11-05） ----
+     * 板子断电回 1970（无 RTC 备份电池，`rtc@7090000` 在设备树里是 disabled），
+     * 而录像目录名、上报帧 `DT=`、日志目录全靠墙钟。开机后第一轮就把模组报的
+     * 网络时间落到系统时间上。
+     *
+     * `wall_sec` 是**已按时区字段换算成 UTC 的 epoch 秒**（模组给的是带 `±zz`
+     * 本地时间，zz 单位 15 分钟）。`time_valid=0` 表示还没读到过；读到之后
+     * 保留旧值不清零 —— 但装配层只在"与当前系统时间差 > 阈值"时才真正设，
+     * 陈旧值不会造成反复对时（两者用同一个 epoch 走时，差值不变）。 */
+    int      time_valid;
+    int64_t  wall_sec;
 
     /* ---- 判定（后端算一次，前端不重算） ---- */
     int      usable;             /* 1 = SIM 就绪 && 已注册 && 已附着 && 有 IP */

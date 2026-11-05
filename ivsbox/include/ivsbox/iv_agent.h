@@ -598,9 +598,17 @@ typedef struct {
      * 去读那个错的路径，把好不容易探对的口又扔了。 */
     char         cell_dev[IV_AGENT_CELL_DEV_N];
     uint64_t     cell_rescan_ms;    /* 上次因"整轮无响应"而重探的时刻；防风暴 */
-    /* 4G 对时的失败退避。成功不节流（差值回到容差内自然不再设），
-     * 失败才等 `IV_AGENT_TIME_RETRY_MS` 再试 —— 免得无权限时每拍刷一条日志。 */
+    /* 4G 对时的退避。成功/失败都等 `IV_AGENT_TIME_RETRY_MS` 再试 ——
+     * 免得模组时间在容差边缘反复触发时每拍刷一条日志。 */
     uint64_t     time_sync_ms;
+    /* CCLK 快照的"出生时刻"。`wall_sec` 是**解析那一瞬**的模组时间，两次 CCLK
+     * 之间它一直是旧值（实测轮询周期 ~31 s）。直接拿它跟 `time(NULL)` 相比，
+     * 差值里就掺进了一个轮询周期，而且符号随快照新旧来回翻 —— 板端实测每
+     * 30 s 抖一次 ±31 s，正好卡在 `IV_AGENT_TIME_TOL_S` 边上，于是永远自我
+     * 触发、把系统时钟来回推。这里记下"首次看见该值的时刻"，比较时先把快照
+     * 按年龄走到此刻再判。`time_last_seen_ms == 0` = 还没见过有效快照。 */
+    int64_t      time_last_wall;    /* 上次看到的 `wall_sec`（变了才重新打戳） */
+    uint64_t     time_last_seen_ms; /* 那个 `wall_sec` 首次出现的时刻 */
     /* 卡读不到时的自愈（见 iv_cellport.h 与 `cell_sim_recover_tick()`）。
      * `cell_sim_bad_rounds` 只在"完整跑完一轮"时结算，所以卡在某一轮中间不会被误计。 */
     uint32_t     cell_sim_bad_rounds;  /* 连续"读不到卡"的轮数；读到 READY 即清零 */

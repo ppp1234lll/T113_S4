@@ -66,8 +66,76 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
 | 摄像机**品牌自动匹配**（发现结果按 IP 回填 `camera.ch.N.vendor` ＋ 修复品牌认错） | 已实现（`iv_onvif_parse()` 厂商自报名字优先于 `hardware`/`MacAddress` 等通用字段；`add_item()` 合并档案时泛 ONVIF 不得覆盖已认出的具体厂商；`app.js` 新增 `DEV_BRAND_VENDOR` 映射 ＋ `devicesByIp()`（5 s 缓存＋飞行中复用）＋ 进页面/IP 提交时自动选品牌并重算地址；新增 `tests/web/ui_camera_vendor.mjs` 16 条、`test_device` 新增 d15 与 d07 三段；`make test`/`asan`/`tsan` 各 49 passed、`itest` 16＋1 SKIP、`analyze` 0、`arm` 0 告警、前端 13 用例全绿；反向证伪 3＋1 条 FAIL；**已上板**：发现结果由 4 台 `onvif` 变为 `hikvision`/`dahua`，`ivsboxd` `bfd17f60…`＋`app.js` `7a83e3a5…`） | 2026-10-29 15:22 | 用户问"搜到了、也解析出品牌了，配完 IP 为什么不自动匹配"。三层原因：页面没接线 / 前后端品牌命名两套 / 发现侧把厂商判成泛 ONVIF 且合并时被降级覆盖。详见本文件文末 2026-10-29 15:22 节。 |
 | 配置启动日志误报「unusable (rc=-10)」＋ 主备双份兜底 | 已实现（`iv_config_open()` 按失败原因分流：`ENOENT` → INFO「no … yet (never saved)」，只有"文件在但读不了"才 WARN 且打人话返回码名；坏文件改名 `.bad` 留证；`iv_config_save()` 先复制上一版成 `.bak`；主文件读不了 → 从 `.bak` 恢复 → **立刻重建主文件**；`iv_cfg_stat_t` 加 `from_backup`；`test_config` 新增 `case_backup_and_recover()` 24 条断言；VM `make test` 56 RUN rc=0、`GIT_VER` 变体 rc=0、`arm` 0 告警、`tsan` 0 报告；**板端实测四条全过**，ARM 原生 `test_config` rc=0，`ivsboxd` md5 `09873626…`） | 2026-11-04 18:23 | 现场把 `rc=-10` 读成"配置坏了、改的设置重启就丢"；实测设置并没丢（干净重启与 `reboot -f` 后 md5 不变、`config.apply` 后重启值仍在），真问题是日志把"文件不存在"与"读坏了"混为一谈，且文件真坏时静默回默认值、下次保存还覆盖现场。详见本文件文末 2026-11-04 18:23 节。 |
 | SD 自动清理时钟基准修复 ＋ 4G 开机对时 | 已实现（`iv_storage_run_once()` 改传墙钟 `time(NULL)` 给 `decide`（`now_ms` 只留 interval/`last_round_ms`）；`iv_store_decide()` 对 `mtime > now + 2×keep + 60s` 的"未来条目"取消 keep_youngest 保护；`iv_cell` 命令表末尾加纯查询 `AT+CCLK?`，`parse_cclk()` 用 `timegm` 减时区偏移换 UTC epoch；`iv_agent` 新增 `cfg.settime_fn` ＋ `cell_time_sync()`（容差 30 s、成功/失败均冷却 60 s）；`main.c` 新增 `app_settime()`/`app_rtc_write()`；`test_storage` c05 补 3 组反向用例、`test_cellular` 新增 c13；VM `make test` 56/56、`GIT_VER=1b86570` 56/56、`arm` 0 告警；**板端实测**：设 1970 后 100 ms 内被 4G 纠回，腾空间后 `reject -> ok (62%)` 与两路开录同秒，`video/20261105/` 持续增长） | 2026-11-05 09:35 | 现场"没有录像"两条根因：清理把单调毫秒当 epoch 秒 ⇒ `mtime + keep > now` 恒成立 ⇒ 一条不删、卡涨到 91% 被闸门拒；板子无可用 RTC ⇒ 每次上电 1970、目录名 `19700101`。详见本文件文末 2026-11-05 09:35 节。 |
+| RTC **启用**（改 dtb 重烧 boot）＋ 写 RTC 字段约定修正 ＋ 4G 对时抖动修正 | 已实现（`boot.img` 内嵌 FDT 里 `soc@3000000/rtc@7090000` 的 `status` 原地等长改 `okay`，`rtc_ccu@7090000` 无 `status` 默认 okay 无需改；`app_rtc_write()` 去掉 `tm_mon + 1` / `tm_year + 1900`（`struct rtc_time` 与 `struct tm` 同约定，多加 1 让 `tm_mon` 变 12 被 `rtc_valid_tm()` 拒 ⇒ `RTC_SET_TIME` 返回 `-EINVAL` ⇒ 日志只有 `rtc write failed (-42)`）；`cell_time_sync()` 新增 `time_last_wall`/`time_last_seen_ms` 给 CCLK 快照打戳并按年龄走到此刻再比；VM `make test` 56/56、`GIT_VER=eee07aa` 56/56、`arm` 0 告警；**板端实测**：`/dev/rtc0` 出现、重启后 `uptime 0:00` 即是正确时间（不再 1970）、拨回 1 h 被纠回且写 RTC 无告警、不再每 30 s 跳钟、双通道 2/2 在录） | 2026-11-05 11:12 | 用户要求启用 RTC；启用后立刻暴露"写不进 RTC"（`-42`）与"对时每 30 s 抖 ±31 s"。另查明设备树里 `rtc@51`（`nxp,pcf8563`）虽为 `okay` 但**硬件不存在**（手动 bind → `probe of 1-0051 failed with error -5`）。详见本文件文末 2026-11-05 11:12 节。 |
 |===
 
+
+== 2026-11-05 11:12 RTC 启用 ＋ 写 RTC 字段约定 ＋ 4G 对时抖动
+
+=== 干了什么事
+
+* **设备树 / 引导镜像**（不入 git，只改板端 `/dev/mmcblk0p4`）
+ ** `soc@3000000/rtc@7090000` 的 `status`：`disabled` → `okay`。改法是**原地等长
+    改写** FDT 属性值（`ANDROID!` v2、page `0x800`、dtb 绝对偏移 `12075008`、
+    共 `62452 B`；属性原值 `disabled\0` 9 B，写成 `okay\0` ＋ 4 个 `0x00`）。
+    FDT 头、字符串块、所有偏移都不动 ⇒ 只需 `dd` 覆盖 8 个字节，不重编内核。
+ ** `rtc_ccu@7090000` **没有 `status` 属性**（默认 okay），无需改；它的
+    `compatible` 是 `allwinner,sun8iw20-rtc-ccu`，内核里 `sun8iw20-rtc-ccu` /
+    `sunxi-rtc` / `sunxi-rtc-ccu` 三个 platform 驱动都已注册，能力齐备。
+* `src/app/main.c`
+ ** `app_rtc_write()`：`rt.tm_mon = tm.tm_mon`（**不再 +1**）、
+    `rt.tm_year = tm.tm_year`（**不再 +1900**）。
+* `include/ivsbox/iv_agent.h` / `src/modules/agent/iv_agent.c`
+ ** `iv_agent_t` 加 `time_last_wall`（上次看到的 `wall_sec`）与
+    `time_last_seen_ms`（该值首次出现的单调毫秒）。
+ ** `cell_time_sync()`：快照值变了才重新打戳；比较前先算
+    `expect = wall_sec + (now_ms - time_last_seen_ms)/1000`，再与 `time(NULL)` 比，
+    并把 `expect` 交给回调（写 RTC 的也是这个补偿后的值）。
+
+=== 解决什么问题
+
+1. **RTC 从来没被启用**：`rtc@7090000` 在设备树里 `status="disabled"`，驱动虽然
+   编进内核（`sunxi_rtc_probe` 等 23 个符号在 `/proc/kallsyms` 里）却永不 probe ⇒
+   `/sys/class/rtc/` 空、`/dev/rtc*` 不存在、`dmesg` 一条 rtc 日志都没有。
+   断电即回 1970，录像目录写 `19700101/`。
+2. **`rtc write failed (-42)`**：`struct rtc_time` 与 `struct tm` **同约定**
+   （`tm_mon` 0 起、`tm_year` 距 1900）。原代码按"1 起 / 绝对年份"填，`tm_mon`
+   变 12 → `rtc_valid_tm()` 判非法 → `RTC_SET_TIME` 返 `-EINVAL` → 映射成
+   `IV_EIO(-42)`。日志只有一句 `-42`，看着像驱动坏了，其实是参数。
+3. **对时每 30 s 跳一次**：`snap.wall_sec` 只在收到 `AT+CCLK?` 应答那一刻更新，
+   两次之间恒为旧值（轮询周期 ≈31 s）。直接比就是"模组时间 − 当前时间"里永远
+   掺着一个轮询周期的滞后，且符号随快照新旧翻转（刚设完 → 差 −31；读到新值 →
+   差 +32），两头都刚过 30 s 容差 ⇒ 每轮必触发、来回跳。
+
+=== 影响范围
+
+* `time_last_seen_ms == 0` 时（还没见过有效快照）直接返回，不设钟。
+* 快照年龄补偿最多引入一拍（驱动节拍 100 ms）的误差，相比轮询周期可忽略。
+* 系统时间已正确时**不会**再调 `settime_fn` —— 这是刻意的，避免无意义跳钟；
+  想确认对时是否工作，看日志里有没有 `time synced`，别拿"没跳钟"当没工作。
+* 无 RTC 的机型（`open` 返 `ENOENT`）仍静默跳过，行为与改前一致。
+
+=== 验证方式与结果
+
+* dtb：`cmp -l` 新旧镜像**只差 8 字节**且全在 `status` 属性内；
+  `dtc -I dtb -O dts` 解析通过、`fdtget -t s … status` = `okay`；
+  md5 `f24466bc…` → `b5668301…`，烧写后回读一致。
+* 板端 1.64（`ivsboxd` `727befd2…`）：
+ ** `/dev/rtc0` / `/dev/rtc` 出现，`/sys/class/rtc/rtc0` →
+    `soc@3000000/7090000.rtc`；`hwclock -w` rc=0。
+ ** **重启后 `uptime 0:00` 系统时间即 `2026-11-05 11:09:57 CST`**（改前必然 1970），
+    `since_epoch` 与 `date -u` 一致，`video/` 不再出现 `19700101/`。
+ ** 把系统时间拨回 1 h：一个轮询周期内 `time synced … (diff +3660 s)`，
+    **不再有** `rtc write failed`；随后 `since_epoch` 与 `date -u` 差 5 s。
+ ** 新代码运行期间（含一次重启）只有 0~1 条 `time synced`（改前每 30 s 一条）。
+* VM：`make test` 56/56、`GIT_VER=eee07aa` 56/56、`make arm` 0 告警。
+* 遗留：
+ ** dmesg `Invalid year 3926` 是 RTC 上电初值无效（对时一次后即被覆盖），
+    不是故障；`Using internal RC 16M clock source` 说明**无外部 32.768 kHz 晶振**、
+    只走内部 RC —— 数分钟量级与系统时钟一致，**小时级精度待实测**，故 4G 对时不可省。
+ ** `twi@2502400/rtc@51`（`nxp,pcf8563`）在设备树里是 `okay`，但硬件上没有这颗
+    芯片：手动 `bind` 后 `pcf8563_write_block_data: err=-22` ⇒
+    `probe of 1-0051 failed with error -5`。参考板遗留空节点，排查时别被 `okay` 误导。
 
 == 2026-11-05 09:35 SD 自动清理时钟基准修复 ＋ 4G 开机对时
 
@@ -130,6 +198,8 @@ NOTE: 本文档是 `AGENTS.md` 规则 4 的权威记录：不看代码也能知�
  ** 腾空间后 `storage level reject -> ok (used=62%)` 与两路 `record start` 同一秒发生，
     `video/20261105/channel*.mp4` 持续增长（26 s 涨 2.88 MB）。
 * 未做：设备树 `rtc@7090000` 仍是 `disabled`，启用需改 dts 重编 dtb（本轮不动内核）。
+  → **2026-11-05 11:12 已完成**：不重编内核，改为原地等长改写 `boot.img` 内嵌 dtb 的
+  `status` 属性并重烧 boot 分区，见本文件上一节。
 
 
 == 2026-10-15 10:21 M8-S8.3 受控远程通道装配接线

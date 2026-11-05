@@ -4901,14 +4901,19 @@ static void cell_link_drop(iv_agent_t *a)
  * 那里没有 now_ms、也不该反向依赖 agent 的配置；而这里只比两个整数，100 ms 一次的
  * 代价可忽略。
  *
- * 为什么不会反复设：设过去之后两边同步走时，差值恒在容差内。真正需要重设的场景
- * （模组重新同步了网络时间、或有人手动改了时钟）差值会重新拉开。
+ * 为什么不会反复设：快照按年龄走到此刻后再比，设过去之后两边同步走时，差值恒在
+ * 容差内。真正需要重设的场景（模组重新同步了网络时间、或有人手动改了时钟）差值
+ * 会重新拉开。
  *
- * 这条对时是"板子断电回 1970"的兜底：`rtc@7090000` 在设备树里是 disabled，
- * 没有任何开机校时脚本，而日志目录、上报 `DT=`、录像目录名全吃系统时间。 */
+ * 这条对时的定位（2026-11-05 起）： `rtc@7090000` 已在设备树里启用，开机系统时间
+ * 由 RTC 带来；4G 对时负责**开机第一次校准**并回写 RTC。两者缺一不可 ——
+ * RTC 只走内部 RC 振荡器（dmesg `Using internal RC 16M clock source`），
+ * 长时间会漂；4G 是唯一可信的外部时间源。日志目录、上报 `DT=`、录像目录名
+ * 全吃系统时间，所以这条链路必须稳。 */
 static void cell_time_sync(iv_agent_t *a, uint64_t now_ms)
 {
     iv_cell_snap_t s;
+    long long      expect;
     long long      diff;
     time_t         now;
 
@@ -4921,17 +4926,31 @@ static void cell_time_sync(iv_agent_t *a, uint64_t now_ms)
     if (!s.time_valid)
         return;
 
-    now  = time(NULL);
-    diff = (long long)s.wall_sec - (long long)now;
+    /* 给快照打戳：`wall_sec` 变了才算新快照。取"第一次看见"的时刻而不是解析
+     * 时刻 —— 最多晚一拍（驱动节拍 100 ms），相比一个轮询周期可忽略，换来的是
+     * 这里完全不依赖 cellular 内部的时钟。 */
+    if (s.wall_sec != a->time_last_wall) {
+        a->time_last_wall    = s.wall_sec;
+        a->time_last_seen_ms = now_ms;
+    }
+    if (a->time_last_seen_ms == 0 || now_ms < a->time_last_seen_ms)
+        return;
+
+    /* 把快照按年龄走到此刻，再跟系统时间比。不补偿的话差值恒等于"快照年龄"，
+     * 而快照年龄正好等于 CCLK 轮询周期 —— 每轮都超容差、每轮都设一次钟。 */
+    expect = (long long)s.wall_sec +
+             (long long)((now_ms - a->time_last_seen_ms) / 1000u);
+    now    = time(NULL);
+    diff   = expect - (long long)now;
     if (diff <= IV_AGENT_TIME_TOL_S && diff >= -IV_AGENT_TIME_TOL_S)
         return;
 
-    if (a->cfg.settime_fn(s.wall_sec, a->cfg.settime_arg) == IV_OK) {
-        /* 成功也要冷却：模组时间是"上次网络同步 + 本地走时"，与主机差几秒是常态，
+    if (a->cfg.settime_fn(expect, a->cfg.settime_arg) == IV_OK) {
+        /* 成功也冷却：模组时间是"上次网络同步 + 本地走时"，与主机差几秒是常态，
          * 差值恰在容差边缘时会一拍一跳（板端实测一秒内 5 条同样的日志）。 */
         a->time_sync_ms = now_ms;
         IV_LOG_I(AG_MOD, "time synced from 4G: %lld -> %lld (diff %+lld s)",
-                 (long long)now, (long long)s.wall_sec, diff);
+                 (long long)now, expect, diff);
     } else {
         a->time_sync_ms = now_ms;
         IV_LOG_W(AG_MOD, "time sync from 4G failed (clock_settime refused?)");

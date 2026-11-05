@@ -449,10 +449,12 @@ static int ctl_do_settime(int64_t wall_sec, void *arg)
  *   1) **4G 网络时间**：`iv_cell` 轮询里带 `AT+CCLK?`，差值超容差就调本函数
  *      （agent 负责判定，见 `cell_time_sync()`）。这条路不依赖 RTC 是否启用，
  *      只要 4G 能注册上网络就有正确时间 —— 属于"每次开机都能自愈"的兜底。
- *   2) **写回 RTC**：RTC 一旦在设备树里启用（`/dev/rtc0` 出现），对时成功就
- *      顺手写进去；下次断电重开，`hwclock -s`（或本函数读回）能立刻得到正确
- *      时间，不必等 4G 上网。RTC 不存在时 `open` 返回 ENOENT，**不算错误**，
- *      静默跳过 —— 这正是当前板子的状态。 */
+ *   2) **写回 RTC**：2026-11-05 已把 `rtc@7090000` 的 `status` 改成 okay 并重烧
+ *      boot 分区，`/dev/rtc0` 已出现，对时成功就顺手写进去，下次重开由 RTC 直接
+ *      给出时间（内核 `hctosys`），不必等 4G 上网。注意该 RTC **只走内部 RC
+ *      振荡器**（dmesg：`Using internal RC 16M clock source`），无外部 32.768 kHz
+ *      晶振，长时间会漂数分钟 —— 所以 4G 校准这条不能省。
+ *      若将来出现没有 RTC 的机型，`open` 返回 ENOENT 仍**不算错误**，静默跳过。 */
 #define APP_RTC_DEV "/dev/rtc0"
 
 static int app_rtc_write(time_t wall)
@@ -472,8 +474,15 @@ static int app_rtc_write(time_t wall)
     rt.tm_min  = tm.tm_min;
     rt.tm_hour = tm.tm_hour;
     rt.tm_mday = tm.tm_mday;
-    rt.tm_mon  = tm.tm_mon + 1;
-    rt.tm_year = tm.tm_year + 1900;
+    /* `struct rtc_time` 与 `struct tm` **同约定**：`tm_mon` 从 0 起算、`tm_year`
+     * 是"距 1900 的年数"。内核 `rtc_tm_to_time64()` 自己做 `tm_mon + 1` /
+     * `tm_year + 1900`，`rtc_valid_tm()` 也按 0 起的月份校验 —— 曾经在这里
+     * "顺手"多加 1 和 1900，结果月份凑成 12 被 `rtc_valid_tm()` 判非法，
+     * `RTC_SET_TIME` 返回 -EINVAL，板端日志只留一句
+     * `rtc write failed (-42)`（-42 = IV_EIO），看着像驱动坏了。
+     * 逐字段直传即可，busybox `hwclock -w` 就是这么做的。 */
+    rt.tm_mon  = tm.tm_mon;
+    rt.tm_year = tm.tm_year;
     rc = ioctl(fd, RTC_SET_TIME, &rt);
     (void)close(fd);
     return (rc == 0) ? IV_OK : IV_EIO;

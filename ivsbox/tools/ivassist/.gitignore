@@ -1,0 +1,4 @@
+# 构建产物与载荷（frpc.exe / 专用私钥 id_ed25519 绝不入库）
+build/
+payload/
+*.exe

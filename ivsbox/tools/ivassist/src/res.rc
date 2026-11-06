@@ -1,0 +1,41 @@
+#include <windows.h>
+
+#pragma code_page(65001)
+
+/* 内嵌载荷（构建时由 build.sh 从 _deploy/exe/payload 拷到 ../payload/）：
+ *   frpc.exe      —— stcp 访客，PC 本地开 16000 指向设备 22
+ *   id_ed25519    —— 设备 authorized_keys 里那把专用私钥（ssh 走隧道用）
+ * visitor.toml 不内嵌：运行时按 SN + 令牌现算 secretKey（见 main.c 的 toml_write）。 */
+100 RCDATA "..\\payload\\frpc.exe"
+102 RCDATA "..\\payload\\id_ed25519"
+
+/* 视觉样式 + DPI + 不要求管理员 */
+1 24 "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_APP
+FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "ivsbox"
+            VALUE "FileDescription",  "运维箱助手（配置·令牌·远程连接）"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "ivassist"
+            VALUE "OriginalFilename", "运维箱助手.exe"
+            VALUE "ProductName",      "运维箱助手"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
